@@ -594,6 +594,7 @@ TABLE entities
   extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
   redact_identification INTEGER notnull=1 pk=0 default=Some("0")
   hide_from_shared_surfaces INTEGER notnull=1 pk=0 default=Some("0")
+  owner_focus TEXT notnull=0 pk=0 default=None
 TABLE entity_facts
   id TEXT notnull=0 pk=1 default=None
   entity_id TEXT notnull=0 pk=0 default=None

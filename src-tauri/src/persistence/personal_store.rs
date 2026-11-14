@@ -883,7 +883,11 @@ pub(crate) async fn create_entity_fact_with_provenance_conn(
 // ---------------------------------------------------------------------------
 
 /// Load all active entity_facts rows (valid_until IS NULL) for a
-/// user+persona. Returns rows in an unspecified order — caller (lifecycle,
+/// user+persona, EXCEPT the facts of a Focus-owned entity (items.id=891,
+/// entities.owner_focus): this is the Persona-wide load that every Focus run
+/// makes, and an owned entity's facts belong to its Focus alone (a Focus reads
+/// them through its own derived text, never through PersonalTrack). Returns rows
+/// in an unspecified order — caller (lifecycle,
 /// via PersonalTrack::add_entity_fact) is responsible for ordering if
 /// order-sensitive presentation is ever needed; none of R1's consumers are.
 ///
@@ -906,6 +910,8 @@ pub async fn load_entity_facts_for_context(
         "SELECT id, entity_id, field_name, field_value, sensitivity, sensitivity_severity,
          source_persona_id, cross_persona_export, origin_persona_id
          FROM entity_facts WHERE valid_until IS NULL
+         AND (entity_id IS NULL
+              OR entity_id NOT IN (SELECT id FROM entities WHERE owner_focus IS NOT NULL))
          ORDER BY field_name",
     )
     .fetch_all(&mut conn)
@@ -1061,6 +1067,8 @@ pub async fn list_pending_cross_persona_exports(
         "SELECT id, entity_id, field_name, field_value, sensitivity, sensitivity_severity,
          source_persona_id, cross_persona_export, origin_persona_id
          FROM entity_facts WHERE valid_until IS NULL AND cross_persona_export = 1
+         AND (entity_id IS NULL
+              OR entity_id NOT IN (SELECT id FROM entities WHERE owner_focus IS NOT NULL))
          ORDER BY field_name",
     )
     .fetch_all(&mut conn)
@@ -2239,5 +2247,141 @@ mod tests {
             None => std::env::remove_var("QR_DATA_ROOT"),
         }
         outcome.expect("floor consent assertions must pass");
+    }
+
+    /// items.id=891: the Persona-wide entity-fact load that every Focus run makes
+    /// leaves out the facts of a Focus-owned entity (and so does the Privacy
+    /// Guardian's entity-fact resolution, which reads through it), while an
+    /// unowned entity's facts and the Persona's singleton facts are still loaded.
+    #[tokio::test]
+    async fn the_persona_wide_fact_load_leaves_out_a_focus_owned_entitys_facts() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
+
+        let outcome = async {
+            crate::persistence::migrations::migrate_personal_db("u1", "p1", key_hex)
+                .await
+                .expect("migration");
+            let mut conn = open_personal_db("u1", "p1", key_hex).await?;
+            let plain = crate::persistence::entity_store::create_entity_conn(
+                &mut conn,
+                "person",
+                "Contact",
+                &[],
+                None,
+                None,
+            )
+            .await?;
+            let owned = crate::persistence::entity_store::create_owned_entity_conn(
+                &mut conn,
+                "tech-support",
+                "focus_subject",
+                "Router",
+                &[],
+                None,
+            )
+            .await?;
+            for (entity, field, value) in [
+                (Some(plain.as_str()), "phone", "555-1234"),
+                (Some(owned.as_str()), "serial_number", "SN-OWNED"),
+                (None, "city", "Portland"),
+            ] {
+                create_entity_fact_with_provenance_conn(
+                    &mut conn, entity, field, value, "personal", "test", "p1", false, None, None,
+                )
+                .await?;
+            }
+            drop(conn);
+
+            let loaded = load_entity_facts_for_context("u1", "p1", key_hex).await?;
+            let mut names: Vec<&str> = loaded.iter().map(|f| f.field_name.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                ["city", "phone"],
+                "the owned entity's fact is not loaded"
+            );
+            assert!(loaded.iter().all(|f| f.field_value != "SN-OWNED"));
+            Ok::<(), PersonalStoreError>(())
+        }
+        .await;
+
+        match saved_root {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
+        outcome.expect("owned-entity fact exclusion must hold");
+    }
+
+    /// items.id=891 (Chat-PM addition to stage 1): the pending cross-Persona
+    /// confirmation list leaves out an owned entity's fact flagged for export,
+    /// while an unowned entity's flagged fact is listed.
+    #[tokio::test]
+    async fn the_pending_cross_persona_list_leaves_out_a_focus_owned_entitys_facts() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
+
+        let outcome = async {
+            crate::persistence::migrations::migrate_personal_db("u1", "p1", key_hex)
+                .await
+                .expect("migration");
+            let mut conn = open_personal_db("u1", "p1", key_hex).await?;
+            let plain = crate::persistence::entity_store::create_entity_conn(
+                &mut conn,
+                "person",
+                "Contact",
+                &[],
+                None,
+                None,
+            )
+            .await?;
+            let owned = crate::persistence::entity_store::create_owned_entity_conn(
+                &mut conn,
+                "tech-support",
+                "focus_subject",
+                "Router",
+                &[],
+                None,
+            )
+            .await?;
+            for (entity, field, value) in [
+                (Some(plain.as_str()), "phone", "555-1234"),
+                (Some(owned.as_str()), "serial_number", "SN-OWNED"),
+            ] {
+                create_entity_fact_with_provenance_conn(
+                    &mut conn,
+                    entity,
+                    field,
+                    value,
+                    "personal",
+                    "test",
+                    "p1",
+                    true,
+                    Some("p0"),
+                    None,
+                )
+                .await?;
+            }
+            drop(conn);
+
+            let listed = list_pending_cross_persona_exports("u1", "p1", key_hex).await?;
+            let names: Vec<&str> = listed.iter().map(|f| f.field_name.as_str()).collect();
+            assert_eq!(names, ["phone"], "only the unowned entity's fact is listed");
+            assert!(listed.iter().all(|f| f.field_value != "SN-OWNED"));
+            Ok::<(), PersonalStoreError>(())
+        }
+        .await;
+
+        match saved_root {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
+        outcome.expect("owned-entity export exclusion must hold");
     }
 }

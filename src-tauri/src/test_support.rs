@@ -308,3 +308,48 @@ impl Drop for KillGroupOnDrop {
         }
     }
 }
+
+/// items.id=891: add a Focus-OWNED entity with one fact to a Persona's real
+/// personal.db, for the tests that prove an owned entity never leaves its
+/// Focus. Returns the entity id. The fact value is the distinctive text the
+/// callers search the other side for.
+#[cfg(test)]
+pub async fn add_owned_entity_with_fact(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    owner_focus: &str,
+    name: &str,
+    field: &str,
+    value: &str,
+) -> String {
+    let mut conn =
+        crate::persistence::personal_store::open_personal_db(user_id, persona_id, key_hex)
+            .await
+            .expect("open personal.db");
+    let id = crate::persistence::entity_store::create_owned_entity_conn(
+        &mut conn,
+        owner_focus,
+        "focus_subject",
+        name,
+        &[],
+        None,
+    )
+    .await
+    .expect("create owned entity");
+    crate::persistence::personal_store::create_entity_fact_with_provenance_conn(
+        &mut conn,
+        Some(id.as_str()),
+        field,
+        value,
+        "personal",
+        "test",
+        persona_id,
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("create owned fact");
+    id
+}

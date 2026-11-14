@@ -100,7 +100,9 @@ use x25519_dalek::StaticSecret;
 use crate::auth::persona_sharing::{SharedEntityFact, SharedVoiceProfileEntry};
 use crate::auth::registry::KeyRegistry;
 use crate::auth::sharing_keypair::{self, SharingKeypairError};
-use crate::persistence::entity_store::{self, Entity, EntityFilter, EntityUpdate, ParentFilter};
+use crate::persistence::entity_store::{
+    self, Entity, EntityFilter, EntityUpdate, OwnerFilter, ParentFilter,
+};
 use crate::persistence::personal_store::{self, PersonalStoreError};
 use crate::persistence::source_registry_store::{self, RefreshVerdict};
 use crate::persona_sync::settings_store::{self, PersonaShareSyncSettingsError};
@@ -570,10 +572,12 @@ async fn push_if_changed(
         owner_user_id,
         owner_persona_id,
         owner_personal_key_hex,
+        // items.id=891: a Focus-owned entity is never pushed (OwnerFilter::Unowned).
         &EntityFilter {
             entity_type: None,
             status: Some("active".to_owned()),
             parent: ParentFilter::Any,
+            owner: OwnerFilter::Unowned,
         },
     )
     .await?;
@@ -3356,6 +3360,131 @@ mod tests {
             still_present.is_some(),
             "a user_created voice profile entry this sync relationship never wrote \
              must never be touched by absence retirement"
+        );
+    }
+
+    /// items.id=891: an owner's Focus-owned entity (and its facts) is never
+    /// pushed, while an unowned entity added at the same time is.
+    #[tokio::test]
+    async fn a_push_never_carries_a_focus_owned_entity_or_its_facts() {
+        let _env = setup().await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x16).await;
+        let (recipient_id, _, recipient_key, recipient_priv) =
+            make_user_with_persona(pool, "Bob", 0x26).await;
+
+        let share_id = send_persona_share(
+            pool,
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &recipient_id,
+            ShareType::Synced,
+        )
+        .await
+        .unwrap();
+        let persona_id = accept_and_provision_sync(
+            pool,
+            &share_id,
+            &recipient_id,
+            &recipient_key,
+            &recipient_priv,
+        )
+        .await
+        .unwrap();
+        let shared_folder = tempfile::tempdir().unwrap();
+        let folder_path = shared_folder.path().to_str().unwrap();
+        settings_store::set_persona_share_sync_folder(
+            &owner_id,
+            &owner_key,
+            &owner_persona,
+            &share_id,
+            settings_store::SyncRole::Owner,
+            folder_path,
+        )
+        .await
+        .unwrap();
+        settings_store::set_persona_share_sync_folder(
+            &recipient_id,
+            &recipient_key,
+            &persona_id,
+            &share_id,
+            settings_store::SyncRole::Recipient,
+            folder_path,
+        )
+        .await
+        .unwrap();
+
+        let owned_id = crate::test_support::add_owned_entity_with_fact(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            "tech-support",
+            "Router",
+            "serial_number",
+            "SN-OWNED-2",
+        )
+        .await;
+        let plain_id = entity_store::create_entity(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            "person",
+            "Late Contact",
+            &[],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(push_if_changed(
+            pool,
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &share_id,
+            &recipient_id,
+        )
+        .await
+        .unwrap());
+        pull_if_newer(
+            &recipient_id,
+            &persona_id,
+            &recipient_key,
+            &share_id,
+            &recipient_priv,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            entity_store::get_entity(&recipient_id, &persona_id, &recipient_key, &plain_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the unowned entity reached the recipient"
+        );
+        assert!(
+            entity_store::get_entity(&recipient_id, &persona_id, &recipient_key, &owned_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the owned entity did not"
+        );
+        let mut conn = personal_store::open_personal_db(&recipient_id, &persona_id, &recipient_key)
+            .await
+            .unwrap();
+        let leaked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM entity_facts WHERE field_value = 'SN-OWNED-2'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            leaked, 0,
+            "no fact of the owned entity reached the recipient"
         );
     }
 }

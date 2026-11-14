@@ -386,6 +386,7 @@ mod tests {
             extra_metadata: serde_json::json!({}),
             redact_identification: false,
             hide_from_shared_surfaces: false,
+            owner_focus: None,
         }
     }
 

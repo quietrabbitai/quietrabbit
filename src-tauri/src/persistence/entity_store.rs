@@ -146,6 +146,17 @@ pub struct Entity {
     /// Full semantics owned by decisions.id=513 (P4 -- One Home). Defaults
     /// false (personal_003.sql).
     pub hide_from_shared_surfaces: bool,
+    /// items.id=891 (personal_011.sql): the Focus that owns this entity, or None
+    /// for an UNOWNED entity (every entity that exists outside a Focus op). An
+    /// owned entity is read and written only by its Focus and is never copied
+    /// to another Persona or loaded into another Focus.
+    ///
+    /// NOT serialized and defaulted on read: Entity is the wire shape of the
+    /// persona share, sync and view-sync payloads, and only unowned entities
+    /// ever reach them (OwnerFilter::Unowned at every loader), so the field
+    /// adds nothing to a payload and must not change a payload's content hash.
+    #[serde(default, skip_serializing)]
+    pub owner_focus: Option<String>,
 }
 
 impl crate::conductor::visibility::VisibilityFlags for Entity {
@@ -171,6 +182,24 @@ pub enum ParentFilter {
     Under(String),
 }
 
+/// Which entities a read may see by ownership (items.id=891, personal_011.sql).
+///
+/// Persona-wide readers (persona share, sync, view-only sync, the PersonalTrack
+/// load) must say `Unowned` so a Focus-owned entity never leaves its Focus. A
+/// source scan (entity_store tests) pins that every non-test caller outside
+/// this file names `owner` explicitly, so a new reader cannot inherit `Any` by
+/// accident.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum OwnerFilter {
+    /// No constraint on owner_focus (maintenance and tests).
+    #[default]
+    Any,
+    /// Only entities no Focus owns (owner_focus IS NULL).
+    Unowned,
+    /// Only entities owned by this Focus.
+    Focus(String),
+}
+
 /// Structured filter for list_entities / search_entities.
 ///
 /// entity_type + status together hit idx_entities_type_status
@@ -181,6 +210,7 @@ pub struct EntityFilter {
     pub entity_type: Option<String>,
     pub status: Option<String>,
     pub parent: ParentFilter,
+    pub owner: OwnerFilter,
 }
 
 impl EntityFilter {
@@ -190,6 +220,7 @@ impl EntityFilter {
             entity_type: Some(entity_type.to_owned()),
             status: Some("active".to_owned()),
             parent: ParentFilter::Any,
+            owner: OwnerFilter::Any,
         }
     }
 }
@@ -268,6 +299,7 @@ fn row_to_entity(row: &sqlx::sqlite::SqliteRow) -> Result<Entity, PersonalStoreE
         extra_metadata,
         redact_identification: redact_identification_int != 0,
         hide_from_shared_surfaces: hide_from_shared_surfaces_int != 0,
+        owner_focus: row.try_get("owner_focus")?,
     })
 }
 
@@ -346,6 +378,14 @@ fn filter_clause(filter: &EntityFilter) -> (String, Vec<String>) {
             binds.push(parent_id.clone());
         }
     }
+    match &filter.owner {
+        OwnerFilter::Any => {}
+        OwnerFilter::Unowned => clauses.push("owner_focus IS NULL"),
+        OwnerFilter::Focus(focus) => {
+            clauses.push("owner_focus = ?");
+            binds.push(focus.clone());
+        }
+    }
 
     if clauses.is_empty() {
         (String::new(), binds)
@@ -358,7 +398,7 @@ fn filter_clause(filter: &EntityFilter) -> (String, Vec<String>) {
 /// list and row_to_entity() cannot drift apart.
 const ENTITY_COLUMNS: &str = "id, entity_type, display_name, aliases, parent_entity_id, status, \
      modification_state, source_registry_id, source_url, created_at, \
-     extra_metadata, redact_identification, hide_from_shared_surfaces";
+     extra_metadata, redact_identification, hide_from_shared_surfaces, owner_focus";
 
 // ---------------------------------------------------------------------------
 // Create
@@ -410,6 +450,69 @@ pub(crate) async fn create_entity_conn(
     parent_entity_id: Option<&str>,
     extra_metadata: Option<serde_json::Value>,
 ) -> Result<String, PersonalStoreError> {
+    insert_entity_conn(
+        conn,
+        None,
+        entity_type,
+        display_name,
+        aliases,
+        parent_entity_id,
+        extra_metadata,
+    )
+    .await
+}
+
+/// Longest owner_focus slug (the same limit as a Focus id, 1 to 64 characters of
+/// lowercase letters, digits, '-' and '_').
+const OWNER_FOCUS_MAX_CHARS: usize = 64;
+
+/// items.id=891: create an entity OWNED by a Focus (personal_011.sql). The one
+/// way an owner_focus is ever written: a persona share, a sync apply, a source
+/// import and a plain create_entity all leave it NULL. There is no top-level
+/// parent, so a Focus-owned entity is always a root (relationships and
+/// hierarchy are deferred in R1, decisions.id=940 ruling 2).
+#[allow(dead_code)] // items.id=891 stage 3 (the entity writer) is the first non-test caller
+pub(crate) async fn create_owned_entity_conn(
+    conn: &mut SqliteConnection,
+    owner_focus: &str,
+    entity_type: &str,
+    display_name: &str,
+    aliases: &[String],
+    extra_metadata: Option<serde_json::Value>,
+) -> Result<String, PersonalStoreError> {
+    let valid = !owner_focus.is_empty()
+        && owner_focus.len() <= OWNER_FOCUS_MAX_CHARS
+        && owner_focus
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+    if !valid {
+        return Err(PersonalStoreError::Validation(
+            "owner_focus must be a Focus slug: lowercase letters, digits, '-' and '_', \
+             1 to 64 characters."
+                .to_owned(),
+        ));
+    }
+    insert_entity_conn(
+        conn,
+        Some(owner_focus),
+        entity_type,
+        display_name,
+        aliases,
+        None,
+        extra_metadata,
+    )
+    .await
+}
+
+async fn insert_entity_conn(
+    conn: &mut SqliteConnection,
+    owner_focus: Option<&str>,
+    entity_type: &str,
+    display_name: &str,
+    aliases: &[String],
+    parent_entity_id: Option<&str>,
+    extra_metadata: Option<serde_json::Value>,
+) -> Result<String, PersonalStoreError> {
     validate_identity(entity_type, display_name)?;
 
     let new_id = uuid::Uuid::new_v4().to_string();
@@ -423,8 +526,8 @@ pub(crate) async fn create_entity_conn(
     sqlx::query(
         "INSERT INTO entities
          (id, entity_type, display_name, aliases, parent_entity_id, status,
-          created_at, extra_metadata)
-         VALUES (?, ?, ?, ?, ?, 'active', ?, ?)",
+          created_at, extra_metadata, owner_focus)
+         VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)",
     )
     .bind(&new_id)
     .bind(entity_type)
@@ -433,6 +536,7 @@ pub(crate) async fn create_entity_conn(
     .bind(parent_entity_id)
     .bind(crate::providers::utils::now())
     .bind(&metadata_json)
+    .bind(owner_focus)
     .execute(&mut *conn)
     .await?;
 
@@ -934,11 +1038,13 @@ mod tests {
     const PERSONAL_SCHEMA_V1: &str = include_str!("../../schema/personal_001.sql");
     const PERSONAL_SCHEMA_V2: &str = include_str!("../../schema/personal_002.sql");
     const PERSONAL_SCHEMA_V3: &str = include_str!("../../schema/personal_003.sql");
+    const PERSONAL_SCHEMA_V11: &str = include_str!("../../schema/personal_011.sql");
 
-    /// In-memory personal.db with the real schema applied, v1 through v3 —
-    /// the same order and the same statement splitter the migration runner
-    /// uses, so the v2 entities rebuild and the v3 flag-column additions are
-    /// both exercised on every single test.
+    /// In-memory personal.db with the real schema applied, v1 through v3 plus
+    /// v11 (the owner column; v4 to v10 touch no entity table) — the same order
+    /// and the same statement splitter the migration runner uses, so the v2
+    /// entities rebuild and the v3 and v11 column additions are all exercised on
+    /// every single test.
     async fn test_db() -> SqliteConnection {
         let mut conn = SqliteConnectOptions::new()
             .filename(":memory:")
@@ -946,7 +1052,12 @@ mod tests {
             .await
             .expect("in-memory connection failed");
 
-        for schema in [PERSONAL_SCHEMA_V1, PERSONAL_SCHEMA_V2, PERSONAL_SCHEMA_V3] {
+        for schema in [
+            PERSONAL_SCHEMA_V1,
+            PERSONAL_SCHEMA_V2,
+            PERSONAL_SCHEMA_V3,
+            PERSONAL_SCHEMA_V11,
+        ] {
             for stmt in parse_statements(schema) {
                 sqlx::query(&stmt)
                     .execute(&mut conn)
@@ -1673,6 +1784,7 @@ mod tests {
 
         apply_v2(&mut conn).await;
         apply_v3(&mut conn).await;
+        apply_v11(&mut conn).await;
 
         let all = list_entities_conn(&mut conn, &EntityFilter::default())
             .await
@@ -1818,6 +1930,15 @@ mod tests {
         }
     }
 
+    async fn apply_v11(conn: &mut SqliteConnection) {
+        for stmt in parse_statements(PERSONAL_SCHEMA_V11) {
+            sqlx::query(&stmt)
+                .execute(&mut *conn)
+                .await
+                .unwrap_or_else(|e| panic!("v11 statement failed: {e}\n{stmt}"));
+        }
+    }
+
     #[tokio::test]
     async fn migration_v3_adds_visibility_columns_defaulting_false_and_preserves_rows() {
         // Applies v1+v2 first (pre-existing row, no knowledge of the new
@@ -1834,11 +1955,21 @@ mod tests {
             }
         }
 
-        let id = create_entity_conn(&mut conn, "recipe", "Pre-v3 Bread", &[], None, None)
-            .await
-            .expect("pre-v3 create failed");
+        // A raw insert: create_entity_conn names owner_focus (personal_011), a
+        // column this database does not have yet.
+        let id = "e-pre-v3".to_owned();
+        sqlx::query(
+            "INSERT INTO entities (id, entity_type, display_name, aliases, status,
+             created_at, extra_metadata)
+             VALUES (?, 'recipe', 'Pre-v3 Bread', '[]', 'active', 't', '{}')",
+        )
+        .bind(&id)
+        .execute(&mut conn)
+        .await
+        .expect("pre-v3 insert failed");
 
         apply_v3(&mut conn).await;
+        apply_v11(&mut conn).await;
 
         let e = get_entity_conn(&mut conn, &id)
             .await
@@ -1862,7 +1993,12 @@ mod tests {
             .connect()
             .await
             .expect("in-memory connection failed");
-        for schema in [PERSONAL_SCHEMA_V1, PERSONAL_SCHEMA_V2, PERSONAL_SCHEMA_V3] {
+        for schema in [
+            PERSONAL_SCHEMA_V1,
+            PERSONAL_SCHEMA_V2,
+            PERSONAL_SCHEMA_V3,
+            PERSONAL_SCHEMA_V11,
+        ] {
             for stmt in parse_statements(schema) {
                 sqlx::query(&stmt).execute(&mut conn).await.unwrap();
             }
@@ -1879,6 +2015,234 @@ mod tests {
         assert!(
             result.is_err(),
             "the CHECK (redact_identification IN (0, 1)) constraint must reject 2"
+        );
+    }
+
+    // -- items.id=891 stage 1: Focus ownership (personal_011.sql) -----------
+
+    #[tokio::test]
+    async fn an_entity_created_the_ordinary_way_is_unowned_and_an_owned_one_names_its_focus() {
+        let mut conn = test_db().await;
+        let plain = create_entity_conn(&mut conn, "recipe", "Bread", &[], None, None)
+            .await
+            .unwrap();
+        let owned = create_owned_entity_conn(
+            &mut conn,
+            "tech-support",
+            "focus_subject",
+            "Router",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+
+        let plain = get_entity_conn(&mut conn, &plain).await.unwrap().unwrap();
+        let owned = get_entity_conn(&mut conn, &owned).await.unwrap().unwrap();
+        assert_eq!(plain.owner_focus, None);
+        assert_eq!(owned.owner_focus.as_deref(), Some("tech-support"));
+        assert_eq!(owned.status, "active");
+        assert_eq!(owned.parent_entity_id, None, "an owned entity is a root");
+        assert_eq!(owned.modification_state, "user_created");
+    }
+
+    #[tokio::test]
+    async fn an_owner_focus_must_be_a_focus_slug() {
+        let mut conn = test_db().await;
+        for bad in ["", "Tech Support", "tech/support", &"a".repeat(65)] {
+            assert!(
+                create_owned_entity_conn(&mut conn, bad, "focus_subject", "Router", &[], None)
+                    .await
+                    .is_err(),
+                "'{bad}' must be refused"
+            );
+        }
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entities")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "a refused create writes nothing");
+    }
+
+    #[tokio::test]
+    async fn the_owner_filter_separates_unowned_owned_and_any() {
+        let mut conn = test_db().await;
+        create_entity_conn(&mut conn, "recipe", "Bread", &[], None, None)
+            .await
+            .unwrap();
+        create_owned_entity_conn(
+            &mut conn,
+            "tech-support",
+            "focus_subject",
+            "Router",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+        create_owned_entity_conn(
+            &mut conn,
+            "other-focus",
+            "focus_subject",
+            "Camera",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+
+        let names = |list: Vec<Entity>| -> Vec<String> {
+            list.into_iter().map(|e| e.display_name).collect()
+        };
+        let with = |owner: OwnerFilter| EntityFilter {
+            owner,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            names(
+                list_entities_conn(&mut conn, &with(OwnerFilter::Any))
+                    .await
+                    .unwrap()
+            ),
+            ["Bread", "Camera", "Router"]
+        );
+        assert_eq!(
+            names(
+                list_entities_conn(&mut conn, &with(OwnerFilter::Unowned))
+                    .await
+                    .unwrap()
+            ),
+            ["Bread"]
+        );
+        assert_eq!(
+            names(
+                list_entities_conn(&mut conn, &with(OwnerFilter::Focus("tech-support".into())))
+                    .await
+                    .unwrap()
+            ),
+            ["Router"]
+        );
+        // Search honours it too.
+        assert_eq!(
+            names(
+                search_entities_conn(&mut conn, "r", &with(OwnerFilter::Unowned))
+                    .await
+                    .unwrap()
+            ),
+            ["Bread"]
+        );
+        assert_eq!(
+            names(
+                search_entities_conn(
+                    &mut conn,
+                    "cam",
+                    &with(OwnerFilter::Focus("other-focus".into()))
+                )
+                .await
+                .unwrap()
+            ),
+            ["Camera"]
+        );
+        assert!(
+            search_entities_conn(
+                &mut conn,
+                "cam",
+                &with(OwnerFilter::Focus("tech-support".into()))
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "another Focus's entity is not found through this Focus's filter"
+        );
+        // The default filter is unconstrained, as before.
+        assert_eq!(EntityFilter::default().owner, OwnerFilter::Any);
+    }
+
+    #[tokio::test]
+    async fn owner_focus_is_not_part_of_the_payload_shape() {
+        let mut conn = test_db().await;
+        let id = create_owned_entity_conn(
+            &mut conn,
+            "tech-support",
+            "focus_subject",
+            "Router",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+        let e = get_entity_conn(&mut conn, &id).await.unwrap().unwrap();
+        let json = serde_json::to_value(&e).unwrap();
+        assert!(
+            json.get("owner_focus").is_none(),
+            "an entity payload (persona share, sync) never carries the owner"
+        );
+        // A payload written before the field existed still reads, as unowned.
+        let back: Entity = serde_json::from_value(json).unwrap();
+        assert_eq!(back.owner_focus, None);
+    }
+
+    /// Every caller of list_entities and search_entities outside this file must
+    /// name an owner filter, so a new reader cannot inherit OwnerFilter::Any by
+    /// accident (items.id=891). The three Persona-wide loaders (persona share,
+    /// sync, view-only sync) say Unowned. The default and the active_of_type
+    /// constructor are Any, so they may not be used outside this file at all.
+    #[test]
+    fn every_entity_reader_outside_this_file_names_an_owner_filter() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        assert!(files.len() > 50, "the scan did not find the source tree");
+
+        let mut saw_loaders = 0;
+        for path in files {
+            if path.ends_with("persistence/entity_store.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            // Non-test part only: tests may build any filter.
+            let prod = text.split("#[cfg(test)]").next().unwrap();
+            let lines: Vec<&str> = prod.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                let t = line.trim_start();
+                if t.starts_with("//") {
+                    continue;
+                }
+                assert!(
+                    !line.contains("EntityFilter::default()")
+                        && !line.contains("EntityFilter::active_of_type"),
+                    "{}:{}: an Any-owner filter constructor outside entity_store",
+                    path.display(),
+                    i + 1
+                );
+                if line.contains("EntityFilter {") {
+                    let window = lines[i..lines.len().min(i + 10)].join("\n");
+                    assert!(
+                        window.contains("owner:"),
+                        "{}:{}: an EntityFilter must name its owner filter",
+                        path.display(),
+                        i + 1
+                    );
+                    if window.contains("OwnerFilter::Unowned") {
+                        saw_loaders += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            saw_loaders, 3,
+            "persona share, sync and view-only sync each list unowned entities"
         );
     }
 }

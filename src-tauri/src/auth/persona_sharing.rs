@@ -69,7 +69,7 @@ use thiserror::Error;
 use x25519_dalek::StaticSecret;
 
 use crate::auth::sharing_keypair::{self, SharingKeypairError};
-use crate::persistence::entity_store::{Entity, EntityFilter, ParentFilter};
+use crate::persistence::entity_store::{Entity, EntityFilter, OwnerFilter, ParentFilter};
 use crate::persistence::persona_registry_store::{self, PersonaRegistryEntry};
 use crate::persistence::persona_store::{self, PersonaStoreError};
 use crate::persistence::personal_store::{self, PersonalStoreError};
@@ -381,10 +381,13 @@ pub async fn send_persona_share(
         owner_user_id,
         source_persona_id,
         owner_key_hex,
+        // items.id=891: a Focus-owned entity (a Tech Support device) is never part
+        // of a share, so only unowned entities are listed.
         &EntityFilter {
             entity_type: None,
             status: Some("active".to_owned()),
             parent: ParentFilter::Any,
+            owner: OwnerFilter::Unowned,
         },
     )
     .await?;
@@ -1857,6 +1860,75 @@ mod tests {
         assert_eq!(
             status, "pending",
             "tampered accept must leave share pending"
+        );
+    }
+
+    /// items.id=891: a Focus-owned entity (a Tech Support device) and its facts
+    /// are not in a persona share, while an unowned entity still is.
+    #[tokio::test]
+    async fn a_share_leaves_out_a_focus_owned_entity_and_its_facts() {
+        let env = setup().await;
+        let pool = &env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x71).await;
+        let (recipient_id, _, _, recipient_priv) = make_user_with_persona(pool, "Bob", 0x72).await;
+
+        entity_store::create_entity(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            "person",
+            "Sam",
+            &[],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let owned_id = crate::test_support::add_owned_entity_with_fact(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            "tech-support",
+            "Router",
+            "serial_number",
+            "SN-OWNED-1",
+        )
+        .await;
+
+        let share_id = send_persona_share(
+            pool,
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &recipient_id,
+            ShareType::Synced,
+        )
+        .await
+        .unwrap();
+        let mut shared_conn = pool.acquire().await.unwrap();
+        let row = sqlx::query("SELECT encrypted_payload FROM pending_persona_shares WHERE id = ?")
+            .bind(&share_id)
+            .fetch_one(&mut *shared_conn)
+            .await
+            .unwrap();
+        let payload =
+            decrypt_payload(&recipient_priv, &row.get::<String, _>("encrypted_payload")).await;
+
+        let names: Vec<&str> = payload
+            .entities
+            .iter()
+            .map(|e| e.display_name.as_str())
+            .collect();
+        assert_eq!(names, ["Sam"], "only the unowned entity is shared");
+        assert!(payload.entities.iter().all(|e| e.id != owned_id));
+        assert!(
+            payload
+                .entity_facts
+                .iter()
+                .all(|f| f.entity_id.as_deref() != Some(owned_id.as_str())
+                    && f.field_value != "SN-OWNED-1"),
+            "the owned entity's facts are not shared either"
         );
     }
 }

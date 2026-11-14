@@ -833,6 +833,7 @@ mod tests {
     const V1: &str = include_str!("../../schema/personal_001.sql");
     const V2: &str = include_str!("../../schema/personal_002.sql");
     const V3: &str = include_str!("../../schema/personal_003.sql");
+    const V11: &str = include_str!("../../schema/personal_011.sql");
     const V7: &str = include_str!("../../schema/personal_007.sql");
 
     async fn test_db() -> SqliteConnection {
@@ -841,7 +842,7 @@ mod tests {
             .connect()
             .await
             .expect("in-memory connection failed");
-        for schema in [V1, V2, V3, V7] {
+        for schema in [V1, V2, V3, V7, V11] {
             for stmt in parse_statements(schema) {
                 sqlx::query(&stmt)
                     .execute(&mut conn)

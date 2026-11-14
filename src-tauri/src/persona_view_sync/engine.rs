@@ -69,7 +69,7 @@ use crate::auth::persona_sharing::{
 };
 use crate::auth::registry::KeyRegistry;
 use crate::auth::sharing_keypair::{self, SharingKeypairError};
-use crate::persistence::entity_store::{self, Entity, EntityFilter, ParentFilter};
+use crate::persistence::entity_store::{self, Entity, EntityFilter, OwnerFilter, ParentFilter};
 use crate::persistence::view_cache_store::{self, ViewCacheStatus, ViewCacheStoreError};
 use crate::persona_sync::settings_store as owner_settings_store;
 use crate::persona_view_sync::settings_store::{self, PersonaViewShareSyncSettingsError};
@@ -531,10 +531,12 @@ async fn push_if_changed_view(
             owner_user_id,
             owner_persona_id,
             owner_personal_key_hex,
+            // items.id=891: a Focus-owned entity is never pushed (OwnerFilter::Unowned).
             &EntityFilter {
                 entity_type: None,
                 status: Some("active".to_owned()),
                 parent: ParentFilter::Any,
+                owner: OwnerFilter::Unowned,
             },
         )
         .await?;
@@ -1409,5 +1411,116 @@ mod tests {
         .await
         .expect("push_if_changed_view must succeed even when unconfigured");
         assert!(!pushed);
+    }
+
+    /// items.id=891: a view-only push never carries a Focus-owned entity or its
+    /// facts into the recipient's read-only cache.
+    #[tokio::test]
+    async fn a_view_push_never_carries_a_focus_owned_entity_or_its_facts() {
+        let _env = setup().await;
+        let pool = &_env.pool;
+        let (owner_id, owner_persona, owner_key, _) =
+            make_user_with_persona(pool, "Alice", 0x34).await;
+        let (recipient_id, recipient_key, recipient_priv) =
+            make_recipient_user(pool, "Bob", 0x44).await;
+
+        let share_id = send_persona_share(
+            pool,
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &recipient_id,
+            ShareType::ViewOnly,
+        )
+        .await
+        .unwrap();
+        accept_persona_view_share(
+            pool,
+            &share_id,
+            &recipient_id,
+            &recipient_key,
+            &recipient_priv,
+        )
+        .await
+        .unwrap();
+        let shared_folder = tempfile::tempdir().unwrap();
+        let folder_path = shared_folder.path().to_str().unwrap();
+        owner_settings_store::set_persona_share_sync_folder(
+            &owner_id,
+            &owner_key,
+            &owner_persona,
+            &share_id,
+            owner_settings_store::SyncRole::Owner,
+            folder_path,
+        )
+        .await
+        .unwrap();
+        settings_store::set_persona_view_share_sync_folder(
+            &recipient_id,
+            &recipient_key,
+            &share_id,
+            folder_path,
+        )
+        .await
+        .unwrap();
+
+        crate::test_support::add_owned_entity_with_fact(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            "tech-support",
+            "Router",
+            "serial_number",
+            "SN-OWNED-3",
+        )
+        .await;
+        entity_store::create_entity(
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            "person",
+            "Late Contact",
+            &[],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(push_if_changed_view(
+            pool,
+            &owner_id,
+            &owner_persona,
+            &owner_key,
+            &share_id,
+            &recipient_id,
+            false,
+        )
+        .await
+        .unwrap());
+        assert!(
+            pull_if_newer_view(&recipient_id, &recipient_key, &share_id, &recipient_priv)
+                .await
+                .unwrap()
+        );
+
+        let mut cache_conn =
+            view_cache_store::open_view_cache_db(&recipient_id, &share_id, &recipient_key)
+                .await
+                .unwrap();
+        let names: Vec<String> = sqlx::query_scalar(
+            "SELECT display_name FROM view_cache_entities ORDER BY display_name",
+        )
+        .fetch_all(&mut cache_conn)
+        .await
+        .unwrap();
+        assert_eq!(names, ["Late Contact"], "the owned entity is not cached");
+        let leaked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM view_cache_entity_facts WHERE field_value = 'SN-OWNED-3'",
+        )
+        .fetch_one(&mut cache_conn)
+        .await
+        .unwrap();
+        assert_eq!(leaked, 0);
     }
 }
