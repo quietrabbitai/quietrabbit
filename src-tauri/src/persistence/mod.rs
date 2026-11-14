@@ -9,6 +9,7 @@ pub mod dedup_store;
 pub mod disclosure_log_store;
 pub mod document_fork_store;
 pub mod domain_context_store;
+pub mod entity_purge;
 pub mod entity_store;
 pub mod focus_composition_store;
 pub mod focus_provider_criteria_store;

@@ -2972,6 +2972,9 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             ));
         };
         lease.bind_run(run_id);
+        // items.id=891: and to its Persona and Focus, so the purge of a Focus's
+        // data can find and stop it.
+        lease.bind_focus(&self.persona_id, &self.focus_id);
         self.lease = Some(lease);
         Ok(())
     }
@@ -7299,6 +7302,44 @@ mod tests {
                 0
             );
             assert!(crate::auth::writer_gate::is_idle("u-cancel-drop"));
+        })
+        .await;
+    }
+
+    /// items.id=891: an attached run lease is bound to the run's Persona and Focus,
+    /// so the purge of a Focus's data finds and stops it, and the binding ends with
+    /// the run.
+    #[tokio::test]
+    async fn an_attached_run_is_found_and_stopped_by_its_focus() {
+        with_temp_data_root(async {
+            let user = "u-focus-stop";
+            let mut run = one_step_run(user);
+            run.attach_lease(
+                crate::auth::writer_gate::acquire(user, crate::auth::writer_gate::Kind::FocusRun)
+                    .unwrap(),
+            )
+            .unwrap();
+            let (persona, focus) = (run.persona_id.clone(), run.focus_id.clone());
+            assert_eq!(
+                crate::auth::writer_gate::live_runs_for_focus(user, &persona, &focus),
+                1
+            );
+            assert_eq!(
+                crate::auth::writer_gate::live_runs_for_focus(user, &persona, "another-focus"),
+                0
+            );
+            assert!(!run.stop_requested());
+            assert_eq!(
+                crate::auth::writer_gate::request_stop_for_focus(user, &persona, &focus),
+                1
+            );
+            assert!(run.stop_requested(), "the run notices the Focus-keyed stop");
+            drop(run);
+            assert_eq!(
+                crate::auth::writer_gate::live_runs_for_focus(user, &persona, &focus),
+                0
+            );
+            assert!(crate::auth::writer_gate::is_idle(user));
         })
         .await;
     }

@@ -187,6 +187,9 @@ struct UserState {
     /// The Focus run each visible lease carries, by lease id (items.id=816).
     /// Bound by `WriterLease::bind_run`, removed with the lease.
     runs: BTreeMap<u64, String>,
+    /// The (persona, Focus) each visible run lease belongs to, by lease id
+    /// (items.id=891). Bound by `WriterLease::bind_focus`, removed with the lease.
+    foci: BTreeMap<u64, (String, String)>,
 }
 
 impl UserState {
@@ -253,6 +256,20 @@ impl WriterLease {
             u.runs.insert(self.id, run_id.to_owned());
         }
     }
+
+    /// Record the Persona and Focus this lease's run belongs to, so the purge of a
+    /// Focus's data can find and stop its live runs (`request_stop_for_focus`,
+    /// items.id=891). Only visible leases are bound. The binding ends with the
+    /// lease.
+    pub fn bind_focus(&self, persona_id: &str, focus_id: &str) {
+        if !self.kind.is_visible_work() {
+            return;
+        }
+        if let Some(u) = gate().users.get_mut(&self.user_id) {
+            u.foci
+                .insert(self.id, (persona_id.to_owned(), focus_id.to_owned()));
+        }
+    }
 }
 
 impl Drop for WriterLease {
@@ -265,6 +282,7 @@ impl Drop for WriterLease {
                 u.stops.remove(&self.id);
                 u.epochs.remove(&self.id);
                 u.runs.remove(&self.id);
+                u.foci.remove(&self.id);
                 if u.is_idle() {
                     g.users.remove(&self.user_id);
                 }
@@ -352,6 +370,58 @@ pub fn request_stop_for_run(user_id: &str, run_id: &str) -> usize {
         }
     }
     tripped
+}
+
+/// The visible run leases of `user_id` bound to this Persona and Focus
+/// (items.id=891), as (lease id, stop token) pairs.
+fn focus_runs(u: &UserState, persona_id: &str, focus_id: &str) -> Vec<(u64, CancellationToken)> {
+    u.foci
+        .iter()
+        .filter(|(_, (p, f))| p == persona_id && f == focus_id)
+        .filter_map(|(id, _)| u.stops.get(id).map(|t| (*id, t.clone())))
+        .collect()
+}
+
+/// Trip the stop token of every live run of `user_id` that belongs to this Persona
+/// and Focus (items.id=891: the purge of a Focus's data, and a withdrawal that
+/// deletes, must stop its runs first; `request_stop_for_run` is keyed by run id
+/// and nothing looked runs up by Focus). Returns how many tokens it tripped: 0
+/// for a Focus with no live run, another user's, or another Persona's. Tripping
+/// again is harmless. The stop is cooperative: the run notices at its next step or
+/// model call and ends `cancelled`, so a caller that must know it ended waits
+/// (`wait_focus_runs_ended`).
+pub fn request_stop_for_focus(user_id: &str, persona_id: &str, focus_id: &str) -> usize {
+    let g = gate();
+    let Some(u) = g.users.get(user_id) else {
+        return 0;
+    };
+    let runs = focus_runs(u, persona_id, focus_id);
+    for (_, token) in &runs {
+        token.cancel();
+    }
+    runs.len()
+}
+
+/// How many live runs of `user_id` belong to this Persona and Focus.
+pub fn live_runs_for_focus(user_id: &str, persona_id: &str, focus_id: &str) -> usize {
+    gate()
+        .users
+        .get(user_id)
+        .map_or(0, |u| focus_runs(u, persona_id, focus_id).len())
+}
+
+/// Wait until no run of this Persona and Focus holds a lease, up to `timeout`.
+/// True when none does (including when none ever did), false when a run is still
+/// live at the deadline. Nothing is force-killed: a run that ignores the stop
+/// leaves this false and the caller refuses what it was about to do.
+pub async fn wait_focus_runs_ended(
+    user_id: &str,
+    persona_id: &str,
+    focus_id: &str,
+    timeout: Duration,
+) -> bool {
+    let wait = wait_until(|| live_runs_for_focus(user_id, persona_id, focus_id) == 0);
+    tokio::time::timeout(timeout, wait).await.is_ok()
 }
 
 /// The engine's half of the ordering: with the rotating flag already set, no
@@ -753,6 +823,103 @@ mod tests {
     use super::*;
 
     // The gate is process-global: every test uses its own user id.
+
+    // -- items.id=891: the runs of one Focus ------------------------------------
+
+    #[test]
+    fn a_stop_for_a_focus_trips_only_that_personas_that_focus_runs() {
+        let u = "gate-focus-stop";
+        let mine = acquire(u, Kind::FocusRun).unwrap();
+        mine.bind_run("run-1");
+        mine.bind_focus("p1", "tech-support");
+        let reply = acquire(u, Kind::Reply).unwrap();
+        reply.bind_run("run-2");
+        reply.bind_focus("p1", "tech-support");
+        let other_focus = acquire(u, Kind::FocusRun).unwrap();
+        other_focus.bind_focus("p1", "writing-assistant");
+        let other_persona = acquire(u, Kind::FocusRun).unwrap();
+        other_persona.bind_focus("p2", "tech-support");
+        let unbound = acquire(u, Kind::FocusRun).unwrap();
+
+        assert_eq!(live_runs_for_focus(u, "p1", "tech-support"), 2);
+        assert_eq!(request_stop_for_focus(u, "p1", "tech-support"), 2);
+        assert!(mine.stop_token().is_cancelled());
+        assert!(reply.stop_token().is_cancelled());
+        assert!(!other_focus.stop_token().is_cancelled());
+        assert!(!other_persona.stop_token().is_cancelled());
+        assert!(!unbound.stop_token().is_cancelled());
+        // Repeating is harmless, and unknown focus or persona trips nothing.
+        assert_eq!(request_stop_for_focus(u, "p1", "tech-support"), 2);
+        assert_eq!(request_stop_for_focus(u, "p1", "no-such-focus"), 0);
+        assert_eq!(
+            request_stop_for_focus(u, "no-such-persona", "tech-support"),
+            0
+        );
+    }
+
+    #[test]
+    fn another_users_runs_are_not_reached_by_focus() {
+        let owner = "gate-focus-owner";
+        let lease = acquire(owner, Kind::FocusRun).unwrap();
+        lease.bind_focus("p1", "tech-support");
+        assert_eq!(
+            request_stop_for_focus("gate-focus-other", "p1", "tech-support"),
+            0
+        );
+        assert_eq!(
+            live_runs_for_focus("gate-focus-other", "p1", "tech-support"),
+            0
+        );
+        assert!(!lease.stop_token().is_cancelled());
+    }
+
+    #[test]
+    fn a_non_visible_lease_is_never_bound_to_a_focus() {
+        let u = "gate-focus-command";
+        let cmd = acquire(u, Kind::Command).unwrap();
+        cmd.bind_focus("p1", "tech-support");
+        assert_eq!(live_runs_for_focus(u, "p1", "tech-support"), 0);
+    }
+
+    #[test]
+    fn the_focus_binding_ends_with_the_lease() {
+        let u = "gate-focus-ended";
+        let lease = acquire(u, Kind::FocusRun).unwrap();
+        lease.bind_focus("p1", "tech-support");
+        assert_eq!(live_runs_for_focus(u, "p1", "tech-support"), 1);
+        drop(lease);
+        assert_eq!(live_runs_for_focus(u, "p1", "tech-support"), 0);
+        assert_eq!(request_stop_for_focus(u, "p1", "tech-support"), 0);
+        assert!(is_idle(u), "no state is left behind");
+    }
+
+    #[tokio::test]
+    async fn the_wait_returns_true_when_the_runs_end_and_false_at_the_deadline() {
+        let u = "gate-focus-wait";
+        // No run at all: true at once.
+        assert!(wait_focus_runs_ended(u, "p1", "tech-support", Duration::from_millis(50)).await);
+
+        // A run that ends after the stop: true.
+        let lease = acquire(u, Kind::FocusRun).unwrap();
+        lease.bind_focus("p1", "tech-support");
+        let token = lease.stop_token().clone();
+        let ender = tokio::spawn(async move {
+            token.cancelled().await;
+            drop(lease);
+        });
+        assert_eq!(request_stop_for_focus(u, "p1", "tech-support"), 1);
+        assert!(wait_focus_runs_ended(u, "p1", "tech-support", Duration::from_secs(5)).await);
+        ender.await.unwrap();
+
+        // A run that ignores the stop: false at the deadline, and still live.
+        let stubborn = acquire(u, Kind::FocusRun).unwrap();
+        stubborn.bind_focus("p1", "tech-support");
+        assert_eq!(request_stop_for_focus(u, "p1", "tech-support"), 1);
+        assert!(!wait_focus_runs_ended(u, "p1", "tech-support", Duration::from_millis(100)).await);
+        assert_eq!(live_runs_for_focus(u, "p1", "tech-support"), 1);
+        drop(stubborn);
+        assert!(wait_focus_runs_ended(u, "p1", "tech-support", Duration::from_millis(100)).await);
+    }
 
     // -- items.id=816: a user's cancel reaches a run by its id ---------------
 

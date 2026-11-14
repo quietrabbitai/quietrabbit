@@ -742,6 +742,32 @@ pub(crate) async fn finish_login(
     // by this login.
     crate::privacy_model::runtime::ensure_started();
 
+    // items.id=891: finish any device purge a stop left half done, and remove the
+    // case and configuration rows of a device that no longer exists, for every
+    // Persona of this account (persistence::entity_purge::reconcile). Best effort
+    // and never awaited: a failure is logged, and a sign-in does not wait for it.
+    // The task holds a sweep lease, so it never runs under a key rotation.
+    {
+        let pool = pool.clone();
+        let user_id = user_id.to_owned();
+        let key_hex_str = crate::auth::registry::key_hex(&data_key);
+        crate::task_supervision::spawn_supervised("entity_purge_reconcile", false, move || {
+            let pool = pool.clone();
+            let user_id = user_id.clone();
+            let key_hex_str = key_hex_str.clone();
+            async move {
+                let Ok(_lease) = crate::auth::writer_gate::acquire(
+                    &user_id,
+                    crate::auth::writer_gate::Kind::Sweep,
+                ) else {
+                    return;
+                };
+                crate::persistence::entity_purge::reconcile_user(&pool, &user_id, &key_hex_str)
+                    .await;
+            }
+        });
+    }
+
     Ok(())
 }
 
