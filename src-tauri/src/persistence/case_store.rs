@@ -638,6 +638,41 @@ pub async fn list_open_cases_for_entity(
         .collect::<Result<Vec<_>, _>>()?)
 }
 
+/// Every case linked to an entity, open or closed, newest first, at most `limit`.
+/// `focus_id` narrows to one Focus's cases (the device sheet shows what its own
+/// Focus recorded); None takes every Focus's, for the maintenance readers.
+/// READ ONLY. items.id=891: the device sheet of the library reads case summaries
+/// (decisions.id=509, 520).
+pub async fn list_cases_for_entity(
+    conn: &mut SqliteConnection,
+    entity_id: &str,
+    focus_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<CaseRecord>, CaseStoreError> {
+    check_id("entity_id", entity_id)?;
+    if let Some(f) = focus_id {
+        check_id("focus_id", f)?;
+    }
+    let rows = sqlx::query(&format!(
+        "{CASE_SELECT}
+         WHERE (? IS NULL OR c.focus_id = ?)
+           AND EXISTS (SELECT 1 FROM case_entities l
+                        WHERE l.case_id = c.case_id AND l.entity_id = ?)
+         ORDER BY c.opened_at DESC, c.case_id
+         LIMIT ?"
+    ))
+    .bind(focus_id)
+    .bind(focus_id)
+    .bind(entity_id)
+    .bind(limit.clamp(1, 500))
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(row_to_case)
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
 /// The open cases (any non-terminal state) of one Focus in this persona's
 /// outputs.db, oldest first. READ ONLY. items.id=886 seeds open_ticket_state and
 /// open_tickets_brief from it at pass start, when no entity has been chosen yet,

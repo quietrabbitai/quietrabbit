@@ -235,6 +235,16 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::collection_consent::submit_collection_consent_decision,
         commands::collection_consent::withdraw_collection_consent,
         commands::collection_consent::list_consent_audit_events,
+        // Group 32 -- Device library of a focus_level Focus (items.id=891,
+        // decisions.id=509, 520, 940, 944)
+        commands::device_library::list_devices,
+        commands::device_library::get_device_sheet,
+        commands::device_library::preview_device_purge,
+        commands::device_library::purge_device,
+        commands::device_library::purge_all_devices,
+        commands::device_library::rename_device,
+        commands::device_library::set_device_fact,
+        commands::device_library::clear_device_fact,
     ])
 }
 

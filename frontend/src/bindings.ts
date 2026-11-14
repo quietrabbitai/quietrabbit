@@ -1033,6 +1033,24 @@ export const commands = {
 	 */
 	withdrawCollectionConsent: (personaId: string, focusId: string) => typedError<CollectionConsentState, string>(__TAURI_INVOKE("withdraw_collection_consent", { personaId, focusId })),
 	listConsentAuditEvents: (personaId: string, focusId: string) => typedError<ConsentAuditEvent[], string>(__TAURI_INVOKE("list_consent_audit_events", { personaId, focusId })),
+	listDevices: (personaId: string, focusId: string) => typedError<DeviceSummary[], string>(__TAURI_INVOKE("list_devices", { personaId, focusId })),
+	getDeviceSheet: (personaId: string, focusId: string, device: string) => typedError<DeviceSheet, string>(__TAURI_INVOKE("get_device_sheet", { personaId, focusId, device })),
+	previewDevicePurge: (personaId: string, focusId: string, device: string) => typedError<DevicePurgeSummary, string>(__TAURI_INVOKE("preview_device_purge", { personaId, focusId, device })),
+	/**
+	 *  Deletes the device and what QuietRabbit recorded about it. Stops the Focus's
+	 *  live runs first and waits for them (up to a minute); Err("runs_still_running")
+	 *  means one ignored the stop and NOTHING was deleted: try again.
+	 */
+	purgeDevice: (personaId: string, focusId: string, device: string) => typedError<DevicePurgeSummary, string>(__TAURI_INVOKE("purge_device", { personaId, focusId, device })),
+	/**
+	 *  The offered control after a withdrawal: every device the Focus owns, and the
+	 *  Focus's parked runs cancelled. Err("runs_still_running") means nothing was
+	 *  deleted.
+	 */
+	purgeAllDevices: (personaId: string, focusId: string) => typedError<DevicePurgeSummary, string>(__TAURI_INVOKE("purge_all_devices", { personaId, focusId })),
+	renameDevice: (personaId: string, focusId: string, device: string, newName: string) => typedError<DeviceSummary, string>(__TAURI_INVOKE("rename_device", { personaId, focusId, device, newName })),
+	setDeviceFact: (personaId: string, focusId: string, device: string, field: string, value: string) => typedError<DeviceFact, string>(__TAURI_INVOKE("set_device_fact", { personaId, focusId, device, field, value })),
+	clearDeviceFact: (personaId: string, focusId: string, device: string, field: string) => typedError<null, string>(__TAURI_INVOKE("clear_device_fact", { personaId, focusId, device, field })),
 };
 
 /* Types */
@@ -1379,6 +1397,63 @@ export type CreatePersonaRequest = {
 
 export type CreatePersonaResponse = {
 	persona_id: string,
+};
+
+/**  A case kept for the device, as a summary. No id: R1 has no per-case action. */
+export type DeviceCase = {
+	state: string,
+	subject_label: string,
+	symptoms: string,
+	current_rung: number,
+	outcome: string | null,
+	opened_at: string,
+	closed_at: string | null,
+};
+
+/**
+ *  A configuration change recorded for the device. `status` is the effective one
+ *  (a stored believed-active older than the degradation window reads as unknown).
+ */
+export type DeviceChange = {
+	description: string,
+	status: string,
+	changed_at: string,
+};
+
+export type DeviceFact = {
+	field_name: string,
+	label: string,
+	category: string,
+	value: string,
+	recorded_at: string,
+};
+
+/**  What a purge removed, or (from the preview) will remove. */
+export type DevicePurgeSummary = {
+	cases: number,
+	strategies: number,
+	changes: number,
+	facts: number,
+};
+
+export type DeviceSheet = {
+	device: DeviceSummary,
+	facts: DeviceFact[],
+	cases: DeviceCase[],
+	changes: DeviceChange[],
+};
+
+/**  One device in the list. `handle` names it in every other command. */
+export type DeviceSummary = {
+	handle: string,
+	display_name: string,
+	/**  The subject class fact (device:endpoint:laptop), when set. */
+	subject_class: string | null,
+	/**  Active catalogued facts. */
+	fact_count: number,
+	/**  Open cases that have this device as their primary subject. */
+	open_case_count: number,
+	created_at: string,
 };
 
 export type DisclosedAttributes = {

@@ -68,6 +68,10 @@ pub enum OwnedEntityError {
     /// active. The four are indistinguishable on purpose.
     #[error("no such entity for this Focus")]
     NotFound,
+    /// Another device of this Focus already has this name or alias (a rename may
+    /// not make two devices answer to one name).
+    #[error("another device already has this name")]
+    NameInUse,
     #[error("the field is not usable: {0}")]
     Value(#[from] ValueError),
     #[error("the device catalogue is unusable: {0}")]
@@ -123,7 +127,7 @@ pub fn normalize_name(s: &str) -> String {
 /// A device name as stored: trimmed and inner whitespace collapsed (a newline or
 /// tab counts as whitespace and becomes one space, the case the user gave is
 /// kept), non-empty, within NAME_MAX_BYTES, no other control character.
-fn clean_name(raw: &str) -> Result<String, OwnedEntityError> {
+pub(crate) fn clean_name(raw: &str) -> Result<String, OwnedEntityError> {
     let name = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     if name.is_empty() {
         return Err(invalid("the device name is empty"));
@@ -201,6 +205,39 @@ pub(crate) async fn find_owned_by_name(
         normalize_name(&e.display_name) == wanted
             || e.aliases.iter().any(|a| normalize_name(a) == wanted)
     }))
+}
+
+/// Rename one of the Focus's owned entities (the device library's rename,
+/// items.id=891). The name is cleaned like a created one and may not be the name
+/// or alias of ANOTHER device of this Focus. Renaming to the name it already has
+/// is a no-op that succeeds, so a retry after a stopped rename completes. The case
+/// labels that show the old name are refreshed by the caller
+/// (case_store::refresh_subject_label), in outputs.db.
+pub(crate) async fn rename_owned(
+    conn: &mut SqliteConnection,
+    focus: &str,
+    entity_id: &str,
+    new_name: &str,
+) -> Result<Entity, OwnedEntityError> {
+    let name = clean_name(new_name)?;
+    let entity = get_owned_active(conn, focus, entity_id).await?;
+    if let Some(other) = find_owned_by_name(conn, focus, &name).await? {
+        if other.id != entity.id {
+            return Err(OwnedEntityError::NameInUse);
+        }
+    }
+    if entity.display_name != name {
+        crate::persistence::entity_store::update_entity_conn(
+            conn,
+            entity_id,
+            &crate::persistence::entity_store::EntityUpdate {
+                display_name: Some(name),
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
+    get_owned_active(conn, focus, entity_id).await
 }
 
 /// The Focus's active owned entities, newest first (ties by id).
@@ -375,7 +412,6 @@ pub struct ActiveFact {
 /// An owned entity's active facts that are in the catalogue, in catalogue order.
 /// A row whose field the catalogue no longer lists is skipped (a data edit can
 /// retire a field without erasing history): it is neither shown nor deleted here.
-#[allow(dead_code)] // items.id=891 stage 5 (device sheet) and stage 6 (subject_context) are its first callers
 pub(crate) async fn list_active_facts(
     conn: &mut SqliteConnection,
     focus: &str,
@@ -879,6 +915,64 @@ mod tests {
             .map(|e| e.display_name)
             .collect();
         assert_eq!(names, ["B", "A"]);
+    }
+
+    #[tokio::test]
+    async fn a_rename_cleans_the_name_and_may_not_take_another_devices() {
+        let mut conn = db().await;
+        let router = make(&mut conn, FOCUS, "Router", "r:1").await;
+        let modem = make(&mut conn, FOCUS, "Modem", "r:2").await;
+        make(&mut conn, OTHER, "Camera", "r:3").await;
+        sqlx::query("UPDATE entities SET aliases = '[\"Main  Gateway\"]' WHERE id = ?")
+            .bind(&modem)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        let e = rename_owned(&mut conn, FOCUS, &router, "  Living   room Router ")
+            .await
+            .unwrap();
+        assert_eq!(e.display_name, "Living room Router");
+        assert_eq!(e.id, router);
+        assert_eq!(e.owner_focus.as_deref(), Some(FOCUS));
+        assert_eq!(e.entity_type, SUBJECT_ENTITY_TYPE);
+        // The same name again succeeds and changes nothing (a retried rename).
+        let again = rename_owned(&mut conn, FOCUS, &router, "living room router")
+            .await
+            .unwrap();
+        assert_eq!(
+            again.display_name, "living room router",
+            "a case-only change is a change"
+        );
+
+        // Another device's name or alias is refused, after normalizing.
+        for taken in ["modem", " MODEM ", "main gateway"] {
+            assert!(
+                matches!(
+                    rename_owned(&mut conn, FOCUS, &router, taken).await,
+                    Err(OwnedEntityError::NameInUse)
+                ),
+                "{taken}"
+            );
+        }
+        // Another Focus's name does not count, and bad names and entities are refused.
+        assert!(rename_owned(&mut conn, FOCUS, &router, "Camera")
+            .await
+            .is_ok());
+        for bad in ["", "   ", "a\0b"] {
+            assert!(matches!(
+                rename_owned(&mut conn, FOCUS, &router, bad).await,
+                Err(OwnedEntityError::Validation(_))
+            ));
+        }
+        assert!(matches!(
+            rename_owned(&mut conn, OTHER, &router, "X").await,
+            Err(OwnedEntityError::NotFound)
+        ));
+        assert!(matches!(
+            rename_owned(&mut conn, FOCUS, "missing", "X").await,
+            Err(OwnedEntityError::NotFound)
+        ));
     }
 
     #[test]

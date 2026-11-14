@@ -569,6 +569,34 @@ pub async fn reconcile(
     Ok(report)
 }
 
+/// Remove one catalogued field of an owned device for good: every row of it, the
+/// active value and the superseded ones (the device sheet's "clear this fact").
+/// Returns how many rows it removed, 0 for a field that was never set. The field
+/// must be in the device catalogue and the entity must be this Focus's own active
+/// one. Not consent-gated and not latch-gated: removing data is the user's to do.
+pub async fn clear_owned_fact(
+    personal: &mut SqliteConnection,
+    focus: &str,
+    entity_id: &str,
+    field: &str,
+) -> Result<i64, PurgeError> {
+    check_focus(focus)?;
+    check_entity_id(entity_id)?;
+    let catalogue = crate::conductor::device_fields::registry().map_err(PurgeError::Validation)?;
+    let def = catalogue
+        .field(field.trim())
+        .ok_or_else(|| PurgeError::Validation("unknown_field".to_owned()))?;
+    crate::persistence::owned_entity_store::get_owned_active(personal, focus, entity_id)
+        .await
+        .map_err(|_| PurgeError::NotFound)?;
+    let done = sqlx::query("DELETE FROM entity_facts WHERE entity_id = ? AND field_name = ?")
+        .bind(entity_id)
+        .bind(&def.name)
+        .execute(&mut *personal)
+        .await?;
+    Ok(done.rows_affected() as i64)
+}
+
 // ---------------------------------------------------------------------------
 // Run control and the persona-level entry points
 // ---------------------------------------------------------------------------
@@ -1295,6 +1323,102 @@ mod tests {
             assert!(counts.is_ok(), "{step:?}: {counts:?}");
             assert_after_a(&mut db, &w).await;
         }
+    }
+
+    // -- the device sheet's reads and a single fact's clear ---------------------
+
+    #[tokio::test]
+    async fn the_cases_of_an_entity_include_closed_and_affected_ones_newest_first() {
+        let _root = TestRoot::new().await;
+        let mut db = dbs().await;
+        let w = world(&mut db).await;
+        // Distinct open times, and close one.
+        for (case, at) in [
+            ("case1", "2026-01-01T00:00:00Z"),
+            ("case2", "2026-02-01T00:00:00Z"),
+            ("case4", "2026-03-01T00:00:00Z"),
+        ] {
+            sqlx::query("UPDATE case_records SET opened_at = ? WHERE case_id = ?")
+                .bind(at)
+                .bind(case)
+                .execute(&mut db.outputs)
+                .await
+                .unwrap();
+        }
+        let ids = |cases: Vec<case_store::CaseRecord>| -> Vec<String> {
+            cases.into_iter().map(|c| c.case_id).collect()
+        };
+        // A: primary of case1 and case4, affected on case2. All Focuses, then one.
+        let all = case_store::list_cases_for_entity(&mut db.outputs, &w.a, None, 50)
+            .await
+            .unwrap();
+        assert_eq!(ids(all), ["case4", "case2", "case1"]);
+        let mine = case_store::list_cases_for_entity(&mut db.outputs, &w.a, Some(FOCUS), 50)
+            .await
+            .unwrap();
+        assert_eq!(ids(mine), ["case2", "case1"], "case4 is another Focus's");
+        let one = case_store::list_cases_for_entity(&mut db.outputs, &w.a, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(ids(one), ["case4"]);
+        assert!(
+            case_store::list_cases_for_entity(&mut db.outputs, "nobody", None, 50)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_a_fact_removes_every_version_of_that_field_only() {
+        let _root = TestRoot::new().await;
+        let mut db = dbs().await;
+        let w = world(&mut db).await;
+        // A has firmware_version (two versions) and serial_number.
+        let removed = clear_owned_fact(&mut db.personal, FOCUS, &w.a, "firmware_version")
+            .await
+            .unwrap();
+        assert_eq!(removed, 2);
+        let left: Vec<String> = ids(
+            &mut db.personal,
+            "SELECT field_name FROM entity_facts WHERE entity_id IN (SELECT id FROM entities WHERE display_name = 'Router')",
+        )
+        .await;
+        assert_eq!(left, ["serial_number"]);
+        // Again: nothing to remove, not an error. Padding in the name is trimmed.
+        assert_eq!(
+            clear_owned_fact(&mut db.personal, FOCUS, &w.a, " firmware_version ")
+                .await
+                .unwrap(),
+            0
+        );
+        // B's facts are untouched, and a field outside the catalogue, another
+        // Focus, an unknown entity and a marked one are all refused.
+        assert!(matches!(
+            clear_owned_fact(&mut db.personal, FOCUS, &w.a, "wifi_password").await,
+            Err(PurgeError::Validation(m)) if m == "unknown_field"
+        ));
+        assert!(matches!(
+            clear_owned_fact(&mut db.personal, OTHER, &w.a, "serial_number").await,
+            Err(PurgeError::NotFound)
+        ));
+        assert!(matches!(
+            clear_owned_fact(&mut db.personal, FOCUS, "nobody", "serial_number").await,
+            Err(PurgeError::NotFound)
+        ));
+        mark_for_purge(&mut db.personal, FOCUS, &w.a).await.unwrap();
+        assert!(matches!(
+            clear_owned_fact(&mut db.personal, FOCUS, &w.a, "serial_number").await,
+            Err(PurgeError::NotFound)
+        ));
+        assert_eq!(
+            n(
+                &mut db.personal,
+                "SELECT COUNT(*) FROM entity_facts WHERE field_name = 'make'"
+            )
+            .await,
+            1
+        );
     }
 
     // -- reconcile: orphans ----------------------------------------------------

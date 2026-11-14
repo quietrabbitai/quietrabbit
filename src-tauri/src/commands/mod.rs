@@ -57,6 +57,7 @@ pub mod chats;
 pub mod cloud_chat_pane;
 pub mod collection_consent;
 pub mod consent;
+pub mod device_library;
 pub mod execution;
 pub mod focus_builder;
 pub mod group;
