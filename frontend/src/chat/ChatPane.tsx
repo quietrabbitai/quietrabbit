@@ -13,6 +13,7 @@ import {
   type MessageInfo,
   type PendingCrossPersonaFact,
 } from '../bindings'
+import { CollectionConsentSection } from './CollectionConsentSection'
 import { CrossPersonaConfirmModal, type CrossPersonaFactDecision } from './CrossPersonaConfirmModal'
 import {
   classifyRunStatus,
@@ -1479,6 +1480,15 @@ export function ChatPane({
         onResolve={handleCrossPersonaResolve}
         onCancel={handleCrossPersonaCancel}
       />
+      {/* items.id=920: the one-time collection consent of a focus_level Focus
+          (Tech Support). Renders nothing for any other Focus. */}
+      {!collapsed && (
+        <CollectionConsentSection
+          key={`${personaId}:${focusId}`}
+          personaId={personaId}
+          focusId={focusId}
+        />
+      )}
       <form
         className="chat-pane__input-row"
         onSubmit={(e) => {

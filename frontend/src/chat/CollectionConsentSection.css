@@ -1,0 +1,17 @@
+/* Collection-consent section of ChatPane (items.id=920 stage 3). */
+
+.collection-consent-section__row {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.collection-consent-section__manage-button {
+  font-size: 13px;
+  padding: 2px 8px;
+}
+
+.collection-consent-section__check-error {
+  font-size: 13px;
+  color: var(--ember);
+  text-align: left;
+}

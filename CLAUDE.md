@@ -413,6 +413,16 @@ data, stage 3 the frontend confirm.
 - write_focus_run_record's keep_input is also consent-aware: the blended chat window is
   not persisted in focus_runs.user_input for a focus_level Focus without the current
   consent (an unreadable state counts as not granted).
+- Frontend (frontend/src/chat/CollectionConsent*.tsx, useCollectionConsent.ts): ChatPane
+  renders CollectionConsentSection for the Focus ids in collectionConsent.ts (tech-support
+  only). It asks ONLY when get_collection_consent_state says needs_decision (the frontend
+  never recomputes who is asked; a test scans for it), with fixed local i18n text (placeholder
+  copy, Chat-BRAND) and one confirm ('Allow Tech Support to remember' / 'Use without saving')
+  that sends the DISPLAYED version. The memory screen (stop, or allow again) says plainly that
+  what QuietRabbit already knows stays until the user deletes it. Dev simulation: in a Vite dev
+  build, localStorage['qr.devSimulateCollectionConsent'] = not_asked, stale_granted,
+  stale_declined, declined, granted or withdrawn fakes the state (and the missing
+  focus_settings_row of tech-support) in memory; the fake is tree-shaken from a production build.
 - items.id=633 will fold personal_010 and shared_044 into the baselines; both files are
   self-explanatory in their headers (decisions.id=857).
 

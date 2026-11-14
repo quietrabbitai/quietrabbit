@@ -281,7 +281,42 @@
       "crossPersonaConfirmContinue": "Continue",
       "crossPersonaConfirmCancel": "Cancel",
       "crossPersonaConfirmCheckError": "Could not check for shareable information from other Personas ({{message}}) -- sending without it.",
-      "provenanceOmissionNotice": "Some information from another Persona wasn't included in this response."
+      "provenanceOmissionNotice": "Some information from another Persona wasn't included in this response.",
+      "collectionConsent": {
+        "title": "Let Tech Support remember?",
+        "changed": "What Tech Support keeps has changed since you last answered, so please choose again.",
+        "intro": "To help with your devices, Tech Support can keep notes about your equipment and the problems you have had. Please read what that means before you choose.",
+        "promise": {
+          "collects_listed_categories_only": "It saves only the kinds of information Tech Support lists, and nothing else.",
+          "never_shared_outside_qr_without_review": "What it saves stays in QuietRabbit. It is never shared outside QuietRabbit, and never used in a cloud conversation without your review.",
+          "per_session_opt_out": "You can turn saving off for a single chat.",
+          "withdraw_any_time": "You can stop it at any time.",
+          "delete_device_and_linked_data": "You can delete a device and everything linked to it."
+        },
+        "declineNote": "Tech Support still works if you choose not to save. It just will not remember anything between chats.",
+        "allow": "Allow Tech Support to remember",
+        "decline": "Use without saving",
+        "saving": "Saving your choice…",
+        "error": {
+          "stale": "The explanation changed while it was open. Please read it again and choose.",
+          "unavailable": "Your choice can't be saved right now. Tech Support is not saving anything.",
+          "other": "Couldn't save your choice ({{message}}). Try again."
+        },
+        "checkError": "Couldn't check your Tech Support memory choice ({{message}}). Tech Support still works, but it is not saving anything.",
+        "manage": {
+          "button": "Tech Support memory",
+          "heading": "Tech Support memory",
+          "statusGranted": "Tech Support is remembering things to help you.",
+          "statusDeclined": "Tech Support is not saving anything. You chose to use it without saving.",
+          "statusWithdrawn": "Tech Support has stopped saving.",
+          "statusNotAsked": "Tech Support has not been set up to remember.",
+          "staysUntilDeleted": "Stopping does not delete anything. What QuietRabbit already knows stays until you delete it.",
+          "withdrawPending": "Tech Support has already stopped saving, but the record of your choice could not be written ({{message}}). Press Stop remembering again to finish.",
+          "stop": "Stop remembering",
+          "stopping": "Stopping…",
+          "close": "Close"
+        }
+      }
     },
     "libraryPane": {
       "listHeading": "Outputs",

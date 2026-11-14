@@ -1,0 +1,55 @@
+/* One-time collection consent (items.id=920 stage 3). An inline alertdialog box
+ * in the same shape as CrossPersonaConfirmModal.css. */
+
+.collection-consent-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 14px;
+  color: var(--text-muted);
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  text-align: left;
+}
+
+.collection-consent-confirm__title {
+  font-weight: 500;
+  color: var(--text);
+}
+
+.collection-consent-confirm__intro,
+.collection-consent-confirm__decline-note {
+  margin: 0;
+}
+
+.collection-consent-confirm__promise {
+  color: var(--text-muted);
+}
+
+.collection-consent-confirm__changed {
+  font-weight: 500;
+}
+
+.collection-consent-confirm__promises {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding-left: 20px;
+}
+
+.collection-consent-confirm__error {
+  color: var(--ember);
+}
+
+.collection-consent-confirm__footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.collection-consent-confirm__allow {
+  font-weight: 500;
+}

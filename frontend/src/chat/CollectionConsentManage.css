@@ -1,0 +1,39 @@
+/* Tech Support memory screen (items.id=920 stage 3). */
+
+.collection-consent-manage {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 14px;
+  color: var(--text-muted);
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  text-align: left;
+}
+
+.collection-consent-manage__heading {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.collection-consent-manage__status {
+  margin: 0;
+}
+
+.collection-consent-manage__stays {
+  font-weight: 500;
+}
+
+.collection-consent-manage__error {
+  color: var(--ember);
+}
+
+.collection-consent-manage__footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
