@@ -1,0 +1,40 @@
+{
+  "catalogue_version": 1,
+  "categories": [
+    { "id": "identity", "label": "Identity" },
+    { "id": "version_firmware", "label": "Version and firmware" },
+    { "id": "hardware_profile", "label": "Hardware profile" },
+    { "id": "network_connectivity", "label": "Network and connectivity" },
+    { "id": "purchase_warranty", "label": "Purchase and warranty" },
+    { "id": "access", "label": "How to reach it" },
+    { "id": "known_issues", "label": "Known issues" }
+  ],
+  "fields": [
+    { "name": "subject_class", "category": "identity", "label": "Kind", "sensitivity": "general", "abstraction_tier2": "pass", "abstraction_tier3": "pass", "max_bytes": 80 },
+    { "name": "make", "category": "identity", "label": "Make", "sensitivity": "general", "abstraction_tier2": "pass", "abstraction_tier3": "pass", "max_bytes": 80 },
+    { "name": "model", "category": "identity", "label": "Model", "sensitivity": "general", "abstraction_tier2": "pass", "abstraction_tier3": "pass", "max_bytes": 80 },
+
+    { "name": "os_version", "category": "version_firmware", "label": "Operating system", "sensitivity": "general", "abstraction_tier2": "pass", "abstraction_tier3": "pass", "max_bytes": 80 },
+    { "name": "software_version", "category": "version_firmware", "label": "Software version", "sensitivity": "general", "abstraction_tier2": "pass", "abstraction_tier3": "pass", "max_bytes": 80 },
+    { "name": "firmware_version", "category": "version_firmware", "label": "Firmware version", "sensitivity": "general", "abstraction_tier2": "pass", "abstraction_tier3": "pass", "max_bytes": 80 },
+    { "name": "last_updated", "category": "version_firmware", "label": "Last updated", "sensitivity": "general", "abstraction_tier2": "pass", "abstraction_tier3": "pass", "max_bytes": 40 },
+
+    { "name": "hardware_specs", "category": "hardware_profile", "label": "Hardware", "sensitivity": "general", "abstraction_tier2": "pass", "abstraction_tier3": "pass", "max_bytes": 300 },
+
+    { "name": "connection_type", "category": "network_connectivity", "label": "Connection", "sensitivity": "general", "abstraction_tier2": "pass", "abstraction_tier3": "pass", "max_bytes": 80 },
+    { "name": "ip_range", "category": "network_connectivity", "label": "Network range", "sensitivity": "personal", "abstraction_tier2": "omit", "abstraction_tier3": "omit", "max_bytes": 80 },
+    { "name": "isp_context", "category": "network_connectivity", "label": "Internet provider", "sensitivity": "personal", "abstraction_tier2": "omit", "abstraction_tier3": "omit", "max_bytes": 120 },
+
+    { "name": "purchase_date", "category": "purchase_warranty", "label": "Bought on", "sensitivity": "personal", "abstraction_tier2": "range_only", "abstraction_tier3": "omit", "max_bytes": 40 },
+    { "name": "retailer", "category": "purchase_warranty", "label": "Bought from", "sensitivity": "personal", "abstraction_tier2": "omit", "abstraction_tier3": "omit", "max_bytes": 120 },
+    { "name": "serial_number", "category": "purchase_warranty", "label": "Serial number", "sensitivity": "personal", "abstraction_tier2": "not_permitted", "abstraction_tier3": "not_permitted", "max_bytes": 80, "access_credential_flag": true },
+    { "name": "warranty_expiry", "category": "purchase_warranty", "label": "Warranty ends", "sensitivity": "personal", "abstraction_tier2": "range_only", "abstraction_tier3": "omit", "max_bytes": 40 },
+    { "name": "warranty_provider", "category": "purchase_warranty", "label": "Warranty provider", "sensitivity": "personal", "abstraction_tier2": "omit", "abstraction_tier3": "omit", "max_bytes": 120 },
+    { "name": "warranty_contact", "category": "purchase_warranty", "label": "Warranty contact", "sensitivity": "personal", "abstraction_tier2": "not_permitted", "abstraction_tier3": "not_permitted", "max_bytes": 160 },
+
+    { "name": "access_method", "category": "access", "label": "Reached by", "sensitivity": "personal", "abstraction_tier2": "omit", "abstraction_tier3": "omit", "max_bytes": 80 },
+    { "name": "access_location", "category": "access", "label": "Address", "sensitivity": "personal", "abstraction_tier2": "not_permitted", "abstraction_tier3": "not_permitted", "max_bytes": 160 },
+
+    { "name": "known_issues", "category": "known_issues", "label": "Known issues", "sensitivity": "general", "abstraction_tier2": "pass", "abstraction_tier3": "pass", "max_bytes": 400 }
+  ]
+}

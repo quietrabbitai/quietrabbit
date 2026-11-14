@@ -7,6 +7,7 @@ pub mod collection_consent_text;
 pub mod concurrency;
 pub mod crisis;
 pub mod declared_inputs;
+pub mod device_fields;
 pub mod executor;
 pub mod extract;
 pub mod failure;

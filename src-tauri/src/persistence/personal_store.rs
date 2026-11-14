@@ -772,6 +772,61 @@ pub(crate) async fn create_entity_fact_with_provenance_conn(
     origin_persona_id: Option<&str>,
     extra_metadata: Option<serde_json::Value>,
 ) -> Result<String, PersonalStoreError> {
+    create_entity_fact_with_policy_conn(
+        conn,
+        entity_id,
+        field_name,
+        field_value,
+        sensitivity,
+        ABSTRACTION_PASS,
+        ABSTRACTION_PASS,
+        source,
+        source_persona_id,
+        cross_persona_export,
+        origin_persona_id,
+        extra_metadata,
+    )
+    .await
+}
+
+/// The abstraction policy every fact is written with unless the caller names
+/// another (the entity_facts column default, personal_001.sql).
+pub(crate) const ABSTRACTION_PASS: &str = "pass";
+
+/// Policies permitted by the entity_facts abstraction_tier2/3 CHECK constraints.
+const ABSTRACTION_POLICIES: [&str; 5] =
+    ["pass", "omit", "summarize", "range_only", "not_permitted"];
+
+/// create_entity_fact_with_provenance_conn with the two abstraction policies
+/// named by the caller (items.id=891). The older writer could only write the
+/// column default, pass, for both tiers, which is wrong for a serial number or an
+/// address: a Focus that writes a closed catalogue of facts (conductor::
+/// device_fields) states each field's policy here. Everything else (supersede,
+/// provenance, validation) is identical, and the older function is now a thin
+/// call into this one with pass for both.
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
+pub(crate) async fn create_entity_fact_with_policy_conn(
+    conn: &mut SqliteConnection,
+    entity_id: Option<&str>,
+    field_name: &str,
+    field_value: &str,
+    sensitivity: &str,
+    abstraction_tier2: &str,
+    abstraction_tier3: &str,
+    source: &str,
+    source_persona_id: &str,
+    cross_persona_export: bool,
+    origin_persona_id: Option<&str>,
+    extra_metadata: Option<serde_json::Value>,
+) -> Result<String, PersonalStoreError> {
+    for policy in [abstraction_tier2, abstraction_tier3] {
+        if !ABSTRACTION_POLICIES.contains(&policy) {
+            return Err(PersonalStoreError::Validation(format!(
+                "Unknown abstraction policy '{policy}'. Must be pass, omit, summarize, \
+                 range_only, or not_permitted."
+            )));
+        }
+    }
     if !matches!(
         sensitivity,
         "general" | "personal" | "medical" | "financial"
@@ -834,16 +889,19 @@ pub(crate) async fn create_entity_fact_with_provenance_conn(
         let new_id = uuid::Uuid::new_v4().to_string();
         sqlx::query(
             "INSERT INTO entity_facts
-             (id, entity_id, field_name, field_value, sensitivity, source,
+             (id, entity_id, field_name, field_value, sensitivity,
+              abstraction_tier2, abstraction_tier3, source,
               created_at, extra_metadata,
               source_persona_id, cross_persona_export, origin_persona_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&new_id)
         .bind(entity_id)
         .bind(field_name)
         .bind(field_value)
         .bind(sensitivity)
+        .bind(abstraction_tier2)
+        .bind(abstraction_tier3)
         .bind(source)
         .bind(&timestamp)
         .bind(&metadata_json)
@@ -2383,5 +2441,96 @@ mod tests {
             None => std::env::remove_var("QR_DATA_ROOT"),
         }
         outcome.expect("owned-entity export exclusion must hold");
+    }
+
+    /// items.id=891 stage 2: the policy writer stores the abstraction policies it
+    /// is given, refuses an unknown one without writing, and the older writer is
+    /// unchanged (both policies pass).
+    #[tokio::test]
+    async fn the_policy_writer_stores_its_policies_and_the_older_writer_still_writes_pass() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+        let key_hex = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
+
+        let outcome = async {
+            crate::persistence::migrations::migrate_personal_db("u1", "p1", key_hex)
+                .await
+                .expect("migration");
+            let mut conn = open_personal_db("u1", "p1", key_hex).await?;
+            create_entity_fact_with_policy_conn(
+                &mut conn,
+                None,
+                "a",
+                "1",
+                "personal",
+                "omit",
+                "not_permitted",
+                "test",
+                "p1",
+                false,
+                None,
+                None,
+            )
+            .await?;
+            create_entity_fact_with_provenance_conn(
+                &mut conn, None, "b", "2", "general", "test", "p1", false, None, None,
+            )
+            .await?;
+            let bad = create_entity_fact_with_policy_conn(
+                &mut conn,
+                None,
+                "c",
+                "3",
+                "general",
+                "pass",
+                "sometimes",
+                "test",
+                "p1",
+                false,
+                None,
+                None,
+            )
+            .await;
+            assert!(matches!(bad, Err(PersonalStoreError::Validation(_))));
+
+            let rows = sqlx::query(
+                "SELECT field_name, abstraction_tier2, abstraction_tier3 FROM entity_facts
+                 ORDER BY field_name",
+            )
+            .fetch_all(&mut conn)
+            .await?;
+            let got: Vec<(String, String, String)> = rows
+                .iter()
+                .map(|r| {
+                    (
+                        r.get("field_name"),
+                        r.get("abstraction_tier2"),
+                        r.get("abstraction_tier3"),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                got,
+                [
+                    (
+                        "a".to_owned(),
+                        "omit".to_owned(),
+                        "not_permitted".to_owned()
+                    ),
+                    ("b".to_owned(), "pass".to_owned(), "pass".to_owned()),
+                ],
+                "the refused policy wrote nothing"
+            );
+            Ok::<(), PersonalStoreError>(())
+        }
+        .await;
+
+        match saved_root {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
+        outcome.expect("policy writer assertions must pass");
     }
 }
