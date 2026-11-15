@@ -21,6 +21,7 @@ pub mod memory_broker;
 pub mod model_block;
 pub mod model_capability;
 pub mod model_resolver;
+pub mod model_resolver_input;
 pub mod model_selection;
 pub mod nightly_batch;
 pub mod privacy;

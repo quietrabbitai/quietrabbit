@@ -476,6 +476,18 @@ impl StepExecutor {
             }
         }
 
+        // items.id=896: a step expanded from a model block carries a requirement
+        // and is resolved by conductor::model_resolver instead of Step 4.5 and
+        // select_model(). A bound API Chat run NEVER takes this path: it keeps its
+        // bound destination whatever the step carries (Step 4.4 above), and a step
+        // with no requirement (every ordinary step) keeps Step 4.5 and
+        // select_model() exactly as they were.
+        let resolver_req = if ctx.bound.is_none() {
+            ctx.step.requirement.as_ref()
+        } else {
+            None
+        };
+
         // -- Step 4.5 — Tier 1.5 (qr_hosted) provider preference gate (F10) --
         // No prescribed default (architecture: "User choice at install. No
         // prescribed default."). An unset preference is a real gap, not
@@ -484,22 +496,43 @@ impl StepExecutor {
         // at all; qr_local never needs a provider. A provider the user HAS
         // set up but this step's ceiling excludes (items.id=692) fails
         // separately, naming the setting to change.
-        if let Some(error) = missing_provider_error(
-            ctx.effective_access,
-            ctx.qr_hosted_provider_preference.as_deref(),
-            ctx.qr_hosted_ceiling_excluded.as_deref(),
-        ) {
-            return Ok(Some(failure_handler.handle(
-                &error,
-                Some(&ctx.step.action_id),
-                Some(&ctx.focus_id),
-                retry_count,
-            )));
+        if resolver_req.is_none() {
+            if let Some(error) = missing_provider_error(
+                ctx.effective_access,
+                ctx.qr_hosted_provider_preference.as_deref(),
+                ctx.qr_hosted_ceiling_excluded.as_deref(),
+            ) {
+                return Ok(Some(failure_handler.handle(
+                    &error,
+                    Some(&ctx.step.action_id),
+                    Some(&ctx.focus_id),
+                    retry_count,
+                )));
+            }
         }
 
-        let selected_model = match &ctx.bound {
-            Some(bound) => select_bound_model(pool, ctx, bound).await?,
-            None => {
+        // The local models the context check may fall back to (items.id=896).
+        // Empty for every step but a resolved one.
+        let mut local_fallbacks: Vec<LocalFallback> = Vec::new();
+        let mut selected_model = match (&ctx.bound, resolver_req) {
+            (Some(bound), _) => select_bound_model(pool, ctx, bound).await?,
+            (None, Some(req)) => match select_model_for_block(pool, ctx, req).await {
+                Ok(sel) => {
+                    local_fallbacks = sel.fallbacks;
+                    sel.selected
+                }
+                // The resolver stopped the step before any model was called: it
+                // parks for the user (F10), like a spend block.
+                Err(e) => {
+                    return Ok(Some(failure_handler.handle(
+                        &e,
+                        Some(&ctx.step.action_id),
+                        Some(&ctx.focus_id),
+                        retry_count,
+                    )));
+                }
+            },
+            (None, None) => {
                 select_model(
                     pool,
                     &ctx.step.task_type,
@@ -657,7 +690,8 @@ impl StepExecutor {
             m
         };
 
-        let effective_ctx = match options_raw.get("num_ctx").and_then(|v| v.as_u64()) {
+        let explicit_num_ctx = options_raw.get("num_ctx").and_then(|v| v.as_u64());
+        let mut effective_ctx = match explicit_num_ctx {
             Some(v) => v as u32,
             // A hosted step's window is the resolved row's own: a model from
             // the user's live list has no curated row to look up again.
@@ -674,7 +708,43 @@ impl StepExecutor {
             },
         };
 
-        let ctx_status = check_context_window(&prompt, &ctx.step.task_type, effective_ctx);
+        let mut ctx_status = check_context_window(&prompt, &ctx.step.task_type, effective_ctx);
+
+        // items.id=896: a resolved step that does not fit its model's window may
+        // move to the next qualifying LOCAL candidate the resolver ranked. The
+        // prompt is NOT re-rendered and Gate 1 is NOT re-run: every fallback is a
+        // local model, as is the one it replaces, so the destination class, the
+        // tiers and the provider recorded by Gate 1 (none) are the same, and the
+        // text is the one already assembled. Only the model changes. The disclosure
+        // log is not touched (it records a provider and fields, and nothing leaves
+        // the device); the change is logged below with the two local model tags.
+        // A step that fixes its own num_ctx has one window whatever the model, so
+        // it never falls back.
+        if resolver_req.is_some()
+            && explicit_num_ctx.is_none()
+            && selected_model.hosted_model.is_none()
+            && ctx_status.status == ContextWindowStatusKind::Exceeded
+        {
+            for fb in std::mem::take(&mut local_fallbacks) {
+                let status =
+                    check_context_window(&prompt, &ctx.step.task_type, fb.context_window_tokens);
+                if status.status != ContextWindowStatusKind::Exceeded {
+                    log::info!(
+                        "executor: step {} does not fit {} ({} tokens): using local fallback {} \
+                         ({} tokens), same prompt, Gate 1 not re-run",
+                        ctx.step.action_id,
+                        selected_model.model_id,
+                        effective_ctx,
+                        fb.model_id,
+                        fb.context_window_tokens
+                    );
+                    selected_model = SelectedModel::local(fb.model_id);
+                    effective_ctx = fb.context_window_tokens;
+                    ctx_status = status;
+                    break;
+                }
+            }
+        }
         if ctx_status.status == ContextWindowStatusKind::Exceeded {
             return Ok(Some(failure_handler.handle(
                 &ConductorError::ContextWindowExceeded {
@@ -724,7 +794,16 @@ impl StepExecutor {
 
         // items.id=715: a hosted step streams only when the run's owner asked
         // for it (API Chat). A local step never does.
-        let hosted_step = ctx.effective_access != ExternalAccess::LocalOnly;
+        // Does this call go to a hosted provider? For an ordinary step the answer
+        // has always been the step's own ceiling. For a RESOLVED step the ceiling
+        // only says what is allowed, and the resolver may well have chosen a local
+        // model under it, so the answer is the model that was chosen. The two can
+        // never disagree the dangerous way: select_model_for_block refuses a hosted
+        // choice under a LocalOnly ceiling before this point.
+        let hosted_step = match resolver_req {
+            Some(_) => selected_model.hosted_model.is_some(),
+            None => ctx.effective_access != ExternalAccess::LocalOnly,
+        };
         let stream_sink: Option<Box<dyn StreamSink>> = match (&ctx.stream, step_streams(ctx)) {
             (Some(_), true) => Some(match app_handle {
                 Some(h) => Box::new(crate::chat_stream::TauriDeltaSink::new(
@@ -752,10 +831,15 @@ impl StepExecutor {
                 // no row is a real ConductorError, not a panic. The spend gate
                 // (items.id=710) runs between building that context and the
                 // network call.
-                match (
-                    ctx.qr_hosted_provider_preference.as_deref(),
-                    selected_model.hosted_model.as_ref(),
-                ) {
+                // For a resolved step the provider is the one the resolver chose
+                // (its row's own provider_id, set together with the model row by
+                // SelectedModel::hosted), not the user's preference, which may be
+                // unset because the resolver does not consult it.
+                let provider_for_call = match resolver_req {
+                    Some(_) => selected_model.provider_id.as_deref(),
+                    None => ctx.qr_hosted_provider_preference.as_deref(),
+                };
+                match (provider_for_call, selected_model.hosted_model.as_ref()) {
                     (Some(provider_id), Some(model)) => {
                         let parts = match (&ctx.stream, stream_sink.as_deref()) {
                             (Some(handle), Some(sink)) => Some(StreamParts {
@@ -1213,6 +1297,29 @@ struct SelectedModel {
     hosted_model: Option<ProviderModel>,
 }
 
+impl SelectedModel {
+    /// A local model. `provider_id` and `hosted_model` are both None.
+    fn local(model_id: String) -> Self {
+        Self {
+            provider_id: None,
+            model_id,
+            hosted_model: None,
+        }
+    }
+
+    /// A hosted model. `provider_id`, `model_id` and `hosted_model` all come from
+    /// the one catalog row, so a hosted selection can never carry a model row
+    /// without its provider (the generation branch's `unreachable!` depends on
+    /// that, items.id=896).
+    fn hosted(model: ProviderModel) -> Self {
+        Self {
+            provider_id: Some(model.provider_id.clone()),
+            model_id: model.model_id.clone(),
+            hosted_model: Some(model),
+        }
+    }
+}
+
 /// Step 4.5's provider gate (F10), pulled out so the two failure shapes are
 /// testable without a full execute_once harness. None when the step needs no
 /// hosted provider or has one selected. Otherwise: the hosted provider is
@@ -1400,6 +1507,203 @@ async fn select_bound_model(
             })
         }
         Err(e) => Err(model_error(&e)),
+    }
+}
+
+/// A local model the context check may switch to (items.id=896).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalFallback {
+    model_id: String,
+    context_window_tokens: u32,
+}
+
+/// What the resolver chose for a model-block step.
+struct BlockSelection {
+    selected: SelectedModel,
+    /// The other qualifying local models in rank order (empty when the choice is
+    /// hosted).
+    fallbacks: Vec<LocalFallback>,
+}
+
+/// A lower bound on the tokens the step's prompt will take: the template's fixed
+/// text with every {token} stripped, which is what the render keeps whatever the
+/// tokens hold. The post-render context check stays the authority.
+fn fixed_prompt_tokens(ctx: &StepContext) -> u32 {
+    let fixed = render_template(
+        &ctx.step.prompt_template,
+        &HashMap::new(),
+        &ctx.step.action_id,
+        &ctx.focus_id,
+    );
+    crate::providers::ollama_client::estimate_token_count(&fixed, &ctx.step.task_type)
+}
+
+/// The run's shipped document profile: the selected document type, read ONLY from
+/// the pass's seeds under the bound name, mapped to its shipped profile. Absent,
+/// unknown or unmappable means no profile (items.id=896 ruling: the block's own
+/// configuration is never consulted).
+fn run_profile(ctx: &StepContext) -> Option<String> {
+    let selected = ctx
+        .store_tokens
+        .seeds
+        .get(crate::conductor::model_resolver_input::DOCUMENT_TYPE_NAME)?;
+    let shipped = crate::conductor::model_block::document_type::registry().ok()?;
+    crate::conductor::model_resolver::profile_for_document_type(selected, shipped, &[])
+}
+
+/// The two stops the resolver can return, as the error the failure handler parks.
+fn resolver_stop(outcome: &crate::conductor::model_resolver::Resolution) -> Option<ConductorError> {
+    use crate::conductor::model_resolver::{NoCandidateReason, OptionEntry, Resolution, Standing};
+    fn entry(o: &OptionEntry) -> serde_json::Value {
+        let (standing, attained) = match o.standing {
+            Standing::BelowBar(a) => ("below_bar", Some(a.as_str())),
+            Standing::NotMeasured => ("not_measured", None),
+        };
+        let mut m = serde_json::Map::new();
+        m.insert(
+            "subject".into(),
+            serde_json::json!(o.model.subject.as_str()),
+        );
+        if !o.model.provider_id.is_empty() {
+            m.insert("provider_id".into(), serde_json::json!(o.model.provider_id));
+        }
+        m.insert("model_id".into(), serde_json::json!(o.model.model_id));
+        m.insert("standing".into(), serde_json::json!(standing));
+        if let Some(a) = attained {
+            m.insert("attained".into(), serde_json::json!(a));
+        }
+        serde_json::Value::Object(m)
+    }
+    match outcome {
+        Resolution::Selected { .. } => None,
+        Resolution::TooWeak {
+            required,
+            best_below_bar,
+            options,
+        } => {
+            // Bounded: the parameters ride in the failure's metadata.
+            let shown: Vec<serde_json::Value> = options.iter().take(16).map(entry).collect();
+            Some(spend_block_error(
+                &SpendBlock::new(Code::ResolverTooWeak)
+                    .with(
+                        "required",
+                        serde_json::to_value(required).unwrap_or(serde_json::Value::Null),
+                    )
+                    .with(
+                        "best_below_bar",
+                        best_below_bar
+                            .as_ref()
+                            .map(entry)
+                            .unwrap_or(serde_json::Value::Null),
+                    )
+                    .with("options", serde_json::Value::Array(shown)),
+            ))
+        }
+        Resolution::NoCandidate(reason) => Some(spend_block_error(
+            &SpendBlock::new(Code::ResolverNoCandidate).with(
+                "reason",
+                match reason {
+                    NoCandidateReason::NoDestination => "no_destination",
+                    NoCandidateReason::NoneReady => "none_ready",
+                    NoCandidateReason::ContextTooSmall => "context_too_small",
+                },
+            ),
+        )),
+    }
+}
+
+/// Resolve the model of a model-block step (items.id=896). Gathers the candidates
+/// and the measured capability rows, runs the pure resolver, and turns its answer
+/// into a SelectedModel. Never consults the user's provider preference: the
+/// resolver chooses inside the ceiling and the requirement's own range.
+///
+/// A hosted choice under a LocalOnly ceiling is refused here, before any gate: the
+/// resolver already filters by ceiling, so this is the check that keeps the network
+/// predicate in execute_once safe even if that filter were ever wrong.
+async fn select_model_for_block(
+    pool: &sqlx::SqlitePool,
+    ctx: &StepContext,
+    req: &crate::conductor::model_block::config::ModelRequirement,
+) -> Result<BlockSelection, ConductorError> {
+    use crate::conductor::model_block::config::Destination;
+    use crate::conductor::model_capability::CapabilitySubject;
+    use crate::conductor::model_resolver::{resolve, Resolution, ResolveInput};
+    use crate::conductor::model_resolver_input::{gather, GatherInput};
+
+    let ceiling = ctx.effective_access.min(req.range.highest_tier);
+    let local_allowed = req.range.destinations.contains(&Destination::Local);
+    let hosted_allowed = req.range.destinations.contains(&Destination::HostedApi)
+        && ceiling >= ExternalAccess::AnonymousPreferred;
+    let fixed_tokens = fixed_prompt_tokens(ctx);
+    let est_output = ctx
+        .step
+        .options_override
+        .get("num_predict")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(1024);
+    let gathered = gather(&GatherInput {
+        pool,
+        user_id: &ctx.user_id,
+        key_hex: &ctx.key_hex,
+        ceiling,
+        local_allowed,
+        hosted_allowed,
+        est_input_tokens: fixed_tokens,
+        est_output_tokens: est_output,
+    })
+    .await;
+    let profile = run_profile(ctx);
+    let outcome = resolve(&ResolveInput {
+        requirement: req,
+        profile: profile.as_deref(),
+        ceiling: ctx.effective_access,
+        min_context_tokens: fixed_tokens,
+        candidates: &gathered.candidates,
+        capabilities: &gathered.capabilities,
+    });
+    let (chosen, fallbacks) = match outcome {
+        Resolution::Selected { chosen, fallbacks } => (chosen, fallbacks),
+        // TooWeak and NoCandidate each have their stop. resolver_stop answers None
+        // only for a selection, so the fallback is never taken, and it fails closed.
+        other => {
+            return Err(resolver_stop(&other).unwrap_or_else(|| {
+                spend_block_error(&SpendBlock::new(Code::BlockModelUnavailable))
+            }))
+        }
+    };
+    match chosen.model.subject {
+        CapabilitySubject::Local => Ok(BlockSelection {
+            selected: SelectedModel::local(chosen.model.model_id),
+            fallbacks: fallbacks
+                .into_iter()
+                .map(|f| LocalFallback {
+                    model_id: f.model.model_id,
+                    context_window_tokens: f.context_window_tokens,
+                })
+                .collect(),
+        }),
+        CapabilitySubject::Hosted => {
+            if ctx.effective_access == ExternalAccess::LocalOnly {
+                return Err(ConductorError::TierBoundaryViolation {
+                    plain_language: format!(
+                        "Step '{}' resolved to a hosted model under a local-only ceiling. \
+                         [Get help]",
+                        ctx.step.action_id
+                    ),
+                });
+            }
+            let key = (chosen.model.provider_id, chosen.model.model_id);
+            match gathered.hosted_models.get(&key) {
+                Some(row) => Ok(BlockSelection {
+                    selected: SelectedModel::hosted(row.clone()),
+                    fallbacks: Vec::new(),
+                }),
+                None => Err(spend_block_error(&SpendBlock::new(
+                    Code::BlockModelUnavailable,
+                ))),
+            }
+        }
     }
 }
 
@@ -2310,7 +2614,7 @@ async fn resolve_hosted_inputs(
 /// catalog is skipped entirely -- Ollama ids have no providers row to hang a
 /// catalog entry off yet (Ollama-as-qr_local wiring is a separate, larger,
 /// out-of-scope initiative). Not a full close of B4.
-async fn get_context_window(
+pub(crate) async fn get_context_window(
     pool: &sqlx::SqlitePool,
     provider_id: Option<&str>,
     model_id: &str,
@@ -6868,5 +7172,730 @@ mod tests {
         assert!(is_user_stop(&f));
         assert_eq!(f.plain_language, "This was stopped.");
         assert!(!f.is_recoverable);
+    }
+
+    // -----------------------------------------------------------------------
+    // items.id=896 stage 3: resolved model-block steps. Real migrated shared.db
+    // (the seeded local model rows and capability cells), loopback stand-ins for
+    // the local model, no live calls.
+    // -----------------------------------------------------------------------
+
+    use crate::conductor::concurrency::ConductorScheduler;
+    use crate::conductor::model_block::config::{
+        Destination, Difficulty, ModelRange, ModelRequirement, ModelTaskType, OutputSize,
+        QualityBar, QualityFloor, TaskNeed,
+    };
+    use crate::conductor::privacy::logger::TestLogger;
+
+    /// Trust flag and forced port for a local-model call, reset on drop.
+    struct LocalModelStub {
+        server: LoopbackServer,
+        _port: crate::ollama_sidecar::ForcedPortGuard,
+    }
+
+    impl LocalModelStub {
+        fn start(replies: usize) -> Self {
+            crate::ollama_sidecar::force_trust_for_test(true);
+            let canned = (0..replies)
+                .map(|_| {
+                    Canned::json(
+                        200,
+                        r#"{"response":"A drafted reply.","done":true,"model":"stub"}"#,
+                    )
+                })
+                .collect();
+            let server = LoopbackServer::start(canned);
+            let port: u16 = server.base().rsplit(':').next().unwrap().parse().unwrap();
+            let _port = crate::ollama_sidecar::ForcedPortGuard::set(port);
+            Self { server, _port }
+        }
+    }
+
+    impl Drop for LocalModelStub {
+        fn drop(&mut self) {
+            crate::ollama_sidecar::force_trust_for_test(false);
+        }
+    }
+
+    fn requirement(
+        min: QualityBar,
+        destinations: &[Destination],
+        tier: ExternalAccess,
+    ) -> ModelRequirement {
+        ModelRequirement {
+            block_stable_id: "fx".to_owned(),
+            need: TaskNeed {
+                task_type: ModelTaskType::CreativeWriting,
+                difficulty: Difficulty::Low,
+                output_size: OutputSize::Short,
+            },
+            range: ModelRange {
+                quality_floor: QualityFloor {
+                    min,
+                    max: QualityBar::High,
+                },
+                highest_tier: tier,
+                destinations: destinations.to_vec(),
+            },
+            class_preference: None,
+        }
+    }
+
+    /// A context for a resolved step: `access` is the ceiling, the document type
+    /// is seeded under the bound name when given.
+    fn resolved_ctx(
+        req: Option<ModelRequirement>,
+        access: ExternalAccess,
+        document_type: Option<&str>,
+        template: &str,
+    ) -> StepContext {
+        let mut ctx = hosted_ctx(RunAttendance::Attended, &fixture_key_hex());
+        ctx.step.task_type = "creative_writing".to_owned();
+        ctx.step.prompt_template = template.to_owned();
+        ctx.step.requirement = req;
+        ctx.step.routing_tier = access;
+        ctx.step.external_access_override = Some(access);
+        ctx.focus_external_access = access;
+        ctx.effective_access = access;
+        ctx.qr_hosted_provider_preference = None;
+        let local = access == ExternalAccess::LocalOnly;
+        ctx.execution_tier = if local { 1 } else { 2 };
+        ctx.abstraction_tier = if local { 1 } else { 2 };
+        ctx.raw_abstraction = 1;
+        if let Some(d) = document_type {
+            ctx.store_tokens.seeds.insert(
+                crate::conductor::model_resolver_input::DOCUMENT_TYPE_NAME.to_owned(),
+                d.to_owned(),
+            );
+        }
+        ctx
+    }
+
+    async fn install_local_models(pool: &sqlx::SqlitePool) {
+        sqlx::query("UPDATE providers SET installed = 1 WHERE provider_type = 'local_model'")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn run_once(
+        ctx: &StepContext,
+        pool: &sqlx::SqlitePool,
+    ) -> (
+        Result<Option<FailureResult>, ConductorError>,
+        TaskTrack,
+        PrivacyGateway<TestLogger>,
+    ) {
+        let mut track = TaskTrack::new();
+        let gateway = PrivacyGateway::new(TestLogger::new());
+        let out = StepExecutor::new()
+            .execute_once(
+                ctx,
+                0,
+                &PersonalTrack::new(),
+                &mut track,
+                &mut SharedStateTrack::new(),
+                &FailureHandler::new(ctx.effective_access),
+                &gateway,
+                &Arc::new(ConductorScheduler::new()),
+                None,
+                pool,
+            )
+            .await;
+        (out, track, gateway)
+    }
+
+    fn parked_code(r: &FailureResult) -> String {
+        assert_eq!(r.action, FailureAction::AwaitUser, "{r:?}");
+        assert_eq!(r.failure_mode.as_deref(), Some("F10"));
+        r.metadata.as_ref().unwrap()["code"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn local_req() -> ModelRequirement {
+        requirement(
+            QualityBar::Basic,
+            &[Destination::Local],
+            ExternalAccess::AnonymousPreferred,
+        )
+    }
+
+    // -- condition 3: no document type, the step parks through TooWeak ---------
+
+    #[tokio::test]
+    async fn without_the_bound_document_type_the_step_parks_with_too_weak() {
+        with_temp_shared_db(|pool| async move {
+            install_local_models(&pool).await;
+            let ctx = resolved_ctx(
+                Some(local_req()),
+                ExternalAccess::LocalOnly,
+                None,
+                "Write it.",
+            );
+            let (out, track, gateway) = run_once(&ctx, &pool).await;
+            let failure = out.unwrap().expect("the step parks");
+            assert_eq!(parked_code(&failure), "resolver.too_weak");
+            let meta = failure.metadata.unwrap();
+            assert_eq!(meta["required"], "basic");
+            assert!(meta["best_below_bar"].is_null(), "nothing was measured");
+            let options = meta["options"].as_array().unwrap();
+            assert_eq!(options.len(), 3, "every ready local model is listed");
+            assert!(options.iter().all(|o| o["standing"] == "not_measured"));
+            // Nothing ran: no gate, no model, no step recorded.
+            assert_eq!(gateway.logger.entry_count(), 0);
+            assert!(track.steps().is_empty());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_unknown_document_type_is_no_profile_and_parks_the_same_way() {
+        with_temp_shared_db(|pool| async move {
+            install_local_models(&pool).await;
+            let ctx = resolved_ctx(
+                Some(local_req()),
+                ExternalAccess::LocalOnly,
+                Some("not-a-shipped-type"),
+                "Write it.",
+            );
+            let (out, _, _) = run_once(&ctx, &pool).await;
+            assert_eq!(parked_code(&out.unwrap().unwrap()), "resolver.too_weak");
+        })
+        .await;
+    }
+
+    /// The i18n parity of the two new stops: every resolver code has a key in the
+    /// frontend's en.json (placeholder copy, Chat-BRAND owns the wording).
+    #[test]
+    fn every_resolver_code_has_an_i18n_key() {
+        let en: serde_json::Value =
+            serde_json::from_str(include_str!("../../../frontend/src/i18n/en.json")).unwrap();
+        for code in [Code::ResolverTooWeak, Code::ResolverNoCandidate] {
+            let tail = code.as_str().strip_prefix("resolver.").unwrap();
+            let text = en["resolver"]["stop"][tail]
+                .as_str()
+                .unwrap_or_else(|| panic!("en.json has no resolver.stop.{tail}"));
+            assert!(!text.trim().is_empty());
+            // Placeholder copy names no model and no provider.
+            assert!(!text.contains("llama") && !text.contains("qwen"), "{text}");
+        }
+    }
+
+    // -- selection --------------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_selected_document_type_decides_the_model_and_the_ranked_fallbacks() {
+        with_temp_shared_db(|pool| async move {
+            install_local_models(&pool).await;
+            let ctx = resolved_ctx(
+                Some(local_req()),
+                ExternalAccess::AnonymousPreferred,
+                Some("rma_letter"),
+                "Write it.",
+            );
+            let sel = select_model_for_block(&pool, &ctx, ctx.step.requirement.as_ref().unwrap())
+                .await
+                .map_err(|e| format!("{e:?}"))
+                .unwrap();
+            // The smallest model Jason rated acceptable for this type, a local one.
+            assert_eq!(sel.selected.model_id, "llama3.2:3b");
+            assert!(sel.selected.provider_id.is_none() && sel.selected.hosted_model.is_none());
+            // qwen2.5:7b is unrated for this type: not a fallback.
+            assert_eq!(
+                sel.fallbacks
+                    .iter()
+                    .map(|f| f.model_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["llama3.1:8b"]
+            );
+        })
+        .await;
+    }
+
+    /// The pin for an uncalibrated LOCAL cell at the glue level: the only ready
+    /// model has no cell for this type, so it is listed as not measured and is not
+    /// run.
+    #[tokio::test]
+    async fn an_uncalibrated_local_cell_is_not_chosen_and_is_listed_as_not_measured() {
+        with_temp_shared_db(|pool| async move {
+            install_local_models(&pool).await;
+            // Turn off the two models rated for this type; qwen2.5:7b is unrated.
+            sqlx::query(
+                "UPDATE providers SET qr_disabled_by_user = 1
+                  WHERE local_model_tag IN ('llama3.2:3b', 'llama3.1:8b')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            let ctx = resolved_ctx(
+                Some(local_req()),
+                ExternalAccess::AnonymousPreferred,
+                Some("rma_letter"),
+                "Write it.",
+            );
+            let err = select_model_for_block(&pool, &ctx, ctx.step.requirement.as_ref().unwrap())
+                .await
+                .err()
+                .expect("an unmeasured model is not selected");
+            assert_eq!(block_code(&err), "resolver.too_weak");
+            let ConductorError::SpendBlock { params, .. } = &err else {
+                panic!()
+            };
+            let options = params["options"].as_array().unwrap();
+            assert_eq!(options.len(), 1);
+            assert_eq!(options[0]["model_id"], "qwen2.5:7b");
+            assert_eq!(options[0]["standing"], "not_measured");
+        })
+        .await;
+    }
+
+    /// And a HOSTED model with no cell, ready in every other way (key, consent,
+    /// price): excluded and listed as not measured. With a cell it is chosen, and
+    /// the selection carries the provider and the model row together.
+    #[tokio::test]
+    async fn an_unmeasured_hosted_model_is_excluded_and_a_measured_one_is_selected_whole() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            let (key_hex, _model) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+            grant_consent(&pool, &key_hex, true).await;
+            let req = requirement(
+                QualityBar::Basic,
+                &[Destination::HostedApi],
+                ExternalAccess::AnonymousPreferred,
+            );
+            let mut ctx = resolved_ctx(
+                Some(req),
+                ExternalAccess::AnonymousPreferred,
+                Some("rma_letter"),
+                "Write it.",
+            );
+            ctx.key_hex = key_hex.clone();
+
+            let err = select_model_for_block(&pool, &ctx, ctx.step.requirement.as_ref().unwrap())
+                .await
+                .err()
+                .expect("an unmeasured hosted model is not selected");
+            assert_eq!(block_code(&err), "resolver.too_weak");
+            let ConductorError::SpendBlock { params, .. } = &err else {
+                panic!()
+            };
+            let hosted: Vec<&serde_json::Value> = params["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|o| o["subject"] == "hosted")
+                .collect();
+            assert_eq!(hosted.len(), 1);
+            assert_eq!(hosted[0]["provider_id"], "fixture-host-a");
+            assert_eq!(hosted[0]["standing"], "not_measured");
+
+            // Measured: now it is the choice, and the pair is whole.
+            sqlx::query(
+                "INSERT INTO model_capabilities
+                   (subject_kind, provider_id, model_id, task_type, profile, attained_bar,
+                    model_class, sample_count, measured_at, provenance)
+                 VALUES ('hosted', 'fixture-host-a', 'fixture-model-a', 'creative_writing',
+                         'rma_letter', 'basic', 'large', 1, '2026-11-13', 'harness_hosted')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            let sel = select_model_for_block(&pool, &ctx, ctx.step.requirement.as_ref().unwrap())
+                .await
+                .map_err(|e| format!("{e:?}"))
+                .unwrap();
+            assert_eq!(sel.selected.provider_id.as_deref(), Some("fixture-host-a"));
+            let row = sel.selected.hosted_model.as_ref().expect("the model row");
+            assert_eq!(row.provider_id, "fixture-host-a");
+            assert_eq!(sel.selected.model_id, row.model_id);
+            assert!(sel.fallbacks.is_empty());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_hosted_model_without_a_key_a_consent_or_a_price_is_not_a_candidate() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            let req = requirement(
+                QualityBar::Basic,
+                &[Destination::HostedApi],
+                ExternalAccess::AnonymousPreferred,
+            );
+            let measured = |pool: sqlx::SqlitePool| async move {
+                sqlx::query(
+                    "INSERT OR REPLACE INTO model_capabilities
+                       (subject_kind, provider_id, model_id, task_type, profile, attained_bar,
+                        model_class, sample_count, measured_at, provenance)
+                     VALUES ('hosted', 'fixture-host-a', 'fixture-model-a', 'creative_writing',
+                             'rma_letter', 'high', 'large', 1, '2026-11-13', 'harness_hosted')",
+                )
+                .execute(&pool)
+                .await
+                .unwrap();
+            };
+            // Priced, keyed, but never consented.
+            let (key_hex, _m) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+            measured(pool.clone()).await;
+            let mut ctx = resolved_ctx(
+                Some(req.clone()),
+                ExternalAccess::AnonymousPreferred,
+                Some("rma_letter"),
+                "Write it.",
+            );
+            ctx.key_hex = key_hex.clone();
+            let err = select_model_for_block(&pool, &ctx, &req)
+                .await
+                .err()
+                .expect("no consent");
+            assert_eq!(block_code(&err), "resolver.no_candidate");
+            // Consented: chosen.
+            grant_consent(&pool, &key_hex, true).await;
+            assert!(select_model_for_block(&pool, &ctx, &req).await.is_ok());
+            // No session key: nothing hosted is usable.
+            ctx.key_hex = String::new();
+            assert!(select_model_for_block(&pool, &ctx, &req).await.is_err());
+            ctx.key_hex = key_hex.clone();
+            // Unpriced: never chosen automatically, even measured and consented.
+            sqlx::query("UPDATE provider_models SET pricing = NULL")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let err = select_model_for_block(&pool, &ctx, &req)
+                .await
+                .err()
+                .expect("an unpriced model");
+            assert_eq!(block_code(&err), "resolver.no_candidate");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_hosted_range_under_a_local_only_ceiling_resolves_to_nothing() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            let (key_hex, _m) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+            grant_consent(&pool, &key_hex, true).await;
+            let req = requirement(
+                QualityBar::Basic,
+                &[Destination::HostedApi],
+                ExternalAccess::Unrestricted,
+            );
+            // The run's own ceiling is local only: the requirement cannot widen it.
+            let mut ctx = resolved_ctx(
+                Some(req.clone()),
+                ExternalAccess::LocalOnly,
+                Some("rma_letter"),
+                "Write it.",
+            );
+            ctx.key_hex = key_hex;
+            let err = select_model_for_block(&pool, &ctx, &req)
+                .await
+                .err()
+                .expect("no destination");
+            assert_eq!(block_code(&err), "resolver.no_candidate");
+            let ConductorError::SpendBlock { params, .. } = &err else {
+                panic!()
+            };
+            assert_eq!(params["reason"], "no_destination");
+        })
+        .await;
+    }
+
+    // -- the network predicate ---------------------------------------------------
+
+    /// A resolved step whose ceiling allows hosted but whose chosen model is local
+    /// takes the LOCAL call, with no hosted traffic and no panic in the hosted
+    /// branch. The ordinary predicate would have sent it down the hosted branch.
+    #[tokio::test]
+    async fn a_local_choice_under_an_external_ceiling_takes_the_local_path() {
+        with_temp_shared_db(|pool| async move {
+            install_local_models(&pool).await;
+            let stub = LocalModelStub::start(1);
+            let ctx = resolved_ctx(
+                Some(requirement(
+                    QualityBar::Basic,
+                    &[Destination::Local, Destination::HostedApi],
+                    ExternalAccess::AnonymousPreferred,
+                )),
+                ExternalAccess::AnonymousPreferred,
+                Some("rma_letter"),
+                "Write it.",
+            );
+            let (out, track, gateway) = run_once(&ctx, &pool).await;
+            assert!(out.unwrap().is_none(), "the step completed");
+            let seen = stub.server.captured();
+            assert_eq!(seen.len(), 1, "one local call");
+            assert!(seen[0].path.contains("/api/generate"));
+            assert_eq!(seen[0].json()["model"], "llama3.2:3b");
+            assert_eq!(track.steps().len(), 1);
+            // Gate 1 ran once, for a local destination (no provider).
+            assert!(gateway
+                .logger
+                .entries()
+                .iter()
+                .all(|e| e.provider.is_none()));
+        })
+        .await;
+    }
+
+    // -- the context fallback ----------------------------------------------------
+
+    /// A template of fixed text whose size estimate is inside the first model's
+    /// hard limit, so the resolver keeps it and the post-render check rejects it.
+    fn template_that_overflows_the_first_window() -> String {
+        let mut n = 0;
+        loop {
+            let text = "x".repeat(n);
+            let est =
+                crate::providers::ollama_client::estimate_token_count(&text, "creative_writing");
+            if est as f64 / 4096.0 >= 0.95 {
+                assert!(est <= 4096, "the estimate stepped past the window");
+                return text;
+            }
+            n += 4;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_context_fallback_changes_the_model_only() {
+        with_temp_shared_db(|pool| async move {
+            install_local_models(&pool).await;
+            let template = template_that_overflows_the_first_window();
+
+            // The same step with a short template: no fallback, the first model.
+            let stub = LocalModelStub::start(1);
+            let short = resolved_ctx(
+                Some(local_req()),
+                ExternalAccess::AnonymousPreferred,
+                Some("rma_letter"),
+                "Write it.",
+            );
+            let (out, _, gateway_short) = run_once(&short, &pool).await;
+            assert!(out.unwrap().is_none());
+            assert_eq!(stub.server.captured()[0].json()["model"], "llama3.2:3b");
+            let entries_short = gateway_short.logger.entries().len();
+            drop(stub);
+
+            // The long one does not fit that model's window, so it moves to the
+            // next ranked local model, and nothing else about the call changes.
+            let stub = LocalModelStub::start(1);
+            let long = resolved_ctx(
+                Some(local_req()),
+                ExternalAccess::AnonymousPreferred,
+                Some("rma_letter"),
+                &template,
+            );
+            let (out, track, gateway) = run_once(&long, &pool).await;
+            assert!(
+                out.unwrap().is_none(),
+                "the step completed after the fallback"
+            );
+            let seen = stub.server.captured();
+            assert_eq!(seen.len(), 1, "one call, to the fallback only");
+            let body = seen[0].json();
+            assert_eq!(body["model"], "llama3.1:8b");
+            assert_eq!(
+                body["prompt"],
+                template.as_str(),
+                "the same prompt, not re-rendered"
+            );
+            assert_eq!(track.steps().len(), 1);
+            // The disclosure log: Gate 1 ran once, as it does without a fallback
+            // (the same number of entries), every entry for a local destination.
+            let entries = gateway.logger.entries();
+            assert_eq!(entries.len(), entries_short);
+            assert!(entries.iter().all(|e| e.provider.is_none()));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_step_that_fixes_its_own_window_never_falls_back() {
+        with_temp_shared_db(|pool| async move {
+            install_local_models(&pool).await;
+            let stub = LocalModelStub::start(1);
+            let mut ctx = resolved_ctx(
+                Some(local_req()),
+                ExternalAccess::AnonymousPreferred,
+                Some("rma_letter"),
+                &template_that_overflows_the_first_window(),
+            );
+            ctx.step
+                .options_override
+                .insert("num_ctx".to_owned(), serde_json::json!(4096));
+            let (out, _, _) = run_once(&ctx, &pool).await;
+            let failure = out.unwrap().expect("the step stops");
+            assert!(
+                failure.plain_language.contains("too long"),
+                "{}",
+                failure.plain_language
+            );
+            assert!(stub.server.captured().is_empty(), "no model was called");
+        })
+        .await;
+    }
+
+    // -- steps that must not change ----------------------------------------------
+
+    /// A step with no requirement keeps Step 4.5: at an external ceiling with no
+    /// provider set up it parks with the "no provider" failure, exactly as before.
+    /// The same context WITH a requirement goes to the resolver instead.
+    #[tokio::test]
+    async fn a_step_without_a_requirement_keeps_step_4_5_and_a_resolved_one_skips_it() {
+        with_temp_shared_db(|pool| async move {
+            install_local_models(&pool).await;
+            let plain = resolved_ctx(None, ExternalAccess::AnonymousPreferred, None, "Write it.");
+            let (out, _, _) = run_once(&plain, &pool).await;
+            let failure = out.unwrap().expect("parks");
+            assert!(
+                failure
+                    .plain_language
+                    .contains("No Tier 1.5 AI provider is set up yet"),
+                "{}",
+                failure.plain_language
+            );
+            assert_ne!(failure.failure_mode.as_deref(), Some("F10_RESOLVER"));
+
+            let resolved = resolved_ctx(
+                Some(local_req()),
+                ExternalAccess::AnonymousPreferred,
+                None,
+                "Write it.",
+            );
+            let (out, _, _) = run_once(&resolved, &pool).await;
+            let failure = out.unwrap().expect("parks");
+            assert_eq!(parked_code(&failure), "resolver.too_weak");
+        })
+        .await;
+    }
+
+    /// A step with no requirement keeps select_model()'s own choice: the default
+    /// local model for its task type, whatever the capability data says.
+    #[tokio::test]
+    async fn a_step_without_a_requirement_keeps_the_hardcoded_local_choice() {
+        with_temp_shared_db(|pool| async move {
+            // Nothing is installed: select_model() does not look.
+            let stub = LocalModelStub::start(1);
+            let ctx = resolved_ctx(None, ExternalAccess::LocalOnly, None, "Write it.");
+            let (out, _, _) = run_once(&ctx, &pool).await;
+            assert!(out.unwrap().is_none());
+            // task_type creative_writing is the default arm of select_model().
+            assert_eq!(stub.server.captured()[0].json()["model"], "llama3.1:8b");
+        })
+        .await;
+    }
+
+    /// A bound API Chat run keeps its bound destination whatever the step carries:
+    /// a step with a requirement on a bound run is NOT resolved. The binding names
+    /// a provider that is not in the catalog, so select_bound_model() stops the
+    /// run with its own error, and the resolver's code never appears.
+    #[tokio::test]
+    async fn a_bound_api_chat_run_ignores_the_requirement() {
+        with_temp_shared_db(|pool| async move {
+            install_local_models(&pool).await;
+            let mut ctx = resolved_ctx(
+                Some(local_req()),
+                ExternalAccess::AnonymousPreferred,
+                Some("rma_letter"),
+                "Write it.",
+            );
+            ctx.bound = Some(crate::api_chat::BoundDestination {
+                provider_id: "no-such-provider".to_owned(),
+                model_id: "no-such-model".to_owned(),
+            });
+            ctx.qr_hosted_provider_preference = Some("no-such-provider".to_owned());
+            let (out, track, gateway) = run_once(&ctx, &pool).await;
+            match out {
+                Err(ConductorError::SpendBlock { params, .. }) => {
+                    let code = params["code"].as_str().unwrap();
+                    assert!(!code.starts_with("resolver."), "{code}");
+                }
+                Ok(Some(f)) => {
+                    assert!(
+                        !f.metadata
+                            .as_ref()
+                            .and_then(|m| m["code"].as_str().map(str::to_owned))
+                            .unwrap_or_default()
+                            .starts_with("resolver."),
+                        "{f:?}"
+                    );
+                }
+                other => panic!("the bound run must stop on its own binding: {other:?}"),
+            }
+            assert!(track.steps().is_empty());
+            assert_eq!(gateway.logger.entry_count(), 0);
+        })
+        .await;
+    }
+
+    // -- the privacy-critical sites ------------------------------------------------
+
+    /// SelectedModel's two constructors never produce a provider without its model
+    /// row or the reverse: the generation branch's `unreachable!` depends on it.
+    #[test]
+    fn a_selected_model_is_either_wholly_local_or_wholly_hosted() {
+        let local = SelectedModel::local("some-tag".to_owned());
+        assert!(local.provider_id.is_none() && local.hosted_model.is_none());
+        let row = ProviderModel {
+            id: "p:m".to_owned(),
+            provider_id: "p".to_owned(),
+            model_id: "m".to_owned(),
+            context_window_tokens: 1000,
+            is_default: false,
+            created_at: "t".to_owned(),
+            pricing: None,
+            request_options: None,
+            token_factor: 1.0,
+            output_overhead: 1.0,
+            status: crate::persistence::provider_store::ModelStatus::Active,
+            retires_at: None,
+            requires_paid: false,
+            qr_recommended: false,
+            qr_recommendation_rank: None,
+            retains_data_override: None,
+            trains_on_data_override: None,
+            retention_days_override: None,
+            context_window_source: None,
+            context_window_as_of: None,
+        };
+        let hosted = SelectedModel::hosted(row);
+        assert_eq!(hosted.provider_id.as_deref(), Some("p"));
+        assert_eq!(hosted.model_id, "m");
+        assert_eq!(hosted.hosted_model.as_ref().unwrap().provider_id, "p");
+    }
+
+    /// The three sites keyed on the network predicate, pinned in the source of
+    /// execute_once itself: the hosted call's provider comes from the selection for
+    /// a resolved step and from the preference otherwise, hosted_step follows the
+    /// chosen model for a resolved step, and the render branch still keys on the
+    /// ceiling (a hosted choice implies a ceiling above local, so the stricter
+    /// render always applies before a hosted call).
+    #[test]
+    fn the_three_network_sites_are_as_reviewed() {
+        let src = include_str!("executor.rs");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        // Site 1.
+        assert!(flat.contains(
+            "let hosted_step = match resolver_req { Some(_) => selected_model.hosted_model.is_some(), None => ctx.effective_access != ExternalAccess::LocalOnly, };"
+        ));
+        // Site 2: unchanged.
+        assert!(flat.contains(
+            "let prompt = if ctx.effective_access != ExternalAccess::LocalOnly { let disclosure = shared_state.read_disclosure_buffer(&ctx.step.action_id);"
+        ));
+        // Site 3.
+        assert!(flat.contains(
+            "let provider_for_call = match resolver_req { Some(_) => selected_model.provider_id.as_deref(), None => ctx.qr_hosted_provider_preference.as_deref(), }; match (provider_for_call, selected_model.hosted_model.as_ref()) {"
+        ));
+        // The panic arm is the original one, once, with its original message.
+        assert_eq!(code.matches("unreachable!(").count(), 2);
+        assert!(
+            code.contains("effective_access != LocalOnly with no qr_hosted_provider_preference")
+        );
+        // A hosted selection under a local-only ceiling is refused before any gate.
+        assert!(flat.contains("if ctx.effective_access == ExternalAccess::LocalOnly { return Err(ConductorError::TierBoundaryViolation {"));
     }
 }

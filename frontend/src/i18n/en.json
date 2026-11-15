@@ -560,5 +560,11 @@
       "summary": "{{level}}: cloud-hosted, {{login}}.",
       "caveat": "This is the provider's default; your account settings may differ."
     }
+  },
+  "resolver": {
+    "stop": {
+      "too_weak": "None of the AI models available for this task is good enough for it yet, so nothing was run.",
+      "no_candidate": "There is no AI model this task is allowed to use right now, so nothing was run."
+    }
   }
 }

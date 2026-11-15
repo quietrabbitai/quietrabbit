@@ -18,6 +18,8 @@
 //   consent_state.* where a provider's consent stands
 //   api_chat.*     an API Chat send was stopped before any network traffic
 //                  for a reason that is not spend (items.id=716)
+//   resolver.*     the model resolver stopped a model-block step before any
+//                  model was called (items.id=896)
 
 use serde::{Deserialize, Serialize};
 
@@ -137,6 +139,17 @@ pub enum Code {
     /// verified Privacy Filter).
     ApiChatPrivacyFilterUnavailable,
 
+    // -- the model resolver stopped a model-block step (items.id=896) ----------
+    /// No model reaches the step's quality bar for this task type and document
+    /// profile. Nothing was called and no model below the bar was used. The
+    /// parameters carry the required bar, the best model below it and every other
+    /// candidate with why it did not qualify (below the bar, or not measured).
+    ResolverTooWeak,
+    /// The resolver found nothing it may use: no destination the ceiling and the
+    /// step allow, nothing ready, or no window large enough. The parameters carry
+    /// the reason.
+    ResolverNoCandidate,
+
     // -- cost basis, price state, limit state, consent state ------------------
     CostBasisListPriceEstimate,
     PriceStateKnown,
@@ -188,6 +201,8 @@ impl Code {
         Code::ApiChatReviewBlocked,
         Code::ApiChatWrongChatKind,
         Code::ApiChatPrivacyFilterUnavailable,
+        Code::ResolverTooWeak,
+        Code::ResolverNoCandidate,
         Code::CostBasisListPriceEstimate,
         Code::PriceStateKnown,
         Code::PriceStateUnknown,
@@ -238,6 +253,8 @@ impl Code {
             Code::ApiChatReviewBlocked => "api_chat.review_blocked",
             Code::ApiChatWrongChatKind => "api_chat.wrong_chat_kind",
             Code::ApiChatPrivacyFilterUnavailable => "api_chat.privacy_filter_unavailable",
+            Code::ResolverTooWeak => "resolver.too_weak",
+            Code::ResolverNoCandidate => "resolver.no_candidate",
             Code::CostBasisListPriceEstimate => "cost_basis.list_price_estimate",
             Code::PriceStateKnown => "price_state.known",
             Code::PriceStateUnknown => "price_state.unknown",
@@ -322,6 +339,8 @@ mod tests {
             "api_chat.review_blocked",
             "api_chat.wrong_chat_kind",
             "api_chat.privacy_filter_unavailable",
+            "resolver.too_weak",
+            "resolver.no_candidate",
             "cost_basis.list_price_estimate",
             "price_state.known",
             "price_state.unknown",
@@ -349,9 +368,9 @@ mod tests {
     /// this length check keeps the two in step.
     #[test]
     fn all_lists_every_variant() {
-        // 17 warnings + 11 blocks + 6 API Chat stops + 1 cost basis
-        // + 3 price states + 3 limit states + 4 consent states.
-        assert_eq!(Code::ALL.len(), 45);
+        // 17 warnings + 11 blocks + 6 API Chat stops + 2 resolver stops + 1 cost
+        // basis + 3 price states + 3 limit states + 4 consent states.
+        assert_eq!(Code::ALL.len(), 47);
     }
 
     #[test]

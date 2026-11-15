@@ -33,7 +33,7 @@ use crate::persistence::user_provider_preference_store::preferred_providers;
 /// API. Cloud Chat panes (split_screen_web/external_service)
 /// are never candidates here -- those are user-driven and not gated by the
 /// ceiling (decisions.id=680).
-const HOSTED_PROVIDER_TYPE: &str = "cloud_inference_api";
+pub(crate) const HOSTED_PROVIDER_TYPE: &str = "cloud_inference_api";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalProviderResolution {

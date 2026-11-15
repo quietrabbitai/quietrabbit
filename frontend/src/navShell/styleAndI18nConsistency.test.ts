@@ -62,6 +62,8 @@ const PRE_EXISTING_ORPHAN_KEYS: string[] = [
   'navShell.chat.notSentNotice', // same
   'navShell.focusSettings.crumbLabel', // defined, no t() call site anywhere
   'privacyGuardianModal.selectedCount', // defined, no t() call site anywhere
+  'resolver.stop.too_weak', // items.id=896: the backend parks a model-block step with this code; the screen that shows it is items.id=902 or 904
+  'resolver.stop.no_candidate', // same
 ]
 
 function walk(dir: string, exts: string[], out: string[] = []): string[] {
