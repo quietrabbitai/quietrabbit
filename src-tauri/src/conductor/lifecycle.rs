@@ -1734,6 +1734,14 @@ pub struct FocusRun<L: DisclosureLoggerForRun = SqliteDisclosureLogger> {
     /// write_mode, which cannot be read without a chat, fails the pass closed.
     /// items.id=888 (resume pin) must carry it across a resume.
     pub context_key: Option<String>,
+    /// items.id=387: the raw text of the turn this pass is answering, for the
+    /// hand-off return writer (handoff_ingest) ALONE. Set by the sender of a chat
+    /// turn (commands::messages) through set_current_turn, never by the frontend
+    /// DTO. NEVER persisted: not in focus_runs, not in a checkpoint or snapshot, not
+    /// in a log; rehydrate_focus_run leaves it None, so a resumed run has none and
+    /// handoff_ingest fails closed. Debug redacts it and only conductor::
+    /// handoff_writer can read it (the compiler and a source scan hold that).
+    current_turn: Option<crate::conductor::handoff_writer::CurrentTurn>,
     /// items.id=886: the seeds read at the start of the current pass and the
     /// names a step sees only when its own template names them. Empty until
     /// execute() seeds it.
@@ -1803,10 +1811,18 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             chat_stream: None,
             chat_binding: None,
             context_key: None,
+            current_turn: None,
             store_tokens: crate::conductor::taint::StoreTokens::default(),
             store_vars: HashMap::new(),
             lease: None,
         }
+    }
+
+    /// items.id=387: hand the run the raw text of the chat turn it answers. Called
+    /// by commands::messages::send_message with the turn as typed or pasted. See
+    /// the field's doc: it is used by handoff_ingest alone and never persisted.
+    pub fn set_current_turn(&mut self, text: String) {
+        self.current_turn = Some(crate::conductor::handoff_writer::CurrentTurn::new(text));
     }
 
     // =========================================================================
@@ -3090,6 +3106,13 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             // Re-checked inside run_store_op, which is the contract the writer
             // tests pin.
             collection,
+            // items.id=387: for handoff_ingest alone (see handoff_writer.rs).
+            user_id: &self.user_id,
+            data_key: self
+                .key_hex
+                .as_deref()
+                .map(crate::conductor::handoff_writer::SecretHex::new),
+            turn_text: self.current_turn.as_ref().map(|t| t.lend()),
         };
         let done = run_store_op(&mut conn, entities, &ctx, op, &vars).await?;
         log::debug!(
@@ -9757,6 +9780,38 @@ mod tests {
         );
     }
 
+    /// items.id=387: in a Focus with a handoff_ingest row, a step that names
+    /// {user_input} (the window that carries the pasted reply) is left out of
+    /// extraction, and so is a step that names its output. The same steps in a
+    /// Focus without the return row are read as before.
+    #[test]
+    fn extraction_drops_user_input_steps_only_in_a_focus_with_a_hand_off_return() {
+        let ingest = writer_step(
+            "ingest",
+            "handoff_ingest",
+            Some("draft_ref"),
+            serde_json::Value::Null,
+            Some(("handoff_pending", "present", None)),
+        );
+        let mut def = single_tier3_step_focus_def();
+        def.steps = vec![
+            ingest,
+            local_step("chat", "answer {user_input}", Some("a")),
+            local_step("polish", "polish {a}", Some("b")),
+            local_step("plain", "no names", Some("c")),
+        ];
+        let mut tt = TaskTrack::new();
+        for (id, out) in [("chat", "a"), ("polish", "b"), ("plain", "c")] {
+            tt.add_step(recorded(id, Some(out), &format!("{id} content")));
+        }
+        assert_eq!(
+            extraction_step_outputs(&tt, &def),
+            vec![("plain".to_owned(), "plain content".to_owned())]
+        );
+        def.steps.remove(0);
+        assert_eq!(extraction_step_outputs(&tt, &def).len(), 3);
+    }
+
     #[test]
     fn extraction_is_unchanged_when_no_step_names_a_bound_name() {
         let mut def = single_tier3_step_focus_def();
@@ -11034,6 +11089,90 @@ steps:
         .await;
     }
 
+    /// items.id=387: the hand-off return row through the real loader. Guarded on
+    /// handoff_pending being present it loads; unguarded or guarded on anything
+    /// else it is refused, and the two names stay out of session_put.
+    #[tokio::test]
+    async fn store_load_handoff_ingest_needs_its_guard_and_the_names_stay_reserved() {
+        with_temp_data_root(async {
+            let ingest = || swriter("ing", "handoff_ingest", Some("draft_ref"), None);
+            let def = store_load(
+                "ho-ok",
+                vec![
+                    smodel("a", "v"),
+                    ingest().guarded("handoff_pending", "present", None),
+                ],
+            )
+            .await
+            .unwrap_or_else(|m| panic!("a guarded hand-off return must load: {m}"));
+            assert!(def.steps.iter().any(|s| s
+                .store_op
+                .as_ref()
+                .is_some_and(|o| o.op.as_str() == "handoff_ingest")));
+
+            let cases = vec![
+                (
+                    "unguarded",
+                    vec![smodel("a", "v"), ingest()],
+                    "needs a guard on 'handoff_pending'",
+                ),
+                (
+                    "guarded on absent",
+                    vec![
+                        smodel("a", "v"),
+                        ingest().guarded("handoff_pending", "absent", None),
+                    ],
+                    "needs a guard on 'handoff_pending'",
+                ),
+                (
+                    "guarded on the other name",
+                    vec![
+                        smodel("a", "v"),
+                        ingest().guarded("handoff_received", "present", None),
+                    ],
+                    "needs a guard on 'handoff_pending'",
+                ),
+                (
+                    "session_put to a hand-off name",
+                    vec![
+                        smodel("a", "v"),
+                        swriter(
+                            "put",
+                            "session_put",
+                            Some("handoff_pending"),
+                            Some(r#"{"value":"v"}"#),
+                        ),
+                    ],
+                    "hand-off name",
+                ),
+                (
+                    "a hand-off name as an argument",
+                    vec![
+                        smodel("a", "v"),
+                        swriter(
+                            "put",
+                            "session_put",
+                            Some("locked_intent"),
+                            Some(r#"{"value":"handoff_received"}"#),
+                        )
+                        .guarded("handoff_received", "present", None),
+                    ],
+                    "hand-off name",
+                ),
+                (
+                    "an output variable named like a hand-off name",
+                    vec![smodel("a", "handoff_pending")],
+                    "output_var 'handoff_pending'",
+                ),
+            ];
+            for (i, (label, rows, want)) in cases.into_iter().enumerate() {
+                let m = store_load(&format!("ho-rej-{i}"), rows).await.unwrap_err();
+                assert!(m.contains(want), "{label}: expected '{want}' in: {m}");
+            }
+        })
+        .await;
+    }
+
     /// The path-sensitive half of "a write row cannot sit before the data it
     /// needs": the row that produces the argument is guarded away on some path
     /// that still runs the writer.
@@ -12151,6 +12290,163 @@ steps:
         open_outputs_db(&run.user_id, &run.persona_id, CRISIS_TEST_KEY_HEX)
             .await
             .unwrap()
+    }
+
+    /// items.id=387: a handoff_ingest row run through execute() with the turn the
+    /// sender handed the run. It stores the paste, clears handoff_pending and sets
+    /// handoff_received, and the turn then appears nowhere the run persists: not in
+    /// a checkpoint's task or shared-state JSON, not in the run row, not in a
+    /// session variable. (The stored draft itself is the one place it lives.)
+    #[tokio::test]
+    async fn execute_runs_handoff_ingest_and_the_turn_reaches_no_checkpoint_or_run_row() {
+        with_temp_data_root(async {
+            const MARKER: &str = "ZEBRA-MARKER-7f3a pasted reply text";
+            let mut run = writer_run(
+                vec![writer_step(
+                    "ingest",
+                    "handoff_ingest",
+                    Some("draft_ref"),
+                    serde_json::Value::Null,
+                    Some(("handoff_pending", "present", None)),
+                )],
+                Some("chat-ho"),
+                &[],
+            );
+            let run_id = run.focus_run_id.clone().unwrap();
+            crate::persistence::output_store::test_seed_focus_run(
+                &run.user_id,
+                &run.persona_id,
+                CRISIS_TEST_KEY_HEX,
+                &run_id,
+                "f",
+            )
+            .await
+            .unwrap();
+            let mut conn = outputs(&run).await;
+            crate::persistence::session_store::put_session_variable(
+                &mut conn,
+                &crate::persistence::session_store::SessionWrite {
+                    context_key: "chat-ho",
+                    focus_id: "f",
+                    name: "handoff_pending",
+                    value: "h_0123456789ab",
+                    written_by_run: "out-run",
+                    expected_version: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            run.set_current_turn(MARKER.to_owned());
+            assert!(!format!("{:?}", run.current_turn).contains(MARKER));
+            assert!(run.execute().await.unwrap().is_none());
+
+            let handle = run.store_vars.get("draft_ref").cloned().expect("published");
+            let get = |name: &'static str| {
+                let c = open_outputs_db(&run.user_id, &run.persona_id, CRISIS_TEST_KEY_HEX);
+                async move {
+                    let mut c = c.await.unwrap();
+                    crate::persistence::session_store::get_session_variable(
+                        &mut c, "chat-ho", "f", name,
+                    )
+                    .await
+                    .unwrap()
+                    .map(|v| v.value)
+                }
+            };
+            assert_eq!(get("handoff_pending").await, None);
+            assert_eq!(
+                get("handoff_received").await.as_deref(),
+                Some(handle.as_str())
+            );
+            let text = crate::persistence::handoff_draft_store::read_draft_by_handle(
+                &mut conn, "f", &handle,
+            )
+            .await
+            .unwrap();
+            assert_eq!(text.as_str(), MARKER);
+            // The writer recorded nothing on the track.
+            assert!(ran_ids(&run).is_empty());
+
+            // Everything a run persists, dumped: the marker is in none of it.
+            run.write_checkpoint("ingest").await.unwrap();
+            run.write_focus_run_record_logged("awaiting_user").await;
+            let mut dump = String::new();
+            for row in
+                sqlx::query("SELECT task_track_json, shared_state_json FROM focus_run_snapshots")
+                    .fetch_all(&mut conn)
+                    .await
+                    .unwrap()
+            {
+                dump.push_str(&row.try_get::<String, _>("task_track_json").unwrap());
+                dump.push_str(&row.try_get::<String, _>("shared_state_json").unwrap());
+            }
+            assert!(!dump.is_empty(), "a checkpoint was written");
+            for row in sqlx::query("SELECT user_input FROM focus_runs")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap()
+            {
+                dump.push_str(
+                    &row.try_get::<Option<String>, _>("user_input")
+                        .unwrap()
+                        .unwrap_or_default(),
+                );
+            }
+            for row in sqlx::query("SELECT value FROM session_variables")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap()
+            {
+                dump.push_str(&row.try_get::<String, _>("value").unwrap());
+            }
+            assert!(
+                !dump.contains(MARKER),
+                "the turn leaked into persisted state"
+            );
+        })
+        .await;
+    }
+
+    /// items.id=387: a run that was never handed a turn (a resumed run, a swept
+    /// run, API Chat) fails the pass closed and stores nothing.
+    #[tokio::test]
+    async fn handoff_ingest_without_a_turn_fails_the_pass_and_stores_nothing() {
+        with_temp_data_root(async {
+            let mut run = writer_run(
+                vec![writer_step(
+                    "ingest",
+                    "handoff_ingest",
+                    Some("draft_ref"),
+                    serde_json::Value::Null,
+                    Some(("handoff_pending", "present", None)),
+                )],
+                Some("chat-ho"),
+                &[],
+            );
+            let mut conn = outputs(&run).await;
+            crate::persistence::session_store::put_session_variable(
+                &mut conn,
+                &crate::persistence::session_store::SessionWrite {
+                    context_key: "chat-ho",
+                    focus_id: "f",
+                    name: "handoff_pending",
+                    value: "h_0123456789ab",
+                    written_by_run: "out-run",
+                    expected_version: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(run.execute().await.is_err(), "the pass fails closed");
+            assert!(
+                crate::persistence::handoff_draft_store::list_draft_ids(&mut conn, "f")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        })
+        .await;
     }
 
     #[tokio::test]

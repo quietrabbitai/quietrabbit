@@ -690,6 +690,9 @@ pub async fn send_message(
     )
     .await?;
     run.attach_lease(lease).map_err(|e| e.to_string())?;
+    // items.id=387: the raw turn, for the hand-off return writer alone (never
+    // persisted or logged; see conductor::handoff_writer).
+    run.set_current_turn(content);
 
     // 4-6. Reserve the placeholder, finish the run in the background, return
     // the transcript.

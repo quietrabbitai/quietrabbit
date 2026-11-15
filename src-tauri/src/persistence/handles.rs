@@ -156,6 +156,13 @@ pub fn looks_like_entity_handle(raw: &str) -> bool {
     canonical(raw, Kind::Entity).is_some()
 }
 
+/// items.id=387: true when `raw` is EXACTLY a draft handle in canonical form
+/// (H-XXXXXXXX, capital letters, no surrounding text). The validator of the
+/// handoff_received session name, which holds one.
+pub fn is_draft_handle(raw: &str) -> bool {
+    canonical(raw, Kind::Draft).as_deref() == Some(raw)
+}
+
 /// Reads a model-supplied handle into its canonical text, or None when it is not
 /// one. Whitespace around it and one surrounding pair of square brackets are
 /// allowed, and case is folded: those are the ways a model echoes a token it was
@@ -288,6 +295,23 @@ mod tests {
                 seen.insert(case_handle("tech-support", &format!("run-{i}:open"))),
                 "collision at {i}"
             );
+        }
+    }
+
+    #[test]
+    fn is_draft_handle_accepts_only_the_canonical_form() {
+        let h = draft_handle("f", "o");
+        assert!(is_draft_handle(&h));
+        for bad in [
+            h.to_lowercase(),
+            format!(" {h}"),
+            format!("[{h}]"),
+            format!("{h}x"),
+            case_handle("f", "o"),
+            String::new(),
+            "H-".to_owned(),
+        ] {
+            assert!(!is_draft_handle(&bad), "{bad}");
         }
     }
 

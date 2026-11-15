@@ -55,6 +55,29 @@
 // is the artifact's alone: LOAD refuses it as a row's output_var, as a
 // session_put target and as the argument of any writer.
 //
+// items.id=387 adds one more, the HAND-OFF RETURN writer (decisions.id=942 point 7),
+// run by conductor::handoff_writer:
+//
+//   handoff_ingest   persistence::handoff_draft_store::store_draft plus
+//                    session_store::settle_handoff_return: the pasted reply of a
+//                    manual hand-off is stored as an untrusted Library draft, and
+//                    in one transaction handoff_pending is cleared and
+//                    handoff_received set to the draft's H- handle. store_target is
+//                    REQUIRED: the pass variable the handle is published under.
+//                    NO SLOTS. LOAD requires a guard on handoff_pending with
+//                    `present`. Gated by the collection consent (it saves the
+//                    user's text).
+//
+// THE SINGLE EXCEPTION TO "RAW USER TEXT IS NEVER A STORE ARGUMENT". Every writer
+// above takes its values from named variables, and LOAD refuses a system token
+// (below). handoff_ingest is the ONE operation that reads the raw text of the turn
+// the pass is answering, and it does so without a slot: a variable would be a
+// model's copy of the paste, and the point is the exact text. The turn travels as
+// WriterContext.turn_text (a TurnText borrowed from the run's CurrentTurn), which
+// only conductor::handoff_writer can read; it is never persisted, serialized into a
+// checkpoint or snapshot, or logged, and its Debug redacts it. A source scan
+// (handoff_writer_pins in store_op_tests.rs) pins that no other file reads it.
+//
 // A model never names an entity id. Every entity slot of case_open, case_link,
 // delta_record, delta_changed and entity_fact_put must be the id PUBLISHED by an
 // earlier entity_find_or_create row (LOAD), the model picks an existing device by
@@ -123,7 +146,9 @@ use std::collections::HashSet;
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
-use crate::conductor::bound_spec::{self, Presence, Source, WRITE_MODE};
+use crate::conductor::bound_spec::{
+    self, Presence, Source, HANDOFF_NAMES, HANDOFF_PENDING, WRITE_MODE,
+};
 use crate::conductor::guard::Condition;
 use crate::conductor::tokens::{is_system_token, ActionDefinition};
 use crate::persistence::focus_composition_store::CollectionPosture;
@@ -150,11 +175,12 @@ pub enum Op {
     EntityFactPut,
     ArtifactPut,
     ArtifactClear,
+    HandoffIngest,
 }
 
 impl Op {
     /// The closed set, in documentation order.
-    pub const ALL: [Op; 16] = [
+    pub const ALL: [Op; 17] = [
         Op::Latch,
         Op::SessionPut,
         Op::CaseOpen,
@@ -171,6 +197,7 @@ impl Op {
         Op::EntityFactPut,
         Op::ArtifactPut,
         Op::ArtifactClear,
+        Op::HandoffIngest,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -191,6 +218,7 @@ impl Op {
             Op::EntityFactPut => "entity_fact_put",
             Op::ArtifactPut => "artifact_put",
             Op::ArtifactClear => "artifact_clear",
+            Op::HandoffIngest => "handoff_ingest",
         }
     }
 
@@ -213,7 +241,8 @@ impl Op {
             | Op::EntityChanged
             | Op::SessionClear
             | Op::ArtifactPut
-            | Op::ArtifactClear => false,
+            | Op::ArtifactClear
+            | Op::HandoffIngest => false,
         }
     }
 
@@ -238,7 +267,8 @@ impl Op {
             | Op::SessionClear
             | Op::EntityFindOrCreate
             | Op::ArtifactPut
-            | Op::ArtifactClear => false,
+            | Op::ArtifactClear
+            | Op::HandoffIngest => false,
         }
     }
 
@@ -260,6 +290,8 @@ impl Op {
     ///
     /// items.id=895: artifact_put saves text (a brief, voice guidance, a report)
     /// and is gated. artifact_clear removes data, like session_clear, and is not.
+    ///
+    /// items.id=387: handoff_ingest saves the user's pasted text and is gated.
     pub fn requires_collection_consent(self) -> bool {
         match self {
             Op::Latch | Op::SessionClear | Op::ArtifactClear => false,
@@ -275,7 +307,8 @@ impl Op {
             | Op::EntityChanged
             | Op::EntityFindOrCreate
             | Op::EntityFactPut
-            | Op::ArtifactPut => true,
+            | Op::ArtifactPut
+            | Op::HandoffIngest => true,
         }
     }
 
@@ -509,6 +542,15 @@ pub const OP_SPECS: &[OpSpec] = &[
         optional: &[],
         needs_an_optional: false,
     },
+    // items.id=387: no slots (the pasted turn is not a slot, see the header) and a
+    // required target for the published handle.
+    OpSpec {
+        op: Op::HandoffIngest,
+        target: TargetRule::PublishIdRequired,
+        required: &[],
+        optional: &[],
+        needs_an_optional: false,
+    },
 ];
 
 /// Longest variable name a row may name.
@@ -531,7 +573,7 @@ pub struct StoreOp {
 pub enum StoreOpError {
     #[error("store_target or store_args is set without store_op (set: {0}): the three columns go together")]
     HalfSet(String),
-    #[error("unknown store_op '{0}' (expected one of latch, session_put, case_open, case_update, strategy_append, delta_record, delta_confirm, delta_changed, case_select, case_link, entity_changed, session_clear, entity_find_or_create, entity_fact_put, artifact_put, artifact_clear)")]
+    #[error("unknown store_op '{0}' (expected one of latch, session_put, case_open, case_update, strategy_append, delta_record, delta_confirm, delta_changed, case_select, case_link, entity_changed, session_clear, entity_find_or_create, entity_fact_put, artifact_put, artifact_clear, handoff_ingest)")]
     UnknownOp(String),
     #[error("store_op '{0}' needs a store_target")]
     TargetRequired(&'static str),
@@ -626,6 +668,17 @@ pub enum StoreOpError {
     ArtifactNotSessionName { action_id: String, name: String },
     #[error("step '{action_id}': slot '{slot}' names '{var}', a per-pass artifact that a template reads as a bound name and a store writer never takes as an argument")]
     ArgumentArtifact {
+        action_id: String,
+        slot: &'static str,
+        var: String,
+    },
+    // -- items.id=387: the hand-off names and the return writer ------------------
+    #[error("step '{action_id}': handoff_ingest needs a guard on '{HANDOFF_PENDING}' with the condition present, so the row only runs while a hand-off is waiting for its reply")]
+    HandoffIngestUnguarded { action_id: String },
+    #[error("step '{action_id}': session_put target '{name}' is a hand-off name, written only by the hand-off operations")]
+    HandoffNameNotSessionPutable { action_id: String, name: String },
+    #[error("step '{action_id}': slot '{slot}' names '{var}', a hand-off name that only the hand-off operations write and that is never a writer's argument")]
+    ArgumentHandoffName {
         action_id: String,
         slot: &'static str,
         var: String,
@@ -794,10 +847,13 @@ impl StoreOp {
     }
 
     /// The pass variable this row publishes a new id under (case_open and
-    /// delta_record with a store_target, entity_find_or_create always), else None.
+    /// delta_record with a store_target, entity_find_or_create and handoff_ingest
+    /// always), else None.
     pub fn published_var(&self) -> Option<&str> {
         match self.op {
-            Op::CaseOpen | Op::DeltaRecord | Op::EntityFindOrCreate => self.target.as_deref(),
+            Op::CaseOpen | Op::DeltaRecord | Op::EntityFindOrCreate | Op::HandoffIngest => {
+                self.target.as_deref()
+            }
             _ => None,
         }
     }
@@ -865,10 +921,27 @@ pub fn check_composition(
             }
         }
 
+        // items.id=387: handoff_ingest only runs while a hand-off is waiting.
+        if op.op == Op::HandoffIngest {
+            let guarded = step
+                .guards()
+                .iter()
+                .any(|g| g.var == HANDOFF_PENDING && g.condition == Condition::Present);
+            if !guarded {
+                return Err(StoreOpError::HandoffIngestUnguarded { action_id });
+            }
+        }
+
         // The target of session_put is a registered session name, and the latch
         // is out of its reach.
         if op.op == Op::SessionPut {
             let name = op.target.as_deref().unwrap_or("");
+            if HANDOFF_NAMES.contains(&name) {
+                return Err(StoreOpError::HandoffNameNotSessionPutable {
+                    action_id,
+                    name: name.to_owned(),
+                });
+            }
             if name == WRITE_MODE {
                 return Err(StoreOpError::WriteModeNotPutable { action_id });
             }
@@ -963,6 +1036,13 @@ pub fn check_composition(
                     reason: "only the latch operation touches the one-time latch",
                 });
             }
+            if HANDOFF_NAMES.contains(&var) {
+                return Err(StoreOpError::ArgumentHandoffName {
+                    action_id,
+                    slot,
+                    var: var.to_owned(),
+                });
+            }
             if let Some(s) = bound_spec::spec(var) {
                 if s.source == Source::Artifact {
                     return Err(StoreOpError::ArgumentArtifact {
@@ -1032,6 +1112,7 @@ pub fn check_composition(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conductor::bound_spec::HANDOFF_RECEIVED;
     use crate::conductor::guard::Guard;
     use crate::conductor::tokens::{ExternalAccess, StepType};
     use std::collections::HashMap;
@@ -1618,6 +1699,156 @@ mod tests {
             Some(&format!(r#"{{"value":"{var}"}}"#)),
             None,
         )
+    }
+
+    // -- items.id=387: handoff_ingest and the hand-off names ----------------------
+
+    fn ingest(
+        target: &str,
+        guard: Option<Guard>,
+        and_guards: Vec<Guard>,
+    ) -> (ActionDefinition, Option<String>) {
+        let (mut s, v) = writer("ingest", "handoff_ingest", Some(target), None, guard);
+        s.and_guards = and_guards;
+        (s, v)
+    }
+
+    fn guard_on(var: &str, condition: Condition) -> Guard {
+        Guard {
+            var: var.to_owned(),
+            condition,
+        }
+    }
+
+    #[test]
+    fn handoff_ingest_takes_a_target_and_no_slots() {
+        let o = parse("handoff_ingest", Some("draft_ref"), None).unwrap();
+        assert_eq!(o.op, Op::HandoffIngest);
+        assert_eq!(o.published_var(), Some("draft_ref"));
+        assert!(o.args.is_empty());
+        assert_eq!(
+            parse("handoff_ingest", None, None),
+            Err(StoreOpError::TargetRequired("handoff_ingest"))
+        );
+        assert_eq!(
+            parse("handoff_ingest", Some("r"), Some("{}")),
+            Err(StoreOpError::ArgsNotAllowed("handoff_ingest"))
+        );
+        // The paste is NOT a slot, under any name: there is nothing to configure.
+        assert_eq!(
+            parse(
+                "handoff_ingest",
+                Some("r"),
+                Some(r#"{"value":"user_input"}"#)
+            ),
+            Err(StoreOpError::ArgsNotAllowed("handoff_ingest"))
+        );
+        assert!(matches!(
+            parse("handoff_ingest", Some("bad name"), None),
+            Err(StoreOpError::BadTarget(_))
+        ));
+        assert!(!Op::HandoffIngest.is_entity_op());
+        assert!(!Op::HandoffIngest.takes_entity_ids());
+        assert!(!Op::HandoffIngest.writes_case());
+        assert!(Op::HandoffIngest.requires_collection_consent());
+        assert_eq!(Op::ALL.len(), 17);
+        assert_eq!(Op::ALL.len(), OP_SPECS.len());
+    }
+
+    #[test]
+    fn handoff_ingest_loads_only_guarded_on_pending_being_present() {
+        let present = || Some(guard_on(HANDOFF_PENDING, Condition::Present));
+        for posture in [CollectionPosture::FocusLevel, CollectionPosture::PerField] {
+            assert_eq!(
+                check_with(vec![ingest("draft_ref", present(), vec![])], posture),
+                Ok(()),
+                "guard"
+            );
+            // The clause list counts too: the clauses are ANDed.
+            assert_eq!(
+                check_with(
+                    vec![ingest(
+                        "draft_ref",
+                        None,
+                        vec![guard_on(HANDOFF_PENDING, Condition::Present)]
+                    )],
+                    posture
+                ),
+                Ok(()),
+                "clause"
+            );
+        }
+        // Unguarded, or guarded on anything else, or on the wrong condition.
+        for (g, ands) in [
+            (None, vec![]),
+            (Some(guard_on("write_mode", Condition::Present)), vec![]),
+            (Some(guard_on(HANDOFF_PENDING, Condition::Absent)), vec![]),
+            (
+                Some(guard_on(
+                    HANDOFF_PENDING,
+                    Condition::Eq("h_000000000000".into()),
+                )),
+                vec![],
+            ),
+            (Some(guard_on(HANDOFF_RECEIVED, Condition::Present)), vec![]),
+            (None, vec![guard_on(HANDOFF_PENDING, Condition::Absent)]),
+        ] {
+            assert!(
+                matches!(
+                    check(vec![ingest("draft_ref", g.clone(), ands.clone())]),
+                    Err(StoreOpError::HandoffIngestUnguarded { .. })
+                ),
+                "{g:?} {ands:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_published_handle_name_cannot_collide() {
+        let present = || Some(guard_on(HANDOFF_PENDING, Condition::Present));
+        for bad in [
+            "handoff_pending",
+            "handoff_received",
+            "content_brief",
+            "user_input",
+        ] {
+            assert!(
+                matches!(
+                    check(vec![ingest(bad, present(), vec![])]),
+                    Err(StoreOpError::PublishedNameCollision { .. })
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hand_off_names_are_never_a_session_put_target_or_a_writer_argument() {
+        for name in HANDOFF_NAMES {
+            assert!(
+                matches!(
+                    check(vec![model("a", "v"), put(name, "v")]),
+                    Err(StoreOpError::HandoffNameNotSessionPutable { .. })
+                ),
+                "target {name}"
+            );
+            // As an argument, even with the guard an optional name would need.
+            let (mut row, v) = writer(
+                "copy",
+                "session_put",
+                Some("locked_intent"),
+                Some(&format!(r#"{{"value":"{name}"}}"#)),
+                Some(guard_on(name, Condition::Present)),
+            );
+            row.and_guards = Vec::new();
+            assert!(
+                matches!(
+                    check(vec![(row, v)]),
+                    Err(StoreOpError::ArgumentHandoffName { .. })
+                ),
+                "argument {name}"
+            );
+        }
     }
 
     /// items.id=895: an artifact_put to each artifact name, from an earlier

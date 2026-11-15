@@ -16,6 +16,9 @@ pub mod executor;
 pub mod extract;
 pub mod failure;
 pub mod guard;
+pub mod handoff_writer;
+#[cfg(test)]
+mod handoff_writer_tests;
 pub mod lifecycle;
 pub mod memory_broker;
 pub mod model_block;

@@ -62,6 +62,13 @@ pub const WRITE_MODE_NAME: &str = "write_mode";
 /// The only value the latch row can hold.
 pub const WRITE_MODE_SUPPRESSED: &str = "suppressed";
 
+/// items.id=387: the two session variables of a manual hand-off. handoff_pending
+/// is set when a starter was rendered for the user to take elsewhere and cleared
+/// when the pasted reply is ingested. handoff_received then holds the H- handle of
+/// the stored reply. bound_spec.rs names the same two (a test pins it).
+pub const HANDOFF_PENDING_NAME: &str = "handoff_pending";
+pub const HANDOFF_RECEIVED_NAME: &str = "handoff_received";
+
 const CONTEXT_KEY_MAX_CHARS: usize = 128;
 const FOCUS_ID_MAX_CHARS: usize = 128;
 const NAME_MAX_CHARS: usize = 64;
@@ -96,6 +103,9 @@ pub enum SessionStoreError {
     VersionConflict { current_version: Option<i64> },
     #[error("{0}")]
     Latch(#[from] LatchError),
+    /// items.id=387: a hand-off return with no hand-off waiting for it.
+    #[error("no hand-off is pending in this chat")]
+    HandoffNotPending,
 }
 
 // ---------------------------------------------------------------------------
@@ -504,6 +514,68 @@ pub async fn clear_session_state(
         .execute(&mut *conn)
         .await?;
         Ok::<u64, SessionStoreError>(done.rows_affected())
+    }
+    .await;
+    finish_write(conn, result).await
+}
+
+/// items.id=387: the RETURN of a manual hand-off, in ONE write transaction.
+/// Requires handoff_pending to exist for this chat and Focus, then removes it and
+/// sets handoff_received to `received_value` (the H- handle of the stored reply),
+/// replacing any earlier one. Refused once the chat is latched, inside the
+/// transaction like every writer here, and refused with HandoffNotPending when
+/// nothing is waiting: in either refusal nothing changes. Either both changes land
+/// or neither does, so a chat is never left with a reply received and a hand-off
+/// still pending, or the reverse.
+pub async fn settle_handoff_return(
+    conn: &mut SqliteConnection,
+    context_key: &str,
+    focus_id: &str,
+    received_value: &str,
+    written_by_run: &str,
+) -> Result<(), SessionStoreError> {
+    validate_context_key(context_key).map_err(SessionStoreError::Validation)?;
+    validate_text("focus_id", focus_id, FOCUS_ID_MAX_CHARS)
+        .map_err(SessionStoreError::Validation)?;
+    validate_value(received_value).map_err(SessionStoreError::Validation)?;
+    if received_value.is_empty() {
+        return Err(SessionStoreError::Validation(
+            "received value must not be empty".into(),
+        ));
+    }
+    validate_text("written_by_run", written_by_run, 256).map_err(SessionStoreError::Validation)?;
+
+    begin_write(conn).await?;
+    let result = async {
+        ensure_writable(conn, context_key).await?;
+        let pending =
+            get_session_variable_inner(conn, context_key, focus_id, HANDOFF_PENDING_NAME).await?;
+        if pending.is_none() {
+            return Err(SessionStoreError::HandoffNotPending);
+        }
+        let received =
+            get_session_variable_inner(conn, context_key, focus_id, HANDOFF_RECEIVED_NAME).await?;
+        put_inner(
+            conn,
+            &SessionWrite {
+                context_key,
+                focus_id,
+                name: HANDOFF_RECEIVED_NAME,
+                value: received_value,
+                written_by_run,
+                expected_version: received.map(|r| r.version),
+            },
+        )
+        .await?;
+        sqlx::query(
+            "DELETE FROM session_variables WHERE context_key = ? AND focus_id = ? AND name = ?",
+        )
+        .bind(context_key)
+        .bind(focus_id)
+        .bind(HANDOFF_PENDING_NAME)
+        .execute(&mut *conn)
+        .await?;
+        Ok::<(), SessionStoreError>(())
     }
     .await;
     finish_write(conn, result).await
@@ -987,5 +1059,150 @@ mod tests {
             .await
             .expect("no transaction left open");
         sqlx::query("ROLLBACK").execute(&mut conn).await.unwrap();
+    }
+
+    // -- items.id=387: settle_handoff_return ---------------------------------
+
+    async fn pending(conn: &mut SqliteConnection, chat: &str, focus: &str, run: &str) {
+        put_session_variable(
+            conn,
+            &SessionWrite {
+                context_key: chat,
+                focus_id: focus,
+                name: HANDOFF_PENDING_NAME,
+                value: "h_0123456789ab",
+                written_by_run: run,
+                expected_version: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn settling_a_return_clears_pending_and_sets_received_in_one_step() {
+        let mut conn = mem_outputs_conn().await;
+        pending(&mut conn, CHAT, FOCUS, "out-run").await;
+        settle_handoff_return(&mut conn, CHAT, FOCUS, "H-ABCDEFGH", "back-run")
+            .await
+            .unwrap();
+        assert!(
+            get_session_variable(&mut conn, CHAT, FOCUS, HANDOFF_PENDING_NAME)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let got = get_session_variable(&mut conn, CHAT, FOCUS, HANDOFF_RECEIVED_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((got.value.as_str(), got.version), ("H-ABCDEFGH", 1));
+        assert_eq!(got.written_by_run, "back-run");
+    }
+
+    #[tokio::test]
+    async fn a_second_return_replaces_the_received_handle() {
+        let mut conn = mem_outputs_conn().await;
+        pending(&mut conn, CHAT, FOCUS, "r1").await;
+        settle_handoff_return(&mut conn, CHAT, FOCUS, "H-AAAAAAAA", "r2")
+            .await
+            .unwrap();
+        pending(&mut conn, CHAT, FOCUS, "r3").await;
+        settle_handoff_return(&mut conn, CHAT, FOCUS, "H-BBBBBBBB", "r4")
+            .await
+            .unwrap();
+        let got = get_session_variable(&mut conn, CHAT, FOCUS, HANDOFF_RECEIVED_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((got.value.as_str(), got.version), ("H-BBBBBBBB", 2));
+    }
+
+    #[tokio::test]
+    async fn nothing_pending_refuses_and_changes_nothing() {
+        let mut conn = mem_outputs_conn().await;
+        let err = settle_handoff_return(&mut conn, CHAT, FOCUS, "H-ABCDEFGH", "r").await;
+        assert!(matches!(err, Err(SessionStoreError::HandoffNotPending)));
+        assert_eq!(count(&mut conn, "session_variables").await, 0);
+        // A pending hand-off of another Focus or another chat does not count.
+        pending(&mut conn, CHAT, "other-focus", "r").await;
+        pending(&mut conn, "chat-2", FOCUS, "r").await;
+        let err = settle_handoff_return(&mut conn, CHAT, FOCUS, "H-ABCDEFGH", "r").await;
+        assert!(matches!(err, Err(SessionStoreError::HandoffNotPending)));
+        assert_eq!(count(&mut conn, "session_variables").await, 2);
+        sqlx::query("BEGIN")
+            .execute(&mut conn)
+            .await
+            .expect("no transaction left open");
+        sqlx::query("ROLLBACK").execute(&mut conn).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn settling_touches_only_its_own_chat_and_focus() {
+        let mut conn = mem_outputs_conn().await;
+        pending(&mut conn, CHAT, FOCUS, "r").await;
+        pending(&mut conn, CHAT, "other-focus", "r").await;
+        pending(&mut conn, "chat-2", FOCUS, "r").await;
+        settle_handoff_return(&mut conn, CHAT, FOCUS, "H-ABCDEFGH", "r2")
+            .await
+            .unwrap();
+        for (chat, focus) in [(CHAT, "other-focus"), ("chat-2", FOCUS)] {
+            assert!(
+                get_session_variable(&mut conn, chat, focus, HANDOFF_PENDING_NAME)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{chat}/{focus} must keep its pending hand-off"
+            );
+            assert!(
+                get_session_variable(&mut conn, chat, focus, HANDOFF_RECEIVED_NAME)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_latched_chat_refuses_the_return_and_keeps_pending() {
+        let mut conn = mem_outputs_conn().await;
+        pending(&mut conn, CHAT, FOCUS, "r").await;
+        latch_write_suppressed(&mut conn, CHAT, FOCUS, "r")
+            .await
+            .unwrap();
+        let err = settle_handoff_return(&mut conn, CHAT, FOCUS, "H-ABCDEFGH", "r2").await;
+        assert!(matches!(
+            err,
+            Err(SessionStoreError::Latch(LatchError::Suppressed))
+        ));
+        assert!(
+            get_session_variable(&mut conn, CHAT, FOCUS, HANDOFF_PENDING_NAME)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            get_session_variable(&mut conn, CHAT, FOCUS, HANDOFF_RECEIVED_NAME)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bad_received_value_is_refused_before_anything_is_written() {
+        let mut conn = mem_outputs_conn().await;
+        pending(&mut conn, CHAT, FOCUS, "r").await;
+        for bad in ["", "a\0b", &"a".repeat(SESSION_VALUE_MAX_BYTES + 1)] {
+            assert!(settle_handoff_return(&mut conn, CHAT, FOCUS, bad, "r2")
+                .await
+                .is_err());
+        }
+        assert!(
+            get_session_variable(&mut conn, CHAT, FOCUS, HANDOFF_PENDING_NAME)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }

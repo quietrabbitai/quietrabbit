@@ -103,6 +103,22 @@ pub const VOICE_GUIDANCE: &str = "voice_guidance";
 pub const VALIDATION_REPORT: &str = "validation_report";
 pub const DELTA_ITEMS: &str = "delta_items";
 
+/// items.id=387: the two session names of a manual hand-off. handoff_pending holds
+/// the opaque id of a hand-off whose starter was rendered and whose reply has not
+/// come back (`h_` and 12 lowercase hex characters). handoff_received holds the H-
+/// handle of the reply stored by handoff_ingest (persistence::handles, Kind::Draft).
+/// They are written only by the hand-off operations (the outbound render, S3, and
+/// handoff_ingest): LOAD refuses them as a session_put target and as the argument of
+/// any writer. Both are ordinary Session-source bound names otherwise: restricted to
+/// the step whose own template names them, tainting such a step, and refused in an
+/// external step while STORE_NAMES_EXTERNAL_ALLOWED is false. Their normal use is a
+/// guard (`present`, `absent`), so a pass routes on them.
+pub const HANDOFF_PENDING: &str = "handoff_pending";
+pub const HANDOFF_RECEIVED: &str = "handoff_received";
+
+/// The hand-off names, in table order.
+pub const HANDOFF_NAMES: [&str; 2] = [HANDOFF_PENDING, HANDOFF_RECEIVED];
+
 /// The artifact names, in table order.
 pub const ARTIFACT_NAMES: [&str; 4] = [
     CONTENT_BRIEF,
@@ -129,6 +145,8 @@ pub const NAMES: &[&str] = &[
     VOICE_GUIDANCE,
     VALIDATION_REPORT,
     DELTA_ITEMS,
+    HANDOFF_PENDING,
+    HANDOFF_RECEIVED,
 ];
 
 pub const SPECS: &[BoundSpec] = &[
@@ -225,6 +243,22 @@ pub const SPECS: &[BoundSpec] = &[
         literals: Literals::Authored,
         validate: valid_artifact,
     },
+    // items.id=387: the hand-off names. Optional (absent until a hand-off starts, and
+    // absent again once its reply is ingested) and Authored (an id and a handle).
+    BoundSpec {
+        name: HANDOFF_PENDING,
+        source: Source::Session,
+        presence: Presence::Optional,
+        literals: Literals::Authored,
+        validate: valid_handoff_id,
+    },
+    BoundSpec {
+        name: HANDOFF_RECEIVED,
+        source: Source::Session,
+        presence: Presence::Optional,
+        literals: Literals::Authored,
+        validate: valid_draft_handle,
+    },
 ];
 
 /// The spec of a bound name, or None for any other name.
@@ -262,6 +296,20 @@ fn valid_case_id(s: &str) -> bool {
 /// derived name always exists and says "nothing" with an empty value.
 fn valid_text(s: &str) -> bool {
     s.len() <= DERIVED_TEXT_MAX_BYTES && !s.contains('\0')
+}
+
+/// A hand-off id: `h_` and exactly 12 lowercase hex characters.
+fn valid_handoff_id(s: &str) -> bool {
+    s.len() == 14
+        && s.starts_with("h_")
+        && s[2..]
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+}
+
+/// A draft handle, exactly as handles::draft_handle writes it.
+fn valid_draft_handle(s: &str) -> bool {
+    crate::persistence::handles::is_draft_handle(s)
 }
 
 /// An artifact value: at most pass_artifact_store::ARTIFACT_MAX_BYTES, no NUL,
@@ -339,6 +387,9 @@ mod tests {
         for n in ARTIFACT_NAMES {
             assert_eq!(row(n), (Source::Artifact, Presence::Optional, None), "{n}");
         }
+        for n in HANDOFF_NAMES {
+            assert_eq!(row(n), (Source::Session, Presence::Optional, None), "{n}");
+        }
         assert_eq!(WRITE_MODE_VALUES, &["open", "suppressed"]);
         assert_eq!(OPEN_TICKET_STATE_VALUES, &["none", "one", "many"]);
         // A derived name is never absent.
@@ -403,6 +454,47 @@ mod tests {
         assert_eq!(from_specs, ARTIFACT_NAMES);
         for n in ARTIFACT_NAMES {
             assert!(ArtifactKind::parse(n).is_some(), "{n}");
+        }
+    }
+
+    /// items.id=387: the store module and the spec table name the same two
+    /// variables, and the validators accept exactly what the writers produce.
+    #[test]
+    fn the_hand_off_names_match_the_store_and_validate_what_is_written() {
+        use crate::persistence::handles::draft_handle;
+        use crate::persistence::session_store::{HANDOFF_PENDING_NAME, HANDOFF_RECEIVED_NAME};
+        assert_eq!(HANDOFF_PENDING, HANDOFF_PENDING_NAME);
+        assert_eq!(HANDOFF_RECEIVED, HANDOFF_RECEIVED_NAME);
+        let pending = spec(HANDOFF_PENDING).unwrap();
+        for ok in ["h_0123456789ab", "h_ffffffffffff", "h_000000000000"] {
+            assert!((pending.validate)(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "h_0123456789a",
+            "h_0123456789abc",
+            "H_0123456789ab",
+            "h_0123456789AB",
+            "h_0123456789ag",
+            "x_0123456789ab",
+            "h-0123456789ab",
+            " h_0123456789ab",
+        ] {
+            assert!(!(pending.validate)(bad), "{bad}");
+        }
+        let received = spec(HANDOFF_RECEIVED).unwrap();
+        assert!((received.validate)(&draft_handle(
+            "writing-assistant",
+            "out-1"
+        )));
+        for bad in [
+            "",
+            "H-abcdefgh",
+            "T-ABCDEFGH",
+            "H-ABCDEFG",
+            "h_0123456789ab",
+        ] {
+            assert!(!(received.validate)(bad), "{bad}");
         }
     }
 

@@ -91,6 +91,9 @@ fn ctx<'a>(focus: &'a str, run: &'a str, action: &'a str) -> WriterContext<'a> {
         run_id: run,
         action_id: action,
         collection: Collection::Granted,
+        user_id: "",
+        data_key: None,
+        turn_text: None,
     }
 }
 

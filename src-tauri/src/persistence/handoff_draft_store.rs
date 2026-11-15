@@ -373,9 +373,13 @@ mod tests {
             store_draft(USER, PERSONA, "not-a-key", FOCUS, "ok").await,
             Err(DraftError::BadKey)
         ));
-        // No database was even opened, and no blob exists.
-        let ingest_root = ingest_blob::ingest_blob_path(USER, PERSONA, "x", 1);
-        assert!(!ingest_root.parent().unwrap().exists());
+        // No blob directory was ever created for this persona.
+        let blob_root = ingest_blob::ingest_blob_path(USER, PERSONA, "x", 1)
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap()
+            .to_path_buf();
+        assert!(!blob_root.exists(), "{blob_root:?}");
     }
 
     #[tokio::test]

@@ -21,6 +21,14 @@
 //     step directly before it on this path", which can only drop MORE from
 //     extraction, never less. It changes nothing for a Focus with no tainted
 //     row.
+//   * (items.id=387) in a Focus that has a handoff_ingest row, `user_input` is a
+//     tainting name too. The chat window a pass renders ({user_input}) holds the
+//     last messages, and after a manual hand-off the newest is a pasted reply from
+//     outside. A step that names it could copy that text into its own output, which
+//     extraction reads, so such a step is dropped from extraction like any other
+//     tainted step. A Focus without a handoff_ingest row is unchanged. The side
+//     effect, accepted: while STORE_NAMES_EXTERNAL_ALLOWED is false, an EXTERNAL
+//     step of such a Focus cannot name {user_input}.
 // The fixpoint ignores row order on purpose: a template that names a variable
 // only a LATER row produces would otherwise escape.
 //
@@ -46,6 +54,18 @@ pub struct Taint {
     pub actions: HashSet<String>,
     /// Output variables of tainted steps.
     pub vars: HashSet<String>,
+    /// items.id=387: `user_input` counts as a tainting name in this Focus (it has a
+    /// handoff_ingest row). Always false otherwise.
+    pub user_input: bool,
+}
+
+/// items.id=387: whether the Focus has a hand-off return row.
+fn has_handoff_ingest(steps: &[ActionDefinition]) -> bool {
+    steps.iter().any(|s| {
+        s.store_op
+            .as_ref()
+            .is_some_and(|o| o.op == crate::conductor::store_op::Op::HandoffIngest)
+    })
 }
 
 /// Names a step's prompt template mentions (empty for a block row, which has
@@ -66,7 +86,10 @@ pub fn taint_closure(
 ) -> Taint {
     debug_assert_eq!(steps.len(), row_vars.len());
     let names: Vec<Vec<String>> = steps.iter().map(template_names).collect();
-    let mut taint = Taint::default();
+    let mut taint = Taint {
+        user_input: has_handoff_ingest(steps),
+        ..Taint::default()
+    };
     let mut tainted_rows = vec![false; steps.len()];
 
     loop {
@@ -75,7 +98,9 @@ pub fn taint_closure(
             if tainted_rows[i] {
                 continue;
             }
-            let names_bound = names[i].iter().any(|n| bound.contains(&n.as_str()));
+            let names_bound = names[i]
+                .iter()
+                .any(|n| bound.contains(&n.as_str()) || (taint.user_input && n == "user_input"));
             let names_tainted_var = names[i].iter().any(|n| taint.vars.contains(n));
             let names_previous = names[i].iter().any(|n| n == "previous_output")
                 && tainted_rows[..i].iter().any(|t| *t);
@@ -101,7 +126,11 @@ pub fn tainting_name(step: &ActionDefinition, taint: &Taint, bound: &[&str]) -> 
     let names = template_names(step);
     names
         .iter()
-        .find(|n| bound.contains(&n.as_str()) || taint.vars.contains(*n))
+        .find(|n| {
+            bound.contains(&n.as_str())
+                || taint.vars.contains(*n)
+                || (taint.user_input && *n == "user_input")
+        })
         .or_else(|| names.iter().find(|n| *n == "previous_output"))
         .cloned()
 }
@@ -211,6 +240,78 @@ mod tests {
         ];
         let t = closure(&steps, &["locked_intent"]);
         assert_eq!(actions(&t), ["a", "after", "late"]);
+    }
+
+    // -- items.id=387: user_input in a Focus with a hand-off return row ---------------
+
+    fn ingest_row() -> ActionDefinition {
+        let mut s = step("ingest", "", None);
+        s.store_op = crate::conductor::store_op::StoreOp::from_columns(
+            Some("handoff_ingest"),
+            Some("draft_ref"),
+            None,
+        )
+        .unwrap();
+        s
+    }
+
+    #[test]
+    fn user_input_taints_steps_only_in_a_focus_with_a_hand_off_return_row() {
+        let with = [
+            ingest_row(),
+            step("chat", "answer {user_input}", Some("a")),
+            step("after", "refine {a}", Some("b")),
+            step("clean", "no names", Some("c")),
+        ];
+        let t = closure(&with, &[]);
+        assert!(t.user_input);
+        assert_eq!(actions(&t), ["after", "chat"]);
+        assert_eq!(t.vars, HashSet::from(["a".to_owned(), "b".to_owned()]));
+        assert_eq!(
+            tainting_name(&with[1], &t, &[]).as_deref(),
+            Some("user_input")
+        );
+
+        // The same steps without the return row are untouched.
+        let without = [
+            step("chat", "answer {user_input}", Some("a")),
+            step("after", "refine {a}", Some("b")),
+        ];
+        let t = closure(&without, &[]);
+        assert!(!t.user_input);
+        assert!(t.actions.is_empty() && t.vars.is_empty());
+        assert_eq!(tainting_name(&without[0], &t, &[]), None);
+    }
+
+    #[test]
+    fn the_return_row_itself_and_other_system_tokens_are_not_tainted() {
+        let steps = [
+            ingest_row(),
+            step("p", "ctx {persona_context} prev", Some("x")),
+            step("v", "voice {voice_profile}", Some("y")),
+        ];
+        let t = closure(&steps, &[]);
+        assert!(t.actions.is_empty(), "{:?}", t.actions);
+    }
+
+    #[test]
+    fn an_external_step_naming_user_input_in_such_a_focus_fails_the_interim_lint() {
+        let mut ext = step("send", "reply to {user_input}", Some("o"));
+        ext.routing_tier = ExternalAccess::AnonymousRequired;
+        ext.declared_inputs = vec!["user_input".to_owned()];
+        let steps = [ingest_row(), ext.clone()];
+        let vars: Vec<Option<String>> = steps.iter().map(|s| s.output_var.clone()).collect();
+        // While STORE_NAMES_EXTERNAL_ALLOWED is false, a tainted external step is
+        // refused: the paste-bearing window never leaves in a prompt.
+        let err = crate::conductor::declared_inputs::lint_with(&steps, &vars, &[], false)
+            .expect_err("a tainted external step must fail");
+        assert!(err.contains("send"), "{err}");
+        // Without the return row, the same external step loads.
+        let plain = [ext];
+        let plain_vars: Vec<Option<String>> = plain.iter().map(|s| s.output_var.clone()).collect();
+        assert!(
+            crate::conductor::declared_inputs::lint_with(&plain, &plain_vars, &[], false).is_ok()
+        );
     }
 
     #[test]

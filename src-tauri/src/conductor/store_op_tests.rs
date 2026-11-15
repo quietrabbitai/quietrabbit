@@ -89,6 +89,9 @@ fn ctx<'a>(focus: &'a str, run: &'a str, action: &'a str) -> WriterContext<'a> {
         run_id: run,
         action_id: action,
         collection: Collection::Granted,
+        user_id: "",
+        data_key: None,
+        turn_text: None,
     }
 }
 
@@ -606,6 +609,8 @@ fn every_writer() -> Vec<(StoreOp, HashMap<String, String>)> {
             v.clone(),
         ),
         (op("artifact_clear", Some("content_brief"), None), v.clone()),
+        // items.id=387: no slots, a required target for the published handle.
+        (op("handoff_ingest", Some("draft_ref"), None), v.clone()),
         (op("session_clear", None, None), v),
     ]
 }
@@ -1780,11 +1785,28 @@ async fn session_clear_resets_the_intent_and_the_active_case_and_never_the_latch
         .match_indices("DELETE FROM session_variables")
         .map(|(i, _)| &flat[i..i + 200])
         .collect::<Vec<_>>();
-    assert_eq!(delete.len(), 1, "one delete in the store: {delete:?}");
+    // items.id=387: exactly two deletes, session_clear's and the hand-off return's
+    // removal of the one pending row.
+    assert_eq!(delete.len(), 2, "two deletes in the store: {delete:?}");
     assert!(
         delete[0].contains("AND name <> ?") && delete[0].contains("name IN (?, ?)"),
         "the delete names its two variables and excludes the latch: {}",
         delete[0]
+    );
+    assert!(
+        delete[1].contains("AND name = ?") && !delete[1].contains("name IN"),
+        "the hand-off delete names one variable: {}",
+        delete[1]
+    );
+    let at = flat
+        .find("DELETE FROM session_variables WHERE context_key = ? AND focus_id = ? AND name = ?")
+        .expect("the hand-off delete");
+    let settle = flat
+        .find("pub async fn settle_handoff_return")
+        .expect("settle fn");
+    assert!(
+        settle < at,
+        "the second delete is inside settle_handoff_return"
     );
 }
 
@@ -1973,12 +1995,13 @@ fn ctx_no_consent<'a>(focus: &'a str, run: &'a str, action: &'a str) -> WriterCo
     }
 }
 
-/// The thirteen operations that save something, written out so the gate's own
+/// The fourteen operations that save something, written out so the gate's own
 /// classification (Op::requires_collection_consent) is checked against the
 /// decision and not against itself. entity_find_or_create and entity_fact_put are
 /// the Focus-owned entity writers (items.id=891), exercised with real entity
 /// stores in entity_writer_tests.rs. artifact_put (items.id=895) saves text.
-const GATED_OPS: [&str; 13] = [
+/// handoff_ingest (items.id=387) saves the user's pasted reply.
+const GATED_OPS: [&str; 14] = [
     "session_put",
     "case_select",
     "case_link",
@@ -1992,6 +2015,7 @@ const GATED_OPS: [&str; 13] = [
     "entity_find_or_create",
     "entity_fact_put",
     "artifact_put",
+    "handoff_ingest",
 ];
 
 /// An open chat holding a case and a delta, so a writer that was NOT refused

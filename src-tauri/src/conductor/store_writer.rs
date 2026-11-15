@@ -108,12 +108,14 @@ use sqlx::SqliteConnection;
 
 use crate::conductor::bound_spec::{self, ACTIVE_CASE_ID};
 use crate::conductor::entity_writer;
+use crate::conductor::handoff_writer::{self, SecretHex, TurnText};
 use crate::conductor::store_op::{Op, Slot, StoreOp};
 use crate::persistence::case_store::{
     self, AppendOutcome, CaseState, CaseStoreError, CaseUpdate, DeltaOutcome, DeltaStatus,
     LinkOutcome, NewCase, NewConfigDelta, NewStrategy, OpenOutcome, ResolutionPath,
 };
 use crate::persistence::handles::{self, HandleError};
+use crate::persistence::handoff_draft_store::DraftError;
 use crate::persistence::owned_entity_store::OwnedEntityError;
 use crate::persistence::pass_artifact_store::{
     self, ArtifactKind, ArtifactWrite, ClearOutcome, Fingerprint, PassArtifactError,
@@ -165,6 +167,16 @@ pub struct WriterContext<'a> {
     pub action_id: &'a str,
     /// items.id=920. See Collection.
     pub collection: Collection,
+    /// items.id=387: the running user, for the one writer that stores a document
+    /// (handoff_ingest). Empty in a test that never runs it.
+    pub user_id: &'a str,
+    /// items.id=387: the session's data key in hex, for the same writer. Debug
+    /// redacts it. None in a test that never runs handoff_ingest.
+    pub data_key: Option<SecretHex<'a>>,
+    /// items.id=387: the raw text of the turn this pass is answering, for
+    /// handoff_ingest ALONE. Debug redacts it and only conductor::handoff_writer
+    /// can read it: a source scan pins that no other file reads this field.
+    pub turn_text: Option<TurnText<'a>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,6 +242,17 @@ pub enum StoreWriteError {
     InvalidArtifactValue(String),
     #[error("{0}")]
     Artifact(#[from] PassArtifactError),
+    /// items.id=387: the pass has no turn text (a run that did not come from a chat
+    /// send, a resumed run, an API Chat run): handoff_ingest fails closed.
+    #[error("no pasted turn is available to this pass")]
+    HandoffTurnUnavailable,
+    /// items.id=387: handoff_ingest was run without the user or the data key.
+    #[error("the hand-off writer was not given the user and the data key")]
+    HandoffNoStoreAccess,
+    /// items.id=387: the pasted reply cannot be stored (blank, too large, a NUL, a
+    /// store failure). Names the rule, never the text.
+    #[error("{0}")]
+    Draft(#[from] DraftError),
     #[error("{0}")]
     Session(#[from] SessionStoreError),
     #[error("{0}")]
@@ -285,7 +308,7 @@ pub async fn run_store_op(
     Err(err)
 }
 
-fn refused() -> Done {
+pub(crate) fn refused() -> Done {
     Done {
         outcome: Outcome::RefusedOneTime,
         published: None,
@@ -337,6 +360,8 @@ async fn run_inner(
                 Err(StoreWriteError::EntityStoreUnavailable)
             }
         },
+
+        Op::HandoffIngest => handoff_writer::run_handoff_ingest(conn, key, ctx, op).await,
 
         Op::Latch => {
             let out =

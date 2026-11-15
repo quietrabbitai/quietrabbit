@@ -65,7 +65,8 @@ use sqlx::SqliteConnection;
 
 use crate::conductor::bound_spec::{
     self as spec, Presence, Source, ACTIVE_CASE_ID, CASE_CONTEXT, DELTA_CONTEXT,
-    DERIVED_TEXT_MAX_BYTES, LOCKED_INTENT, OPEN_TICKETS_BRIEF, OPEN_TICKET_STATE, WRITE_MODE,
+    DERIVED_TEXT_MAX_BYTES, HANDOFF_PENDING, HANDOFF_RECEIVED, LOCKED_INTENT, OPEN_TICKETS_BRIEF,
+    OPEN_TICKET_STATE, WRITE_MODE,
 };
 use crate::conductor::executor::find_tokens;
 use crate::conductor::taint::{taint_closure, StoreTokens};
@@ -224,6 +225,15 @@ pub async fn read_seeds(
     if wants(LOCKED_INTENT) {
         if let Some(v) = read_session(conn, context_key, focus_id, LOCKED_INTENT).await? {
             out.insert(LOCKED_INTENT.to_owned(), v);
+        }
+    }
+
+    // items.id=387: the hand-off names, absent until a hand-off starts.
+    for name in [HANDOFF_PENDING, HANDOFF_RECEIVED] {
+        if wants(name) {
+            if let Some(v) = read_session(conn, context_key, focus_id, name).await? {
+                out.insert(name.to_owned(), v);
+            }
         }
     }
 
