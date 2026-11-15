@@ -72,6 +72,9 @@ use crate::conductor::privacy::types::{
     AbstractionPolicy, PersonalField as GateField, PersonalTrack as GateTrack, Sensitivity,
 };
 use crate::conductor::privacy::PrivacyGateway;
+use crate::conductor::step_treatment::{
+    self, floor_invariant_violation, Basis, CeilingValues, Chosen, StepTreatment,
+};
 use crate::conductor::tokens::{ActionDefinition, ExternalAccess};
 use crate::conductor::types::{PersonalTrack, SharedStateTrack, TaskStep, TaskTrack};
 use crate::final_failure;
@@ -395,40 +398,18 @@ impl StepExecutor {
         app_handle: Option<&tauri::AppHandle<tauri::Wry>>,
         pool: &sqlx::SqlitePool,
     ) -> Result<Option<FailureResult>, ConductorError> {
-        let execution_tier = ctx.execution_tier;
-        let abstraction_tier = ctx.abstraction_tier;
-        let raw_abstraction = ctx.raw_abstraction;
-
         // -- Floor invariants (ADR-012 Amendment 3, D6-348) --
         // Explicit Err() returns — never debug_assert!, which is stripped in release builds.
         // These are load-bearing privacy checks, not programmer-error guards.
-        if execution_tier > 1 {
-            if abstraction_tier < 2 {
-                return Err(ConductorError::TierBoundaryViolation {
-                    plain_language: format!(
-                        "Floor invariant: execution_tier={execution_tier} requires \
-                         abstraction_tier >= 2, got {abstraction_tier}. \
-                         Lifecycle configuration error. [Get help]"
-                    ),
-                });
-            }
-            if raw_abstraction > abstraction_tier {
-                return Err(ConductorError::TierBoundaryViolation {
-                    plain_language: format!(
-                        "Floor invariant: raw_abstraction ({raw_abstraction}) \
-                         > abstraction_tier ({abstraction_tier}). \
-                         Lifecycle configuration error. [Get help]"
-                    ),
-                });
-            }
-        } else if abstraction_tier != raw_abstraction {
-            return Err(ConductorError::TierBoundaryViolation {
-                plain_language: format!(
-                    "Tier 1 invariant: abstraction_tier ({abstraction_tier}) \
-                     != raw_abstraction ({raw_abstraction}) at execution_tier=1. \
-                     Lifecycle configuration error. [Get help]"
-                ),
-            });
+        // items.id=921: checked here on the CEILING values lifecycle computed (the
+        // same text as before, now from step_treatment), and again inside
+        // step_treatment::derive on the values the step is actually gated with.
+        if let Some(plain_language) = floor_invariant_violation(
+            ctx.execution_tier,
+            ctx.abstraction_tier,
+            ctx.raw_abstraction,
+        ) {
+            return Err(ConductorError::TierBoundaryViolation { plain_language });
         }
 
         // -- Step 3 — external_access ceiling gate (items.id=439, Part 6e) --
@@ -482,7 +463,7 @@ impl StepExecutor {
         // bound destination whatever the step carries (Step 4.4 above), and a step
         // with no requirement (every ordinary step) keeps Step 4.5 and
         // select_model() exactly as they were.
-        let resolver_req = if ctx.bound.is_none() {
+        let resolver_req = if is_resolved(ctx) {
             ctx.step.requirement.as_ref()
         } else {
             None
@@ -549,6 +530,30 @@ impl StepExecutor {
             }
         };
 
+        // items.id=921: from here to the end of the step, the privacy treatment keys
+        // off the DESTINATION the step actually goes to, not the ceiling it may
+        // reach. `treatment` is derived once per attempt, from this attempt's own
+        // selection (a retry or a resumed run selects and derives again), and is
+        // never stored. An ordinary step and a bound API Chat run get exactly the
+        // ceiling values lifecycle computed; a resolved step with a local pick gets
+        // the local treatment; a resolved step with a hosted pick keeps the
+        // external treatment at its reach. A disagreement (a hosted pick under a
+        // local-only ceiling or outside the step's range, a half-hosted selection)
+        // stops the step before any gate.
+        let treatment = match derive_treatment(ctx, resolver_req, &selected_model) {
+            Ok(t) => t,
+            Err(e) => {
+                return Ok(Some(failure_handler.handle(
+                    &ConductorError::TierBoundaryViolation {
+                        plain_language: e.plain_language(&ctx.step.action_id),
+                    },
+                    Some(&ctx.step.action_id),
+                    Some(&ctx.focus_id),
+                    retry_count,
+                )));
+            }
+        };
+
         // Build gate track for Gate1/Gate2 calls.
         // privacy::types::PersonalTrack (typed enum fields) differs from
         // conductor::types::PersonalTrack (sqlx-friendly String fields).
@@ -561,10 +566,10 @@ impl StepExecutor {
                 &ctx.step.action_id,
                 &ctx.focus_run_id,
                 &gate_track,
-                abstraction_tier,
-                raw_abstraction,
-                execution_tier,
-                ctx.effective_access,
+                treatment.abstraction_tier,
+                treatment.raw_abstraction,
+                treatment.execution_tier,
+                treatment.access,
                 selected_model.provider_id.clone(),
             )
             .await
@@ -594,8 +599,8 @@ impl StepExecutor {
                     .write(DisclosureLogEntry {
                         action_id: ctx.step.action_id.clone(),
                         focus_run_id: ctx.focus_run_id.clone(),
-                        execution_tier,
-                        abstraction_tier: Some(abstraction_tier),
+                        execution_tier: treatment.execution_tier,
+                        abstraction_tier: Some(treatment.abstraction_tier),
                         provider: selected_model.provider_id.clone(),
                         fields_shared: projected_fields.keys().cloned().collect(),
                         fields_abstracted: IndexMap::new(),
@@ -629,11 +634,11 @@ impl StepExecutor {
                 );
                 meta.insert(
                     "execution_tier".to_owned(),
-                    serde_json::Value::Number(execution_tier.into()),
+                    serde_json::Value::Number(treatment.execution_tier.into()),
                 );
                 meta.insert(
                     "abstraction_tier".to_owned(),
-                    serde_json::Value::Number(abstraction_tier.into()),
+                    serde_json::Value::Number(treatment.abstraction_tier.into()),
                 );
                 return Ok(Some(FailureResult {
                     action: FailureAction::AwaitFloorConsent,
@@ -662,10 +667,12 @@ impl StepExecutor {
         // scan_voice_profile is async (writes disclosure audit on contamination).
         // Called once; result passed to both render paths.
         let cleaned_voice_profile =
-            scan_voice_profile(ctx, personal_track, privacy_gateway).await?;
+            scan_voice_profile(ctx, &treatment, personal_track, privacy_gateway).await?;
         let voice_profile_str = format_voice_profile(&cleaned_voice_profile);
 
-        let prompt = if ctx.effective_access != ExternalAccess::LocalOnly {
+        // items.id=921: keyed on the destination (treatment.hosted), which for an
+        // ordinary step is the ceiling test it always was.
+        let prompt = if treatment.hosted {
             let disclosure = shared_state.read_disclosure_buffer(&ctx.step.action_id);
             render_prompt_with_disclosure(
                 ctx,
@@ -720,8 +727,11 @@ impl StepExecutor {
         // the device); the change is logged below with the two local model tags.
         // A step that fixes its own num_ctx has one window whatever the model, so
         // it never falls back.
+        // items.id=921: `treatment` is local here and stays so. The fallback changes
+        // the model only, never the treatment.
         if resolver_req.is_some()
             && explicit_num_ctx.is_none()
+            && !treatment.hosted
             && selected_model.hosted_model.is_none()
             && ctx_status.status == ContextWindowStatusKind::Exceeded
         {
@@ -797,13 +807,11 @@ impl StepExecutor {
         // Does this call go to a hosted provider? For an ordinary step the answer
         // has always been the step's own ceiling. For a RESOLVED step the ceiling
         // only says what is allowed, and the resolver may well have chosen a local
-        // model under it, so the answer is the model that was chosen. The two can
-        // never disagree the dangerous way: select_model_for_block refuses a hosted
-        // choice under a LocalOnly ceiling before this point.
-        let hosted_step = match resolver_req {
-            Some(_) => selected_model.hosted_model.is_some(),
-            None => ctx.effective_access != ExternalAccess::LocalOnly,
-        };
+        // model under it, so the answer is the model that was chosen. Both come out
+        // of the one derivation (items.id=921), which refuses a hosted choice under
+        // a LocalOnly ceiling before any gate, and the same flag keys the render,
+        // the stream sink and (items.id=884) the outbound review.
+        let hosted_step = treatment.hosted;
         let stream_sink: Option<Box<dyn StreamSink>> = match (&ctx.stream, step_streams(ctx)) {
             (Some(_), true) => Some(match app_handle {
                 Some(h) => Box::new(crate::chat_stream::TauriDeltaSink::new(
@@ -900,6 +908,7 @@ impl StepExecutor {
                         keep_partial_reply(ctx, &stream_tail, app_handle).await;
                         let g2 = reply_gate2(
                             ctx,
+                            &treatment,
                             privacy_gateway,
                             &gate_track,
                             &stream_tail.received_text,
@@ -959,6 +968,7 @@ impl StepExecutor {
         // streamed reply and a whole-body reply take this one path.
         let g2 = reply_gate2(
             ctx,
+            &treatment,
             privacy_gateway,
             &gate_track,
             &response.content,
@@ -980,13 +990,14 @@ impl StepExecutor {
         // D4-040: content = model output ONLY — never prompt-expanded input.
         // step_sensitivity: from projected fields (Tier 2) or template token scan (qr_local),
         // raised to the highest matched Gate 2 field (completed_step).
-        let step_sensitivity = compute_step_sensitivity(ctx, personal_track, &projected_fields);
+        let step_sensitivity =
+            compute_step_sensitivity(ctx, &treatment, personal_track, &projected_fields);
 
         let step = completed_step(
             ctx,
             &response.content,
             step_sensitivity,
-            execution_tier,
+            treatment.execution_tier,
             &g2,
         );
         let step_sensitivity = step.sensitivity_severity;
@@ -995,7 +1006,11 @@ impl StepExecutor {
         // -- Step 13 — PG_GATE_3: cross-tier content promotion (conditional) --
         // Only when next step has higher execution_tier.
         if let Some(next_tier) = ctx.next_execution_tier {
-            if next_tier > execution_tier {
+            // items.id=921: the tier this step really ran at. A local pick under an
+            // external ceiling is tier 1, so Gate 3 fires when the next step may
+            // go out (next_execution_tier is the ceiling look-ahead and cannot
+            // know that step's own pick, so it may fire when that one stays local).
+            if next_tier > treatment.execution_tier {
                 let content_key = ctx
                     .step
                     .output_var
@@ -1012,7 +1027,7 @@ impl StepExecutor {
                         step_sensitivity as u8,
                         next_tier,
                         ctx.focus_external_access,
-                        execution_tier,
+                        treatment.execution_tier,
                         app_handle,
                         // items.id=406: no specific-provider selection concept
                         // at this generic Focus-step-promotion layer -- falls
@@ -1195,6 +1210,7 @@ fn render_prompt_with_disclosure(
 /// Python oracle: StepExecutor._scan_voice_profile()
 async fn scan_voice_profile<L: DisclosureLogger>(
     ctx: &StepContext,
+    treatment: &StepTreatment,
     personal_track: &PersonalTrack,
     privacy_gateway: &PrivacyGateway<L>,
 ) -> Result<HashMap<String, String>, ConductorError> {
@@ -1233,7 +1249,7 @@ async fn scan_voice_profile<L: DisclosureLogger>(
             log::warn!(
                 "executor: voice profile contamination — attr={attr} type={ct} \
                  tier={} focus={} step={}",
-                ctx.execution_tier,
+                treatment.execution_tier,
                 ctx.focus_id,
                 ctx.step.action_id,
             );
@@ -1245,8 +1261,8 @@ async fn scan_voice_profile<L: DisclosureLogger>(
                 .write(DisclosureLogEntry {
                     action_id: ctx.step.action_id.clone(),
                     focus_run_id: ctx.focus_run_id.clone(),
-                    execution_tier: ctx.execution_tier,
-                    abstraction_tier: Some(ctx.abstraction_tier),
+                    execution_tier: treatment.execution_tier,
+                    abstraction_tier: Some(treatment.abstraction_tier),
                     provider: None,
                     fields_shared: vec![],
                     fields_abstracted: IndexMap::new(),
@@ -1258,7 +1274,10 @@ async fn scan_voice_profile<L: DisclosureLogger>(
                 })
                 .await;
 
-            if ctx.effective_access != ExternalAccess::LocalOnly {
+            // items.id=921: keyed on the step's destination. A local pick under an
+            // external ceiling strips the attribute and continues, as any local
+            // step does; a hosted call still halts.
+            if treatment.access != ExternalAccess::LocalOnly {
                 // External access live: halt — contaminated data must not leave the device.
                 return Err(ConductorError::VoiceProfileContamination {
                     plain_language: "One of your communication style settings appears to contain \
@@ -1617,9 +1636,10 @@ fn resolver_stop(outcome: &crate::conductor::model_resolver::Resolution) -> Opti
 /// into a SelectedModel. Never consults the user's provider preference: the
 /// resolver chooses inside the ceiling and the requirement's own range.
 ///
-/// A hosted choice under a LocalOnly ceiling is refused here, before any gate: the
-/// resolver already filters by ceiling, so this is the check that keeps the network
-/// predicate in execute_once safe even if that filter were ever wrong.
+/// A hosted choice under a LocalOnly ceiling is refused before any gate: the
+/// resolver already filters by ceiling, and since items.id=921 the refusal is made
+/// by step_treatment::derive in execute_once (HostedUnderLocalOnly, same wording),
+/// which keeps the network predicate safe even if that filter were ever wrong.
 async fn select_model_for_block(
     pool: &sqlx::SqlitePool,
     ctx: &StepContext,
@@ -1684,15 +1704,6 @@ async fn select_model_for_block(
                 .collect(),
         }),
         CapabilitySubject::Hosted => {
-            if ctx.effective_access == ExternalAccess::LocalOnly {
-                return Err(ConductorError::TierBoundaryViolation {
-                    plain_language: format!(
-                        "Step '{}' resolved to a hosted model under a local-only ceiling. \
-                         [Get help]",
-                        ctx.step.action_id
-                    ),
-                });
-            }
             let key = (chosen.model.provider_id, chosen.model.model_id);
             match gathered.hosted_models.get(&key) {
                 Some(row) => Ok(BlockSelection {
@@ -2180,8 +2191,51 @@ async fn hosted_step_call<Tz: chrono::TimeZone>(
 
 /// Whether this step streams its reply (items.id=715): its run's owner asked
 /// for it AND the step goes to a hosted provider. A local step never streams.
+///
+/// items.id=921: the retry loop asks this without a selection (it has neither the
+/// error nor the selected model), so it cannot key on the destination a resolver
+/// picked. A RESOLVED step therefore never streams (R1 streams only API Chat, whose
+/// bound run is never resolved); asking the same question from here and from
+/// execute_once keeps the two in step. An ordinary step and a bound run answer as
+/// before.
 fn step_streams(ctx: &StepContext) -> bool {
-    ctx.stream.is_some() && ctx.effective_access != ExternalAccess::LocalOnly
+    ctx.stream.is_some() && ctx.effective_access != ExternalAccess::LocalOnly && !is_resolved(ctx)
+}
+
+/// Whether the model of this step is chosen by the resolver (items.id=896): it
+/// carries a requirement and is not a bound API Chat run, which keeps its bound
+/// destination whatever the step carries. One definition for execute_once's
+/// resolver gate and the stream predicate.
+fn is_resolved(ctx: &StepContext) -> bool {
+    ctx.bound.is_none() && ctx.step.requirement.is_some()
+}
+
+/// The treatment of this attempt (items.id=921): the ceiling values lifecycle
+/// computed, run through step_treatment::derive with this attempt's own selection.
+fn derive_treatment(
+    ctx: &StepContext,
+    resolver_req: Option<&crate::conductor::model_block::config::ModelRequirement>,
+    selected: &SelectedModel,
+) -> Result<StepTreatment, step_treatment::TreatmentError> {
+    let basis = match resolver_req {
+        None => Basis::Ordinary,
+        Some(req) => Basis::Resolved {
+            highest_tier: req.range.highest_tier,
+            chosen: Chosen::from_parts(
+                selected.provider_id.is_some(),
+                selected.hosted_model.is_some(),
+            )?,
+        },
+    };
+    step_treatment::derive(
+        CeilingValues {
+            access: ctx.effective_access,
+            execution_tier: ctx.execution_tier,
+            abstraction_tier: ctx.abstraction_tier,
+            raw_abstraction: ctx.raw_abstraction,
+        },
+        basis,
+    )
 }
 
 /// The one token the retry machinery watches (items.id=816). When the step
@@ -2265,8 +2319,10 @@ impl ReplyGate2 {
 ///
 /// qr_local is inert: Gate 1 at Raw abstraction shares every field and gate2
 /// skips shared fields, so this never flags a local step.
+#[allow(clippy::too_many_arguments)] // items.id=921: the treatment joined an already explicit call.
 async fn reply_gate2<L: DisclosureLogger>(
     ctx: &StepContext,
+    treatment: &StepTreatment,
     privacy_gateway: &PrivacyGateway<L>,
     gate_track: &GateTrack,
     text: &str,
@@ -2283,8 +2339,8 @@ async fn reply_gate2<L: DisclosureLogger>(
             &ctx.focus_run_id,
             text,
             gate_track,
-            ctx.execution_tier,
-            ctx.effective_access,
+            treatment.execution_tier,
+            treatment.access,
             provider,
             Some(fields_shared),
         )
@@ -2686,10 +2742,12 @@ fn build_options(
 /// magnitude question threaded in separately.
 fn compute_step_sensitivity(
     ctx: &StepContext,
+    treatment: &StepTreatment,
     personal_track: &PersonalTrack,
     projected_fields: &HashMap<String, String>,
 ) -> i32 {
-    if ctx.effective_access != ExternalAccess::LocalOnly && !projected_fields.is_empty() {
+    // items.id=921: keyed on the step's destination, not its ceiling.
+    if treatment.access != ExternalAccess::LocalOnly && !projected_fields.is_empty() {
         let severities: Vec<i32> = projected_fields
             .keys()
             .filter_map(|name| personal_track.fields().get(name))
@@ -2698,7 +2756,7 @@ fn compute_step_sensitivity(
         return severities.into_iter().max().unwrap_or(1);
     }
 
-    if ctx.effective_access == ExternalAccess::LocalOnly {
+    if treatment.access == ExternalAccess::LocalOnly {
         let used_fields: Vec<i32> = find_tokens(&ctx.step.prompt_template)
             .into_iter()
             .filter_map(|token| personal_track.fields().get(&token))
@@ -2944,6 +3002,18 @@ fn format_voice_profile(voice_profile: &HashMap<String, String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The treatment of an ORDINARY step (items.id=921): the context's own ceiling
+    /// values, copied as they are (no invariant check, so a test may set them freely).
+    fn ordinary(ctx: &StepContext) -> StepTreatment {
+        StepTreatment {
+            access: ctx.effective_access,
+            execution_tier: ctx.execution_tier,
+            abstraction_tier: ctx.abstraction_tier,
+            raw_abstraction: ctx.raw_abstraction,
+            hosted: ctx.effective_access != ExternalAccess::LocalOnly,
+        }
+    }
 
     #[test]
     fn find_tokens_basic() {
@@ -4015,7 +4085,10 @@ mod tests {
         };
         let mut projected = HashMap::new();
         projected.insert("name".to_owned(), "Alice (abstracted)".to_owned());
-        assert_eq!(compute_step_sensitivity(&ctx, &pt, &projected), 2);
+        assert_eq!(
+            compute_step_sensitivity(&ctx, &ordinary(&ctx), &pt, &projected),
+            2
+        );
     }
 
     #[test]
@@ -4082,7 +4155,10 @@ mod tests {
             bound: None,
             store_tokens: Default::default(),
         };
-        assert_eq!(compute_step_sensitivity(&ctx, &pt, &HashMap::new()), 2);
+        assert_eq!(
+            compute_step_sensitivity(&ctx, &ordinary(&ctx), &pt, &HashMap::new()),
+            2
+        );
     }
 
     #[test]
@@ -4137,7 +4213,10 @@ mod tests {
             bound: None,
             store_tokens: Default::default(),
         };
-        assert_eq!(compute_step_sensitivity(&ctx, &pt, &HashMap::new()), 1);
+        assert_eq!(
+            compute_step_sensitivity(&ctx, &ordinary(&ctx), &pt, &HashMap::new()),
+            1
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -6841,6 +6920,7 @@ mod tests {
                 let track = gate_track_with("home_city", "Springfield");
                 let g2 = reply_gate2(
                     &ctx,
+                    &ordinary(&ctx),
                     &gw,
                     &track,
                     "You live in Springfield, right?",
@@ -6891,7 +6971,17 @@ mod tests {
                     ("You live in Springfield", vec!["home_city".to_owned()]),
                     ("", vec![]),
                 ] {
-                    let g2 = reply_gate2(&ctx, &gw, &track, text, None, &shared, None).await;
+                    let g2 = reply_gate2(
+                        &ctx,
+                        &ordinary(&ctx),
+                        &gw,
+                        &track,
+                        text,
+                        None,
+                        &shared,
+                        None,
+                    )
+                    .await;
                     assert_eq!(g2, ReplyGate2::default(), "{text}");
                 }
                 assert_eq!(gw.logger.entry_count(), 0);
@@ -6908,8 +6998,17 @@ mod tests {
                 let ctx = hosted_ctx(RunAttendance::Attended, &key_hex);
                 let gw = PrivacyGateway::new(FailLogger);
                 let track = track_of(&[("diagnosis", "Hypertension", 3)]);
-                let g2 =
-                    reply_gate2(&ctx, &gw, &track, "You have hypertension", None, &[], None).await;
+                let g2 = reply_gate2(
+                    &ctx,
+                    &ordinary(&ctx),
+                    &gw,
+                    &track,
+                    "You have hypertension",
+                    None,
+                    &[],
+                    None,
+                )
+                .await;
                 // Not a failure of the step: flagged, with the audit entry
                 // reported as unavailable, and the severity recovered.
                 assert_eq!(
@@ -6943,6 +7042,7 @@ mod tests {
                 ] {
                     let a = reply_gate2(
                         &whole,
+                        &ordinary(&whole),
                         &PrivacyGateway::new(TestLogger::new()),
                         &track,
                         text,
@@ -6953,6 +7053,7 @@ mod tests {
                     .await;
                     let b = reply_gate2(
                         &streamed,
+                        &ordinary(&streamed),
                         &PrivacyGateway::new(TestLogger::new()),
                         &track,
                         text,
@@ -6992,6 +7093,7 @@ mod tests {
             ctx.execution_tier = 1;
             let g2 = reply_gate2(
                 &ctx,
+                &ordinary(&ctx),
                 &gw,
                 &track,
                 "Springfield and Acme Credit",
@@ -7023,6 +7125,7 @@ mod tests {
             let ext = hosted_ctx(RunAttendance::Attended, "");
             let g2_ext = reply_gate2(
                 &ext,
+                &ordinary(&ext),
                 &gw,
                 &track,
                 "Springfield and Acme Credit",
@@ -7286,13 +7389,27 @@ mod tests {
         TaskTrack,
         PrivacyGateway<TestLogger>,
     ) {
+        run_once_with(ctx, pool, &PersonalTrack::new()).await
+    }
+
+    /// run_once with a personal track (items.id=921: the privacy treatment is
+    /// observable through what Gate 1 does with the track's fields).
+    async fn run_once_with(
+        ctx: &StepContext,
+        pool: &sqlx::SqlitePool,
+        personal: &PersonalTrack,
+    ) -> (
+        Result<Option<FailureResult>, ConductorError>,
+        TaskTrack,
+        PrivacyGateway<TestLogger>,
+    ) {
         let mut track = TaskTrack::new();
         let gateway = PrivacyGateway::new(TestLogger::new());
         let out = StepExecutor::new()
             .execute_once(
                 ctx,
                 0,
-                &PersonalTrack::new(),
+                personal,
                 &mut track,
                 &mut SharedStateTrack::new(),
                 &FailureHandler::new(ctx.effective_access),
@@ -7867,26 +7984,457 @@ mod tests {
         assert_eq!(hosted.hosted_model.as_ref().unwrap().provider_id, "p");
     }
 
+    // -- items.id=921: the privacy treatment keys off the selected destination -----
+
+    /// A track whose one field is clamped by the floor: shared as it is at tier 1,
+    /// withheld at tier 2 (so an external treatment has something to ask about).
+    fn clamping_track() -> PersonalTrack {
+        use crate::conductor::types::PersonalField as CF;
+        let mut pt = PersonalTrack::new();
+        pt.add_field(CF {
+            field_name: "diagnosis".to_owned(),
+            field_value: "X".to_owned(),
+            sensitivity: "medical".to_owned(),
+            sensitivity_severity: 3,
+            source_id: "s".to_owned(),
+            abstraction_tier2: "omit".to_owned(),
+            abstraction_tier3: "omit".to_owned(),
+        })
+        .unwrap();
+        pt
+    }
+
+    fn gate1_entries(gateway: &PrivacyGateway<TestLogger>) -> Vec<DisclosureLogEntry> {
+        gateway
+            .logger
+            .entries()
+            .into_iter()
+            .filter(|e| e.event_type == "gate1_pass")
+            .collect()
+    }
+
+    /// A fixture host the resolver can pick: priced, keyed, consented, measured.
+    async fn hosted_pick_rig(pool: &sqlx::SqlitePool) -> String {
+        let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+        let (key_hex, _m) = spend_rig(pool, &server, Some(PRICE_TEXT)).await;
+        sqlx::query(
+            "INSERT OR REPLACE INTO model_capabilities
+               (subject_kind, provider_id, model_id, task_type, profile, attained_bar,
+                model_class, sample_count, measured_at, provenance)
+             VALUES ('hosted', 'fixture-host-a', 'fixture-model-a', 'creative_writing',
+                     'rma_letter', 'high', 'large', 1, '2026-11-13', 'harness_hosted')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        grant_consent(pool, &key_hex, true).await;
+        key_hex
+    }
+
+    fn hosted_row() -> ProviderModel {
+        ProviderModel {
+            id: "p:m".to_owned(),
+            provider_id: "p".to_owned(),
+            model_id: "m".to_owned(),
+            context_window_tokens: 1000,
+            is_default: false,
+            created_at: "t".to_owned(),
+            pricing: None,
+            request_options: None,
+            token_factor: 1.0,
+            output_overhead: 1.0,
+            status: crate::persistence::provider_store::ModelStatus::Active,
+            retires_at: None,
+            requires_paid: false,
+            qr_recommended: false,
+            qr_recommendation_rank: None,
+            retains_data_override: None,
+            trains_on_data_override: None,
+            retention_days_override: None,
+            context_window_source: None,
+            context_window_as_of: None,
+        }
+    }
+
+    /// The case items.id=921 exists for. Under an external ceiling the resolver
+    /// picks a LOCAL model: nothing leaves the device, so Gate 1 runs as it does for
+    /// a local step (tier 1, no provider, nothing clamped), there is no floor-consent
+    /// prompt, a contaminated voice attribute is stripped rather than halting the
+    /// step, the sensitivity comes from the template, and the step is recorded at
+    /// tier 1.
+    #[tokio::test]
+    async fn a_local_pick_under_an_external_ceiling_is_gated_and_recorded_as_local() {
+        with_temp_shared_db(|pool| async move {
+            install_local_models(&pool).await;
+            let stub = LocalModelStub::start(1);
+            let ctx = resolved_ctx(
+                Some(requirement(
+                    QualityBar::Basic,
+                    &[Destination::Local, Destination::HostedApi],
+                    ExternalAccess::AnonymousPreferred,
+                )),
+                ExternalAccess::AnonymousPreferred,
+                Some("rma_letter"),
+                "Write it. {diagnosis}",
+            );
+            // The ceiling values are the external ones lifecycle computes (the
+            // fixture sets 2/2/1): without the fix this track is clamped and the
+            // step parks on floor consent.
+            assert_eq!((ctx.execution_tier, ctx.abstraction_tier), (2, 2));
+            let mut personal = clamping_track();
+            let mut voice = IndexMap::new();
+            voice.insert(
+                "tone".to_owned(),
+                "mail me at someone@example.com".to_owned(),
+            );
+            personal.set_voice_profile(voice).unwrap();
+
+            let (out, track, gateway) = run_once_with(&ctx, &pool, &personal).await;
+            assert!(out.unwrap().is_none(), "no floor-consent prompt, no halt");
+            assert_eq!(stub.server.captured().len(), 1, "one local call");
+
+            let g1 = gate1_entries(&gateway);
+            assert_eq!(g1.len(), 1);
+            assert_eq!(g1[0].execution_tier, 1);
+            assert_eq!(g1[0].abstraction_tier, Some(1));
+            assert!(g1[0].provider.is_none());
+            assert_eq!(g1[0].fields_shared, vec!["diagnosis".to_owned()]);
+            assert!(g1[0].fields_withheld.is_empty());
+            let all = gateway.logger.entries();
+            assert!(!all.iter().any(|e| e.event_type == "floor_consent_auto"));
+            let contamination: Vec<_> = all
+                .iter()
+                .filter(|e| e.event_type == "voice_profile_contamination")
+                .collect();
+            assert_eq!(contamination.len(), 1, "stripped and logged, not fatal");
+            assert_eq!(contamination[0].execution_tier, 1);
+
+            let step = &track.steps()[0];
+            assert_eq!(step.routing_tier_used, 1);
+            assert_eq!(
+                step.sensitivity_severity, 3,
+                "a local destination scores the template's tokens"
+            );
+        })
+        .await;
+    }
+
+    /// A HOSTED pick keeps the external treatment at its reach: Gate 1 abstracts at
+    /// tier 2 or more for its provider, the clamped field is withheld, and the step
+    /// parks on floor consent before anything is sent.
+    #[tokio::test]
+    async fn a_hosted_pick_keeps_the_external_treatment_and_the_floor_consent_prompt() {
+        with_temp_shared_db(|pool| async move {
+            let key_hex = hosted_pick_rig(&pool).await;
+            let mut ctx = resolved_ctx(
+                Some(requirement(
+                    QualityBar::Basic,
+                    &[Destination::HostedApi],
+                    ExternalAccess::AnonymousPreferred,
+                )),
+                ExternalAccess::AnonymousPreferred,
+                Some("rma_letter"),
+                "Write it.",
+            );
+            ctx.key_hex = key_hex;
+            let (out, track, gateway) = run_once_with(&ctx, &pool, &clamping_track()).await;
+            let failure = out.unwrap().expect("the step parks");
+            assert_eq!(failure.action, FailureAction::AwaitFloorConsent);
+            let meta = failure.metadata.unwrap();
+            assert_eq!(
+                meta["floor_clamped_fields"],
+                serde_json::json!(["diagnosis"])
+            );
+            assert_eq!(meta["abstraction_tier"], 2);
+            assert_eq!(
+                meta["execution_tier"], 3,
+                "the reach of anonymous_preferred"
+            );
+            let g1 = gate1_entries(&gateway);
+            assert_eq!(g1.len(), 1);
+            assert_eq!(g1[0].provider.as_deref(), Some("fixture-host-a"));
+            assert_eq!(g1[0].abstraction_tier, Some(2));
+            assert_eq!(g1[0].execution_tier, 3);
+            assert_eq!(g1[0].fields_withheld, vec!["diagnosis".to_owned()]);
+            assert!(track.steps().is_empty(), "nothing ran");
+        })
+        .await;
+    }
+
+    /// The resolved hosted pick and an ORDINARY external step park on the same
+    /// floor consent with the same clamped fields: a resolved hosted step is gated
+    /// no looser than an ordinary one at the same ceiling.
+    #[tokio::test]
+    async fn a_hosted_pick_is_gated_like_an_ordinary_external_step() {
+        with_temp_shared_db(|pool| async move {
+            let key_hex = hosted_pick_rig(&pool).await;
+            let mut resolved = resolved_ctx(
+                Some(requirement(
+                    QualityBar::Basic,
+                    &[Destination::HostedApi],
+                    ExternalAccess::AnonymousPreferred,
+                )),
+                ExternalAccess::AnonymousPreferred,
+                Some("rma_letter"),
+                "Write it.",
+            );
+            resolved.key_hex = key_hex.clone();
+            let mut ordinary_ctx =
+                resolved_ctx(None, ExternalAccess::AnonymousPreferred, None, "Write it.");
+            ordinary_ctx.key_hex = key_hex;
+            ordinary_ctx.qr_hosted_provider_preference = Some("fixture-host-a".to_owned());
+            let (a, _, ga) = run_once_with(&resolved, &pool, &clamping_track()).await;
+            let (b, _, gb) = run_once_with(&ordinary_ctx, &pool, &clamping_track()).await;
+            let (a, b) = (a.unwrap().expect("parks"), b.unwrap().expect("parks"));
+            assert_eq!(a.action, FailureAction::AwaitFloorConsent);
+            assert_eq!(b.action, FailureAction::AwaitFloorConsent);
+            assert_eq!(
+                a.metadata.as_ref().unwrap()["floor_clamped_fields"],
+                b.metadata.as_ref().unwrap()["floor_clamped_fields"]
+            );
+            let (ea, eb) = (gate1_entries(&ga), gate1_entries(&gb));
+            assert_eq!(ea.len(), 1);
+            assert_eq!(eb.len(), 1);
+            assert_eq!(ea[0].abstraction_tier, eb[0].abstraction_tier);
+            assert_eq!(ea[0].fields_withheld, eb[0].fields_withheld);
+            assert_eq!(ea[0].provider, eb[0].provider);
+        })
+        .await;
+    }
+
+    /// A step with no requirement: the treatment is exactly the ceiling values, for
+    /// every ceiling (the ordinary external step above also parks as it always did).
+    #[test]
+    fn a_step_without_a_requirement_is_treated_by_its_ceiling_values() {
+        for access in [
+            ExternalAccess::LocalOnly,
+            ExternalAccess::AnonymousRequired,
+            ExternalAccess::AnonymousPreferred,
+            ExternalAccess::Unrestricted,
+        ] {
+            let ctx = resolved_ctx(None, access, None, "x");
+            assert!(!is_resolved(&ctx));
+            let t = derive_treatment(&ctx, None, &SelectedModel::local("any".to_owned())).unwrap();
+            assert_eq!(t, ordinary(&ctx), "{access:?}");
+        }
+    }
+
+    /// A bound API Chat run carrying a requirement is NOT resolved: its treatment is
+    /// the ceiling values, and it still streams at an external ceiling.
+    #[test]
+    fn a_bound_api_chat_run_is_treated_by_its_ceiling_values_and_still_streams() {
+        let reg = crate::chat_stream::ChatStreamRegistry::default();
+        let mut ctx = resolved_ctx(
+            Some(local_req()),
+            ExternalAccess::AnonymousPreferred,
+            Some("rma_letter"),
+            "x",
+        );
+        ctx.bound = Some(crate::api_chat::BoundDestination {
+            provider_id: "p".to_owned(),
+            model_id: "m".to_owned(),
+        });
+        ctx.stream = Some(reg.register(SPEND_USER, "run-1"));
+        assert!(!is_resolved(&ctx));
+        assert!(step_streams(&ctx), "a bound external run streams");
+        let t = derive_treatment(&ctx, None, &SelectedModel::hosted(hosted_row())).unwrap();
+        assert_eq!(t, ordinary(&ctx));
+    }
+
+    /// A resolved step never streams (the retry loop cannot see its pick), even at
+    /// an external ceiling with a stream attached.
+    #[test]
+    fn a_resolved_step_never_streams() {
+        let reg = crate::chat_stream::ChatStreamRegistry::default();
+        let mut ctx = resolved_ctx(
+            Some(local_req()),
+            ExternalAccess::AnonymousPreferred,
+            Some("rma_letter"),
+            "x",
+        );
+        ctx.stream = Some(reg.register(SPEND_USER, "run-2"));
+        assert!(is_resolved(&ctx));
+        assert!(!step_streams(&ctx));
+        // The retry machinery then watches the lease token, as for a local step.
+        assert!(
+            effective_stop(&ctx).is_none(),
+            "this ctx has no lease token"
+        );
+    }
+
+    /// The disagreements derive_treatment refuses, through the executor's own
+    /// glue: a hosted pick under a local-only ceiling (the shipped wording), a hosted
+    /// pick from a range that reaches only the device, and a half-hosted selection.
+    #[test]
+    fn a_disagreement_between_the_ceiling_and_the_selection_is_refused() {
+        use crate::conductor::step_treatment::TreatmentError;
+        let req = |tier| requirement(QualityBar::Basic, &[Destination::HostedApi], tier);
+
+        let local_only = resolved_ctx(
+            Some(req(ExternalAccess::AnonymousPreferred)),
+            ExternalAccess::LocalOnly,
+            None,
+            "x",
+        );
+        let e = derive_treatment(
+            &local_only,
+            local_only.step.requirement.as_ref(),
+            &SelectedModel::hosted(hosted_row()),
+        )
+        .unwrap_err();
+        assert_eq!(e, TreatmentError::HostedUnderLocalOnly);
+        assert_eq!(
+            e.plain_language("s1"),
+            "Step 's1' resolved to a hosted model under a local-only ceiling. [Get help]"
+        );
+
+        let device_only = resolved_ctx(
+            Some(req(ExternalAccess::LocalOnly)),
+            ExternalAccess::Unrestricted,
+            None,
+            "x",
+        );
+        assert_eq!(
+            derive_treatment(
+                &device_only,
+                device_only.step.requirement.as_ref(),
+                &SelectedModel::hosted(hosted_row())
+            )
+            .unwrap_err(),
+            TreatmentError::HostedAboveRange
+        );
+
+        let external = resolved_ctx(
+            Some(req(ExternalAccess::AnonymousPreferred)),
+            ExternalAccess::AnonymousPreferred,
+            None,
+            "x",
+        );
+        let half = SelectedModel {
+            provider_id: Some("p".to_owned()),
+            model_id: "m".to_owned(),
+            hosted_model: None,
+        };
+        assert_eq!(
+            derive_treatment(&external, external.step.requirement.as_ref(), &half).unwrap_err(),
+            TreatmentError::InconsistentSelection
+        );
+        let other_half = SelectedModel {
+            provider_id: None,
+            model_id: "m".to_owned(),
+            hosted_model: Some(hosted_row()),
+        };
+        assert_eq!(
+            derive_treatment(&external, external.step.requirement.as_ref(), &other_half)
+                .unwrap_err(),
+            TreatmentError::InconsistentSelection
+        );
+    }
+
+    /// A disagreement stops the step through the failure handler BEFORE any gate:
+    /// no disclosure-log entry, no step recorded. (A hosted pick cannot come from the
+    /// resolver under a local-only ceiling, so the broken selection is injected at
+    /// the derivation; this pins that execute_once routes the error to a stop.)
+    #[tokio::test]
+    async fn the_executor_stops_a_step_on_a_derivation_error_before_any_gate() {
+        let src = include_str!("executor.rs");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        let derive_at = flat
+            .find("let treatment = match derive_treatment(ctx, resolver_req, &selected_model) {")
+            .expect("the derivation");
+        let gate1_at = flat.find(".gate1(").expect("gate 1");
+        assert!(derive_at < gate1_at, "the derivation comes before Gate 1");
+        assert!(flat[derive_at..gate1_at].contains(
+            "return Ok(Some(failure_handler.handle( &ConductorError::TierBoundaryViolation {"
+        ));
+    }
+
+    /// The derived treatment is a local of one attempt: nothing stores it, so a retry
+    /// or a resumed run derives it again from its own selection.
+    #[test]
+    fn the_treatment_is_never_stored() {
+        for (name, src) in [
+            ("lifecycle.rs", include_str!("lifecycle.rs")),
+            ("types.rs", include_str!("types.rs")),
+            ("tokens.rs", include_str!("tokens.rs")),
+        ] {
+            assert!(
+                !src.contains("StepTreatment"),
+                "{name} mentions StepTreatment"
+            );
+        }
+        let src = include_str!("executor.rs");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let ctx_struct = code
+            .split("pub struct StepContext {")
+            .nth(1)
+            .and_then(|r| r.split("\n}\n").next())
+            .expect("StepContext");
+        assert!(!ctx_struct.contains("treatment"));
+    }
+
+    /// Every read of the CEILING values in the production code of this file, pinned.
+    /// execute_once reads ctx.effective_access for the three pre-selection decisions
+    /// only (the bound-run stop, Step 4.5 and select_model); its tier fields only in
+    /// the floor-invariant check on the ceiling values. Gate 1, the floor consent
+    /// gate, the render, the voice scan, Gate 2, the sensitivity score, the recorded
+    /// tier and Gate 3 read the treatment.
+    #[test]
+    fn the_ceiling_values_are_read_only_where_reviewed() {
+        let src = include_str!("executor.rs");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let live: String = code
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // execute_once alone.
+        let body = live
+            .split("async fn execute_once<")
+            .nth(1)
+            .and_then(|r| r.split("pub(crate) fn render_template(").next())
+            .expect("execute_once");
+        assert_eq!(body.matches("ctx.effective_access").count(), 3);
+        assert_eq!(body.matches("ctx.execution_tier").count(), 1);
+        assert_eq!(body.matches("ctx.abstraction_tier").count(), 1);
+        assert_eq!(body.matches("ctx.raw_abstraction").count(), 1);
+        // The whole production file.
+        assert_eq!(live.matches("ctx.effective_access").count(), 7);
+        assert_eq!(live.matches("ctx.execution_tier").count(), 2);
+        assert_eq!(live.matches("ctx.abstraction_tier").count(), 2);
+        assert_eq!(live.matches("ctx.raw_abstraction").count(), 2);
+        // The gates take the treatment.
+        let flat: String = live.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains(
+            "treatment.abstraction_tier, treatment.raw_abstraction, treatment.execution_tier, treatment.access, selected_model.provider_id.clone(), )"
+        ));
+        assert!(flat.contains("let hosted_step = treatment.hosted;"));
+        assert!(flat.contains("let prompt = if treatment.hosted {"));
+        assert!(flat.contains("if next_tier > treatment.execution_tier {"));
+        assert!(
+            flat.contains("scan_voice_profile(ctx, &treatment, personal_track, privacy_gateway)")
+        );
+    }
+
     /// The three sites keyed on the network predicate, pinned in the source of
-    /// execute_once itself: the hosted call's provider comes from the selection for
-    /// a resolved step and from the preference otherwise, hosted_step follows the
-    /// chosen model for a resolved step, and the render branch still keys on the
-    /// ceiling (a hosted choice implies a ceiling above local, so the stricter
-    /// render always applies before a hosted call).
+    /// execute_once itself. Since items.id=921 two of them follow the derived
+    /// treatment: hosted_step and the render branch both read `treatment.hosted`
+    /// (the ceiling test for an ordinary step, the chosen model for a resolved one),
+    /// and the hosted call's provider still comes from the selection for a resolved
+    /// step and from the preference otherwise.
     #[test]
     fn the_three_network_sites_are_as_reviewed() {
         let src = include_str!("executor.rs");
         let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
         let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
         // Site 1.
+        assert!(flat.contains("let hosted_step = treatment.hosted;"));
+        // Site 2: the render keys on the same flag.
         assert!(flat.contains(
-            "let hosted_step = match resolver_req { Some(_) => selected_model.hosted_model.is_some(), None => ctx.effective_access != ExternalAccess::LocalOnly, };"
+            "let prompt = if treatment.hosted { let disclosure = shared_state.read_disclosure_buffer(&ctx.step.action_id);"
         ));
-        // Site 2: unchanged.
-        assert!(flat.contains(
-            "let prompt = if ctx.effective_access != ExternalAccess::LocalOnly { let disclosure = shared_state.read_disclosure_buffer(&ctx.step.action_id);"
-        ));
-        // Site 3.
+        // Site 3: unchanged.
         assert!(flat.contains(
             "let provider_for_call = match resolver_req { Some(_) => selected_model.provider_id.as_deref(), None => ctx.qr_hosted_provider_preference.as_deref(), }; match (provider_for_call, selected_model.hosted_model.as_ref()) {"
         ));
@@ -7895,7 +8443,12 @@ mod tests {
         assert!(
             code.contains("effective_access != LocalOnly with no qr_hosted_provider_preference")
         );
-        // A hosted selection under a local-only ceiling is refused before any gate.
-        assert!(flat.contains("if ctx.effective_access == ExternalAccess::LocalOnly { return Err(ConductorError::TierBoundaryViolation {"));
+        // A hosted selection under a local-only ceiling is refused before any gate,
+        // by the derivation.
+        assert!(flat.contains(
+            "let treatment = match derive_treatment(ctx, resolver_req, &selected_model) {"
+        ));
+        let derive_src = include_str!("step_treatment.rs");
+        assert!(derive_src.contains("return Err(TreatmentError::HostedUnderLocalOnly);"));
     }
 }
