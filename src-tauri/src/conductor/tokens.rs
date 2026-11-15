@@ -354,6 +354,30 @@ impl ActionDefinition {
     pub fn is_guarded(&self) -> bool {
         self.guard.is_some() || !self.and_guards.is_empty()
     }
+
+    /// items.id=387: true for a RENDER block row (cb-15, the manual hand-off
+    /// starter, conductor::handoff_render): a block row that makes no model call
+    /// and renders its own template from its declared inputs.
+    pub fn is_render_block(&self) -> bool {
+        self.block_stable_id.as_deref().is_some_and(|id| {
+            crate::conductor::block_dispatch::block_kind(id)
+                == Some(crate::conductor::block_dispatch::BlockKind::Render)
+        })
+    }
+
+    /// True when the row has a prompt template the lint, the taint closure and the
+    /// seed requirements must read: every non-block row, and a render block row.
+    /// (A pure or model block row carries no template of its own.)
+    pub fn reads_template(&self) -> bool {
+        self.block_stable_id.is_none() || self.is_render_block()
+    }
+
+    /// items.id=387: true when the declared-inputs lint treats the row as EXTERNAL:
+    /// a step whose routing tier is above local_only, and a render block row,
+    /// which makes no call but renders text bound for an outside provider.
+    pub fn is_external_for_lint(&self) -> bool {
+        self.routing_tier != ExternalAccess::LocalOnly || self.is_render_block()
+    }
 }
 
 // ---------------------------------------------------------------------------

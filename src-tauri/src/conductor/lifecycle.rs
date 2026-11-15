@@ -941,6 +941,26 @@ pub(crate) async fn load_focus_definition_from_db(
                         )
                         .map_err(fail)?
                     }
+                    RegisteredBlock::Render(spec) => {
+                        // items.id=387: a RENDER block (cb-15) is parsed (typed, no
+                        // unknown key, declared inputs only, no refused system token)
+                        // and becomes one LocalOnly block row that carries its own
+                        // template and declared inputs, so the declared-inputs lint
+                        // (which treats it as external), the taint closure and the
+                        // seed requirements read exactly what the renderer will use.
+                        let cfg = (spec.parse)(&block_customization).map_err(|e| {
+                            LifecycleError::ValidationFailed(format!(
+                                "Focus '{focus_id}' step '{}': block '{stable_id}': {e}",
+                                row.action_id
+                            ))
+                        })?;
+                        crate::conductor::handoff_render::expand(
+                            &cfg,
+                            &row.action_id,
+                            block_customization.clone(),
+                            default_guide_id,
+                        )
+                    }
                 }
             }
         };
@@ -1016,7 +1036,10 @@ fn guarded_composition_paths(
             action_id: &s.action_id,
             guards: s.guards(),
             output_var: row_var.as_deref(),
-            is_block: s.block_stable_id.is_some(),
+            // items.id=387: the block-placement rule is about a PURE block's advisory
+            // verdict. A render block's output is real content (the starter), so it
+            // may be last and may precede any row.
+            is_block: s.block_stable_id.is_some() && !s.is_render_block(),
             local_and_no_handoff: s.routing_tier == ExternalAccess::LocalOnly
                 && !s.requires_user_handoff,
             transparent: s.store_op.is_some(),
@@ -1041,6 +1064,8 @@ fn row_output_vars(steps: &[ActionDefinition]) -> Vec<Option<String>> {
     steps
         .iter()
         .map(|s| match s.block_stable_id.as_deref() {
+            // items.id=387: a render block row records its configured variable.
+            Some(_) if s.is_render_block() => s.output_var.clone().filter(|v| !v.is_empty()),
             Some(id) => {
                 let handler = crate::conductor::block_dispatch::block_handler(id)?;
                 (handler.output_var)(s.block_customization.as_ref()?)
@@ -3127,6 +3152,80 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         Ok(())
     }
 
+    /// items.id=387 (S3): run a RENDER block row, the outbound half of a manual
+    /// hand-off. It renders the row's template from its DECLARED INPUTS ONLY (the
+    /// pass's variables, filtered by the row's own declaration), records the starter
+    /// on the TaskTrack as the pass's output, and then marks the hand-off pending
+    /// (conductor::handoff_render::mark_pending: the typed session store, latch-
+    /// gated, not consent-gated). No model, no provider, no gate: the copy-time
+    /// review is the gate when the user copies the starter (decisions.id=846).
+    /// An empty starter or a failed marker fails the pass closed, and the starter is
+    /// recorded only after the marker is set, so a failed pass shows no starter.
+    async fn execute_handoff_render(
+        &mut self,
+        step: &ActionDefinition,
+    ) -> Result<Option<FailureResult>, LifecycleError> {
+        let mut values = guard::track_vars(self.task_track.as_ref().ok_or_else(|| {
+            LifecycleError::ValidationFailed(format!(
+                "step '{}': render row run without a task track",
+                step.action_id
+            ))
+        })?);
+        // Declared bound names (seeded at pass start) and the turn window, only when
+        // the row declares them: render_starter takes declared names alone.
+        values.extend(self.store_tokens.seeds.clone());
+        values.insert("user_input".to_owned(), self.user_input.clone());
+
+        let starter =
+            crate::conductor::handoff_render::render_starter(step, &values, &self.focus_id)
+                .map_err(|e| LifecycleError::ValidationFailed(e.to_string()))?;
+
+        // Mark the hand-off pending (a chat is required: a run with no chat has no
+        // session to remember it in, and renders the starter alone).
+        if let Some(key) = self.context_key.clone() {
+            let run_id = self.focus_run_id.clone().unwrap_or_default();
+            let mut conn = crate::persistence::output_store::open_outputs_db(
+                &self.user_id,
+                &self.persona_id,
+                self.key_hex.as_deref().unwrap_or(""),
+            )
+            .await
+            .map_err(|e| crate::conductor::store_writer::StoreWriteError::Open(e.to_string()))?;
+            let marked = crate::conductor::handoff_render::mark_pending(
+                &mut conn,
+                &key,
+                &self.focus_id,
+                &run_id,
+                &step.action_id,
+            )
+            .await
+            .map_err(crate::conductor::store_writer::StoreWriteError::from)?;
+            log::debug!(
+                "lifecycle: hand-off render '{}' -> {:?}",
+                step.action_id,
+                marked
+            );
+        }
+
+        let output_var = step.output_var.clone().filter(|v| !v.is_empty());
+        self.task_track
+            .as_mut()
+            .expect("checked above")
+            .add_step(TaskStep {
+                action_id: step.action_id.clone(),
+                output_var,
+                content: starter,
+                // 1 = general: a render row never raises the run's sensitivity
+                // ceiling (add_step keeps the max).
+                sensitivity_severity: 1,
+                // Local, no provider.
+                routing_tier_used: 1,
+                personal_flagged: false,
+                audit_unavailable: false,
+            });
+        Ok(None)
+    }
+
     /// items.id=129: run a composition-authored block step. Pure over the
     /// TaskTrack: no provider call, no PersonalTrack, no tier computation
     /// (a block step is LocalOnly by construction, see
@@ -3208,6 +3307,12 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         // registry load_focus_definition_from_db() checks at LOAD -- and
         // records the result on the TaskTrack. A block step makes no provider
         // call and never reaches StepExecutor.
+        // items.id=387: a RENDER block (cb-15) is dispatched before anything else
+        // too: it makes no model call, so it never reaches the tier computation
+        // below, the executor, a gate, the spend gate or a provider.
+        if step.is_render_block() {
+            return self.execute_handoff_render(step).await;
+        }
         if let Some(block_id) = &step.block_stable_id {
             return self.execute_block_step(step, block_id);
         }
@@ -11171,6 +11276,612 @@ steps:
             }
         })
         .await;
+    }
+
+    // -- items.id=387 (S3): the render block cb-15 -------------------------------------
+
+    /// A render block row citing cb-15 with this configuration.
+    fn srender(id: &'static str, custom: serde_json::Value) -> SRow {
+        SRow {
+            id,
+            op: None,
+            target: None,
+            args: None,
+            guard: None,
+            block: Some("cb-15"),
+            custom: custom.to_string(),
+            trigger: false,
+            clauses: None,
+        }
+    }
+
+    fn starter_cfg(template: &str, declared: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "display_name": "Hand-off starter",
+            "output_var": "starter_text",
+            "template": template,
+            "declared_inputs": declared,
+        })
+    }
+
+    const FIXTURE_STARTER: &str = "Please write a short reply to a customer who asks for a refund.";
+    const FIXTURE_ACK: &str = "Thanks, your reply was received and saved.";
+
+    /// THE FIXTURE FOCUS of the hand-off (items.id=387): the outbound row, the return
+    /// rows and nothing else, all in one Focus because the two session names are keyed
+    /// by (chat, Focus). Static text only: until items.id=884's frontend half flips
+    /// STORE_NAMES_EXTERNAL_ALLOWED a starter cannot name a store-backed name, and in a
+    /// Focus with a return row it cannot name {user_input} either.
+    ///   offer  a render row, guarded on no hand-off pending: the starter
+    ///   ack    a render row, guarded on a hand-off pending: the reply of the return
+    ///          pass. It sits BEFORE the return row because the ingest row records
+    ///          nothing on the track, and a real Focus follows it with model steps (B7c).
+    ///          It marks the hand-off pending again, and the return row clears it.
+    ///   take   handoff_ingest, guarded on a hand-off pending
+    fn fixture_rows() -> Vec<SRow> {
+        vec![
+            srender("offer", starter_cfg(FIXTURE_STARTER, &[])).guarded(
+                "handoff_pending",
+                "absent",
+                None,
+            ),
+            SRow {
+                custom: serde_json::json!({
+                    "display_name": "Return acknowledgement",
+                    "output_var": "ack_text",
+                    "template": FIXTURE_ACK,
+                    "declared_inputs": [],
+                })
+                .to_string(),
+                ..srender("ack", serde_json::Value::Null)
+            }
+            .guarded("handoff_pending", "present", None),
+            swriter("take", "handoff_ingest", Some("draft_ref"), None).guarded(
+                "handoff_pending",
+                "present",
+                None,
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn store_load_a_render_row_loads_as_a_local_block_row_with_its_template() {
+        with_temp_data_root(async {
+            let def = store_load(
+                "rb-ok",
+                vec![
+                    smodel("supply", "topic"),
+                    srender("offer", starter_cfg("Help me with {topic}.", &["topic"])),
+                ],
+            )
+            .await
+            .unwrap_or_else(|m| panic!("a render row after its producer must load: {m}"));
+            let step = def.steps.iter().find(|s| s.action_id == "offer").unwrap();
+            assert!(step.is_render_block() && step.is_external_for_lint());
+            assert_eq!(step.routing_tier, ExternalAccess::LocalOnly);
+            assert_eq!(step.block_stable_id.as_deref(), Some("cb-15"));
+            assert_eq!(step.prompt_template, "Help me with {topic}.");
+            assert_eq!(step.declared_inputs, ["topic"]);
+            assert_eq!(step.output_var.as_deref(), Some("starter_text"));
+            assert!(step.field_requirements.is_empty());
+            // A render row is the pass's reply: it may be the last row.
+            assert_eq!(
+                row_output_vars(&def.steps),
+                [Some("topic".to_owned()), Some("starter_text".to_owned())]
+            );
+            // And the next row may be anything: it is not a pure block's verdict.
+            let def = store_load(
+                "rb-mid",
+                vec![
+                    srender("offer", starter_cfg("Fixed text.", &[])),
+                    smodel("after", "after_out"),
+                ],
+            )
+            .await
+            .unwrap_or_else(|m| panic!("{m}"));
+            assert_eq!(def.steps.len(), 2);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn store_load_the_fixture_focus_loads_with_two_paths() {
+        with_temp_data_root(async {
+            let def = store_load("ho-fixture-load", fixture_rows())
+                .await
+                .unwrap_or_else(|m| panic!("the fixture Focus must load: {m}"));
+            assert_eq!(def.steps.len(), 3);
+            assert_eq!(
+                analyze_guarded_composition("ho-fixture-load", &def.steps).unwrap(),
+                2,
+                "one path to offer, one to ack and take"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn store_load_a_render_row_is_linted_as_an_external_step() {
+        with_temp_data_root(async {
+            let cases: Vec<(&str, Vec<SRow>, &str)> = vec![
+                (
+                    "a name the template does not declare",
+                    vec![
+                        smodel("supply", "topic"),
+                        srender("offer", starter_cfg("Help with {topic}.", &[])),
+                    ],
+                    "not in declared_inputs",
+                ),
+                (
+                    "persona_context",
+                    vec![srender(
+                        "offer",
+                        starter_cfg("Hi {persona_context}", &["persona_context"]),
+                    )],
+                    "never an input",
+                ),
+                (
+                    "previous_output declared but unused",
+                    vec![srender("offer", starter_cfg("Hi.", &["previous_output"]))],
+                    "never an input",
+                ),
+                (
+                    "a declared name no earlier row produces",
+                    vec![srender("offer", starter_cfg("Hi {ghost}", &["ghost"]))],
+                    "ghost",
+                ),
+                (
+                    "a store-backed bound name while the interim invariant holds",
+                    vec![srender(
+                        "offer",
+                        starter_cfg("Brief: {content_brief}", &["content_brief"]),
+                    )],
+                    "cannot name or declare 'content_brief'",
+                ),
+                (
+                    "a hand-off name",
+                    vec![srender(
+                        "offer",
+                        starter_cfg("Id {handoff_pending}", &["handoff_pending"]),
+                    )],
+                    "handoff_pending",
+                ),
+                (
+                    "a variable a tainted step produced",
+                    vec![
+                        {
+                            let mut m = smodel("tainted", "tainted_v");
+                            m.custom = serde_json::json!({
+                                "routing_tier": 1,
+                                "prompt_template": "Context: {case_context}",
+                                "output_var": "tainted_v"
+                            })
+                            .to_string();
+                            m
+                        },
+                        srender("offer", starter_cfg("Hi {tainted_v}", &["tainted_v"])),
+                    ],
+                    "cannot name or declare 'tainted_v'",
+                ),
+                (
+                    "an unknown key in the customization",
+                    vec![srender("offer", {
+                        let mut c = starter_cfg("Hi.", &[]);
+                        c["tier"] = serde_json::json!(3);
+                        c
+                    })],
+                    "unknown field",
+                ),
+                (
+                    "a bound name as the output variable",
+                    vec![srender("offer", {
+                        let mut c = starter_cfg("Hi.", &[]);
+                        c["output_var"] = serde_json::json!("content_brief");
+                        c
+                    })],
+                    "output_var",
+                ),
+            ];
+            for (i, (label, rows, want)) in cases.into_iter().enumerate() {
+                let m = store_load(&format!("rb-rej-{i}"), rows).await.unwrap_err();
+                assert!(m.contains(want), "{label}: expected '{want}' in: {m}");
+                assert!(m.contains("offer"), "{label}: names the row: {m}");
+            }
+        })
+        .await;
+    }
+
+    /// The S2 consequence, pinned: {user_input} is declarable by a starter in a Focus
+    /// with no return row, and refused in a Focus that has one (the paste-bearing
+    /// window never leaves in a prompt) until the interim invariant is lifted.
+    #[tokio::test]
+    async fn store_load_user_input_in_a_starter_depends_on_the_return_row() {
+        with_temp_data_root(async {
+            let starter = || srender("offer", starter_cfg("Q: {user_input}", &["user_input"]));
+            store_load("rb-ui-plain", vec![starter()])
+                .await
+                .unwrap_or_else(|m| panic!("without a return row it loads: {m}"));
+            let m = store_load(
+                "rb-ui-ret",
+                vec![
+                    starter().guarded("handoff_pending", "absent", None),
+                    swriter("take", "handoff_ingest", Some("draft_ref"), None).guarded(
+                        "handoff_pending",
+                        "present",
+                        None,
+                    ),
+                    smodel("after", "after_out"),
+                ],
+            )
+            .await
+            .unwrap_err();
+            assert!(m.contains("user_input"), "{m}");
+        })
+        .await;
+    }
+
+    // -- execute(): a render row over a real encrypted outputs.db -----------------------
+
+    fn render_step(id: &str, template: &str, declared: &[&str]) -> ActionDefinition {
+        let cfg = starter_cfg(template, declared);
+        let parsed = crate::conductor::handoff_render::parse(&cfg).unwrap();
+        crate::conductor::handoff_render::expand(&parsed, id, cfg, "g")
+    }
+
+    async fn pending_of(
+        run: &FocusRun<crate::conductor::privacy::logger::TestLogger>,
+        chat: &str,
+    ) -> Option<String> {
+        let mut conn = outputs(run).await;
+        crate::persistence::session_store::get_session_variable(
+            &mut conn,
+            chat,
+            "f",
+            "handoff_pending",
+        )
+        .await
+        .unwrap()
+        .map(|v| v.value)
+    }
+
+    #[tokio::test]
+    async fn execute_renders_declared_inputs_only_records_the_starter_and_marks_pending() {
+        with_temp_data_root(async {
+            let mut run = writer_run(
+                vec![render_step("offer", "Help me with {topic}.", &["topic"])],
+                Some("chat-hr"),
+                &[
+                    ("topic", "a refund"),
+                    // In the pass, not declared by the row: never used.
+                    ("other", "UNDECLARED-VALUE"),
+                ],
+            );
+            assert!(run.execute().await.unwrap().is_none());
+
+            let track = run.task_track.as_ref().unwrap();
+            let last = track.steps().last().unwrap();
+            assert_eq!(last.action_id, "offer");
+            assert_eq!(last.output_var.as_deref(), Some("starter_text"));
+            assert_eq!(last.content, "Help me with a refund.");
+            assert_eq!(track.last_output(), Some("Help me with a refund."));
+            // The pending id is this run's and this row's.
+            assert_eq!(
+                pending_of(&run, "chat-hr").await,
+                Some(crate::conductor::handoff_render::handoff_id(
+                    &run.focus_run_id.clone().unwrap(),
+                    "offer"
+                ))
+            );
+            // A block row emits nothing live: the starter arrives as the reply.
+            assert!(run.emitted_for_test.lock().unwrap().is_empty());
+            // And it is never read by extraction.
+            let def = run.focus_def.clone().unwrap();
+            assert!(extraction_step_outputs(track, &def)
+                .iter()
+                .all(|(id, _)| id != "offer"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_latched_chat_gets_the_starter_and_no_pending_marker() {
+        with_temp_data_root(async {
+            let mut run = writer_run(
+                vec![render_step("offer", "Fixed starter.", &[])],
+                Some("chat-hl"),
+                &[],
+            );
+            let mut conn = outputs(&run).await;
+            crate::persistence::session_store::latch_write_suppressed(
+                &mut conn, "chat-hl", "f", "r0",
+            )
+            .await
+            .unwrap();
+            assert!(run.execute().await.unwrap().is_none());
+            assert_eq!(
+                run.task_track.as_ref().unwrap().last_output(),
+                Some("Fixed starter.")
+            );
+            assert_eq!(pending_of(&run, "chat-hl").await, None);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_run_with_no_chat_renders_the_starter_and_records_nothing() {
+        with_temp_data_root(async {
+            let mut run = writer_run(vec![render_step("offer", "Fixed starter.", &[])], None, &[]);
+            assert!(run.execute().await.unwrap().is_none());
+            assert_eq!(
+                run.task_track.as_ref().unwrap().last_output(),
+                Some("Fixed starter.")
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_empty_starter_fails_the_pass_and_marks_nothing() {
+        with_temp_data_root(async {
+            let mut run = writer_run(
+                vec![render_step("offer", "{topic}", &["topic"])],
+                Some("chat-he"),
+                &[],
+            );
+            assert!(run.execute().await.is_err());
+            assert!(run.task_track.as_ref().unwrap().steps().is_empty());
+            assert_eq!(pending_of(&run, "chat-he").await, None);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_value_with_braces_cannot_pull_in_an_undeclared_value() {
+        with_temp_data_root(async {
+            let mut run = writer_run(
+                vec![render_step("offer", "Topic: {topic}", &["topic"])],
+                Some("chat-hb"),
+                &[("topic", "see {secret_var}"), ("secret_var", "HIDDEN")],
+            );
+            assert!(run.execute().await.unwrap().is_none());
+            let out = run.task_track.as_ref().unwrap().last_output().unwrap();
+            assert_eq!(out, "Topic: see (secret_var)");
+            assert!(!out.contains("HIDDEN"));
+        })
+        .await;
+    }
+
+    // -- the full two-pass test on the fixture Focus --------------------------------------
+
+    /// OUTBOUND, COPY-REVIEW TEXT, PASTE, INGEST, through the real loader and execute().
+    /// The copy review itself needs an AppHandle and is not unit-testable (consent.rs
+    /// says so); what is pinned is its INPUT: the starter is the pass's last output,
+    /// exactly the template, which is the text "Copy last response" hands to it.
+    #[tokio::test]
+    async fn the_fixture_focus_runs_outbound_then_paste_then_ingest() {
+        with_temp_data_root(async {
+            const CHAT: &str = "chat-fx";
+            const PASTE: &str =
+                "  {raw} Dear customer,\n\nYour refund is approved. \u{2014} thanks\n";
+            let mut def = store_load("ho-fixture-run", fixture_rows())
+                .await
+                .unwrap_or_else(|m| panic!("{m}"));
+            // The test pool seeds every Focus focus_level; a hand-off Focus like the
+            // Writing Assistant is per_field, which the consent gate never consults.
+            def.collection_posture = CollectionPosture::PerField;
+
+            let new_run = |def: &FocusDefinition| {
+                let mut run = tier3_ready_run(false);
+                run.focus_def = Some(def.clone());
+                run.context_key = Some(CHAT.to_owned());
+                run
+            };
+
+            // PASS 1, outbound: no hand-off pending, so `offer` runs and `ack`/`take` do not.
+            let mut run1 = new_run(&def);
+            assert!(run1.execute().await.unwrap().is_none());
+            assert_eq!(ran_ids(&run1), ["offer"]);
+            let starter = run1.task_track.as_ref().unwrap().last_output().unwrap();
+            assert_eq!(starter, FIXTURE_STARTER, "the text the copy review sees");
+            let pending = pending_of(&run1, CHAT)
+                .await
+                .expect("a hand-off is pending");
+            assert_eq!(
+                pending,
+                crate::conductor::handoff_render::handoff_id(
+                    &run1.focus_run_id.clone().unwrap(),
+                    "offer"
+                )
+            );
+            assert!(extraction_step_outputs(run1.task_track.as_ref().unwrap(), &def).is_empty());
+
+            // PASS 2, return: the paste is the next turn. `ack` is the reply, `take`
+            // ingests the paste and clears the hand-off.
+            let mut run2 = new_run(&def);
+            run2.set_current_turn(PASTE.to_owned());
+            assert!(run2.execute().await.unwrap().is_none());
+            assert_eq!(ran_ids(&run2), ["ack"]);
+            assert_eq!(
+                run2.task_track.as_ref().unwrap().last_output(),
+                Some(FIXTURE_ACK)
+            );
+            assert_eq!(
+                pending_of(&run2, CHAT).await,
+                None,
+                "the hand-off is settled"
+            );
+            let handle = run2.store_vars.get("draft_ref").cloned().expect("a handle");
+            let mut conn = outputs(&run2).await;
+            let received = crate::persistence::session_store::get_session_variable(
+                &mut conn,
+                CHAT,
+                "f",
+                "handoff_received",
+            )
+            .await
+            .unwrap()
+            .expect("received is set")
+            .value;
+            assert_eq!(received, handle);
+            // Read by handle: the exact paste, as an untrusted draft.
+            let draft = crate::persistence::handoff_draft_store::read_draft_by_handle(
+                &mut conn, "f", &handle,
+            )
+            .await
+            .unwrap();
+            assert_eq!(draft.as_str(), PASTE);
+            // The paste is not in the reply, the track or any recorded output.
+            for step in run2.task_track.as_ref().unwrap().steps() {
+                assert!(!step.content.contains("Dear customer"));
+            }
+
+            // PASS 3: nothing is pending now, so the next turn starts a new hand-off.
+            let mut run3 = new_run(&def);
+            assert!(run3.execute().await.unwrap().is_none());
+            assert_eq!(ran_ids(&run3), ["offer"]);
+            assert!(pending_of(&run3, CHAT).await.is_some());
+            // The earlier reply is still received until a newer one replaces it.
+            let still = crate::persistence::session_store::get_session_variable(
+                &mut conn,
+                CHAT,
+                "f",
+                "handoff_received",
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .value;
+            assert_eq!(still, handle);
+        })
+        .await;
+    }
+
+    /// A return pass with no turn (a resumed or swept run) fails closed at `take` and
+    /// leaves the hand-off pending, so the reply can still be pasted.
+    #[tokio::test]
+    async fn a_return_pass_without_a_turn_fails_and_keeps_the_hand_off_pending() {
+        with_temp_data_root(async {
+            const CHAT: &str = "chat-fy";
+            let mut def = store_load("ho-fixture-noturn", fixture_rows())
+                .await
+                .unwrap_or_else(|m| panic!("{m}"));
+            def.collection_posture = CollectionPosture::PerField;
+            let mut run1 = tier3_ready_run(false);
+            run1.focus_def = Some(def.clone());
+            run1.context_key = Some(CHAT.to_owned());
+            assert!(run1.execute().await.unwrap().is_none());
+            let before = pending_of(&run1, CHAT).await.unwrap();
+
+            let mut run2 = tier3_ready_run(false);
+            run2.focus_def = Some(def);
+            run2.context_key = Some(CHAT.to_owned());
+            assert!(run2.execute().await.is_err(), "no turn: take fails closed");
+            // `ack` ran first and re-marked pending under this run's id; `take` did not
+            // clear it, so a hand-off is still waiting.
+            let after = pending_of(&run2, CHAT).await.unwrap();
+            assert_ne!(before, after);
+            let mut conn = outputs(&run2).await;
+            assert!(
+                crate::persistence::handoff_draft_store::list_draft_ids(&mut conn, "f")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        })
+        .await;
+    }
+
+    // -- the render row never reaches a model --------------------------------------------
+
+    /// THE PINS of items.id=387 S3: the render dispatch comes before the tier
+    /// computation in execute_step, the render function's body names no executor,
+    /// provider, gate or spend path, and no file but executor.rs calls
+    /// hosted_step_call or execute_once.
+    #[test]
+    fn the_render_row_never_calls_hosted_step_call_or_execute_once() {
+        let src = include_str!("lifecycle.rs");
+        let production = src.split("#[cfg(test)]\nmod ").next().unwrap();
+
+        // 1. Dispatch order inside execute_step.
+        let step_fn = production
+            .find("async fn execute_step(")
+            .expect("execute_step");
+        let body = &production[step_fn..];
+        let render_at = body
+            .find("step.is_render_block()")
+            .expect("render dispatch");
+        let tier_at = body.find("let execution_tier").expect("tier computation");
+        let block_at = body
+            .find("execute_block_step(step, block_id)")
+            .expect("block dispatch");
+        assert!(render_at < tier_at && render_at < block_at);
+
+        // 2. The render function's own body.
+        let start = production
+            .find("async fn execute_handoff_render(")
+            .expect("execute_handoff_render");
+        let rest = &production[start..];
+        let end = rest.find("\n    }\n").expect("end of fn");
+        let fn_body: String = rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for banned in [
+            "execute_once",
+            "hosted_step_call",
+            "StepExecutor",
+            "self.execute_step",
+            "execute_full",
+            "OllamaClient",
+            "HostedRequest",
+            "gate3",
+            "spend",
+            "privacy_gateway",
+            "Gate1",
+            "step_review",
+            "render_prompt",
+        ] {
+            assert!(
+                !fn_body.contains(banned),
+                "execute_handoff_render names {banned}"
+            );
+        }
+
+        // 3. Only executor.rs (production code) calls the two send paths.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        walk(&root, &mut files);
+        for path in files {
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel == "conductor/executor.rs" {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let prod = text.split("#[cfg(test)]\nmod ").next().unwrap();
+            for line in prod.lines().filter(|l| !l.trim_start().starts_with("//")) {
+                if line.contains("hosted_step_call(") {
+                    panic!("{rel} calls hosted_step_call: {line}");
+                }
+                if line.contains("execute_once(") && (rel.contains("handoff")) {
+                    panic!("{rel} calls execute_once: {line}");
+                }
+            }
+        }
     }
 
     /// The path-sensitive half of "a write row cannot sit before the data it

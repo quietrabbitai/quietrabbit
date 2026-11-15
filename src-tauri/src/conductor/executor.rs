@@ -1085,7 +1085,7 @@ impl StepExecutor {
 /// Unresolved tokens are stripped (logged at DEBUG). Matches Python oracle.
 ///
 /// Python oracle: StepExecutor._render_template()
-fn render_template(
+pub(crate) fn render_template(
     template: &str,
     tokens: &HashMap<String, String>,
     action_id: &str,

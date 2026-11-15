@@ -6,7 +6,8 @@
 // block that skips one fails CI instead of waiting for a review to notice:
 //
 //   1  its kind is consistent (a pure block has a handler and no spec, a model
-//      block a spec and no handler, and no id is both)
+//      block a spec and no handler, a render block (items.id=387) a render spec and
+//      neither, and no id is two kinds)
 //   2  it is a mirror row (shared_043.sql adds the model blocks) and a member of
 //      the building_blocks mirror as inline_composable
 //   3  its catalog row, from the checked-in export of qr_docs.db, has the floor
@@ -41,7 +42,7 @@ use serde_json::{json, Value};
 
 use crate::conductor::block_dispatch::{
     block_handler, block_kind, registered_block, RegisteredBlock, PURE_STABLE_IDS,
-    REGISTERED_STABLE_IDS,
+    REGISTERED_STABLE_IDS, RENDER_STABLE_IDS,
 };
 use crate::conductor::model_block::config::{tighten, Envelope, EnvelopeOverride};
 use crate::conductor::model_block::document_type::{
@@ -108,6 +109,7 @@ const PINNED_KEYS: &[&str] = &[
     "spec",
     "task_type",
     "temperature",
+    "template",
     "tone",
     "top_p",
     "voice",
@@ -134,6 +136,7 @@ fn example_of(id: &str) -> Value {
     match registered_block(id).unwrap() {
         RegisteredBlock::Pure(h) => (h.example)(),
         RegisteredBlock::Model(s) => (s.example)(),
+        RegisteredBlock::Render(s) => (s.example)(),
     }
 }
 
@@ -142,6 +145,7 @@ fn check(id: &str, v: &Value) -> Result<(), String> {
     match registered_block(id).unwrap() {
         RegisteredBlock::Pure(h) => (h.validate)(v),
         RegisteredBlock::Model(s) => (s.parse)(v, EXTERNAL_MODEL_BLOCKS_ALLOWED).map(|_| ()),
+        RegisteredBlock::Render(s) => (s.parse)(v).map(|_| ()),
     }
 }
 
@@ -188,6 +192,13 @@ fn input_names(id: &str, ex: &Value) -> Vec<String> {
             .map(|n| n.as_str().unwrap().to_owned())
             .filter(|n| !is_system_token(n))
             .collect(),
+        RegisteredBlock::Render(_) => ex["declared_inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap().to_owned())
+            .filter(|n| !is_system_token(n))
+            .collect(),
     }
 }
 
@@ -195,6 +206,7 @@ fn output_var_of(id: &str, ex: &Value) -> Option<String> {
     match registered_block(id).unwrap() {
         RegisteredBlock::Pure(h) => (h.output_var)(ex),
         RegisteredBlock::Model(_) => ex["common"]["output_var"].as_str().map(str::to_owned),
+        RegisteredBlock::Render(s) => (s.output_var)(ex),
     }
 }
 
@@ -206,6 +218,7 @@ fn output_var_of(id: &str, ex: &Value) -> Option<String> {
 fn every_registered_id_has_exactly_one_kind_and_the_lists_agree() {
     let mut pure = BTreeSet::new();
     let mut model = BTreeSet::new();
+    let mut render = BTreeSet::new();
     for id in REGISTERED_STABLE_IDS {
         let kind = block_kind(id).unwrap_or_else(|| panic!("{id} is listed but not registered"));
         match (registered_block(id).unwrap(), kind) {
@@ -222,9 +235,22 @@ fn every_registered_id_has_exactly_one_kind_and_the_lists_agree() {
                 );
                 model.insert(*id);
             }
+            (RegisteredBlock::Render(s), BlockKind::Render) => {
+                assert_eq!(s.stable_id, *id);
+                assert!(block_handler(id).is_none(), "{id} must not have a handler");
+                assert!(
+                    crate::conductor::model_block::model_block_spec(id).is_none(),
+                    "{id} must not also be a model block"
+                );
+                render.insert(*id);
+            }
             _ => panic!("{id}: kind does not match its registration"),
         }
     }
+    assert_eq!(
+        render,
+        RENDER_STABLE_IDS.iter().copied().collect::<BTreeSet<_>>()
+    );
     assert_eq!(
         pure,
         PURE_STABLE_IDS.iter().copied().collect::<BTreeSet<_>>()
@@ -233,14 +259,17 @@ fn every_registered_id_has_exactly_one_kind_and_the_lists_agree() {
         model,
         MODEL_STABLE_IDS.iter().copied().collect::<BTreeSet<_>>()
     );
-    assert_eq!(pure.len() + model.len(), REGISTERED_STABLE_IDS.len());
+    assert_eq!(
+        pure.len() + model.len() + render.len(),
+        REGISTERED_STABLE_IDS.len()
+    );
     // No seed block is registered yet: its contract belongs to B7a.
     assert!(REGISTERED_STABLE_IDS
         .iter()
         .all(|id| block_kind(id) != Some(BlockKind::Seed)));
     // Nothing unregistered resolves.
     for id in [
-        "cb-01", "cb-02", "cb-10", "pc-03", "pc-04", "cb-15", "nope", "",
+        "cb-01", "cb-02", "cb-10", "pc-03", "pc-04", "cb-16", "nope", "",
     ] {
         assert!(registered_block(id).is_none(), "{id}");
     }
@@ -276,6 +305,7 @@ fn every_registered_block_has_a_filled_catalog_row_in_the_checked_in_export() {
         let want = match block_kind(id).unwrap() {
             BlockKind::Pure => "pure",
             BlockKind::Model => "model",
+            BlockKind::Render => "render",
             BlockKind::Seed => "seed",
         };
         assert_eq!(
@@ -415,6 +445,27 @@ fn every_block_names_an_output_variable_that_is_not_reserved() {
             for bound in crate::conductor::declared_inputs::bound_names() {
                 let mut m = example_of(id);
                 m["common"]["output_var"] = json!(bound);
+                assert!(check(id, &m).is_err(), "{id}: output_var {bound} accepted");
+            }
+        }
+        // items.id=387: a render block's own parser refuses the same names.
+        if block_kind(id) == Some(BlockKind::Render) {
+            for reserved in [
+                "user_input",
+                "persona_context",
+                "voice_profile",
+                "previous_output",
+            ] {
+                let mut m = example_of(id);
+                m["output_var"] = json!(reserved);
+                assert!(
+                    check(id, &m).is_err(),
+                    "{id}: output_var {reserved} accepted"
+                );
+            }
+            for bound in crate::conductor::declared_inputs::bound_names() {
+                let mut m = example_of(id);
+                m["output_var"] = json!(bound);
                 assert!(check(id, &m).is_err(), "{id}: output_var {bound} accepted");
             }
         }
@@ -568,8 +619,10 @@ async fn every_example_loads_through_the_real_loader_as_the_right_kind_of_step()
     for id in REGISTERED_STABLE_IDS {
         let ex = example_of(id);
         let pure = block_kind(id) == Some(BlockKind::Pure);
+        let render = block_kind(id) == Some(BlockKind::Render);
         // A model block expands to an ordinary step, so it may be the LAST row, which
-        // the placement lint forbids for a pure block.
+        // the placement lint forbids for a pure block. A render block's output is the
+        // starter, real content, so it may be last too (items.id=387).
         let focus_id = format!("admission-{id}");
         seed_focus(&env.pool, &focus_id, "local_only", &rows_for(id, &ex, pure)).await;
 
@@ -587,6 +640,29 @@ async fn every_example_loads_through_the_real_loader_as_the_right_kind_of_step()
             assert_eq!(step.block_stable_id.as_deref(), Some(*id));
             assert!(step.requirement.is_none());
             assert_eq!(step.routing_tier, ExternalAccess::LocalOnly);
+        } else if render {
+            // items.id=387: a block row that carries its own template and declared
+            // inputs, makes no call, is external to the lint and is no model step.
+            assert_eq!(step.block_stable_id.as_deref(), Some(*id));
+            assert!(step.is_render_block() && step.is_external_for_lint());
+            assert!(step.requirement.is_none() && step.block_customization.is_some());
+            assert_eq!(step.routing_tier, ExternalAccess::LocalOnly);
+            assert_eq!(step.external_access_override, None);
+            assert!(!step.requires_user_handoff);
+            assert!(step.field_requirements.is_empty() && step.store_op.is_none());
+            assert!(!step.prompt_template.is_empty());
+            assert_eq!(
+                step.output_var.as_deref(),
+                output_var_of(id, &ex).as_deref()
+            );
+            let named: BTreeSet<String> =
+                crate::conductor::executor::find_tokens(&step.prompt_template)
+                    .into_iter()
+                    .collect();
+            assert!(
+                named.iter().all(|n| step.declared_inputs.contains(n)),
+                "{id}: the template names only declared inputs"
+            );
         } else {
             // 7: an ordinary local step.
             assert_eq!(
@@ -891,6 +967,8 @@ fn every_configuration_key_is_pinned_and_none_names_a_gate() {
         ex["common"]["class_preference"] = json!("small");
         all_keys(&ex, &mut keys);
     }
+    // items.id=387: the render block's own keys (template is the one new key).
+    all_keys(&crate::conductor::handoff_render::example(), &mut keys);
     // The document type (its length_words map keys are data, not configuration),
     // the settings and the two override shapes.
     let reg = registry().unwrap();

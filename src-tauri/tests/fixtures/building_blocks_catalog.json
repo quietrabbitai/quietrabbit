@@ -1,6 +1,6 @@
 {
   "exported": "2026-11-15",
-  "note": "Checked-in export of the qr_docs.db building_blocks catalog for the registered blocks (building_blocks.id 6, 16, 17, 18, all catalog_status confirmed). Code re-exports this file (items.id=895 moved the re-export from Chat-PM to Code): read the rows with db_query.py, copy the columns below unchanged and add the informational kind field (pure, model or seed), which the database does not hold and the admission test checks against the registry. Re-export whenever a registered block is added or its catalog row changes. The admission test (conductor/model_block/admission_tests.rs) reads this file.",
+  "note": "Checked-in export of the qr_docs.db building_blocks catalog for the registered blocks (building_blocks.id 6, 16, 17, 18, all catalog_status confirmed, and cb-15 as proposed: see its source). Code re-exports this file (items.id=895 moved the re-export from Chat-PM to Code): read the rows with db_query.py, copy the columns below unchanged and add the informational kind field (pure, model, render or seed), which the database does not hold and the admission test checks against the registry. Re-export whenever a registered block is added or its catalog row changes. The admission test (conductor/model_block/admission_tests.rs) reads this file.",
   "rows": [
     {
       "stable_id": "cb-06",
@@ -61,6 +61,21 @@
       "capability_toggles": "document type (latitude and revise parameters), class_preference, range. Not exposed: any gate, step_type, a model id.",
       "generic_customization_notes": "JSON {common: {display_name, output_var, need: {task_type, difficulty, output_size}, declared_inputs, range: {quality_floor: {min, max}, highest_tier, destinations}, class_preference}, spec: {...}}, deny_unknown_fields at every level, validated at LOAD, closed vocabularies (task_type is one of the eight evaluation task types, quality bars basic|standard|high, destinations local|hosted_api|manual_handoff). declared_inputs must be exactly the names the generated template uses. spec: {document_type, draft_var, change_var} (the two must differ).",
       "source": "qr_docs.db building_blocks id 18, read with db_query.py, exported 2026-11-15"
+    },
+    {
+      "stable_id": "cb-15",
+      "name": "Manual hand-off starter",
+      "kind": "render",
+      "block_kind": "infrastructure",
+      "invocation_mode": "inline_composable",
+      "catalog_status": "confirmed",
+      "description": "Renders, without any model call, the starter text a person takes to a provider by hand, from the row's declared inputs only, and marks a hand-off as waiting for its reply (session name handoff_pending). The reply comes back as the next chat turn through the handoff_ingest store operation.",
+      "known_adopters": "Writing Assistant (planned rebuild, items.id=892; manual hand-off strategy, hand-off panel items.id=912); any Focus offering a manual_handoff destination (decisions.id=941 point 6)",
+      "second_adopter_status": "planned_second_adopter",
+      "floor_declaration": "Render block: it makes no model call and has no provider access. The declared-inputs lint treats it as an external step: its template may name only its own declared inputs, never {persona_context}, {voice_profile} or {previous_output}, and it carries no field_requirements. While STORE_NAMES_EXTERNAL_ALLOWED is false it may not name a store-backed name. Its text leaves the device only when the user copies it, through the copy-time review (decisions.id=846). Its output is never extracted. It writes handoff_pending (latch-gated, not consent-gated, no user content) and does not flip EXTERNAL_MODEL_BLOCKS_ALLOWED.",
+      "capability_toggles": "template (the starter's words, authored per Focus as data), declared_inputs. Not exposed: any gate, routing tier, a provider or model, field_requirements.",
+      "generic_customization_notes": "JSON {display_name, output_var, template, declared_inputs}, deny_unknown_fields, validated at LOAD. The template names only tokens listed in declared_inputs, each of which must be an earlier row's output variable or a system token the external lint allows. Nothing else is configurable.",
+      "source": "PROPOSED by Code in the items.id=387 S2 report (2026-11-15), values as proposed there: qr_docs.db building_blocks had no cb-15 row when read with db_query.py at 13:35 on 2026-11-15 (18 rows, max id 18). Replace by re-export once the row is readable."
     }
   ]
 }

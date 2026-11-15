@@ -15,10 +15,12 @@
 // placement lint forbids a block last or before an external step. A model block's
 // output is real content, so none of that applies.
 //
-// Three kinds of block exist (BlockKind): Pure (a BlockHandler over the
-// TaskTrack, cb-06), Model (this module: cb-12 draft, cb-13 voice, cb-14 revise)
-// and Seed (a bound-name producer; none is registered yet, the first belong to
-// B7a, and a seed's contract lives with items.id=886's bound-name table).
+// Four kinds of block exist (BlockKind): Pure (a BlockHandler over the
+// TaskTrack, cb-06), Model (this module: cb-12 draft, cb-13 voice, cb-14 revise),
+// Render (items.id=387: cb-15, the manual hand-off starter, conductor::
+// handoff_render: a deterministic render of text from declared inputs, no model
+// call) and Seed (a bound-name producer; none is registered yet, the first belong
+// to B7a, and a seed's contract lives with items.id=886's bound-name table).
 //
 // WHAT LOAD ENFORCES FOR A MODEL BLOCK (each with its own message):
 //   * the configuration parses, with closed vocabularies and no unknown key;
@@ -84,6 +86,12 @@ pub enum BlockKind {
     Pure,
     /// A ModelBlockSpec: expands to an ordinary model-call step at LOAD.
     Model,
+    /// items.id=387: a deterministic RENDER of text from the row's declared inputs
+    /// (cb-15). It makes no model call and has no BlockHandler (a handler sees only
+    /// the TaskTrack, a render also reads the seeded declared inputs). Its row is
+    /// a block row to the registry and an EXTERNAL step to the declared-inputs
+    /// lint (conductor::handoff_render).
+    Render,
     /// A bound-name producer. None registered yet.
     Seed,
 }

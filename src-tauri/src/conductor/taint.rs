@@ -68,10 +68,10 @@ fn has_handoff_ingest(steps: &[ActionDefinition]) -> bool {
     })
 }
 
-/// Names a step's prompt template mentions (empty for a block row, which has
-/// no template).
+/// Names a step's prompt template mentions (empty for a pure or model block row,
+/// which has no template of its own; a render block row, items.id=387, has one).
 fn template_names(step: &ActionDefinition) -> Vec<String> {
-    if step.block_stable_id.is_some() {
+    if !step.reads_template() {
         return Vec::new();
     }
     find_tokens(&step.prompt_template)

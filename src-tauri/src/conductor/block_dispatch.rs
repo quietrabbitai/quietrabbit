@@ -78,28 +78,45 @@ pub const PURE_STABLE_IDS: &[&str] = &["cb-06"];
 /// Every registered stable_id of every kind (pure, model, seed). Used by tests to
 /// hold the registry and the building_blocks mirror together, and by the
 /// admission test (conductor::model_block::admission_tests).
-pub const REGISTERED_STABLE_IDS: &[&str] = &["cb-06", "cb-12", "cb-13", "cb-14"];
+pub const REGISTERED_STABLE_IDS: &[&str] = &["cb-06", "cb-12", "cb-13", "cb-14", "cb-15"];
+
+/// items.id=387: every RENDER block's stable id (cb-15, the manual hand-off
+/// starter, conductor::handoff_render). A render block has no BlockHandler and no
+/// model-block spec: its row is built at LOAD and rendered by the lifecycle.
+pub const RENDER_STABLE_IDS: &[&str] = &["cb-15"];
 
 pub use crate::conductor::model_block::BlockKind;
 
 /// One registry lookup for the loader (items.id=894): a pure handler, or a model
-/// block's spec. (BlockKind::Seed has no members yet: the first seeds are B7a's.)
+/// block's spec, or a render block's (items.id=387). (BlockKind::Seed has no members
+/// yet: the first seeds are B7a's.)
 pub enum RegisteredBlock {
     Pure(&'static BlockHandler),
     Model(&'static crate::conductor::model_block::ModelBlockSpec),
+    /// items.id=387: a render block (cb-15).
+    Render(&'static crate::conductor::handoff_render::RenderBlockSpec),
 }
 
 pub fn registered_block(stable_id: &str) -> Option<RegisteredBlock> {
     if let Some(h) = block_handler(stable_id) {
         return Some(RegisteredBlock::Pure(h));
     }
-    crate::conductor::model_block::model_block_spec(stable_id).map(RegisteredBlock::Model)
+    if let Some(spec) = crate::conductor::model_block::model_block_spec(stable_id) {
+        return Some(RegisteredBlock::Model(spec));
+    }
+    match stable_id {
+        crate::conductor::handoff_render::STABLE_ID => Some(RegisteredBlock::Render(
+            &crate::conductor::handoff_render::CB15,
+        )),
+        _ => None,
+    }
 }
 
 pub fn block_kind(stable_id: &str) -> Option<BlockKind> {
     registered_block(stable_id).map(|b| match b {
         RegisteredBlock::Pure(_) => BlockKind::Pure,
         RegisteredBlock::Model(_) => BlockKind::Model,
+        RegisteredBlock::Render(_) => BlockKind::Render,
     })
 }
 

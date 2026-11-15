@@ -363,17 +363,18 @@ mod tests {
 
     /// items.id=129: shared_038 takes the mirror from 9 rows to 10 (pc-03 in).
     /// items.id=894: shared_043 adds the three model blocks, 13 rows.
+    /// items.id=387: shared_046 adds the render block cb-15, 14 rows.
     /// pc-04, cb-04 and cb-09 stay out, and pc-03 is a member with no handler.
     #[tokio::test]
-    async fn mirror_has_thirteen_rows_with_pc03_in_and_pc04_cb04_cb09_out() {
+    async fn mirror_has_fourteen_rows_with_pc03_in_and_pc04_cb04_cb09_out() {
         let env = setup().await;
         let pool = &env.pool;
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM building_blocks")
             .fetch_one(pool)
             .await
             .unwrap();
-        assert_eq!(n, 13);
-        for id in ["cb-12", "cb-13", "cb-14"] {
+        assert_eq!(n, 14);
+        for id in ["cb-12", "cb-13", "cb-14", "cb-15"] {
             assert!(is_inline_composable_block(pool, id).await.unwrap(), "{id}");
         }
         assert!(is_inline_composable_block(pool, "pc-03").await.unwrap());

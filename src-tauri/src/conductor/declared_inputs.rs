@@ -48,7 +48,7 @@ use std::collections::HashSet;
 
 use crate::conductor::executor::find_tokens;
 use crate::conductor::taint::{taint_closure, tainting_name, Taint};
-use crate::conductor::tokens::{is_system_token, ActionDefinition, ExternalAccess};
+use crate::conductor::tokens::{is_system_token, ActionDefinition};
 
 /// Turn-bound and session-bound variable names: the names a pass reads from the
 /// session and case stores at pass start (items.id=886, decisions.id=939
@@ -172,8 +172,9 @@ pub(crate) fn lint_with(
             }
             .to_string());
         }
-        // A block row has no template and no declaration; it only produces.
-        if step.block_stable_id.is_none() {
+        // A pure or model block row has no template and no declaration; it only
+        // produces. A render block row (items.id=387) has both, and is external.
+        if step.reads_template() {
             lint_step(step, &earlier, bound, &bound_like).map_err(|e| e.to_string())?;
             if !store_names_external_allowed {
                 lint_store_names(step, &taint, bound, &bound_like).map_err(|e| e.to_string())?;
@@ -193,7 +194,7 @@ fn lint_store_names(
     bound: &[&str],
     bound_like: &HashSet<&str>,
 ) -> Result<(), DeclaredInputsError> {
-    if step.routing_tier == ExternalAccess::LocalOnly {
+    if !step.is_external_for_lint() {
         return Ok(());
     }
     let offending = step
@@ -244,7 +245,7 @@ fn lint_step(
         }
     }
 
-    if step.routing_tier == ExternalAccess::LocalOnly {
+    if !step.is_external_for_lint() {
         return Ok(());
     }
 
@@ -273,7 +274,7 @@ fn lint_step(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conductor::tokens::{FieldRequirement, StepType};
+    use crate::conductor::tokens::{ExternalAccess, FieldRequirement, StepType};
     use std::collections::HashMap;
 
     fn step(

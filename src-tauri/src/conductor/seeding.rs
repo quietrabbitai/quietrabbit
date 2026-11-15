@@ -103,7 +103,7 @@ pub enum SeedError {
 pub fn required_names(steps: &[ActionDefinition]) -> Vec<&'static str> {
     let mut wanted: HashSet<String> = HashSet::new();
     for s in steps {
-        if s.block_stable_id.is_none() {
+        if s.reads_template() {
             wanted.extend(find_tokens(&s.prompt_template));
         }
         wanted.extend(s.declared_inputs.iter().cloned());
