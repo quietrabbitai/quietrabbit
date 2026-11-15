@@ -61,6 +61,7 @@ pub mod device_library;
 pub mod execution;
 pub mod focus_builder;
 pub mod group;
+pub mod handoff;
 pub mod ingest;
 pub mod key_rotation;
 pub mod library;

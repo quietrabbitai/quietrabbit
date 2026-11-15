@@ -245,6 +245,9 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::device_library::rename_device,
         commands::device_library::set_device_fact,
         commands::device_library::clear_device_fact,
+        // Group 33 -- Manual hand-off state, read only (items.id=387,
+        // decisions.id=942 point 7; the panel is items.id=912)
+        commands::handoff::get_handoff_state,
     ])
 }
 

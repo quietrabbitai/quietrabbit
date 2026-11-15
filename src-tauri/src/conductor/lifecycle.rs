@@ -3208,21 +3208,21 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         }
 
         let output_var = step.output_var.clone().filter(|v| !v.is_empty());
-        self.task_track
-            .as_mut()
-            .expect("checked above")
-            .add_step(TaskStep {
-                action_id: step.action_id.clone(),
-                output_var,
-                content: starter,
-                // 1 = general: a render row never raises the run's sensitivity
-                // ceiling (add_step keeps the max).
-                sensitivity_severity: 1,
-                // Local, no provider.
-                routing_tier_used: 1,
-                personal_flagged: false,
-                audit_unavailable: false,
-            });
+        let track = self.task_track.as_mut().expect("checked above");
+        // The starter carries its declared inputs' content out of the device when the
+        // user copies it, so its record is at least as sensitive as the steps that
+        // produced them (highest severity, any personal flag).
+        let inherited = crate::conductor::handoff_render::inherit_from_inputs(step, track);
+        track.add_step(TaskStep {
+            action_id: step.action_id.clone(),
+            output_var,
+            content: starter,
+            sensitivity_severity: inherited.sensitivity_severity,
+            // Local, no provider: the render itself calls nothing.
+            routing_tier_used: 1,
+            personal_flagged: inherited.personal_flagged,
+            audit_unavailable: inherited.audit_unavailable,
+        });
         Ok(None)
     }
 
@@ -11583,6 +11583,72 @@ steps:
         .await;
     }
 
+    /// items.id=387 S4: the starter's record inherits the highest sensitivity and any
+    /// personal flag of the steps that produced its DECLARED inputs, and nothing from
+    /// a sensitive variable it does not declare.
+    #[tokio::test]
+    async fn the_starter_record_inherits_its_inputs_sensitivity_and_personal_flag() {
+        with_temp_data_root(async {
+            let producer = |id: &str, var: &str, sev: i32, flagged: bool| TaskStep {
+                action_id: id.to_owned(),
+                output_var: Some(var.to_owned()),
+                content: format!("{id} content"),
+                sensitivity_severity: sev,
+                routing_tier_used: 1,
+                personal_flagged: flagged,
+                audit_unavailable: flagged,
+            };
+            let record_of = |run: &FocusRun<crate::conductor::privacy::logger::TestLogger>| {
+                run.task_track
+                    .as_ref()
+                    .unwrap()
+                    .steps()
+                    .iter()
+                    .find(|s| s.action_id == "offer")
+                    .cloned()
+                    .expect("the starter was recorded")
+            };
+
+            // Declared input from a flagged, sensitivity-3 step.
+            let mut run = writer_run(
+                vec![render_step("offer", "About {topic}.", &["topic"])],
+                Some("chat-hs"),
+                &[],
+            );
+            {
+                let t = run.task_track.as_mut().unwrap();
+                t.add_step(producer("p1", "topic", 3, true));
+                t.add_step(producer("p2", "unrelated", 4, true));
+            }
+            assert!(run.execute().await.unwrap().is_none());
+            let rec = record_of(&run);
+            assert_eq!(
+                rec.sensitivity_severity, 3,
+                "the declared input's, not the unrelated 4"
+            );
+            assert!(rec.personal_flagged && rec.audit_unavailable);
+            assert_eq!(rec.routing_tier_used, 1);
+
+            // Declared input from a plain step: the starter stays general and unflagged
+            // even though another, undeclared variable in the pass is sensitive.
+            let mut run = writer_run(
+                vec![render_step("offer", "About {topic}.", &["topic"])],
+                Some("chat-hs2"),
+                &[],
+            );
+            {
+                let t = run.task_track.as_mut().unwrap();
+                t.add_step(producer("p1", "topic", 1, false));
+                t.add_step(producer("p2", "unrelated", 4, true));
+            }
+            assert!(run.execute().await.unwrap().is_none());
+            let rec = record_of(&run);
+            assert_eq!(rec.sensitivity_severity, 1);
+            assert!(!rec.personal_flagged && !rec.audit_unavailable);
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn a_latched_chat_gets_the_starter_and_no_pending_marker() {
         with_temp_data_root(async {
@@ -14488,8 +14554,10 @@ steps:
     /// parked on a requires_user_handoff step resumes AT that step
     /// (resume_index, status awaiting_user) and execute() checks
     /// requires_user_handoff BEFORE execute_step() with no bypass, so a resumed run
-    /// parks again every time. B5 (manual hand-off on chat passes, not parked
-    /// steps) is where this changes; update this test then.
+    /// parks again every time. items.id=387 (B5) does NOT change this: the manual
+    /// hand-off runs on chat passes and parks nothing, so it never reaches this path
+    /// (and rehydrate_focus_run restores no context_key or turn). This test stays
+    /// as it is.
     #[tokio::test]
     async fn characterization_resuming_a_requires_user_handoff_step_parks_it_again() {
         let _lock = crate::test_support::ENV_MUTEX.lock().await;

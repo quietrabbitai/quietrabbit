@@ -561,6 +561,14 @@
       "caveat": "This is the provider's default; your account settings may differ."
     }
   },
+  "handoff": {
+    "error": {
+      "persona_not_found": "This persona is not available.",
+      "invalid_focus_id": "This assistant is not available.",
+      "invalid_context_key": "This chat is not available.",
+      "handoff_state_unavailable": "Couldn't check where your hand-off stands. Try again in a moment."
+    }
+  },
   "resolver": {
     "stop": {
       "too_weak": "None of the AI models available for this task is good enough for it yet, so nothing was run.",

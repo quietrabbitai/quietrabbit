@@ -60,6 +60,7 @@ use crate::conductor::bound_spec::{self, HANDOFF_PENDING};
 use crate::conductor::executor::{find_tokens, render_template};
 use crate::conductor::seeding::clean;
 use crate::conductor::tokens::{is_system_token, ActionDefinition, ExternalAccess, StepType};
+use crate::conductor::types::TaskTrack;
 use crate::persistence::session_store::{self, LatchError, SessionStoreError, SessionWrite};
 
 /// The catalog id of the block.
@@ -272,6 +273,47 @@ pub fn render_starter(
         return Err(RenderError::Empty(step.action_id.clone()));
     }
     Ok(text)
+}
+
+/// What the starter inherits from the steps that produced its declared inputs
+/// (items.id=387 S4). The starter carries those steps' content out of the device when
+/// the user copies it, so its record must be at least as sensitive as theirs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Inherited {
+    /// The highest sensitivity_severity among the producers (1 when none).
+    pub sensitivity_severity: i32,
+    /// Gate 2 flagged a withheld personal value in any producer.
+    pub personal_flagged: bool,
+    /// A flagged producer's disclosure-log entry could not be written. Only
+    /// meaningful with personal_flagged, as on TaskStep.
+    pub audit_unavailable: bool,
+}
+
+/// The record a render row inherits: over each DECLARED input, the step that
+/// produced the value the render uses (the LAST step recorded under that variable,
+/// as the variable view resolves it). An input with no producing step (the
+/// {user_input} token, a name seeded from the store) contributes nothing: it has no
+/// record to inherit. Only declared inputs count, so a sensitive variable the row
+/// does not read does not mark its starter.
+pub fn inherit_from_inputs(step: &ActionDefinition, track: &TaskTrack) -> Inherited {
+    let mut out = Inherited {
+        sensitivity_severity: 1,
+        personal_flagged: false,
+        audit_unavailable: false,
+    };
+    for name in &step.declared_inputs {
+        let producer = track
+            .steps()
+            .iter()
+            .rev()
+            .find(|s| s.output_var.as_deref() == Some(name.as_str()));
+        if let Some(p) = producer {
+            out.sensitivity_severity = out.sensitivity_severity.max(p.sensitivity_severity);
+            out.personal_flagged |= p.personal_flagged;
+            out.audit_unavailable |= p.audit_unavailable;
+        }
+    }
+    out
 }
 
 /// The opaque id of a hand-off: `h_` and 12 lowercase hex characters of SHA-256
@@ -521,6 +563,103 @@ mod tests {
         assert_eq!(
             render_starter(&step, &vals(&[("a", "   ")]), "f"),
             Err(RenderError::Empty("offer".to_owned()))
+        );
+    }
+
+    // -- inheritance of sensitivity and the personal flag ---------------------------
+
+    fn produced(
+        id: &str,
+        var: &str,
+        sev: i32,
+        flagged: bool,
+        audit: bool,
+    ) -> crate::conductor::types::TaskStep {
+        crate::conductor::types::TaskStep {
+            action_id: id.to_owned(),
+            output_var: Some(var.to_owned()),
+            content: format!("{id} content"),
+            sensitivity_severity: sev,
+            routing_tier_used: 1,
+            personal_flagged: flagged,
+            audit_unavailable: audit,
+        }
+    }
+
+    #[test]
+    fn the_starter_inherits_the_highest_sensitivity_and_any_personal_flag_of_its_inputs() {
+        let cfg = json!({"display_name":"n","output_var":"o","template":"{a} {b}",
+                         "declared_inputs":["a","b","c"]});
+        let step = step_of(cfg);
+        let mut track = TaskTrack::new();
+        // No producers yet: nothing to inherit.
+        assert_eq!(
+            inherit_from_inputs(&step, &track),
+            Inherited {
+                sensitivity_severity: 1,
+                personal_flagged: false,
+                audit_unavailable: false
+            }
+        );
+        track.add_step(produced("pa", "a", 2, false, false));
+        track.add_step(produced("pb", "b", 4, true, true));
+        // A sensitive variable the row does not declare never marks the starter.
+        track.add_step(produced("px", "undeclared", 4, true, true));
+        let got = inherit_from_inputs(&step, &track);
+        assert_eq!(
+            got,
+            Inherited {
+                sensitivity_severity: 4,
+                personal_flagged: true,
+                audit_unavailable: true
+            }
+        );
+        // The highest wins, and the flag is an OR.
+        let only_a = step_of(json!({"display_name":"n","output_var":"o","template":"{a}",
+                                   "declared_inputs":["a"]}));
+        assert_eq!(
+            inherit_from_inputs(&only_a, &track),
+            Inherited {
+                sensitivity_severity: 2,
+                personal_flagged: false,
+                audit_unavailable: false
+            }
+        );
+    }
+
+    #[test]
+    fn the_last_producer_of_a_variable_is_the_one_inherited_from() {
+        let step = step_of(json!({"display_name":"n","output_var":"o","template":"{a}",
+                                  "declared_inputs":["a"]}));
+        let mut track = TaskTrack::new();
+        track.add_step(produced("first", "a", 4, true, false));
+        track.add_step(produced("second", "a", 2, false, false));
+        // The renderer uses the value of the later step, so it inherits from that one.
+        assert_eq!(
+            inherit_from_inputs(&step, &track),
+            Inherited {
+                sensitivity_severity: 2,
+                personal_flagged: false,
+                audit_unavailable: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_declared_system_token_or_a_missing_producer_contributes_nothing() {
+        let step = step_of(
+            json!({"display_name":"n","output_var":"o","template":"{user_input}",
+                                  "declared_inputs":["user_input"]}),
+        );
+        let mut track = TaskTrack::new();
+        track.add_step(produced("p", "something", 4, true, true));
+        assert_eq!(
+            inherit_from_inputs(&step, &track),
+            Inherited {
+                sensitivity_severity: 1,
+                personal_flagged: false,
+                audit_unavailable: false
+            }
         );
     }
 

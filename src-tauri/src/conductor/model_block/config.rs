@@ -382,8 +382,9 @@ pub fn validate_range(range: &ModelRange, external_allowed: bool) -> Result<(), 
         {
             return Err(format!(
                 "range: destination {d:?} is not allowed yet (EXTERNAL_MODEL_BLOCKS_ALLOWED is \
-                 false: hosted_api waits for the outbound review of items.id=884, manual_handoff \
-                 for items.id=B5)"
+                 false: hosted_api waits for the outbound review of items.id=884, and \
+                 manual_handoff as a model block's destination for the run plan, items.id=901, and \
+                 B10 -- a hand-off that a Focus row cites directly (items.id=387) is not this)"
             ));
         }
         if tier != ExternalAccess::LocalOnly {

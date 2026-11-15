@@ -1,5 +1,7 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: November 15, 2026 (items.id=896: new "Model resolver" section, and the
+# Last updated: November 15, 2026 (items.id=387: new "Manual hand-off" section, the fourth
+# block kind in "Model blocks", and the one line under it that said B5 changes the re-park).
+# Before that, November 15, 2026 (items.id=896: new "Model resolver" section, and the
 # one line under "Model blocks" that said the executor did not read `requirement`).
 # Before that, November 15, 2026 (items.id=895: new "Per-pass artifact store" section,
 # and the catalog re-export line under "Model blocks" only). Before that, November 14, 2026
@@ -323,10 +325,11 @@ release tag privacy-filter-q8-935d868), paths.rs, marker.rs, install.rs, runtime
   are not coordinated (the release single-instance guard covers shipped builds).
 
 ## Model blocks (items.id=894, decisions.id=941/942)
-Three block kinds share one registry (conductor/block_dispatch.rs,
+Four block kinds share one registry (conductor/block_dispatch.rs,
 registered_block()): Pure (a BlockHandler over the TaskTrack, cb-06), Model
 (conductor/model_block/: cb-12 draft document, cb-13 voice apply or refine,
-cb-14 revise) and Seed (declared, none registered yet). A model block has no
+cb-14 revise), Render (cb-15, the manual hand-off starter: see "Manual hand-off"
+below) and Seed (declared, none registered yet). A model block has no
 handler: at LOAD a composition row citing it is parsed (typed, deny_unknown_fields,
 configuration `{common, spec}`) and EXPANDED into an ordinary ActionDefinition with
 block_stable_id None and a `requirement` (task need, range clamped to the Focus
@@ -352,7 +355,7 @@ with no requirement still goes through select_model.
   file (items.id=895 moved it from Chat-PM): once Chat-PM has written the building_blocks
   row in qr_docs.db, read it READ-ONLY with db_query.py (03_ProjectDocs/scripts/db_utilities,
   SELECT json_object(...) gives exact text), copy the columns unchanged, set the
-  informational `kind` (pure, model or seed: the database has no such column and the
+  informational `kind` (pure, model, render or seed: the database has no such column and the
   admission test checks it against the registry), and update `exported` and the row's
   `source`. Never edit qr_docs.db or the vault from here. conductor/model_block/
   admission_tests.rs checks the rest, and PINNED_KEYS there fails on any new
@@ -362,7 +365,10 @@ with no requirement still goes through select_model.
   USER_INPUT_CLEARED_STATUSES) and is not written for a latched one-time chat. A run
   parked and never finished keeps it until items.id=681 and 888 clear it.
 - Resuming a requires_user_handoff step re-parks it (pinned by a characterization
-  test in lifecycle.rs; B5 changes it).
+  test in lifecycle.rs). items.id=387 does NOT change this: the manual hand-off runs on
+  chat passes and parks nothing (see "Manual hand-off"). rehydrate_focus_run restores
+  neither context_key nor the turn text, so a resumed run cannot run a store writer
+  until items.id=888 persists context_key.
 - The unsupported-additions measures live only in examples/focus_calibration.rs for
   now. They move into one shipped module at B6b; do not add a second copy.
 
@@ -526,6 +532,112 @@ outputs_015 with the other outputs files.
   session_variables. Neither exists yet and this item added neither: until they do, a
   chat's artifacts stay in the persona's outputs.db. clear_artifact is the only delete today.
   Not reached by the entity purge (an artifact names no entity id).
+
+## Manual hand-off (items.id=387, decisions.id=942 point 7, decisions.id=846)
+A person takes a starter to a provider by hand (a chat site, a model they hold an account
+with) and pastes the answer back. It is TWO CHAT PASSES, not a parked step: nothing waits
+in a run, so nothing depends on resume. The legacy requires_user_handoff pause is untouched.
+- OUTBOUND (cb-15, BlockKind::Render, conductor/handoff_render.rs). A Focus row cites cb-15
+  directly with `{display_name, output_var, template, declared_inputs}` (typed, every key
+  required). It renders the template from its DECLARED inputs only (values brace-cleaned
+  through seeding::clean, so one value cannot pull in another's token), records the starter
+  as the pass's output and then sets handoff_pending. NO model call, no provider, no gate:
+  the copy-time review (decisions.id=846: "Copy last response" and every copy path) is the
+  gate, and there is no export command. The starter must be the pass's LAST output, because
+  that button copies the newest assistant reply. A source scan pins that the render row never
+  names execute_once, hosted_step_call, a provider, a gate or the spend gate, and the render
+  dispatch sits before the tier computation in execute_step. Its only use of the executor is
+  render_template (pub(crate) since this item) and find_tokens.
+  - It is a block row to the registry and an EXTERNAL step to the declared-inputs lint
+    (ActionDefinition::is_external_for_lint): declared inputs only, no persona_context,
+    voice_profile, previous_output or focus_context (refused at parse, declared or not),
+    only {user_input} among the system tokens, no field_requirements. While
+    STORE_NAMES_EXTERNAL_ALLOWED is false it may not name or declare a store-backed name, so
+    THE REAL STARTER NAMING content_brief WAITS FOR items.id=884's flag flip; until then it is
+    built and tested with the fixture Focus (static text or untainted earlier variables). In a
+    Focus that also has a handoff_ingest row it cannot name {user_input} either (taint below).
+  - Its record inherits the highest sensitivity_severity, any personal_flagged and
+    audit_unavailable of the steps that produced its DECLARED inputs (last producer of each
+    variable); an input with no producing step (user_input, a seeded name) contributes
+    nothing, a known gap to close when the flag flips and a store-backed name can be declared.
+    routing_tier_used stays 1: the render itself calls nothing.
+  - handoff_pending (Session bound name, `h_` plus 12 lowercase hex of SHA-256 over run and
+    row) is written by the render through the typed session store: latch-gated (a one-time
+    chat still shows the starter and records nothing), NOT collection-consent gated (no user
+    content). A run with no chat renders the starter and records nothing.
+  - EXTERNAL_MODEL_BLOCKS_ALLOWED does not govern this: it is one boolean for a MODEL block's
+    external destinations (hosted_api, manual_handoff) and still waits for B10. A ManualHandoff
+    range of a model block is refused until the run plan (items.id=901) selects it.
+- RETURN (handoff_ingest, conductor/handoff_writer.rs, the 17th store op). The pasted reply
+  is the NEXT chat turn. The row is guarded on handoff_pending `present` (LOAD refuses it
+  otherwise), has NO slots and a required store_target (the pass variable the H- handle is
+  published under), and is gated by the collection consent. Order: consent, the one-time
+  latch (a latched chat stores no blob), a turn must exist, the paste caps, a hand-off must
+  be pending, store_draft, then session_store::settle_handoff_return clears handoff_pending
+  and sets handoff_received in ONE BEGIN IMMEDIATE transaction. A crash between the draft and
+  that transaction leaves a stored reply the chat does not point at and the hand-off still
+  pending, so the retry stores a second reply: accepted, both are the user's Library documents.
+  - THE ONE EXCEPTION to "raw user text is never a store argument" (recorded in the store_op.rs
+    header): handoff_ingest reads the raw turn from WriterContext.turn_text, because a
+    variable would be a model's copy of the paste. The turn is FocusRun.current_turn (a
+    CurrentTurn: not Clone, not Serialize, not Display, Debug redacts it), set only by
+    send_message through set_current_turn, lent as TurnText whose accessor is private to
+    handoff_writer.rs, NEVER persisted, checkpointed, snapshotted, serialized or logged
+    (the one log line carries a byte count). rehydrate_focus_run never sets it, so a resumed
+    run has none and the op fails closed. Scans in conductor/handoff_writer_tests.rs pin
+    that no other file reads turn_text and that there is one sender, one field and one lender.
+  - The reply is stored through persistence/ingested_document_store.rs (the three ingest writes
+    moved out of commands/ingest.rs, behaviour unchanged) by persistence/handoff_draft_store.rs
+    as an ingested output of type handoff_draft filed under the Focus: sensitivity personal,
+    PASTE_MAX_BYTES 256 KiB, non-blank, no NUL, no lease (the run holds one), exact text. It
+    is UNTRUSTED EXTERNAL CONTENT read ONLY by its H- handle (handles::Kind::Draft, resolved
+    among the Focus's own non-deleted replies) through read_draft_by_handle; no template names
+    a handle and no seeded name carries the text (a Derived handoff_draft name is deferred
+    until items.id=907 states its size needs: derived text caps at 6000 bytes, a reply at 256
+    KiB). The chat turn that carried the paste has no byte cap of its own (commands::messages).
+  - TAINT (conductor/taint.rs): in a Focus that has a handoff_ingest row, `user_input` is a
+    tainting name, because the blended chat window ({user_input}, focus_runs.user_input) carries
+    the paste as its newest message for up to HISTORY_WINDOW messages. A step naming it is left
+    out of extraction (and so is a step naming its output), and while
+    STORE_NAMES_EXTERNAL_ALLOWED is false an external step of that Focus cannot name it.
+  - handoff_pending and handoff_received are reserved: never a session_put target, never a
+    writer's argument, never an output_var. Both are seeded at pass start and are ordinary
+    store-backed names otherwise (restricted to the step whose template names them, tainting
+    it, refused in an external step while the flag is false). Their normal use is a guard.
+- CONSENT, FOR A FOCUS AUTHOR. In a focus_level Focus WITHOUT the current consent,
+  handoff_ingest is SILENTLY SKIPPED by the collection-consent gate (declining is not a block:
+  the Focus keeps working and saves nothing). A reply row such as an acknowledgement would
+  still say "received" when nothing was saved, so a Focus author MUST GUARD THE REPLY ON
+  CONSENT STATE, and the hand-off panel reads get_collection_consent_state next to
+  get_handoff_state. A per_field Focus (the Writing Assistant) is always Granted.
+- STATE FOR THE PANEL (commands/handoff.rs, IPC Group 33). get_handoff_state(persona_id,
+  context_key, focus_id) is READ ONLY and never returns a reply's text: pending
+  `{id, since}`, received `{handle, byte_count, received_at}` (None when the reply was deleted
+  from the Library) and one_time_chat. Errors are the codes in handoff::ERROR_CODES
+  (persona_not_found, invalid_focus_id, invalid_context_key, handoff_state_unavailable), each
+  with a placeholder key handoff.error.<code> in frontend/src/i18n/en.json (Chat-BRAND owns the
+  wording; a test requires a key per code). There is no write command, no export command and
+  no paste command: the starter is copied with the existing copy review and the paste is sent
+  through send_message. A cancel control for an abandoned hand-off is items.id=900's design and
+  must be a pass (a guarded typed row), never a command that writes session_variables.
+- WHAT items.id=912 EXPECTS: get_handoff_state, the two session names for guards, the fixture
+  Focus pattern (a render row guarded on handoff_pending absent, a reply row and handoff_ingest
+  guarded on present; the reply row sits BEFORE the ingest row in the fixture because the ingest
+  row records nothing on the track and a real Focus follows it with model steps), and
+  items.id=643 (below) landed before the panel offers any delete.
+- RETENTION (for items.id=888, which must NOT repeat the pass_artifacts gap): the two session
+  names are rows of session_variables, so clear_chat and the 30-day sweep cover them with no
+  change. The pasted reply is NOT chat scratch: it is a durable Library "Imported" document the
+  user owns, removed only through the Library, so clear_chat does NOT delete it (a deliberate
+  ruling, items.id=387 plan Q1). The Library's soft delete zeroes `content` and sets deleted_at
+  but leaves the encrypted blob file on disk: items.id=643 (it now blocks the panel). It is
+  existing behaviour for every imported document and was left alone here.
+- SCHEMA: shared_046.sql (data only, the cb-15 mirror row; the migration tests re-pinned to 46).
+  No new table or column. items.id=633 must absorb shared_046.sql with the other shared files.
+- NOT BUILT: the real Writing Assistant starter (waits for items.id=884's flag flip), a
+  Derived handoff_draft name, multiple hand-offs inside one pass (the return pass's row order is
+  the Focus's), file or document replies beyond a plain paste, any model step after the return
+  row (B7c delta validation reads the reply by handle).
 
 ## Collection consent (items.id=920 stage 1, decisions.id=944, decisions.id=509)
 A focus_level Focus (Tech Support) collects silently after ONE informed consent at

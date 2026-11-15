@@ -18,6 +18,16 @@
 -- The catalog row in qr_docs.db is Chat-PM's, and the checked-in export under
 -- src-tauri/tests/fixtures/building_blocks_catalog.json carries its text.
 --
+-- RETENTION AND PURGE OF THE HAND-OFF (items.id=387, for items.id=888). The block's
+-- two session names, handoff_pending and handoff_received, are rows of
+-- session_variables in each persona's outputs.db (outputs_013.sql), so clear_chat
+-- and the 30-day retention sweep of items.id=888 cover them with no change. The
+-- pasted reply is NOT chat scratch: it is an ingested Library document of type
+-- handoff_draft (outputs rows, source external_ingested, plus an encrypted blob),
+-- owned by the user and removed only through the Library, so clear_chat does not
+-- delete it. The Library's soft delete leaves the blob on disk (items.id=643).
+-- No table or column is added for any of this.
+--
 -- SCHEMA AUTHORING RULE (migrations.rs): no semicolons inside string literals or
 -- comments -- parse_statements() is not a general-purpose SQL parser.
 

@@ -70,9 +70,14 @@ use self::document_type::{Settings, StepParams, WordRange};
 /// INTERIM PRIVACY INVARIANT (decisions.id=942 point 1, items.id=894). While this
 /// is false, LOAD refuses a model block whose range names any destination but
 /// local or any tier above local_only: hosted_api needs the outbound review of a
-/// rendered external prompt (items.id=884), and manual_handoff has no executor
-/// until B5. Flip this to true when items.id=884 lands (B10): it is the only line
-/// that changes. See also declared_inputs::STORE_NAMES_EXTERNAL_ALLOWED.
+/// rendered external prompt (items.id=884). One boolean covers both external
+/// destinations. manual_handoff as a MODEL block's destination also waits for it,
+/// because nothing selects that destination until the run plan (items.id=901) and
+/// B10. The hand-off itself is built (items.id=387): its outbound render (cb-15) and
+/// its return operation (handoff_ingest) are cited by a Focus row directly and need
+/// no model block, so this flag does not govern them. Flip this to true at B10, after
+/// items.id=884 lands: it is the only line that changes. See also
+/// declared_inputs::STORE_NAMES_EXTERNAL_ALLOWED.
 pub const EXTERNAL_MODEL_BLOCKS_ALLOWED: bool = false;
 
 /// The guide every model block's step names. guide_id never injects guide text

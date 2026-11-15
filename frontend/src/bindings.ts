@@ -1051,6 +1051,7 @@ export const commands = {
 	renameDevice: (personaId: string, focusId: string, device: string, newName: string) => typedError<DeviceSummary, string>(__TAURI_INVOKE("rename_device", { personaId, focusId, device, newName })),
 	setDeviceFact: (personaId: string, focusId: string, device: string, field: string, value: string) => typedError<DeviceFact, string>(__TAURI_INVOKE("set_device_fact", { personaId, focusId, device, field, value })),
 	clearDeviceFact: (personaId: string, focusId: string, device: string, field: string) => typedError<null, string>(__TAURI_INVOKE("clear_device_fact", { personaId, focusId, device, field })),
+	getHandoffState: (personaId: string, contextKey: string, focusId: string) => typedError<HandoffState, string>(__TAURI_INVOKE("get_handoff_state", { personaId, contextKey, focusId })),
 };
 
 /* Types */
@@ -1622,6 +1623,41 @@ export type GroupSyncSettingsInfo = {
 	last_synced_at: string | null,
 	last_error: string | null,
 	updated_at: string,
+};
+
+/**  A hand-off whose starter was shown and whose reply has not come back. */
+export type HandoffPending = {
+	/**
+	 *  The opaque hand-off id (`h_` and 12 hex characters). Not secret, not an
+	 *  internal id.
+	 */
+	id: string,
+	/**  When the hand-off was marked pending (the session variable's updated_at). */
+	since: string,
+};
+
+/**  A reply that came back and is stored as a Library draft. Never its text. */
+export type HandoffReceived = {
+	/**  The H- handle a pass reads the reply by. */
+	handle: string,
+	/**  The size of the stored reply in bytes. */
+	byte_count: number,
+	/**  When it was stored. */
+	received_at: string,
+};
+
+export type HandoffState = {
+	pending: HandoffPending | null,
+	/**
+	 *  None when no reply has come back, or the stored reply was deleted from the
+	 *  Library since.
+	 */
+	received: HandoffReceived | null,
+	/**
+	 *  The chat is a one-time session: nothing is saved in it, so a hand-off in it
+	 *  shows its starter and can take no reply back.
+	 */
+	one_time_chat: boolean,
 };
 
 export type HardwareProfile = {

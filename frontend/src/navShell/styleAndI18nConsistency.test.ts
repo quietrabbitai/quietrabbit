@@ -64,6 +64,10 @@ const PRE_EXISTING_ORPHAN_KEYS: string[] = [
   'privacyGuardianModal.selectedCount', // defined, no t() call site anywhere
   'resolver.stop.too_weak', // items.id=896: the backend parks a model-block step with this code; the screen that shows it is items.id=902 or 904
   'resolver.stop.no_candidate', // same
+  'handoff.error.persona_not_found', // items.id=387: the codes of get_handoff_state; the panel that shows them is items.id=912
+  'handoff.error.invalid_focus_id', // same
+  'handoff.error.invalid_context_key', // same
+  'handoff.error.handoff_state_unavailable', // same
 ]
 
 function walk(dir: string, exts: string[], out: string[] = []): string[] {

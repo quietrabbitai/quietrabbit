@@ -22,7 +22,10 @@
 //      local destination. A hosted model is a candidate only when the requirement
 //      allows hosted_api AND the ceiling (the lower of the requirement's highest
 //      tier and the run's own) is anonymous_preferred or above. Manual hand-off is
-//      never a candidate here (it has no executor until B5). Cloud Chat panes are
+//      never a candidate here: a hand-off is not a model call, it is a pair of
+//      passes a Focus row cites directly (items.id=387: the cb-15 render and the
+//      handoff_ingest return), and choosing it as a strategy is the run plan's
+//      (items.id=901). Cloud Chat panes are
 //      user-driven and never an automatic target (decisions.id=680): they are not
 //      candidates at all.
 //   2. Readiness. Only a candidate its gatherer marked Ready is considered. A hosted
