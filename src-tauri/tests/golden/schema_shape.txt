@@ -478,6 +478,15 @@ TABLE outputs_fts_idx
   segid  notnull=1 pk=1 default=None
   term  notnull=1 pk=2 default=None
   pgno  notnull=0 pk=0 default=None
+TABLE pass_artifacts
+  context_key TEXT notnull=1 pk=1 default=None
+  focus_id TEXT notnull=1 pk=2 default=None
+  kind TEXT notnull=1 pk=3 default=None
+  content TEXT notnull=1 pk=0 default=None
+  version INTEGER notnull=1 pk=0 default=Some("1")
+  written_by_run TEXT notnull=1 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
 TABLE pf_fact_mentions
   id TEXT notnull=1 pk=1 default=None
   focus_run_id TEXT notnull=1 pk=0 default=None

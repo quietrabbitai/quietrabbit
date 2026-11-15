@@ -235,6 +235,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/outputs_014.sql"),
     },
     SchemaFile {
+        prefix: "outputs",
+        version: 15,
+        sql: include_str!("../../schema/outputs_015.sql"),
+    },
+    SchemaFile {
         prefix: "personal",
         version: 1,
         sql: include_str!("../../schema/personal_001.sql"),
@@ -3884,10 +3889,11 @@ mod tests {
 
         assert_eq!(
             result.expect("migration must apply cleanly"),
-            14,
+            15,
             "outputs_001 + outputs_002 + outputs_003 + outputs_004 + outputs_005 + \
              outputs_006 + outputs_007 + outputs_008 + outputs_009 + outputs_010 + \
-             outputs_011 + outputs_012 + outputs_013 + outputs_014 must all apply in one pass"
+             outputs_011 + outputs_012 + outputs_013 + outputs_014 + outputs_015 \
+             must all apply in one pass"
         );
 
         let mut conn =
@@ -5356,8 +5362,8 @@ mod tests {
             .await
             .expect("v11 must apply to a populated outputs.db");
         assert_eq!(
-            applied, 4,
-            "outputs_011, outputs_012, outputs_013 and outputs_014 were pending"
+            applied, 5,
+            "outputs_011, outputs_012, outputs_013, outputs_014 and outputs_015 were pending"
         );
 
         for (table, expected) in FOCUS_RUN_TABLES.iter().zip(before) {
@@ -5410,8 +5416,8 @@ mod tests {
             .await
             .expect("v12 must apply to a populated outputs.db");
         assert_eq!(
-            applied, 3,
-            "outputs_012, outputs_013 and outputs_014 were pending"
+            applied, 4,
+            "outputs_012, outputs_013, outputs_014 and outputs_015 were pending"
         );
 
         let row: (i64, i64, i64) = sqlx::query_as(
@@ -5468,7 +5474,10 @@ mod tests {
         let applied = run_migrations(&mut conn, "outputs", Some(TEST_KEY_HEX))
             .await
             .expect("v13 must apply to a populated outputs.db");
-        assert_eq!(applied, 2, "outputs_013 and outputs_014 were pending");
+        assert_eq!(
+            applied, 3,
+            "outputs_013, outputs_014 and outputs_015 were pending"
+        );
         assert_eq!(row_count(&mut conn, "outputs").await, 1);
         assert_eq!(row_count(&mut conn, "focus_runs").await, 1);
 
@@ -5544,7 +5553,7 @@ mod tests {
         let applied = run_migrations(&mut conn, "outputs", Some(TEST_KEY_HEX))
             .await
             .expect("v14 must apply to a populated outputs.db");
-        assert_eq!(applied, 1, "only outputs_014 was pending");
+        assert_eq!(applied, 2, "outputs_014 and outputs_015 were pending");
 
         for table in [
             "case_records",
@@ -5646,6 +5655,82 @@ mod tests {
                 .await
                 .unwrap();
         assert!(fks.is_empty(), "case_records references nothing: {fks:?}");
+        assert!(
+            fk_violations(&mut conn).await.is_empty(),
+            "foreign_key_check must be clean"
+        );
+    }
+
+    /// items.id=895: outputs_015 adds pass_artifacts. A populated v14 database
+    /// keeps its rows and the session store, and gains one empty table with no
+    /// foreign key (items.id=633 rebuilds focus_runs), no trigger and the size
+    /// and scope constraints.
+    #[tokio::test]
+    async fn outputs_v14_to_v15_adds_pass_artifacts_and_preserves_a_populated_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = open_keyed_scratch(&tmp.path().join("outputs.db")).await;
+        apply_versions_up_to(&mut conn, "outputs", 14).await;
+        exec_all(
+            &mut conn,
+            &[
+                "INSERT INTO focus_runs (id, focus_id, started_at) \
+                 VALUES ('run1', 'f', '2026-01-01T00:00:00Z')",
+                "INSERT INTO session_variables \
+                 (context_key, focus_id, name, value, written_by_run, created_at, updated_at) \
+                 VALUES ('c', 'f', 'locked_intent', 'x', 'run1', \
+                         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                "INSERT INTO case_records \
+                 (case_id, focus_id, opened_by_run, opened_at, updated_at) \
+                 VALUES ('case-1', 'tech-support', 'run1', \
+                         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            ],
+        )
+        .await;
+
+        let applied = run_migrations(&mut conn, "outputs", Some(TEST_KEY_HEX))
+            .await
+            .expect("v15 must apply to a populated outputs.db");
+        assert_eq!(applied, 1, "only outputs_015 was pending");
+
+        assert_eq!(row_count(&mut conn, "focus_runs").await, 1);
+        assert_eq!(row_count(&mut conn, "session_variables").await, 1);
+        assert_eq!(row_count(&mut conn, "case_records").await, 1);
+        assert_eq!(row_count(&mut conn, "pass_artifacts").await, 0);
+
+        let fks: Vec<(String,)> =
+            sqlx::query_as("SELECT \"table\" FROM pragma_foreign_key_list('pass_artifacts')")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert!(fks.is_empty(), "pass_artifacts references nothing: {fks:?}");
+        let triggers: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'pass_artifacts'",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert!(triggers.is_empty(), "no triggers: {triggers:?}");
+        let pk: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM pragma_table_info('pass_artifacts') WHERE pk > 0 ORDER BY pk",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            pk,
+            [
+                ("context_key".to_owned(),),
+                ("focus_id".to_owned(),),
+                ("kind".to_owned(),)
+            ],
+            "one row per chat, Focus and kind"
+        );
+        let version: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_version WHERE version = 15")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(version, 1);
         assert!(
             fk_violations(&mut conn).await.is_empty(),
             "foreign_key_check must be clean"

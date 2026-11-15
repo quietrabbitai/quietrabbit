@@ -26,6 +26,7 @@ pub mod message_store;
 pub mod migrations;
 pub mod output_store;
 pub mod owned_entity_store;
+pub mod pass_artifact_store;
 pub mod persona_registry_store;
 pub mod persona_store;
 pub mod personal_store;
