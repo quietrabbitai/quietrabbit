@@ -286,6 +286,26 @@ pub const RESIDUAL_SHARED_SCHEMA: &[ResidualTable] = &[
         ],
     },
     ResidualTable {
+        // items.id=896 (shared_045.sql): measured capability per model, task type
+        // and document profile. Shipped data, identical for every install, written
+        // only by the signed catalog and the seed. No user content.
+        name: "model_capabilities",
+        class: ResidualClass::GlobalCatalog,
+        columns: &[
+            "subject_kind",
+            "provider_id",
+            "model_id",
+            "task_type",
+            "profile",
+            "attained_bar",
+            "model_class",
+            "sample_count",
+            "measured_at",
+            "provenance",
+            "note",
+        ],
+    },
+    ResidualTable {
         name: "provider_models",
         class: ResidualClass::GlobalCatalog,
         columns: &[

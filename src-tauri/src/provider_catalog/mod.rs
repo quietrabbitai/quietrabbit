@@ -95,6 +95,7 @@ pub mod codes {
 
     pub const SKIP_PRICE_OLDER: &str = "catalog.skip.price_older_than_current";
     pub const SKIP_CONTEXT_OLDER: &str = "catalog.skip.context_older_than_current";
+    pub const SKIP_CAPABILITY_OLDER: &str = "catalog.skip.capability_older_than_current";
 
     /// Why a provider will ask for consent again after this catalog. The
     /// consent attributes hash covers the set of non-retired models and each
@@ -140,6 +141,7 @@ pub mod codes {
         REJECT_UNEXPLAINED_CONSENT_CHANGE,
         SKIP_PRICE_OLDER,
         SKIP_CONTEXT_OLDER,
+        SKIP_CAPABILITY_OLDER,
         CONSENT_MODEL_ADDED,
         CONSENT_MODEL_RETIRED,
         CONSENT_COST_CLASS_CHANGED,

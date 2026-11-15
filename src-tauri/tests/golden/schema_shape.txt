@@ -895,6 +895,18 @@ TABLE migration_lock
   id INTEGER notnull=0 pk=1 default=None
   locked_at TEXT notnull=0 pk=0 default=None
   locked_by TEXT notnull=0 pk=0 default=None
+TABLE model_capabilities
+  subject_kind TEXT notnull=1 pk=1 default=None
+  provider_id TEXT notnull=1 pk=2 default=Some("''")
+  model_id TEXT notnull=1 pk=3 default=None
+  task_type TEXT notnull=1 pk=4 default=None
+  profile TEXT notnull=1 pk=5 default=Some("''")
+  attained_bar TEXT notnull=1 pk=0 default=None
+  model_class TEXT notnull=1 pk=0 default=None
+  sample_count INTEGER notnull=1 pk=0 default=None
+  measured_at TEXT notnull=1 pk=0 default=None
+  provenance TEXT notnull=1 pk=0 default=None
+  note TEXT notnull=0 pk=0 default=None
 TABLE pending_group_invitations
   id TEXT notnull=0 pk=1 default=None
   recipient_persona_id TEXT notnull=1 pk=0 default=None

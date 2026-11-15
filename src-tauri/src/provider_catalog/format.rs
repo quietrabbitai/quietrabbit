@@ -15,12 +15,22 @@
 // release-only (decisions.id=875, Chat-PM ruling on items.id=713, D4/D5). A
 // document that names one is rejected by the parser, not filtered afterwards.
 //
+// CAPABILITIES (items.id=896). The one section that may name a LOCAL model: a
+// measured score for a model the release already curates, keyed by model, task
+// type and document profile (conductor::model_capability). It carries a score
+// and a class, never a price, endpoint, privacy attribute or provider row, so it
+// cannot add a model, a provider or a destination. A catalog that carries it
+// needs min_shared_schema >= CAPABILITIES_MIN_SCHEMA (flow::parse_body).
+//
 // Prices travel as decimal STRINGS ("0.075"). The stored `pricing` text keeps
 // each number's source lexeme because spend::price reads exact decimals; a
 // string here is rendered back into that lexeme without passing through f64.
 
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
+
+use crate::conductor::model_block::config::{ModelClass, ModelTaskType};
+use crate::conductor::model_capability::{AttainedBar, CapabilitySubject, Provenance};
 
 pub const FORMAT_VERSION: u32 = 1;
 /// The one body name a manifest may point at (no path, no other file).
@@ -29,6 +39,8 @@ pub const CATALOG_ASSET_NAME: &str = "provider-catalog.json";
 pub const MAX_MANIFEST_BYTES: u64 = 16 * 1024;
 pub const MAX_SIGNATURE_BYTES: u64 = 4 * 1024;
 pub const MAX_CATALOG_BYTES: u64 = 1024 * 1024;
+/// The shared.db schema version that has model_capabilities (shared_045.sql).
+pub const CAPABILITIES_MIN_SCHEMA: u32 = 45;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,6 +68,31 @@ pub struct CatalogDoc {
     pub models: Vec<ModelUpdate>,
     #[serde(default)]
     pub new_models: Vec<NewModel>,
+    /// Measured capability cells (items.id=896). Absent = none.
+    #[serde(default)]
+    pub capabilities: Vec<CapabilityDoc>,
+}
+
+/// One measured cell, as the table stores it. An existing cell is replaced
+/// field for field (a cell has no governed and release-only parts).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityDoc {
+    pub subject: CapabilitySubject,
+    /// Required for a hosted model, forbidden for a local one.
+    pub provider_id: Option<String>,
+    /// A local model's Ollama tag, or a hosted model's id.
+    pub model_id: String,
+    pub task_type: ModelTaskType,
+    /// The id of a shipped document type. Absent = the task-type-wide cell.
+    pub profile: Option<String>,
+    pub attained_bar: AttainedBar,
+    pub model_class: ModelClass,
+    pub sample_count: u32,
+    /// YYYY-MM-DD.
+    pub measured_at: String,
+    pub provenance: Provenance,
+    pub note: Option<String>,
 }
 
 /// Neutral columns of an EXISTING hosted provider row. An absent field leaves

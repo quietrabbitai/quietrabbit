@@ -1,4 +1,150 @@
 {
+  "capabilities": [
+    {
+      "attained_bar": "basic",
+      "measured_at": "2026-11-13",
+      "model_class": "medium",
+      "model_id": "llama3.1:8b",
+      "note": "Acceptable. Preferred over the 3B for this type.",
+      "profile": "complaint_email",
+      "provenance": "jason_read",
+      "sample_count": 4,
+      "subject": "local",
+      "task_type": "creative_writing"
+    },
+    {
+      "attained_bar": "basic",
+      "measured_at": "2026-11-13",
+      "model_class": "medium",
+      "model_id": "llama3.1:8b",
+      "note": "MARGINAL: poor but acceptable. Expected to change once the voice parameters are tuned.",
+      "profile": "cover_letter",
+      "provenance": "jason_read",
+      "sample_count": 4,
+      "subject": "local",
+      "task_type": "creative_writing"
+    },
+    {
+      "attained_bar": "basic",
+      "measured_at": "2026-11-13",
+      "model_class": "medium",
+      "model_id": "llama3.1:8b",
+      "note": "MARGINAL: uneven between samples and longer drafts were better. Order of preference was qwen2.5:7b, then the 3B, then the 8B.",
+      "profile": "essay_section",
+      "provenance": "jason_read",
+      "sample_count": 4,
+      "subject": "local",
+      "task_type": "creative_writing"
+    },
+    {
+      "attained_bar": "basic",
+      "measured_at": "2026-11-13",
+      "model_class": "medium",
+      "model_id": "llama3.1:8b",
+      "note": "Acceptable.",
+      "profile": "personal_note",
+      "provenance": "jason_read",
+      "sample_count": 4,
+      "subject": "local",
+      "task_type": "creative_writing"
+    },
+    {
+      "attained_bar": "basic",
+      "measured_at": "2026-11-13",
+      "model_class": "medium",
+      "model_id": "llama3.1:8b",
+      "note": "Acceptable.",
+      "profile": "rma_letter",
+      "provenance": "jason_read",
+      "sample_count": 4,
+      "subject": "local",
+      "task_type": "creative_writing"
+    },
+    {
+      "attained_bar": "basic",
+      "measured_at": "2026-11-13",
+      "model_class": "small",
+      "model_id": "llama3.2:3b",
+      "note": "Acceptable.",
+      "profile": "complaint_email",
+      "provenance": "jason_read",
+      "sample_count": 4,
+      "subject": "local",
+      "task_type": "creative_writing"
+    },
+    {
+      "attained_bar": "basic",
+      "measured_at": "2026-11-13",
+      "model_class": "small",
+      "model_id": "llama3.2:3b",
+      "note": "MARGINAL: poor but acceptable. Expected to change once the voice parameters are tuned.",
+      "profile": "cover_letter",
+      "provenance": "jason_read",
+      "sample_count": 4,
+      "subject": "local",
+      "task_type": "creative_writing"
+    },
+    {
+      "attained_bar": "basic",
+      "measured_at": "2026-11-13",
+      "model_class": "small",
+      "model_id": "llama3.2:3b",
+      "note": "MARGINAL: uneven between samples and longer drafts were better. Order of preference was qwen2.5:7b, then the 3B, then the 8B.",
+      "profile": "essay_section",
+      "provenance": "jason_read",
+      "sample_count": 4,
+      "subject": "local",
+      "task_type": "creative_writing"
+    },
+    {
+      "attained_bar": "basic",
+      "measured_at": "2026-11-13",
+      "model_class": "small",
+      "model_id": "llama3.2:3b",
+      "note": "Acceptable.",
+      "profile": "personal_note",
+      "provenance": "jason_read",
+      "sample_count": 4,
+      "subject": "local",
+      "task_type": "creative_writing"
+    },
+    {
+      "attained_bar": "basic",
+      "measured_at": "2026-11-13",
+      "model_class": "small",
+      "model_id": "llama3.2:3b",
+      "note": "Acceptable. Slightly preferred over the 8B for this type.",
+      "profile": "rma_letter",
+      "provenance": "jason_read",
+      "sample_count": 4,
+      "subject": "local",
+      "task_type": "creative_writing"
+    },
+    {
+      "attained_bar": "basic",
+      "measured_at": "2026-11-13",
+      "model_class": "medium",
+      "model_id": "qwen2.5:7b",
+      "note": "MARGINAL: uneven between samples and longer drafts were better. Order of preference was qwen2.5:7b, then the 3B, then the 8B.",
+      "profile": "essay_section",
+      "provenance": "jason_read",
+      "sample_count": 4,
+      "subject": "local",
+      "task_type": "creative_writing"
+    },
+    {
+      "attained_bar": "basic",
+      "measured_at": "2026-11-13",
+      "model_class": "medium",
+      "model_id": "qwen2.5:7b",
+      "note": "Acceptable.",
+      "profile": "personal_note",
+      "provenance": "jason_read",
+      "sample_count": 4,
+      "subject": "local",
+      "task_type": "creative_writing"
+    }
+  ],
   "catalog_version": 2026101100,
   "format": 1,
   "models": [
@@ -455,4 +601,3 @@
     }
   ]
 }
-

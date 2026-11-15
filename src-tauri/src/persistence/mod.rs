@@ -24,6 +24,7 @@ pub mod integration_keys_store;
 pub mod legacy_shape;
 pub mod message_store;
 pub mod migrations;
+pub mod model_capability_store;
 pub mod output_store;
 pub mod owned_entity_store;
 pub mod pass_artifact_store;

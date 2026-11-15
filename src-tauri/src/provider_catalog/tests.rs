@@ -223,7 +223,14 @@ async fn run(pool: &SqlitePool, d: &CatalogDoc) -> Result<Outcome, Reject> {
 /// comparisons.
 async fn dump(pool: &SqlitePool) -> String {
     let mut out = String::new();
-    for (table, id_col) in [("providers", "id"), ("provider_models", "id")] {
+    for (table, id_col) in [
+        ("providers", "id"),
+        ("provider_models", "id"),
+        (
+            "model_capabilities",
+            "subject_kind, provider_id, model_id, task_type, profile",
+        ),
+    ] {
         let cols: Vec<String> = sqlx::query(&format!("PRAGMA table_info({table})"))
             .fetch_all(pool)
             .await
@@ -1479,7 +1486,14 @@ async fn the_baseline_catalog_agrees_with_the_migrated_database() {
     with_db(|pool| async move {
         let d = parse_catalog(BASELINE_CATALOG_JSON.as_bytes()).unwrap();
         let before = dump(&pool).await;
-        let out = run(&pool, &d).await.expect("baseline applies");
+        // A date after the newest cell: the other tests use the fixed 2026-10-20,
+        // before the first calibration read (2026-11-13). The baseline version
+        // itself is unchanged (nothing has ever been signed and published).
+        let mut tx = pool.begin().await.unwrap();
+        let out = apply_catalog(&mut tx, &d, NaiveDate::from_ymd_opt(2026, 11, 20).unwrap())
+            .await
+            .expect("baseline applies");
+        tx.commit().await.unwrap();
         assert!(out.skipped.is_empty(), "{:?}", out.skipped);
         assert!(
             out.is_noop(),
@@ -1648,17 +1662,397 @@ async fn dump_baseline_catalog() {
                 models.push(Value::Object(o));
             }
         }
+        let mut capabilities = Vec::new();
+        for r in sqlx::query(
+            "SELECT subject_kind, provider_id, model_id, task_type, profile, attained_bar,
+                    model_class, sample_count, measured_at, provenance, note
+               FROM model_capabilities
+              ORDER BY subject_kind, provider_id, model_id, task_type, profile",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        {
+            let mut o = serde_json::Map::new();
+            o.insert("subject".into(), json!(r.get::<String, _>("subject_kind")));
+            let provider: String = r.get("provider_id");
+            if !provider.is_empty() {
+                o.insert("provider_id".into(), json!(provider));
+            }
+            o.insert("model_id".into(), json!(r.get::<String, _>("model_id")));
+            o.insert("task_type".into(), json!(r.get::<String, _>("task_type")));
+            let profile: String = r.get("profile");
+            if !profile.is_empty() {
+                o.insert("profile".into(), json!(profile));
+            }
+            o.insert(
+                "attained_bar".into(),
+                json!(r.get::<String, _>("attained_bar")),
+            );
+            o.insert(
+                "model_class".into(),
+                json!(r.get::<String, _>("model_class")),
+            );
+            o.insert(
+                "sample_count".into(),
+                json!(r.get::<i64, _>("sample_count")),
+            );
+            o.insert(
+                "measured_at".into(),
+                json!(r.get::<String, _>("measured_at")),
+            );
+            o.insert("provenance".into(), json!(r.get::<String, _>("provenance")));
+            if let Some(n) = r.get::<Option<String>, _>("note") {
+                o.insert("note".into(), json!(n));
+            }
+            capabilities.push(Value::Object(o));
+        }
         let catalog = json!({
             "format": 1,
             "catalog_version": baseline_version(),
             "providers": providers,
-            "models": models
+            "models": models,
+            "capabilities": capabilities
         });
         println!("-----BEGIN BASELINE-----");
         println!("{}", serde_json::to_string_pretty(&catalog).unwrap());
         println!("-----END BASELINE-----");
     })
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// Capabilities (items.id=896)
+// ---------------------------------------------------------------------------
+
+fn cell(extra: Value) -> Value {
+    let mut base = json!({
+        "subject": "local", "model_id": "qwen2.5:7b", "task_type": "creative_writing",
+        "profile": "rma_letter", "attained_bar": "basic", "model_class": "medium",
+        "sample_count": 4, "measured_at": "2026-10-15", "provenance": "jason_read"});
+    for (k, v) in extra.as_object().unwrap() {
+        base[k] = v.clone();
+    }
+    base
+}
+
+async fn capability_rows(pool: &SqlitePool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM model_capabilities")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn cell_bar(pool: &SqlitePool, model: &str, profile: &str) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT attained_bar FROM model_capabilities WHERE model_id = ? AND profile = ?",
+    )
+    .bind(model)
+    .bind(profile)
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+}
+
+#[test]
+fn a_capability_cell_cannot_carry_anything_the_table_does_not_hold() {
+    let ok = json!({"format":1,"catalog_version":2026111501u64,"capabilities":[cell(json!({}))]});
+    assert!(parse_catalog(ok.to_string().as_bytes()).is_ok());
+    for (field, value) in [
+        ("price", json!("1")),
+        ("base_url_template", json!("x")),
+        ("score", json!(0.9)),
+        ("retains_data", json!(false)),
+    ] {
+        let v = json!({"format":1,"catalog_version":2026111501u64,
+                       "capabilities":[cell(json!({ field: value }))]});
+        assert!(
+            parse_catalog(v.to_string().as_bytes()).is_err(),
+            "capability field {field} must be rejected by the parser"
+        );
+    }
+    for (field, value) in [
+        ("attained_bar", json!("excellent")),
+        ("task_type", json!("poetry")),
+        ("model_class", json!("huge")),
+        ("provenance", json!("vibes")),
+        ("subject", json!("cloud")),
+    ] {
+        let v = json!({"format":1,"catalog_version":2026111501u64,
+                       "capabilities":[cell(json!({ field: value }))]});
+        assert!(
+            parse_catalog(v.to_string().as_bytes()).is_err(),
+            "capability {field} outside its closed vocabulary must not parse"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_capability_cell_is_inserted_replaced_and_left_alone_when_identical() {
+    with_db(|pool| async move {
+        let seeded = capability_rows(&pool).await;
+        assert_eq!(cell_bar(&pool, "qwen2.5:7b", "rma_letter").await, None);
+
+        let d = doc(json!({"capabilities":[cell(json!({}))]}));
+        let out = run(&pool, &d).await.unwrap();
+        assert_eq!(out.changes.len(), 1);
+        assert_eq!(out.changes[0].field, "capability");
+        assert_eq!(out.changes[0].provider_id, "local");
+        assert_eq!(capability_rows(&pool).await, seeded + 1);
+        assert_eq!(
+            cell_bar(&pool, "qwen2.5:7b", "rma_letter").await.as_deref(),
+            Some("basic")
+        );
+
+        // The same cell again is a no-op.
+        assert!(run(&pool, &d).await.unwrap().is_noop());
+
+        // A later measurement replaces it, field for field.
+        let d2 = doc(json!({"capabilities":[cell(json!({
+            "attained_bar": "standard", "measured_at": "2026-10-16", "sample_count": 12,
+            "note": "Re-measured."}))]}));
+        let out = run(&pool, &d2).await.unwrap();
+        assert_eq!(out.changes.len(), 1);
+        assert_eq!(
+            cell_bar(&pool, "qwen2.5:7b", "rma_letter").await.as_deref(),
+            Some("standard")
+        );
+        assert_eq!(capability_rows(&pool).await, seeded + 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_catalog_never_moves_a_cell_back_to_an_older_measurement() {
+    with_db(|pool| async move {
+        // The seeded cell is dated 2026-11-13: a catalog dated earlier skips it.
+        let before = dump(&pool).await;
+        let d = doc(json!({"capabilities":[cell(json!({
+            "model_id": "llama3.1:8b", "profile": "personal_note",
+            "attained_bar": "high", "measured_at": "2026-10-15"}))]}));
+        let out = run(&pool, &d).await.unwrap();
+        assert!(out.is_noop());
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.skipped[0].code, codes::SKIP_CAPABILITY_OLDER);
+        assert_eq!(dump(&pool).await, before);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn rolling_back_removes_a_new_cell_and_restores_a_replaced_one() {
+    with_db(|pool| async move {
+        let before = dump(&pool).await;
+        // Create, then replace, in separate applies, so both before-images exist.
+        // Each catalog is newer than the last: a rollback declines its version.
+        let created = apply_recorded(&pool, &doc(json!({"capabilities":[cell(json!({}))]}))).await;
+        assert_eq!(created.undo.capabilities.len(), 1);
+        assert!(created.undo.capabilities[0].before.is_none());
+        assert_ne!(dump(&pool).await, before);
+        rollback_latest(&pool, now()).await.unwrap();
+        assert_eq!(dump(&pool).await, before, "the created cell is gone");
+
+        apply_recorded(
+            &pool,
+            &doc(json!({"catalog_version": 2026101502u64,
+                        "capabilities":[cell(json!({}))]})),
+        )
+        .await;
+        let mid = dump(&pool).await;
+        let replaced = apply_recorded(
+            &pool,
+            &doc(
+                json!({"catalog_version": 2026101503u64, "capabilities":[cell(json!({
+                "attained_bar": "high", "measured_at": "2026-10-16"}))]}),
+            ),
+        )
+        .await;
+        assert!(replaced.undo.capabilities[0].before.is_some());
+        rollback_latest(&pool, now()).await.unwrap();
+        assert_eq!(dump(&pool).await, mid, "the replaced cell is as it was");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_undo_image_stored_before_capabilities_existed_still_reads() {
+    let old = r#"{"providers":{},"models":{},"added_models":[]}"#;
+    let undo: Undo = serde_json::from_str(old).expect("an old image parses");
+    assert!(undo.capabilities.is_empty());
+}
+
+#[tokio::test]
+async fn a_bad_capability_cell_is_refused_and_writes_nothing() {
+    with_db(|pool| async move {
+        seed(&pool).await;
+        let cases: Vec<(Value, &str)> = vec![
+            // a model the release does not curate, local and hosted
+            (
+                cell(json!({"model_id": "no-such:1b"})),
+                codes::REJECT_UNKNOWN_MODEL,
+            ),
+            (
+                cell(json!({"subject": "hosted", "provider_id": HOST_A,
+                            "model_id": "no-such-model"})),
+                codes::REJECT_UNKNOWN_MODEL,
+            ),
+            // a hosted cell on a provider that is not hosted, and on none
+            (
+                cell(json!({"subject": "hosted", "provider_id": LOCAL, "model_id": "m"})),
+                codes::REJECT_NOT_HOSTED_PROVIDER,
+            ),
+            (
+                cell(
+                    json!({"subject": "hosted", "provider_id": "no-such-provider",
+                            "model_id": "m"}),
+                ),
+                codes::REJECT_UNKNOWN_PROVIDER,
+            ),
+            // provider and subject disagree
+            (
+                cell(json!({"provider_id": HOST_A})),
+                codes::REJECT_BAD_VALUE,
+            ),
+            (
+                cell(json!({"subject": "hosted", "model_id": "model-1"})),
+                codes::REJECT_BAD_VALUE,
+            ),
+            // a profile that is not a shipped document type, and an empty one
+            (cell(json!({"profile": "haiku"})), codes::REJECT_BAD_VALUE),
+            (cell(json!({"profile": ""})), codes::REJECT_BAD_VALUE),
+            // provenance that cannot come from that subject
+            (
+                cell(json!({"provenance": "harness_hosted"})),
+                codes::REJECT_BAD_VALUE,
+            ),
+            // a future date, a silly sample count, an over-long note
+            (
+                cell(json!({"measured_at": "2027-01-01"})),
+                codes::REJECT_BAD_VALUE,
+            ),
+            (
+                cell(json!({"measured_at": "yesterday"})),
+                codes::REJECT_BAD_VALUE,
+            ),
+            (
+                cell(json!({"sample_count": 4_000_000_000u64 / 100})),
+                codes::REJECT_BAD_VALUE,
+            ),
+            (
+                cell(json!({"note": "x".repeat(501)})),
+                codes::REJECT_BAD_VALUE,
+            ),
+            (
+                cell(json!({"note": "bad\u{0007}text"})),
+                codes::REJECT_BAD_VALUE,
+            ),
+        ];
+        let snapshot = dump(&pool).await;
+        for (c, code) in cases {
+            let d = doc(json!({"capabilities":[c.clone()]}));
+            assert_eq!(run(&pool, &d).await.unwrap_err().code, code, "{c}");
+            assert_eq!(
+                dump(&pool).await,
+                snapshot,
+                "a refused catalog writes nothing: {c}"
+            );
+        }
+        // A cell listed twice, and one model given two classes.
+        let d = doc(json!({"capabilities":[cell(json!({})), cell(json!({}))]}));
+        assert_eq!(
+            run(&pool, &d).await.unwrap_err().code,
+            codes::REJECT_DUPLICATE_ENTRY
+        );
+        let d = doc(json!({"capabilities":[
+            cell(json!({})),
+            cell(json!({"profile": "cover_letter", "model_class": "large"}))]}));
+        assert_eq!(
+            run(&pool, &d).await.unwrap_err().code,
+            codes::REJECT_BAD_VALUE
+        );
+        assert_eq!(dump(&pool).await, snapshot);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_hosted_capability_cell_moves_no_consent_attribute() {
+    with_db(|pool| async move {
+        seed(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let before = consent_snapshot(&mut conn, HOST_A).await.unwrap();
+        drop(conn);
+        let d = doc(json!({"capabilities":[cell(json!({
+            "subject": "hosted", "provider_id": HOST_A, "model_id": "model-1",
+            "provenance": "harness_hosted", "attained_bar": "high"}))]}));
+        let out = run(&pool, &d).await.unwrap();
+        assert_eq!(out.changes.len(), 1);
+        assert_eq!(out.changes[0].provider_id, HOST_A);
+        assert!(
+            out.consent_effects.is_empty(),
+            "a score is not a disclosed attribute: {:?}",
+            out.consent_effects
+        );
+        let mut conn = pool.acquire().await.unwrap();
+        let after = consent_snapshot(&mut conn, HOST_A).await.unwrap();
+        assert_eq!(before.hash, after.hash);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn applying_capabilities_changes_no_release_only_column() {
+    with_db(|pool| async move {
+        seed(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let before = release_fingerprint(&mut conn).await.unwrap();
+        drop(conn);
+        let d = doc(json!({"capabilities":[cell(json!({}))]}));
+        run(&pool, &d).await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let after = release_fingerprint(&mut conn).await.unwrap();
+        assert_eq!(before, after);
+    })
+    .await;
+}
+
+#[test]
+fn a_catalog_with_capabilities_must_say_the_app_needs_the_table() {
+    let body = json!({"format":1,"catalog_version":2026111501u64,
+                      "capabilities":[cell(json!({}))]})
+    .to_string();
+    let manifest = |min: u32| Manifest {
+        format: 1,
+        catalog_version: 2026111501,
+        min_shared_schema: min,
+        asset_name: CATALOG_ASSET_NAME.to_owned(),
+        size: body.len() as u64,
+        sha256: "0".repeat(64),
+    };
+    assert_eq!(
+        parse_body(&manifest(44), body.as_bytes()).unwrap_err().code,
+        codes::ERROR_CATALOG_INVALID
+    );
+    assert!(parse_body(&manifest(CAPABILITIES_MIN_SCHEMA), body.as_bytes()).is_ok());
+    // A catalog without the section is unaffected.
+    let plain = json!({"format":1,"catalog_version":2026111501u64}).to_string();
+    assert!(parse_body(&manifest(1), plain.as_bytes()).is_ok());
+}
+
+#[test]
+fn the_baseline_carries_the_seeded_capability_cells() {
+    let d = parse_catalog(BASELINE_CATALOG_JSON.as_bytes()).unwrap();
+    assert_eq!(d.capabilities.len(), 12);
+    assert!(d
+        .capabilities
+        .iter()
+        .all(|c| c.subject == crate::conductor::model_capability::CapabilitySubject::Local));
+    // Not rated by Jason: stays unmeasured.
+    assert!(!d.capabilities.iter().any(|c| c.model_id == "qwen2.5:7b"
+        && matches!(
+            c.profile.as_deref(),
+            Some("rma_letter" | "complaint_email" | "cover_letter")
+        )));
 }
 
 // ---------------------------------------------------------------------------
@@ -1672,7 +2066,7 @@ fn the_code_set_is_pinned_unique_and_prefixed() {
         assert!(c.starts_with("catalog."), "{c}");
         assert!(seen.insert(*c), "duplicate code {c}");
     }
-    assert_eq!(codes::ALL.len(), 36);
+    assert_eq!(codes::ALL.len(), 37);
 }
 
 // ---------------------------------------------------------------------------

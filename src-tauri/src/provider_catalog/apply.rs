@@ -47,12 +47,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sqlx::{Row, SqliteConnection};
 
+use crate::conductor::model_block::document_type::registry as document_type_registry;
+use crate::conductor::model_capability::{class_str, CapabilitySubject, Provenance};
 use crate::persistence::provider_store::{
     self, ModelStatus, Provider, ProviderModel, ProviderStoreError,
 };
 use crate::provider_catalog::codes;
 use crate::provider_catalog::format::{
-    CatalogDoc, ModelUpdate, NewModel, PriceDoc, ProviderUpdate, StatusDoc,
+    CapabilityDoc, CatalogDoc, ModelUpdate, NewModel, PriceDoc, ProviderUpdate, StatusDoc,
 };
 use crate::spend::disclosure::{attributes_hash, cost_class_of, CostClass};
 use crate::spend::money::parse_decimal_micros;
@@ -75,6 +77,8 @@ const MIN_OUTPUT_OVERHEAD: f64 = 1.0;
 const MAX_OUTPUT_OVERHEAD: f64 = 8.0;
 /// A date in a catalog may be at most this many days after today.
 pub const MAX_FUTURE_DAYS: i64 = 2;
+const MAX_CAPABILITY_SAMPLES: u32 = 100_000;
+const MAX_CAPABILITY_NOTE_CHARS: usize = 500;
 
 // ---------------------------------------------------------------------------
 // Governed columns (the only ones a catalog may write)
@@ -187,12 +191,28 @@ pub struct AddedModel {
     pub provider_id: String,
 }
 
+/// The before-image of one capability cell (items.id=896).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CapabilityUndo {
+    pub subject: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub task_type: String,
+    pub profile: String,
+    /// The cell's columns before the apply. None = the cell did not exist, so a
+    /// rollback deletes it.
+    pub before: Option<Map<String, Value>>,
+}
+
 /// Before-images of what an apply touched. Rolling back restores them.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Undo {
     pub providers: BTreeMap<String, Map<String, Value>>,
     pub models: BTreeMap<String, ModelImage>,
     pub added_models: Vec<AddedModel>,
+    /// Absent in an undo image stored before items.id=896.
+    #[serde(default)]
+    pub capabilities: Vec<CapabilityUndo>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -684,12 +704,24 @@ pub async fn apply_catalog(
         }
     }
 
+    check_capability_shapes(&doc.capabilities, today)?;
+
     let mut ctx = Ctx {
         today,
         out: Outcome::default(),
         touched_providers: BTreeSet::new(),
         touched_models: BTreeSet::new(),
     };
+    // A hosted capability cell names a provider: it is checked like any touched
+    // provider, and its consent snapshot must not move (a score is not a
+    // disclosed attribute).
+    for c in &doc.capabilities {
+        if c.subject == CapabilitySubject::Hosted {
+            if let Some(p) = &c.provider_id {
+                ctx.touched_providers.insert(p.clone());
+            }
+        }
+    }
     for p in &doc.providers {
         ctx.touched_providers.insert(p.id.clone());
     }
@@ -721,6 +753,7 @@ pub async fn apply_catalog(
     for n in &doc.new_models {
         add_model(conn, &mut ctx, n).await?;
     }
+    apply_capabilities(conn, &mut ctx, &doc.capabilities).await?;
 
     // -- invariants ---------------------------------------------------------
     // Named first so the failure says what it is, then the general fingerprint.
@@ -1341,6 +1374,273 @@ async fn add_model(conn: &mut SqliteConnection, ctx: &mut Ctx, n: &NewModel) -> 
 }
 
 // ---------------------------------------------------------------------------
+// Capabilities (items.id=896)
+// ---------------------------------------------------------------------------
+
+/// The key of a cell as five strings: subject, provider (empty for local), model,
+/// task type, profile (empty for the task-type-wide cell).
+fn capability_key(c: &CapabilityDoc) -> (String, String, String, String, String) {
+    (
+        c.subject.as_str().to_owned(),
+        c.provider_id.clone().unwrap_or_default(),
+        c.model_id.clone(),
+        c.task_type.as_str().to_owned(),
+        c.profile.clone().unwrap_or_default(),
+    )
+}
+
+/// Everything that needs no database: shape, vocabulary, dates, sizes, and that no
+/// cell is listed twice. Runs before anything is written.
+fn check_capability_shapes(docs: &[CapabilityDoc], today: NaiveDate) -> Result<(), Reject> {
+    if docs.is_empty() {
+        return Ok(());
+    }
+    let reg = document_type_registry().map_err(|_| Reject {
+        code: codes::REJECT_BAD_VALUE,
+        detail: "capability.registry".to_owned(),
+    })?;
+    let mut seen = BTreeSet::new();
+    for c in docs {
+        let bad = |d: &str| reject(codes::REJECT_BAD_VALUE, format!("capability.{d}"));
+        if !seen.insert(capability_key(c)) {
+            return reject(
+                codes::REJECT_DUPLICATE_ENTRY,
+                format!("capability:{}", c.model_id),
+            );
+        }
+        if !model_id_ok(&c.model_id) {
+            return bad("model_id");
+        }
+        match (c.subject, c.provider_id.as_deref()) {
+            (CapabilitySubject::Local, None) => {}
+            (CapabilitySubject::Hosted, Some(p)) if !p.is_empty() => {}
+            _ => return bad("provider_id"),
+        }
+        match (c.subject, c.provenance) {
+            (CapabilitySubject::Local, Provenance::HarnessHosted)
+            | (CapabilitySubject::Hosted, Provenance::HarnessLocal) => return bad("provenance"),
+            _ => {}
+        }
+        if let Some(profile) = &c.profile {
+            // A profile is the id of a SHIPPED document type. The registry holds
+            // shipped types only (a custom type names one as its base).
+            if profile.is_empty() || reg.document_type(profile).is_none() {
+                return bad("profile");
+            }
+        }
+        if !date_ok(&c.measured_at, today) {
+            return bad("measured_at");
+        }
+        if c.sample_count > MAX_CAPABILITY_SAMPLES {
+            return bad("sample_count");
+        }
+        if let Some(n) = &c.note {
+            if !text_ok(n, MAX_CAPABILITY_NOTE_CHARS) {
+                return bad("note");
+            }
+        }
+    }
+    Ok(())
+}
+
+const CAPABILITY_COLUMNS: &[&str] = &[
+    "attained_bar",
+    "model_class",
+    "sample_count",
+    "measured_at",
+    "provenance",
+    "note",
+];
+
+async fn capability_before(
+    conn: &mut SqliteConnection,
+    k: &(String, String, String, String, String),
+) -> Result<Option<Map<String, Value>>, Reject> {
+    let row = sqlx::query(
+        "SELECT attained_bar, model_class, sample_count, measured_at, provenance, note
+           FROM model_capabilities
+          WHERE subject_kind = ? AND provider_id = ? AND model_id = ?
+            AND task_type = ? AND profile = ?",
+    )
+    .bind(&k.0)
+    .bind(&k.1)
+    .bind(&k.2)
+    .bind(&k.3)
+    .bind(&k.4)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    let mut m = Map::new();
+    m.insert(
+        "attained_bar".into(),
+        json!(row.try_get::<String, _>("attained_bar")?),
+    );
+    m.insert(
+        "model_class".into(),
+        json!(row.try_get::<String, _>("model_class")?),
+    );
+    m.insert(
+        "sample_count".into(),
+        json!(row.try_get::<i64, _>("sample_count")?),
+    );
+    m.insert(
+        "measured_at".into(),
+        json!(row.try_get::<String, _>("measured_at")?),
+    );
+    m.insert(
+        "provenance".into(),
+        json!(row.try_get::<String, _>("provenance")?),
+    );
+    m.insert(
+        "note".into(),
+        json!(row.try_get::<Option<String>, _>("note")?),
+    );
+    Ok(Some(m))
+}
+
+async fn write_capability(
+    conn: &mut SqliteConnection,
+    k: &(String, String, String, String, String),
+    cols: &Map<String, Value>,
+) -> Result<(), Reject> {
+    let text = |name: &str| {
+        cols.get(name)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    };
+    sqlx::query(
+        "INSERT INTO model_capabilities
+            (subject_kind, provider_id, model_id, task_type, profile, attained_bar,
+             model_class, sample_count, measured_at, provenance, note)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (subject_kind, provider_id, model_id, task_type, profile)
+         DO UPDATE SET attained_bar = excluded.attained_bar,
+                       model_class = excluded.model_class,
+                       sample_count = excluded.sample_count,
+                       measured_at = excluded.measured_at,
+                       provenance = excluded.provenance,
+                       note = excluded.note",
+    )
+    .bind(&k.0)
+    .bind(&k.1)
+    .bind(&k.2)
+    .bind(&k.3)
+    .bind(&k.4)
+    .bind(text("attained_bar"))
+    .bind(text("model_class"))
+    .bind(
+        cols.get("sample_count")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+    )
+    .bind(text("measured_at"))
+    .bind(text("provenance"))
+    .bind(cols.get("note").and_then(Value::as_str).map(str::to_owned))
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Upsert every measured cell. A cell measured earlier than the stored one is
+/// skipped (a catalog never moves a score back to an older measurement), an
+/// identical cell changes nothing, and the before-image of every changed cell goes
+/// into the undo.
+async fn apply_capabilities(
+    conn: &mut SqliteConnection,
+    ctx: &mut Ctx,
+    docs: &[CapabilityDoc],
+) -> Result<(), Reject> {
+    let mut models: BTreeSet<(String, String, String)> = BTreeSet::new();
+    for c in docs {
+        let k = capability_key(c);
+        let who = c.provider_id.as_deref().unwrap_or("local");
+
+        // The model must be one the release curates: a local tag of a providers
+        // row, or a hosted provider's own model row.
+        let exists =
+            match c.subject {
+                CapabilitySubject::Local => {
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM providers WHERE is_local = 1 AND local_model_tag = ?",
+                    )
+                    .bind(&c.model_id)
+                    .fetch_one(&mut *conn)
+                    .await?
+                }
+                CapabilitySubject::Hosted => sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM provider_models WHERE provider_id = ? AND model_id = ?",
+                )
+                .bind(&k.1)
+                .bind(&c.model_id)
+                .fetch_one(&mut *conn)
+                .await?,
+            };
+        if exists == 0 {
+            return reject(codes::REJECT_UNKNOWN_MODEL, format!("{who}:{}", c.model_id));
+        }
+
+        let before = capability_before(conn, &k).await?;
+        let mut new = Map::new();
+        new.insert("attained_bar".into(), json!(c.attained_bar.as_str()));
+        new.insert("model_class".into(), json!(class_str(c.model_class)));
+        new.insert("sample_count".into(), json!(c.sample_count));
+        new.insert("measured_at".into(), json!(c.measured_at));
+        new.insert("provenance".into(), json!(c.provenance.as_str()));
+        new.insert("note".into(), json!(c.note));
+        models.insert((k.0.clone(), k.1.clone(), k.2.clone()));
+
+        if let Some(b) = &before {
+            let stored_at = b.get("measured_at").and_then(Value::as_str).unwrap_or("");
+            // ISO dates compare as text. A stored value that is not a date counts
+            // as older than any real one.
+            if parse_date(stored_at).is_some() && stored_at > c.measured_at.as_str() {
+                ctx.skip(
+                    codes::SKIP_CAPABILITY_OLDER,
+                    who,
+                    Some(&c.model_id),
+                    "capability",
+                );
+                continue;
+            }
+            if CAPABILITY_COLUMNS
+                .iter()
+                .all(|col| b.get(*col) == new.get(*col))
+            {
+                continue;
+            }
+        }
+        write_capability(conn, &k, &new).await?;
+        ctx.out.undo.capabilities.push(CapabilityUndo {
+            subject: k.0.clone(),
+            provider_id: k.1.clone(),
+            model_id: k.2.clone(),
+            task_type: k.3.clone(),
+            profile: k.4.clone(),
+            before,
+        });
+        ctx.change(who, Some(&c.model_id), "capability");
+    }
+
+    // One class per model: a model is small, medium or large on every row.
+    for (subject, provider, model) in &models {
+        let classes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT model_class) FROM model_capabilities
+              WHERE subject_kind = ? AND provider_id = ? AND model_id = ?",
+        )
+        .bind(subject)
+        .bind(provider)
+        .bind(model)
+        .fetch_one(&mut *conn)
+        .await?;
+        if classes > 1 {
+            return reject(codes::REJECT_BAD_VALUE, "capability.model_class");
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Rollback
 // ---------------------------------------------------------------------------
 
@@ -1352,6 +1652,12 @@ pub async fn rollback(conn: &mut SqliteConnection, undo: &Undo) -> Result<Outcom
     providers.extend(undo.providers.keys().cloned());
     providers.extend(undo.models.values().map(|m| m.provider_id.clone()));
     providers.extend(undo.added_models.iter().map(|a| a.provider_id.clone()));
+    providers.extend(
+        undo.capabilities
+            .iter()
+            .filter(|c| !c.provider_id.is_empty())
+            .map(|c| c.provider_id.clone()),
+    );
     let touched: Vec<String> = providers.into_iter().collect();
 
     let fp_before = release_fingerprint(conn).await?;
@@ -1367,6 +1673,34 @@ pub async fn rollback(conn: &mut SqliteConnection, undo: &Undo) -> Result<Outcom
             .bind(&a.id)
             .execute(&mut *conn)
             .await?;
+    }
+    // Capability cells: restore the before-image, or delete a cell the apply
+    // created. Newest first, so a cell touched twice ends as it began.
+    for c in undo.capabilities.iter().rev() {
+        let k = (
+            c.subject.clone(),
+            c.provider_id.clone(),
+            c.model_id.clone(),
+            c.task_type.clone(),
+            c.profile.clone(),
+        );
+        match &c.before {
+            Some(cols) => write_capability(conn, &k, cols).await?,
+            None => {
+                sqlx::query(
+                    "DELETE FROM model_capabilities
+                      WHERE subject_kind = ? AND provider_id = ? AND model_id = ?
+                        AND task_type = ? AND profile = ?",
+                )
+                .bind(&k.0)
+                .bind(&k.1)
+                .bind(&k.2)
+                .bind(&k.3)
+                .bind(&k.4)
+                .execute(&mut *conn)
+                .await?;
+            }
+        }
     }
     for (id, image) in &undo.providers {
         update_row(
@@ -1443,6 +1777,21 @@ pub async fn rollback(conn: &mut SqliteConnection, undo: &Undo) -> Result<Outcom
             provider_id: a.provider_id.clone(),
             model_id: Some(a.id.clone()),
             field: "removed",
+        });
+    }
+    for c in &undo.capabilities {
+        out.changes.push(Change {
+            provider_id: if c.provider_id.is_empty() {
+                "local".to_owned()
+            } else {
+                c.provider_id.clone()
+            },
+            model_id: Some(c.model_id.clone()),
+            field: if c.before.is_some() {
+                "restored"
+            } else {
+                "removed"
+            },
         });
     }
     Ok(out)

@@ -27,8 +27,8 @@ use crate::provider_catalog::apply::{
 };
 use crate::provider_catalog::codes;
 use crate::provider_catalog::format::{
-    parse_catalog, parse_manifest, CatalogDoc, Manifest, CATALOG_ASSET_NAME, FORMAT_VERSION,
-    MAX_CATALOG_BYTES, MAX_MANIFEST_BYTES, MAX_SIGNATURE_BYTES,
+    parse_catalog, parse_manifest, CatalogDoc, Manifest, CAPABILITIES_MIN_SCHEMA,
+    CATALOG_ASSET_NAME, FORMAT_VERSION, MAX_CATALOG_BYTES, MAX_MANIFEST_BYTES, MAX_SIGNATURE_BYTES,
 };
 use crate::provider_catalog::verify::{verify_manifest, VerifyError};
 use crate::provider_catalog::{baseline_version, version_date};
@@ -151,13 +151,17 @@ fn verified_manifest(
     })
 }
 
-fn parse_body(manifest: &Manifest, body: &[u8]) -> Result<CatalogDoc, Failure> {
+pub(crate) fn parse_body(manifest: &Manifest, body: &[u8]) -> Result<CatalogDoc, Failure> {
     let doc = parse_catalog(body).map_err(|_| Failure {
         code: codes::ERROR_CATALOG_INVALID,
         detail: "parse".to_owned(),
     })?;
     if doc.format != FORMAT_VERSION || doc.catalog_version != manifest.catalog_version {
         return fail(codes::ERROR_CATALOG_INVALID, "version");
+    }
+    // A catalog that writes model_capabilities must say the app needs the table.
+    if !doc.capabilities.is_empty() && manifest.min_shared_schema < CAPABILITIES_MIN_SCHEMA {
+        return fail(codes::ERROR_CATALOG_INVALID, "capabilities_schema");
     }
     Ok(doc)
 }
