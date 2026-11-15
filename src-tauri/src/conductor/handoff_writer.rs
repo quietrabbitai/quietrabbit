@@ -187,16 +187,16 @@ mod tests {
 
     #[test]
     fn debug_never_carries_the_turn_or_the_key() {
-        let secret = "the-secret-pasted-reply";
-        let turn = CurrentTurn::new(secret.to_owned());
-        assert!(!format!("{turn:?}").contains(secret));
+        let marker = "the-secret-pasted-reply";
+        let turn = CurrentTurn::new(marker.to_owned());
+        assert!(!format!("{turn:?}").contains(marker));
         assert!(format!("{turn:?}").contains("redacted"));
         let lent = turn.lend();
-        assert!(!format!("{lent:?}").contains(secret));
+        assert!(!format!("{lent:?}").contains(marker));
         let key = SecretHex::new("00112233445566778899aabbccddeeff");
         assert!(!format!("{key:?}").contains("0011"));
         let opt = Some(lent);
-        assert!(!format!("{opt:?}").contains(secret));
+        assert!(!format!("{opt:?}").contains(marker));
     }
 
     /// The type carries nothing that could serialize, clone or print the text.

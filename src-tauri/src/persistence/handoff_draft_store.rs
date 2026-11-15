@@ -563,10 +563,10 @@ mod tests {
 
     #[test]
     fn debug_and_errors_never_carry_the_text() {
-        let secret = "the-secret-reply-text";
-        let t = DraftText(secret.to_owned());
+        let marker = "the-secret-reply-text";
+        let t = DraftText(marker.to_owned());
         let dbg = format!("{t:?}");
-        assert!(!dbg.contains(secret), "{dbg}");
+        assert!(!dbg.contains(marker), "{dbg}");
         assert!(dbg.contains("redacted"));
         for e in [
             DraftError::Blank,
@@ -577,7 +577,7 @@ mod tests {
             DraftError::NotFound,
             DraftError::Handle(HandleError::NotFound("hand-off reply")),
         ] {
-            assert!(!e.to_string().contains(secret));
+            assert!(!e.to_string().contains(marker));
         }
     }
 
