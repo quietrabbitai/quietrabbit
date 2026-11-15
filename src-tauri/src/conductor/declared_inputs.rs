@@ -646,4 +646,37 @@ mod tests {
         );
         assert!(run(&rows(&["draft_quality_verdict"]), &[]).is_ok());
     }
+
+    /// items.id=891: the two device names are store-backed like the others, so an
+    /// external step may not name or declare either while the invariant holds.
+    /// (The flag stays false in this item: items.id=884 flips it.)
+    #[test]
+    fn an_external_step_cannot_name_or_declare_a_device_name_either() {
+        const { assert!(!STORE_NAMES_EXTERNAL_ALLOWED) };
+        let bound = bound_names();
+        for name in ["subject_context", "device_library_brief"] {
+            assert!(bound.contains(&name), "{name} is a registered bound name");
+            let template = format!("{{{name}}}");
+            let e = run(&[(step("e", EXT, &template, &[name], &[]), None)], bound).unwrap_err();
+            assert!(
+                e.contains("step 'e'")
+                    && e.contains(&format!("'{name}'"))
+                    && e.contains("items.id=884"),
+                "{e}"
+            );
+            // Declared without being named.
+            let e = run(&[(step("e", EXT, "no tokens", &[name], &[]), None)], bound).unwrap_err();
+            assert!(
+                e.contains(&format!("'{name}'")) && e.contains("items.id=884"),
+                "{e}"
+            );
+            // Undeclared in an external template: the bound-name rule fires first.
+            assert!(run(&[(step("e", EXT, &template, &[], &[]), None)], bound).is_err());
+            // A LOCAL step may name it freely.
+            assert!(run(&[(step("a", LOCAL, &template, &[], &[]), Some("v"))], bound).is_ok());
+            // And the name cannot be a row's output variable.
+            let e = run(&[(step("a", LOCAL, "x", &[], &[]), Some(name))], bound).unwrap_err();
+            assert!(e.contains(&format!("output_var '{name}'")), "{e}");
+        }
+    }
 }

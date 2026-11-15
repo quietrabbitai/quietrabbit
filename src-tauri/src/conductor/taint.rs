@@ -320,4 +320,23 @@ mod tests {
         st.apply("intent: {locked_intent}", &mut t);
         assert!(!t.contains_key("locked_intent"));
     }
+
+    /// items.id=891: a step naming either device name is tainted like one naming a
+    /// store name, its variable with it, and so is every step downstream.
+    #[test]
+    fn a_step_naming_a_device_name_is_tainted_with_its_variable_and_downstream() {
+        let names = crate::conductor::bound_spec::NAMES;
+        for name in ["subject_context", "device_library_brief"] {
+            let steps = [
+                step("clean", "hello {user_input}", Some("c")),
+                step("root", &format!("device: {{{name}}}"), Some("v1")),
+                step("down", "from {v1}", Some("v2")),
+                step("after", "{previous_output}", Some("v3")),
+            ];
+            let t = closure(&steps, names);
+            assert_eq!(actions(&t), ["after", "down", "root"], "{name}");
+            assert!(t.vars.contains("v1") && t.vars.contains("v2"), "{name}");
+            assert!(!t.actions.contains("clean"), "{name}");
+        }
+    }
 }

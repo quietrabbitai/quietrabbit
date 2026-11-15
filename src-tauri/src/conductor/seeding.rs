@@ -143,7 +143,34 @@ pub async fn seed_pass(
     let mut conn = crate::persistence::output_store::open_outputs_db(user_id, persona_id, key_hex)
         .await
         .map_err(|e| SeedError::Open(e.to_string()))?;
-    let seeds = read_seeds(&mut conn, context_key, focus_id, &names, Utc::now()).await?;
+    // items.id=891: the two device names read the persona's personal.db as well,
+    // and only a pass that names one opens it. read_seeds below handles every
+    // other name.
+    let (device_names, store_names): (Vec<&'static str>, Vec<&'static str>) = names
+        .iter()
+        .copied()
+        .partition(|n| crate::conductor::device_seeding::is_device_seed(n));
+    let mut seeds = if store_names.is_empty() {
+        HashMap::new()
+    } else {
+        read_seeds(&mut conn, context_key, focus_id, &store_names, Utc::now()).await?
+    };
+    if !device_names.is_empty() {
+        let mut personal =
+            crate::persistence::personal_store::open_personal_db(user_id, persona_id, key_hex)
+                .await
+                .map_err(|e| SeedError::Open(e.to_string()))?;
+        seeds.extend(
+            crate::conductor::device_seeding::read_device_seeds(
+                &mut conn,
+                &mut personal,
+                context_key,
+                focus_id,
+                &device_names,
+            )
+            .await?,
+        );
+    }
     Ok(StoreTokens { seeds, restricted })
 }
 
@@ -304,8 +331,9 @@ async fn read_session(
 // Rendering
 // ---------------------------------------------------------------------------
 
-/// Braces would be read as tokens by render_template().
-fn clean(s: &str) -> String {
+/// Braces would be read as tokens by render_template(). (pub(crate): the device
+/// renderers of conductor::device_seeding clean their values the same way.)
+pub(crate) fn clean(s: &str) -> String {
     s.chars()
         .map(|c| match c {
             '{' => '(',
@@ -319,7 +347,7 @@ fn clean(s: &str) -> String {
 }
 
 /// Cut at DERIVED_TEXT_MAX_BYTES on a character boundary.
-fn cap(mut s: String) -> String {
+pub(crate) fn cap(mut s: String) -> String {
     if s.len() <= DERIVED_TEXT_MAX_BYTES {
         return s;
     }
@@ -548,7 +576,13 @@ mod tests {
     #[tokio::test]
     async fn an_empty_store_gives_absent_session_names_and_present_derived_names() {
         let mut conn = mem_outputs_conn().await;
-        let all: Vec<&'static str> = spec::NAMES.to_vec();
+        // The two device names are read by conductor::device_seeding (they need
+        // the persona's personal.db), so read_seeds is given every other name.
+        let all: Vec<&'static str> = spec::NAMES
+            .iter()
+            .copied()
+            .filter(|n| !crate::conductor::device_seeding::is_device_seed(n))
+            .collect();
         let seeds = read_seeds(&mut conn, Some(CHAT), FOCUS, &all, Utc::now())
             .await
             .unwrap();

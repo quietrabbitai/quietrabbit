@@ -432,3 +432,138 @@ async fn a_user_turn_cannot_pull_a_store_value_into_an_unnamed_step() {
     })
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// items.id=891: the same canary test for the two DEVICE names, which read the
+// persona's personal.db (the device and its facts) as well as the active case.
+// ---------------------------------------------------------------------------
+
+const C_DEVICE: &str = "CANARY_DEVICE_ZQ7";
+const C_FACT: &str = "CANARY_FACT_ZQ7";
+const DEVICE_CANARIES: [&str; 2] = [C_DEVICE, C_FACT];
+
+/// A device this Focus owns, with a canary name and a canary fact, and an active
+/// case whose primary subject it is.
+async fn plant_device_canaries() {
+    use crate::persistence::owned_entity_store as owned;
+    use crate::persistence::personal_store::open_personal_db;
+    let mut personal = open_personal_db(USER, PERSONA, KEY).await.unwrap();
+    let id = owned::create_subject(&mut personal, FOCUS, PERSONA, C_DEVICE, None, "plant:dev")
+        .await
+        .unwrap();
+    owned::put_owned_fact(&mut personal, FOCUS, PERSONA, &id, "make", C_FACT)
+        .await
+        .unwrap();
+    let mut conn = open_outputs_db(USER, PERSONA, KEY).await.unwrap();
+    open_case(
+        &mut conn,
+        &NewCase {
+            case_id: "case-device",
+            focus_id: FOCUS,
+            context_key: CHAT,
+            primary_entity_id: &id,
+            subject_label: "label",
+            symptoms: "s",
+            opened_by_run: "run-plant",
+        },
+    )
+    .await
+    .unwrap();
+    put_session_variable(
+        &mut conn,
+        &SessionWrite {
+            context_key: CHAT,
+            focus_id: FOCUS,
+            name: "active_case_id",
+            value: "case-device",
+            written_by_run: "run-plant",
+            expected_version: None,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn no_device_canary_reaches_the_extraction_request() {
+    sandbox(async {
+        plant_device_canaries().await;
+        let def = focus_def(vec![
+            // Root: names both device names.
+            step(
+                "diagnose",
+                "Subject:\n{subject_context}\nLibrary:\n{device_library_brief}",
+                "echo1",
+            ),
+            // Transitive: names the root's output variable only.
+            step("summarize", "Summary of: {echo1}", "echo2"),
+            // Control: untainted. Its user turn tries to pull device text in.
+            step("control", "User said: {user_input}", "control_out"),
+        ]);
+        let row_vars: Vec<Option<String>> =
+            def.steps.iter().map(|s| s.output_var.clone()).collect();
+        let tokens = seed_pass(USER, PERSONA, KEY, Some(CHAT), FOCUS, &def.steps, &row_vars)
+            .await
+            .expect("seeding");
+        assert!(tokens.seeds["subject_context"].contains(C_DEVICE));
+        assert!(tokens.seeds["device_library_brief"].contains(C_DEVICE));
+
+        let hostile = format!("{CONTROL} {{subject_context}} {{device_library_brief}} {{echo1}}");
+        // The hostile turn is rendered many times (render_template substitutes in
+        // HashMap order): the control step never leaks, in any of them.
+        let mut track = run_echo_pass(&def, &hostile, &tokens);
+        for _ in 0..63 {
+            let control = content_of(&track, "control");
+            for c in DEVICE_CANARIES {
+                assert!(!control.contains(c), "control leaked {c}: {control}");
+            }
+            track = run_echo_pass(&def, &hostile, &tokens);
+        }
+
+        // Not vacuous: both canaries reached the root, and the taint carried on.
+        for c in DEVICE_CANARIES {
+            assert!(content_of(&track, "diagnose").contains(c), "root lacks {c}");
+        }
+        assert!(content_of(&track, "summarize").contains(C_DEVICE));
+        let control = content_of(&track, "control");
+        assert!(control.contains(CONTROL), "{control}");
+
+        let outputs = extraction_step_outputs(&track, &def);
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["control"],
+            "only the untainted step is offered to extraction"
+        );
+
+        let _trust = TrustGuard::trusted();
+        let server = LoopbackServer::start(vec![Canned::json(
+            200,
+            r#"{"response":"[]","done":true,"model":"llama3.2:3b"}"#,
+        )]);
+        let port: u16 = server.base().rsplit(':').next().unwrap().parse().unwrap();
+        let _port = crate::ollama_sidecar::ForcedPortGuard::set(port);
+        let candidates = crate::conductor::extract::extract_candidates(
+            &outputs,
+            &[],
+            &OllamaClient::new(),
+            crate::conductor::extract::SOURCE_CONDUCTOR_BATCH,
+        )
+        .await;
+        assert!(candidates.is_empty());
+
+        let seen = server.captured();
+        assert_eq!(seen.len(), 1, "exactly one extraction request");
+        let body = &seen[0].body;
+        assert!(body.contains(CONTROL), "the control step is in the request");
+        for needle in [C_DEVICE, C_FACT, "Subject:", "Library:", "E-"] {
+            assert!(
+                !body.contains(needle),
+                "{needle} reached the extraction request"
+            );
+        }
+    })
+    .await;
+}

@@ -74,6 +74,14 @@ pub const OPEN_TICKET_STATE: &str = "open_ticket_state";
 pub const OPEN_TICKETS_BRIEF: &str = "open_tickets_brief";
 pub const CASE_CONTEXT: &str = "case_context";
 pub const DELTA_CONTEXT: &str = "delta_context";
+/// items.id=891: the active case's primary device and what is recorded about it
+/// (conductor::device_seeding). Read from personal.db (the entity and its facts)
+/// and outputs.db (the active case). Empty when there is no active case or its
+/// device is not this Focus's own active one.
+pub const SUBJECT_CONTEXT: &str = "subject_context";
+/// items.id=891: one line per active device the Focus owns, newest first, each
+/// opening with the E-XXXXXXXX handle a model can name (conductor::device_seeding).
+pub const DEVICE_LIBRARY_BRIEF: &str = "device_library_brief";
 
 pub const WRITE_MODE_VALUES: &[&str] = &["open", "suppressed"];
 pub const OPEN_TICKET_STATE_VALUES: &[&str] = &["none", "one", "many"];
@@ -87,6 +95,8 @@ pub const NAMES: &[&str] = &[
     OPEN_TICKETS_BRIEF,
     CASE_CONTEXT,
     DELTA_CONTEXT,
+    SUBJECT_CONTEXT,
+    DEVICE_LIBRARY_BRIEF,
 ];
 
 pub const SPECS: &[BoundSpec] = &[
@@ -134,6 +144,20 @@ pub const SPECS: &[BoundSpec] = &[
     },
     BoundSpec {
         name: DELTA_CONTEXT,
+        source: Source::Derived,
+        presence: Presence::Always,
+        literals: Literals::Authored,
+        validate: valid_text,
+    },
+    BoundSpec {
+        name: SUBJECT_CONTEXT,
+        source: Source::Derived,
+        presence: Presence::Always,
+        literals: Literals::Authored,
+        validate: valid_text,
+    },
+    BoundSpec {
+        name: DEVICE_LIBRARY_BRIEF,
         source: Source::Derived,
         presence: Presence::Always,
         literals: Literals::Authored,
@@ -232,7 +256,13 @@ mod tests {
                 Some(OPEN_TICKET_STATE_VALUES)
             )
         );
-        for n in [OPEN_TICKETS_BRIEF, CASE_CONTEXT, DELTA_CONTEXT] {
+        for n in [
+            OPEN_TICKETS_BRIEF,
+            CASE_CONTEXT,
+            DELTA_CONTEXT,
+            SUBJECT_CONTEXT,
+            DEVICE_LIBRARY_BRIEF,
+        ] {
             assert_eq!(row(n), (Source::Derived, Presence::Always, None), "{n}");
         }
         assert_eq!(WRITE_MODE_VALUES, &["open", "suppressed"]);
