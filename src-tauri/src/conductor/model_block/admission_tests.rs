@@ -24,6 +24,12 @@
 //      {persona_context} is refused
 //   9  tighten() never widens an envelope (property test, config.rs) and no
 //      configuration key can switch a gate off (the pinned key list below)
+//  10  the resolver can serve it (items.id=896): every shipped document type has at
+//      least one rated local cell in the shipped capability data or is named in
+//      UNRATED_SHIPPED_TYPES (so adding a type forces a decision about its
+//      rating), every model block's task type has at least one cell or is named
+//      in UNRATED_BLOCK_TASK_TYPES, neither list holds an entry that is rated or
+//      unused, and every local cell names a curated tag
 //
 // The catalog check reads a checked-in file, not qr_docs.db: the running app and
 // CI never query the coordination database. Code re-exports the file (items.id=895)
@@ -991,4 +997,105 @@ fn no_example_uses_a_bound_name_as_its_output_variable() {
     let draft = example_of("cb-12");
     assert_eq!(draft["spec"]["brief_var"], "content_brief");
     assert!(crate::conductor::bound_spec::ARTIFACT_NAMES.contains(&"content_brief"));
+}
+
+// ---------------------------------------------------------------------------
+// 10: the resolver can serve every shipped block and document type (items.id=896)
+// ---------------------------------------------------------------------------
+
+/// Shipped document types with NO rated local cell in the shipped capability data.
+/// A step of such a type resolves to TooWeak (every model not measured) until a
+/// catalog rates it. Naming it here is the decision that this is known. Jason's
+/// first calibration read did not cover creative_story.
+const UNRATED_SHIPPED_TYPES: &[&str] = &["creative_story"];
+
+fn shipped_capabilities() -> Vec<crate::provider_catalog::format::CapabilityDoc> {
+    crate::provider_catalog::format::parse_catalog(
+        crate::provider_catalog::BASELINE_CATALOG_JSON.as_bytes(),
+    )
+    .expect("the baseline catalog parses")
+    .capabilities
+}
+
+#[test]
+fn every_shipped_document_type_is_rated_or_named_as_unrated() {
+    use crate::conductor::model_capability::CapabilitySubject;
+    let reg = crate::conductor::model_block::document_type::registry().unwrap();
+    let cells = shipped_capabilities();
+    for t in &reg.types {
+        let rated = cells.iter().any(|c| {
+            c.subject == CapabilitySubject::Local && c.profile.as_deref() == Some(t.id.as_str())
+        });
+        let named = UNRATED_SHIPPED_TYPES.contains(&t.id.as_str());
+        assert!(
+            rated || named,
+            "document type '{}' has no rated local cell: rate it in the capability data or \
+             name it in UNRATED_SHIPPED_TYPES",
+            t.id
+        );
+        assert!(
+            !(rated && named),
+            "document type '{}' is rated now: remove it from UNRATED_SHIPPED_TYPES",
+            t.id
+        );
+    }
+    for n in UNRATED_SHIPPED_TYPES {
+        assert!(
+            reg.document_type(n).is_some(),
+            "'{n}' is not a shipped type"
+        );
+    }
+}
+
+/// Task types of a registered model block with NO cell in the shipped capability
+/// data. A step of such a block resolves to TooWeak until a catalog rates the task
+/// type. The voice block's example uses quick_response, which the first calibration
+/// read did not cover (it measured drafts, not voice passes): the local half of the
+/// harness (items.id=899) is what rates it. Naming it here is the decision that
+/// this is known.
+const UNRATED_BLOCK_TASK_TYPES: &[&str] = &["quick_response"];
+
+#[test]
+fn every_model_block_task_type_has_a_cell_or_is_named_as_unrated() {
+    let cells = shipped_capabilities();
+    let mut used: BTreeSet<String> = BTreeSet::new();
+    for id in crate::conductor::model_block::MODEL_STABLE_IDS {
+        let ex = example_of(id);
+        let task = ex["common"]["need"]["task_type"]
+            .as_str()
+            .expect("a task type")
+            .to_owned();
+        let rated = cells.iter().any(|c| c.task_type.as_str() == task);
+        let named = UNRATED_BLOCK_TASK_TYPES.contains(&task.as_str());
+        assert!(
+            rated || named,
+            "{id}: no capability cell for task type '{task}': rate it or name it in \
+             UNRATED_BLOCK_TASK_TYPES"
+        );
+        assert!(
+            !(rated && named),
+            "task type '{task}' is rated now: remove it from UNRATED_BLOCK_TASK_TYPES"
+        );
+        used.insert(task);
+    }
+    for n in UNRATED_BLOCK_TASK_TYPES {
+        assert!(
+            used.contains(*n),
+            "'{n}' is named as unrated but no model block uses it"
+        );
+    }
+}
+
+#[test]
+fn every_shipped_local_cell_names_a_curated_tag() {
+    use crate::conductor::model_capability::CapabilitySubject;
+    for c in shipped_capabilities() {
+        if c.subject == CapabilitySubject::Local {
+            assert!(
+                crate::providers::curated_models::is_curated_local_model_tag(&c.model_id),
+                "'{}' is not a curated local tag",
+                c.model_id
+            );
+        }
+    }
 }

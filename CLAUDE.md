@@ -1,5 +1,7 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: November 15, 2026 (items.id=895: new "Per-pass artifact store" section,
+# Last updated: November 15, 2026 (items.id=896: new "Model resolver" section, and the
+# one line under "Model blocks" that said the executor did not read `requirement`).
+# Before that, November 15, 2026 (items.id=895: new "Per-pass artifact store" section,
 # and the catalog re-export line under "Model blocks" only). Before that, November 14, 2026
 # (items.id=891: new "Focus-owned entities and the
 # device library" section only). Before that, November 14, 2026 (items.id=920 stages 1 to 3: new
@@ -330,7 +332,8 @@ configuration `{common, spec}`) and EXPANDED into an ordinary ActionDefinition w
 block_stable_id None and a `requirement` (task need, range clamped to the Focus
 ceiling, optional model-class preference, never a model id). Gate 1, the spend gate,
 Gate 2, Gate 3 and the declared-inputs lint all apply on that one path. The executor
-does not read `requirement` yet (select_model still decides, until the resolver B2).
+resolves `requirement` through the model resolver (see "Model resolver" below); a step
+with no requirement still goes through select_model.
 - EXTERNAL_MODEL_BLOCKS_ALLOWED = false (model_block/mod.rs): LOAD refuses any
   destination but local and any tier above local_only. A block allowing hosted_api
   names neither {user_input} nor {persona_context}. B10 flips the constant after the
@@ -362,6 +365,112 @@ does not read `requirement` yet (select_model still decides, until the resolver 
   test in lifecycle.rs; B5 changes it).
 - The unsupported-additions measures live only in examples/focus_calibration.rs for
   now. They move into one shipped module at B6b; do not add a second copy.
+
+## Model resolver (items.id=896, decisions.id=941 point 4, decisions.id=942 point 9)
+A pure resolver chooses the model of a MODEL-BLOCK step: the lowest-cost model that
+reaches the step's quality bar inside its ceiling. Rules are in the header of
+conductor/model_resolver.rs; the gatherer is conductor/model_resolver_input.rs; the glue
+is select_model_for_block in executor.rs.
+- SCOPE. Only a step whose ActionDefinition carries `requirement`, on a run that is not
+  a bound API Chat run (execute_once: resolver_req). A step with no requirement keeps
+  Step 4.5 and select_model's hardcoded ids (decisions.id=870), and a bound API Chat run
+  keeps its bound destination whatever the step carries. Both are pinned by tests in
+  executor.rs.
+- ANSWERS. Selected (with the other qualifying LOCAL models as ranked fallbacks), TooWeak
+  (nothing reaches the bar: the best one below it, and every other candidate as below the
+  bar or not measured) or NoCandidate (no destination, none ready, window too small).
+  The last two park the step (F10, AwaitUser) with the codes resolver.too_weak and
+  resolver.no_candidate in spend/codes.rs; en.json has placeholder keys under
+  resolver.stop (Chat-BRAND owns the wording) and a Rust test requires a key per code.
+  The required bar is quality_floor.min. Nothing below it is ever selected; quality_floor.max
+  is not read by the resolver (B4, the run plan, uses it).
+- RANK among qualifiers: local, then free, then plan-included, then metered; at
+  anonymous_preferred an anonymous provider first inside a cost tier; then the smallest
+  model class (or the class nearest the block's class_preference, which ranks and never
+  filters); then estimated cost; then ids. A local model that qualifies always beats a
+  hosted one. No model or provider id is named in the resolver (a scan test pins it).
+- CAPABILITY DATA. shared.db model_capabilities (shared_045.sql): one measured cell per
+  (subject local or hosted, provider, model, task type, document profile), holding the
+  highest named bar reached (below_basic, basic, standard, high), the model class, the
+  sample count and provenance. A cell with NO row is UNMEASURED, which is not below_basic:
+  an unmeasured model, hosted or local, is NEVER chosen automatically and is listed as
+  not measured in TooWeak's options (pinned in the resolver and in executor.rs tests).
+  Rows come only from the signed catalog (its `capabilities` section, validated and
+  undoable in provider_catalog/apply.rs, needing min_shared_schema 45) and from
+  shared_045.sql's seed, which is the baseline catalog's own section; nothing at run time
+  writes the table (persistence/model_capability_store.rs is read-only).
+- PROVISIONAL BARS (Jason's read of the variant calibration run, decisions.id=942 addendum
+  3 b): llama3.2:3b and llama3.1:8b are basic for rma_letter, complaint_email and
+  personal_note; both are basic but MARGINAL for cover_letter; qwen2.5:7b is basic for
+  personal_note only, and basic but MARGINAL for essay_section with the other two.
+  qwen2.5:7b is unrated for the RMA letter, complaint and cover letter, creative_story
+  was not run, and no model reaches standard or high anywhere. Preferences live in `note`
+  only. A block whose floor is standard on a local-only ceiling therefore returns TooWeak
+  until items.id=899 and voice tuning change the bars. The admission test
+  (model_block/admission_tests.rs, check 10) lists the unrated shipped types
+  (UNRATED_SHIPPED_TYPES: creative_story) and block task types (UNRATED_BLOCK_TASK_TYPES:
+  quick_response, which cb-13's example uses, so a voice step cannot resolve until a
+  catalog rates that task type); a new type or block forces a decision there.
+- DOCUMENT PROFILE. The profile is the id of a SHIPPED document type and is read ONLY from
+  the pass's seeds under the bound name `document_type` (DOCUMENT_TYPE_NAME in
+  model_resolver_input.rs), never from the block's own configuration. A custom type
+  resolves through `based_on` to its shipped type (profile_for_document_type; custom types
+  are not built yet, items.id=905, so the glue passes none). items.id=897 registers the
+  name in bound_spec and guarantees it a value (a Focus preset that fixes its type seeds
+  the same name at seed time). An absent or unmappable name means no profile, the resolver
+  reads only the task-type-wide cell, the shipped data has none, and the step parks with
+  resolver.too_weak: fail closed on purpose. The exact profile's cell wins, then the
+  task-type-wide cell, never another profile's.
+- READINESS (the gatherer only marks Ready or not). Local: a curated focus-eligible row,
+  its tag exactly one of CURATED_LOCAL_MODEL_TAGS, installed and not disabled by the user.
+  Hosted: a cloud_inference_api provider the ceiling permits (providers_permitted_by_
+  ceiling), with a stored key, a current consent and a readable price (the user's override
+  first); a model of unknown price is never chosen automatically. The spend gate still
+  decides at call time. Cloud Chat panes are never candidates (decisions.id=680).
+- NETWORK PREDICATE (the privacy-critical diff, reviewed line by line by Chat-PM). For a
+  resolved step, `hosted_step` and the hosted call's provider follow the CHOSEN model
+  (selected_model.hosted_model, selected_model.provider_id), not the ceiling or the user's
+  preference. SelectedModel::local and ::hosted are the only constructors the resolver glue
+  uses, so a hosted selection always carries its provider and its row together, which is
+  why the generation branch's `unreachable!` stays unreachable. select_model_for_block
+  refuses a hosted choice under a LocalOnly ceiling before any gate. The render branch is
+  unchanged and still keys on the ceiling. executor.rs has a source-scan test pinning the
+  three sites.
+- CONTEXT FALLBACK. If a resolved local step overflows its window after the render, it
+  moves to the next ranked local candidate that fits. It does NOT re-render and does NOT
+  re-run Gate 1 (every fallback is local, as is the model it replaces, so the provider
+  Gate 1 recorded, none, is unchanged). The disclosure log records a provider and fields,
+  not a model tag, so it is the same with or without a fallback; the switch is logged only
+  as an info line with the two local tags. A step that sets its own num_ctx never falls back.
+- KNOWN BEHAVIOURS LATER BUILDS MUST RESPECT:
+  1. Gate 1, the abstraction floor and the render key off the run's CEILING
+     (effective_access), not the chosen model (spec Parts 6e, 6g, 7b). A local model chosen
+     under an external ceiling is therefore gated and rendered as if it were external, which
+     is stricter, not weaker. Jason ruled that the privacy gate must change before R1; the
+     work is items.id=921 (Plan Mode first, after items.id=896 lands). Do not change it in
+     the resolver or the executor before then.
+  2. Until items.id=897 registers the document-type name, every model-block step parks with
+     resolver.too_weak (nothing runs model blocks today).
+  3. PlanIncluded is never produced (nothing records which plan a user holds): a hosted
+     model is Free or Metered. A hosted model is never chosen until it has a measured cell
+     (items.id=788, 726), and EXTERNAL_MODEL_BLOCKS_ALLOWED is still false (items.id=884,
+     913). The hosted call through execute_once is not tested end to end (the real client is
+     HTTPS only); hosted selection and the call site are tested separately.
+  4. Local context windows still come from get_context_window's hardcoded tag map in
+     executor.rs, which names models in code; the gatherer and the fallback reuse it.
+  5. Each retry resolves again, and a resumed run resolves from its seeds as they are then.
+  6. The resolver's context filter is a lower bound (the template's fixed text), so it
+     never drops a model the post-render check would accept; the post-render check stays
+     the authority.
+  7. The baseline catalog's catalog_version is unchanged (2026101100) though its content
+     gained capability cells dated 2026-11-13; Chat-PM records the bump on items.id=730 and
+     the first signed catalog carries its own version. The baseline agreement test applies
+     the baseline at a fixed later date for that reason.
+  8. items.id=633 must absorb shared_045.sql and regenerate tests/golden/schema_shape.txt.
+- Spec: PROVIDER_REGISTRY_AND_TIER_MODEL_SPEC.md (Chat-PM, rule 71) needs the resolver and
+  the capability data, and Part 8h's per-user hosted ranking (verification status,
+  qr_recommendation_rank, key-configured) is NOT used by the resolver, which ranks by cost
+  tier, anonymity at anonymous_preferred, model class, estimated cost and ids.
 
 ## Per-pass artifact store (items.id=895, decisions.id=942 point 5, decisions.id=938 ruling 2)
 Multi-turn work rides on chat-level passes, so text a later pass needs from an earlier one
