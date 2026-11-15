@@ -26,8 +26,8 @@
 //      configuration key can switch a gate off (the pinned key list below)
 //
 // The catalog check reads a checked-in file, not qr_docs.db: the running app and
-// CI never query the coordination database. Chat-PM re-exports the file after
-// writing the catalog rows for a new block.
+// CI never query the coordination database. Code re-exports the file (items.id=895)
+// from qr_docs.db after Chat-PM has written the catalog rows for a new block.
 
 use std::collections::BTreeSet;
 

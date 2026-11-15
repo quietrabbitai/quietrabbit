@@ -1,5 +1,7 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: November 14, 2026 (items.id=891: new "Focus-owned entities and the
+# Last updated: November 15, 2026 (items.id=895: new "Per-pass artifact store" section,
+# and the catalog re-export line under "Model blocks" only). Before that, November 14, 2026
+# (items.id=891: new "Focus-owned entities and the
 # device library" section only). Before that, November 14, 2026 (items.id=920 stages 1 to 3: new
 # "Collection consent" section only). Before that, November 14, 2026 (items.id=894: new "Model blocks"
 # section only). Before that, November 8, 2026 (items.id=552: Naming Architecture Task->Action
@@ -343,9 +345,15 @@ does not read `requirement` yet (select_model still decides, until the resolver 
   type will use, with no {token} allowed. Rust holds only the template skeleton.
   Tuning wording is a data edit.
 - Adding a block: register it, add its mirror row (a numbered data-only shared_*.sql),
-  and add its row to tests/fixtures/building_blocks_catalog.json (Chat-PM re-exports
-  it from qr_docs.db). conductor/model_block/admission_tests.rs checks the rest, and
-  PINNED_KEYS there fails on any new configuration key until it is reviewed.
+  and add its row to tests/fixtures/building_blocks_catalog.json. CODE re-exports that
+  file (items.id=895 moved it from Chat-PM): once Chat-PM has written the building_blocks
+  row in qr_docs.db, read it READ-ONLY with db_query.py (03_ProjectDocs/scripts/db_utilities,
+  SELECT json_object(...) gives exact text), copy the columns unchanged, set the
+  informational `kind` (pure, model or seed: the database has no such column and the
+  admission test checks it against the registry), and update `exported` and the row's
+  `source`. Never edit qr_docs.db or the vault from here. conductor/model_block/
+  admission_tests.rs checks the rest, and PINNED_KEYS there fails on any new
+  configuration key until it is reviewed.
 - focus_runs.user_input holds the blended chat window so a parked run can resume. It
   is NULLed when the status becomes complete, cancelled or failed (output_store::
   USER_INPUT_CLEARED_STATUSES) and is not written for a latched one-time chat. A run
@@ -354,6 +362,61 @@ does not read `requirement` yet (select_model still decides, until the resolver 
   test in lifecycle.rs; B5 changes it).
 - The unsupported-additions measures live only in examples/focus_calibration.rs for
   now. They move into one shipped module at B6b; do not add a second copy.
+
+## Per-pass artifact store (items.id=895, decisions.id=942 point 5, decisions.id=938 ruling 2)
+Multi-turn work rides on chat-level passes, so text a later pass needs from an earlier one
+(a brief, voice guidance, a validation report, delta items) that does not fit a 2048-byte
+session variable lives in pass_artifacts, in the persona's encrypted outputs.db
+(schema/outputs_015.sql, persistence/pass_artifact_store.rs). items.id=633 must absorb
+outputs_015 with the other outputs files.
+- Table: one row per (context_key, focus_id, kind), content 1 to 16384 bytes (the schema
+  CHECK and ARTIFACT_MAX_BYTES), version compare-and-set, no foreign keys, no triggers, no
+  revision history (a write replaces the text). kind is the closed Rust enum ArtifactKind
+  (no SQL CHECK, a round-trip test pins it): content_brief, voice_guidance,
+  validation_report, delta_items. session_intent is not a kind.
+- Store module: put_artifact, get_artifact, clear_artifact ONLY, over session_store's
+  BEGIN IMMEDIATE transaction and one-time latch (a latched chat refuses every write and the
+  clear, an unreadable latch fails closed). Stored text is exact: nothing rewrites it.
+- RESERVED BOUND NAMES: content_brief, voice_guidance, validation_report, delta_items
+  (bound_spec.rs ARTIFACT_NAMES, Source::Artifact, Presence::Optional, Authored). A name
+  equals its kind, a test pins it, and the name is the artifact's alone: LOAD refuses it as
+  a row's output_var (declared-inputs lint), as a session_put target and as the argument of
+  any store writer. A step that produces one of these texts uses another output_var (the
+  cb-13 refine example uses refined_guidance) and an artifact_put row stores it under the
+  name. cb-12's brief_var content_brief is the artifact, read in a later pass.
+- Writers (store_op.rs, store_writer.rs; no second write path): artifact_put (store_target is
+  the artifact name, one slot `value` from an earlier step's output variable) is gated by the
+  collection consent like session_put (a per_field Focus is always Granted). artifact_clear
+  (store_target only, no slots) removes one kind of the running Focus and chat and is not
+  gated, like session_clear. Both are latch-gated and scoped to the running chat and Focus,
+  never a row's choice. The writer reads the current version and writes with it, as
+  put_session does.
+- Reads: ONLY as bound names, seeded once at pass start (seeding.rs read_artifact). They are
+  store-backed like every bound name: restricted to the step whose own template names them,
+  tainting a step that names one (so it stays out of extraction), and refused in an external
+  step, named or declared, while STORE_NAMES_EXTERNAL_ALLOWED is false (declared_inputs.rs
+  pin test; items.id=884 flips it, and only then does the declaration rule decide). A stored
+  text that fails its validator fails the pass closed.
+- TWO BEHAVIOURS LATER BUILDS MUST RESPECT (items.id=903 and 907 carry the same note):
+  1. Seeded artifact text has `{` and `}` turned into `(` and `)` (seeding::clean, as for the
+     derived names, so stored text cannot become a prompt token). The stored text is exact,
+     so a JSON delta_items renders with parentheses in a prompt. Read it through the store
+     function, not a prompt, when the exact text matters.
+  2. An absent artifact renders as NOTHING: Optional presence means no seed entry, so a
+     guard on it is false and its token is stripped. A step that needs an artifact must be
+     guarded on `present`, or it runs with an empty input. A value written in a pass is seen
+     by the NEXT pass (seeds are read once at pass start), never by a later row of the same
+     pass.
+- Logging: artifact text never reaches a log or an error. The one log line is
+  store_writer::log_artifact_write (kind, outcome, a Fingerprint of byte count and a short
+  SHA-256 prefix), pass_artifact_store and seeding log nothing, Debug on PassArtifact and
+  ArtifactWrite redacts the text, and source-scan tests pin all of it. Use fingerprint() if
+  you must log one.
+- RETENTION AND PURGE: items.id=888's clear_chat and retention sweep MUST ALSO cover
+  pass_artifacts (delete by context_key, and by updated_at for the sweep), the same as
+  session_variables. Neither exists yet and this item added neither: until they do, a
+  chat's artifacts stay in the persona's outputs.db. clear_artifact is the only delete today.
+  Not reached by the entity purge (an artifact names no entity id).
 
 ## Collection consent (items.id=920 stage 1, decisions.id=944, decisions.id=509)
 A focus_level Focus (Tech Support) collects silently after ONE informed consent at

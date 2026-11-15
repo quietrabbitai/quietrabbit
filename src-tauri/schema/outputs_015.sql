@@ -34,8 +34,8 @@
 -- because items.id=633 rebuilds focus_runs. No triggers. No DROP TABLE.
 --
 -- RETENTION AND PURGE. The table is keyed by context_key like session_variables,
--- so the chat-level clear and the retention sweep (items.id=681, items.id=888)
--- delete by context_key and updated_at. Neither exists yet and this item does not
+-- so the chat-level clear and the retention sweep (both items.id=888) delete
+-- by context_key and updated_at. Neither exists yet and this item does not
 -- add them. artifact_clear (one kind of one chat and Focus) is the only delete.
 --
 -- SCHEMA AUTHORING RULE (migrations.rs): no semicolons inside string literals
