@@ -14,6 +14,7 @@ import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { CollectionConsentConfirm } from './CollectionConsentConfirm'
 import { CollectionConsentManage } from './CollectionConsentManage'
+import { DeviceLibrary } from './DeviceLibrary'
 import { shouldAskForConsent } from './collectionConsent'
 import { useCollectionConsent } from './useCollectionConsent'
 import './CollectionConsentSection.css'
@@ -27,6 +28,8 @@ export function CollectionConsentSection({ personaId, focusId }: CollectionConse
   const { t } = useTranslation()
   const consent = useCollectionConsent(personaId, focusId)
   const [manageOpen, setManageOpen] = useState(false)
+  // items.id=891: the device library, a second small entry beside the memory one.
+  const [devicesOpen, setDevicesOpen] = useState(false)
 
   if (consent.status === 'idle' || consent.status === 'loading') return null
 
@@ -50,9 +53,21 @@ export function CollectionConsentSection({ personaId, focusId }: CollectionConse
     )
   }
 
+  if (devicesOpen) {
+    return (
+      <DeviceLibrary
+        personaId={personaId}
+        focusId={focusId}
+        onClose={() => setDevicesOpen(false)}
+      />
+    )
+  }
+
   if (manageOpen) {
     return (
       <CollectionConsentManage
+        personaId={personaId}
+        focusId={focusId}
         state={state}
         busy={consent.busy}
         error={consent.actionError}
@@ -71,6 +86,13 @@ export function CollectionConsentSection({ personaId, focusId }: CollectionConse
         onClick={() => setManageOpen(true)}
       >
         {t('navShell.chat.collectionConsent.manage.button')}
+      </button>
+      <button
+        type="button"
+        className="collection-consent-section__manage-button"
+        onClick={() => setDevicesOpen(true)}
+      >
+        {t('navShell.chat.devices.button')}
       </button>
     </div>
   )

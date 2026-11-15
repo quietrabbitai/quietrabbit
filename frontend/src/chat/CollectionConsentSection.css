@@ -3,6 +3,7 @@
 .collection-consent-section__row {
   display: flex;
   justify-content: flex-end;
+  gap: 8px;
 }
 
 .collection-consent-section__manage-button {

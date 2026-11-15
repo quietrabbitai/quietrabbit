@@ -1,0 +1,139 @@
+/* Tech Support device library (items.id=891 stage 7). */
+
+.device-library {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 14px;
+  color: var(--text-muted);
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  text-align: left;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.device-library__heading,
+.device-library__device-name {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.device-library__section {
+  margin: 8px 0 0;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.device-library__note,
+.device-library__purged {
+  margin: 0;
+}
+
+.device-library__error {
+  margin: 0;
+  color: var(--ember);
+}
+
+.device-library__list,
+.device-library__facts,
+.device-library__records {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.device-library__item {
+  display: block;
+}
+
+.device-library__open {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+}
+
+.device-library__name {
+  font-weight: 500;
+  color: var(--text);
+}
+
+.device-library__kind,
+.device-library__counts {
+  font-size: 13px;
+}
+
+.device-library__title-row,
+.device-library__fact,
+.device-library__form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.device-library__sheet {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.device-library__fact-label {
+  min-width: 9em;
+  color: var(--text);
+}
+
+.device-library__fact-value {
+  flex: 1;
+}
+
+.device-library__label {
+  font-size: 13px;
+}
+
+.device-library__input {
+  min-width: 12em;
+}
+
+.device-library__record {
+  font-size: 13px;
+}
+
+.device-library__confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid var(--ember);
+}
+
+.device-library__confirm-title {
+  margin: 0;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.device-library__confirm-body {
+  margin: 0;
+}
+
+.device-library__danger {
+  font-weight: 500;
+}
+
+.device-library__footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}

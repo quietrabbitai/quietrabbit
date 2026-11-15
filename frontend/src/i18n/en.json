@@ -291,7 +291,7 @@
           "never_shared_outside_qr_without_review": "What it saves stays in QuietRabbit. It is never shared outside QuietRabbit, and never used in a cloud conversation without your review.",
           "per_session_opt_out": "You can turn saving off for a single chat.",
           "withdraw_any_time": "You can stop it at any time.",
-          "delete_device_and_linked_data": "You can delete a device and everything linked to it."
+          "delete_device_and_linked_data": "You can delete a device and what QuietRabbit recorded about it (its facts, tickets and configuration changes)."
         },
         "declineNote": "Tech Support still works if you choose not to save. It just will not remember anything between chats.",
         "allow": "Allow Tech Support to remember",
@@ -314,7 +314,73 @@
           "withdrawPending": "Tech Support has already stopped saving, but the record of your choice could not be written ({{message}}). Press Stop remembering again to finish.",
           "stop": "Stop remembering",
           "stopping": "Stopping…",
-          "close": "Close"
+          "close": "Close",
+          "deleteAll": {
+            "button": "Delete everything Tech Support recorded about my devices",
+            "confirmTitle": "Delete everything Tech Support recorded about your devices?",
+            "confirmBody": "This permanently deletes every device Tech Support has saved, with what QuietRabbit recorded about them (their facts, tickets and configuration changes), and cancels any Tech Support chat that is still waiting.",
+            "confirmNotDeleted": "It does not delete your chat history, anything written in earlier replies, or the record of your choices about what Tech Support remembers.",
+            "confirmPermanent": "This cannot be undone.",
+            "confirm": "Delete everything",
+            "tryAgain": "Try again",
+            "cancel": "Cancel",
+            "deleting": "Deleting…",
+            "done": "Deleted {{facts}} facts, {{cases}} tickets and {{changes}} configuration changes.",
+            "error": {
+              "runsRunning": "A Tech Support chat is still going, so nothing was deleted. Wait a moment and try again.",
+              "other": "Couldn't delete ({{message}}). Nothing was changed. Try again."
+            }
+          }
+        }
+      },
+      "devices": {
+        "button": "Devices",
+        "heading": "Tech Support devices",
+        "close": "Close",
+        "back": "Back to devices",
+        "loading": "Loading…",
+        "loadError": "Couldn't load your devices ({{message}}).",
+        "sheetError": "Couldn't load this device ({{message}}).",
+        "empty": "Tech Support has no devices saved yet.",
+        "counts": "{{facts}} facts, {{open}} open tickets",
+        "rename": "Rename",
+        "renameLabel": "New name",
+        "save": "Save",
+        "cancel": "Cancel",
+        "edit": "Edit",
+        "clear": "Clear",
+        "add": "Add",
+        "addLabel": "Add a fact",
+        "addChoose": "Choose what to add",
+        "addValueLabel": "Value to add",
+        "dismiss": "OK",
+        "factsHeading": "What is recorded",
+        "noFacts": "Nothing recorded about this device yet.",
+        "casesHeading": "Tickets",
+        "noCases": "No tickets for this device.",
+        "caseLine": "{{state}}: {{symptoms}} (opened {{opened}})",
+        "changesHeading": "Configuration changes",
+        "noChanges": "No configuration changes recorded.",
+        "changeLine": "{{description}} ({{status}}, changed {{changed}})",
+        "delete": "Delete this device",
+        "checking": "Checking what would be deleted…",
+        "confirmTitle": "Delete {{name}}?",
+        "confirmBody": "This permanently deletes what QuietRabbit recorded about {{name}}: {{facts}} facts, {{cases}} tickets and {{changes}} configuration changes.",
+        "confirmNotDeleted": "It does not delete your chat history, anything written in earlier replies, or the record of your choices about what Tech Support remembers.",
+        "confirmPermanent": "This cannot be undone.",
+        "confirmDelete": "Delete",
+        "tryAgain": "Try again",
+        "deleting": "Deleting…",
+        "purged": "Deleted: {{facts}} facts, {{cases}} tickets and {{changes}} configuration changes.",
+        "error": {
+          "notFound": "That device is no longer there.",
+          "nameInUse": "Another device already has that name.",
+          "invalidName": "Please enter a name (up to 120 characters).",
+          "unknownField": "That kind of information can't be saved.",
+          "invalidValue": "That value can't be saved. Check its length and that it is on one line.",
+          "runsRunning": "A Tech Support chat is still going, so nothing was deleted. Wait a moment and try again.",
+          "unavailable": "Devices can't be shown right now.",
+          "other": "Something went wrong ({{message}}). Try again."
         }
       }
     },

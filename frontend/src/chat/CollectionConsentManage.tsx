@@ -1,6 +1,9 @@
 // The Tech Support memory screen (items.id=920 stage 3): where the user stops
-// Tech Support remembering, or allows it again. Controlled, no backend calls of
-// its own (CollectionConsentSection owns them). Placeholder copy, Chat-BRAND.
+// Tech Support remembering, or allows it again. Controlled for the consent
+// answers: CollectionConsentSection owns those calls. items.id=891 stage 7 adds
+// the separate DeleteEverythingControl below the status, which owns its own call
+// (stopping keeps what is already known, deleting is its own step). Placeholder
+// copy, Chat-BRAND.
 //
 // THE WITHDRAWAL SAYS PLAINLY that stopping does not delete anything: what
 // QuietRabbit already knows stays until the user deletes it. That sentence is
@@ -11,9 +14,12 @@
 import { useTranslation } from 'react-i18next'
 import type { CollectionConsentState } from '../bindings'
 import type { ConsentActionError } from './useCollectionConsent'
+import { DeleteEverythingControl } from './DeleteEverythingControl'
 import './CollectionConsentManage.css'
 
 export interface CollectionConsentManageProps {
+  personaId: string
+  focusId: string
   state: CollectionConsentState
   busy: boolean
   error: ConsentActionError | null
@@ -23,6 +29,8 @@ export interface CollectionConsentManageProps {
 }
 
 export function CollectionConsentManage({
+  personaId,
+  focusId,
   state,
   busy,
   error,
@@ -55,6 +63,7 @@ export function CollectionConsentManage({
             : t('navShell.chat.collectionConsent.error.other', { message: error.message })}
         </p>
       )}
+      <DeleteEverythingControl personaId={personaId} focusId={focusId} />
       <div className="collection-consent-manage__footer">
         <button type="button" onClick={onClose}>
           {t('navShell.chat.collectionConsent.manage.close')}

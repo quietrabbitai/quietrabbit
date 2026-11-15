@@ -122,10 +122,22 @@ pub struct DeviceChange {
     pub changed_at: String,
 }
 
+/// A catalogued field a device has no value for yet: what the "add a fact"
+/// control of the device screen offers (the screen holds no copy of the
+/// catalogue).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct DeviceFieldChoice {
+    pub field_name: String,
+    pub label: String,
+    pub category: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct DeviceSheet {
     pub device: DeviceSummary,
     pub facts: Vec<DeviceFact>,
+    /// Catalogued fields with no value yet, in catalogue order.
+    pub addable_facts: Vec<DeviceFieldChoice>,
     pub cases: Vec<DeviceCase>,
     pub changes: Vec<DeviceChange>,
 }
@@ -318,9 +330,20 @@ pub(crate) async fn get_device_sheet_for_session(
         .map_err(owned_err)?;
     let catalogue = device_fields::registry().map_err(|_| "catalogue_unavailable".to_owned())?;
 
-    let facts = owned::list_active_facts(&mut db.personal, focus_id, &entity_id)
+    let active = owned::list_active_facts(&mut db.personal, focus_id, &entity_id)
         .await
-        .map_err(owned_err)?
+        .map_err(owned_err)?;
+    let addable_facts = catalogue
+        .fields
+        .iter()
+        .filter(|def| !active.iter().any(|f| f.field_name == def.name))
+        .map(|def| DeviceFieldChoice {
+            field_name: def.name.clone(),
+            label: def.label.clone(),
+            category: def.category.clone(),
+        })
+        .collect();
+    let facts = active
         .into_iter()
         .filter_map(|f| {
             let def = catalogue.field(&f.field_name)?;
@@ -372,6 +395,7 @@ pub(crate) async fn get_device_sheet_for_session(
     Ok(DeviceSheet {
         device: summarize(&mut db, focus_id, &entity).await?,
         facts,
+        addable_facts,
         cases,
         changes,
     })
@@ -972,6 +996,27 @@ mod tests {
         assert_eq!(s.facts[0].label, "Make");
         assert_eq!(s.facts[0].category, "identity");
         assert_eq!(s.facts[1].value, "SN-1");
+        // The fields still open to add, in catalogue order, never one already set.
+        let addable: Vec<&str> = s
+            .addable_facts
+            .iter()
+            .map(|f| f.field_name.as_str())
+            .collect();
+        assert_eq!(addable[0], "subject_class");
+        assert!(!addable.contains(&"make") && !addable.contains(&"serial_number"));
+        assert_eq!(
+            addable.len(),
+            20 - 3,
+            "the catalogue has 20 fields, 3 are set"
+        );
+        assert_eq!(
+            s.addable_facts[1],
+            DeviceFieldChoice {
+                field_name: "model".to_owned(),
+                label: "Model".to_owned(),
+                category: "identity".to_owned()
+            }
+        );
         // This Focus's two cases only, and only its change.
         assert_eq!(s.cases.len(), 2);
         assert!(s.cases.iter().all(|c| c.state == "open"));

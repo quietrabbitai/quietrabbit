@@ -1428,6 +1428,17 @@ export type DeviceFact = {
 	recorded_at: string,
 };
 
+/**
+ *  A catalogued field a device has no value for yet: what the "add a fact"
+ *  control of the device screen offers (the screen holds no copy of the
+ *  catalogue).
+ */
+export type DeviceFieldChoice = {
+	field_name: string,
+	label: string,
+	category: string,
+};
+
 /**  What a purge removed, or (from the preview) will remove. */
 export type DevicePurgeSummary = {
 	cases: number,
@@ -1439,6 +1450,8 @@ export type DevicePurgeSummary = {
 export type DeviceSheet = {
 	device: DeviceSummary,
 	facts: DeviceFact[],
+	/**  Catalogued fields with no value yet, in catalogue order. */
+	addable_facts: DeviceFieldChoice[],
 	cases: DeviceCase[],
 	changes: DeviceChange[],
 };
