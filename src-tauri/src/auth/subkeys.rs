@@ -145,7 +145,7 @@ pub fn derive_db_key(
     Ok(okm)
 }
 
-fn decode_dek_hex(s: &str) -> Result<Zeroizing<[u8; kdf::MASTER_KEY_LEN]>, SubkeyError> {
+pub(crate) fn decode_dek_hex(s: &str) -> Result<Zeroizing<[u8; kdf::MASTER_KEY_LEN]>, SubkeyError> {
     if s.len() != kdf::MASTER_KEY_LEN * 2 || !s.is_ascii() {
         return Err(SubkeyError::InvalidKeyHex);
     }

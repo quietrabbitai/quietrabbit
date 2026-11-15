@@ -61,6 +61,9 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::doc_parse::{self, DocumentKind};
 use crate::persistence::ingest_blob;
+use crate::persistence::ingested_document_store::{
+    persist_ingested_document, INGESTED_DOCUMENT_OUTPUT_TYPE,
+};
 use crate::persistence::output_store;
 use crate::providers::ollama_client::OllamaClient;
 use crate::providers::types::{GenerateOptions, GenerateRequest};
@@ -396,81 +399,6 @@ pub struct StoreIngestedDocumentResponse {
     pub output_id: String,
 }
 
-/// The three writes of an import: the encrypted blob, the ingest-only
-/// focus_run row, the outputs row. If any of them fails the output's blob
-/// directory is removed (items.id=664) and the ORIGINAL error is returned, so
-/// a failed save leaves nothing on disk. Safe because `output_id` is new in
-/// this import and no row references it yet; the caller holds the writer lease
-/// across the writes and this cleanup, so a key rotation cannot interleave.
-/// (A focus_run row written before a failing output insert stays, as before.)
-#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
-async fn persist_ingested_document(
-    user_id: &str,
-    persona_id: &str,
-    master_key: &[u8; crate::auth::kdf::MASTER_KEY_LEN],
-    key_hex_str: &str,
-    output_id: &str,
-    focus_slug: &str,
-    project_entity_id: Option<&str>,
-    sensitivity: &str,
-    original_filename: &str,
-    bytes: &[u8],
-    mirrored_content: Option<&str>,
-) -> Result<(), String> {
-    // A new document's first blob; matches the storage_version=1 that
-    // save_ingested_output inserts below.
-    let version = 1;
-    let storage_path = ingest_blob::ingest_blob_path(user_id, persona_id, output_id, version);
-
-    let saved = async {
-        ingest_blob::write_encrypted_blob(
-            &storage_path,
-            master_key,
-            user_id,
-            persona_id,
-            output_id,
-            version,
-            bytes,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-        let focus_run_id = output_store::create_ingest_focus_run(user_id, persona_id, key_hex_str)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        output_store::save_ingested_output(
-            user_id,
-            persona_id,
-            key_hex_str,
-            output_id,
-            &focus_run_id,
-            "ingested_document",
-            sensitivity,
-            focus_slug,
-            project_entity_id,
-            &storage_path.to_string_lossy(),
-            original_filename,
-            mirrored_content,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-    .await;
-
-    if saved.is_err() {
-        // write_encrypted_blob can fail after its rename (the directory
-        // fsync), so the cleanup runs for a failed blob write too.
-        if let Err(e) = ingest_blob::remove_output_blobs(user_id, persona_id, output_id).await {
-            log::warn!(
-                "store_ingested_document: removing the blob after a failed save failed: {e}"
-            );
-        }
-    }
-    saved
-}
-
 /// Store an uploaded/ingested document: writes its bytes to an encrypted
 /// blob on disk (ingest_blob), creates a lightweight ingest-only focus_run,
 /// and writes the outputs.db row (source='external_ingested').
@@ -572,6 +500,7 @@ pub async fn store_ingested_document(
         &master_key,
         &key_hex_str,
         &output_id,
+        INGESTED_DOCUMENT_OUTPUT_TYPE,
         &focus_slug,
         project_entity_id.as_deref(),
         &sensitivity,
@@ -1123,6 +1052,7 @@ mod tests {
             &TEST_DATA_KEY,
             key_hex_str,
             output_id,
+            INGESTED_DOCUMENT_OUTPUT_TYPE,
             "writing-assistant",
             None,
             sensitivity,

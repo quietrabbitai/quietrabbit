@@ -39,6 +39,12 @@
 // resolve to nothing. An entity id is never shown to a model and never accepted
 // from one.
 //
+// DRAFT HANDLES (items.id=387). H-XXXXXXXX names a pasted hand-off reply the
+// running Focus stored (persistence::handoff_draft_store): an ingested output of
+// type handoff_draft whose focus_slug is the Focus and that has not been deleted.
+// The text is untrusted external content and is read only through the store
+// reader, by handle, never shown to a template through this module.
+//
 // A handle is not a secret and not an authorization: it is an unguessable name
 // for a row the Focus is already allowed to touch. Error text never echoes a
 // value (the handle is model output).
@@ -64,6 +70,7 @@ pub enum Kind {
     Ticket,
     Delta,
     Entity,
+    Draft,
 }
 
 impl Kind {
@@ -72,6 +79,7 @@ impl Kind {
             Kind::Ticket => 'T',
             Kind::Delta => 'D',
             Kind::Entity => 'E',
+            Kind::Draft => 'H',
         }
     }
 
@@ -80,6 +88,7 @@ impl Kind {
             Kind::Ticket => "case",
             Kind::Delta => "delta",
             Kind::Entity => "entity",
+            Kind::Draft => "draft",
         }
     }
 }
@@ -132,6 +141,11 @@ pub fn delta_handle(focus_id: &str, delta_id: &str) -> String {
 /// items.id=891: the handle of a device a Focus owns.
 pub fn entity_handle(focus_id: &str, entity_id: &str) -> String {
     handle_for(Kind::Entity, focus_id, entity_id)
+}
+
+/// items.id=387: the handle of a pasted hand-off reply a Focus stored.
+pub fn draft_handle(focus_id: &str, output_id: &str) -> String {
+    handle_for(Kind::Draft, focus_id, output_id)
 }
 
 /// True when `raw` is shaped like an entity handle (E-XXXXXXXX, however a model
@@ -221,6 +235,22 @@ pub async fn resolve_entity_handle(
         .map(|e| e.id)
         .collect();
     pick(matches, "device")
+}
+
+/// items.id=387: the output id behind a draft handle: a hand-off reply that
+/// `focus_id` stored and that is not deleted, read from the persona's outputs.db.
+pub async fn resolve_draft_handle(
+    conn: &mut SqliteConnection,
+    focus_id: &str,
+    handle: &str,
+) -> Result<String, HandleError> {
+    let want = canonical(handle, Kind::Draft).ok_or(HandleError::Malformed('H'))?;
+    let ids = crate::persistence::handoff_draft_store::list_draft_ids(conn, focus_id).await?;
+    let matches: Vec<String> = ids
+        .into_iter()
+        .filter(|id| draft_handle(focus_id, id) == want)
+        .collect();
+    pick(matches, "hand-off reply")
 }
 
 #[cfg(test)]
