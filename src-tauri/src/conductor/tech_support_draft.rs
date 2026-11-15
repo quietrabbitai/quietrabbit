@@ -39,7 +39,8 @@
 //   close ticket       a closure state, a closing note, the strategy log, THEN
 //                      the closing case_update (the close-ticket lint requires
 //                      it to be the last case write), reply, then session_clear.
-//   device library     reply from the reference material.
+//   device library     reply from the device library (device_library_brief and,
+//                      with an active ticket, subject_context: items.id=891).
 //   one time session   latch, reply.
 //   fallback           any message no row answered (intent OTHER, or a ticket
 //                      that cannot be found) gets one clarifying reply.
@@ -198,7 +199,8 @@ pub fn rows(variant: Variant) -> Vec<DraftRow> {
         m(
             "nc_entity",
             "entity_ref",
-            "Name the device. Message: {user_input}",
+            "Name the device, as the user said it. Devices already saved: {device_library_brief}. \
+             Message: {user_input}",
             feeds_writers(vec![nc, none]),
         ),
         m(
@@ -287,7 +289,8 @@ pub fn rows(variant: Variant) -> Vec<DraftRow> {
         m(
             "resume_reply",
             "reply",
-            "Resume the ticket: {open_tickets_brief}. Message: {user_input}",
+            "Resume the ticket: {open_tickets_brief}. The device: {subject_context}. \
+             Message: {user_input}",
             vec![
                 ("intent", "eq", Some("continue_ticket")),
                 ("ticket_handle", "present", None),
@@ -389,7 +392,8 @@ pub fn rows(variant: Variant) -> Vec<DraftRow> {
         m(
             "dl_reply",
             "reply",
-            "Answer from the device reference: {case_context}. Message: {user_input}",
+            "Answer from the device library: {device_library_brief}. The active ticket's device: \
+             {subject_context}. Message: {user_input}",
             vec![("intent", "eq", Some("device_library"))],
         ),
         m(
