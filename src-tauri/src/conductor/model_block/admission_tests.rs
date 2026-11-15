@@ -525,7 +525,14 @@ fn ordinary_tail() -> Row {
 /// The rows of a test Focus for a block: producers of its inputs, the block, and
 /// (for a pure block, which may not be last) an ordinary tail.
 fn rows_for(id: &str, ex: &Value, with_tail: bool) -> Vec<Row> {
-    let mut rows: Vec<Row> = input_names(id, ex).iter().map(|n| supply(n)).collect();
+    // A name the pass reads from the store (a bound name, items.id=895's artifacts
+    // among them) is seeded at pass start, so no earlier row produces it, and a
+    // row may not (LOAD rejects an output_var with a bound name).
+    let mut rows: Vec<Row> = input_names(id, ex)
+        .iter()
+        .filter(|n| !crate::conductor::bound_spec::NAMES.contains(&n.as_str()))
+        .map(|n| supply(n))
+        .collect();
     rows.push(("the_block".to_owned(), Some(id.to_owned()), ex.clone()));
     if with_tail {
         rows.push(ordinary_tail());
@@ -965,4 +972,23 @@ fn an_empty_override_is_the_identity_and_the_focus_ceiling_only_narrows_every_ex
                 .all(|d| env.destinations.contains(d)));
         }
     }
+}
+
+/// items.id=895: the four artifact names are reserved. No shipped example of any
+/// block may use a bound name as its output variable (the loader would refuse the
+/// Focus), and the draft example's brief is read as the content_brief artifact.
+#[test]
+fn no_example_uses_a_bound_name_as_its_output_variable() {
+    for id in REGISTERED_STABLE_IDS {
+        let ex = example_of(id);
+        if let Some(v) = ex["common"]["output_var"].as_str() {
+            assert!(
+                !crate::conductor::bound_spec::NAMES.contains(&v),
+                "{id}: output_var '{v}' is a bound name"
+            );
+        }
+    }
+    let draft = example_of("cb-12");
+    assert_eq!(draft["spec"]["brief_var"], "content_brief");
+    assert!(crate::conductor::bound_spec::ARTIFACT_NAMES.contains(&"content_brief"));
 }

@@ -9,7 +9,11 @@
 // Each name has:
 //   source    Session: a row of session_variables (persistence::session_store),
 //             or the one-time write latch. Derived: computed read-only from the
-//             case store (persistence::case_store) at pass start.
+//             case store (persistence::case_store) at pass start. Artifact
+//             (items.id=895): the current row of one kind in pass_artifacts
+//             (persistence::pass_artifact_store), written only by the
+//             artifact_put and artifact_clear store operations and absent
+//             until the first write.
 //   presence  Optional: the name is ABSENT until something writes it (a guard
 //             on it is false, its token renders as nothing). Always: every pass
 //             that asks for it gets a value, and a read that fails fails the
@@ -39,6 +43,12 @@ pub enum Source {
     Session,
     /// Computed read-only from the case store at pass start.
     Derived,
+    /// items.id=895: the current per-pass artifact of one kind
+    /// (pass_artifacts, persistence::pass_artifact_store). Read-only to a
+    /// template, a guard and a seed: only artifact_put and artifact_clear write
+    /// it. Never an argument of a store writer (a stored artifact is not data to
+    /// copy back) and never a session_put target.
+    Artifact,
 }
 
 /// Whether a pass can find the name absent.
@@ -83,6 +93,24 @@ pub const SUBJECT_CONTEXT: &str = "subject_context";
 /// opening with the E-XXXXXXXX handle a model can name (conductor::device_seeding).
 pub const DEVICE_LIBRARY_BRIEF: &str = "device_library_brief";
 
+/// items.id=895: the four per-pass artifact names. Each equals its
+/// pass_artifact_store::ArtifactKind::as_str() (a test pins it), so a name is
+/// reserved for the artifact and no row's output_var may use it (the
+/// declared-inputs lint rejects that): a producing step uses another variable
+/// and an artifact_put row stores it under the name.
+pub const CONTENT_BRIEF: &str = "content_brief";
+pub const VOICE_GUIDANCE: &str = "voice_guidance";
+pub const VALIDATION_REPORT: &str = "validation_report";
+pub const DELTA_ITEMS: &str = "delta_items";
+
+/// The artifact names, in table order.
+pub const ARTIFACT_NAMES: [&str; 4] = [
+    CONTENT_BRIEF,
+    VOICE_GUIDANCE,
+    VALIDATION_REPORT,
+    DELTA_ITEMS,
+];
+
 pub const WRITE_MODE_VALUES: &[&str] = &["open", "suppressed"];
 pub const OPEN_TICKET_STATE_VALUES: &[&str] = &["none", "one", "many"];
 
@@ -97,6 +125,10 @@ pub const NAMES: &[&str] = &[
     DELTA_CONTEXT,
     SUBJECT_CONTEXT,
     DEVICE_LIBRARY_BRIEF,
+    CONTENT_BRIEF,
+    VOICE_GUIDANCE,
+    VALIDATION_REPORT,
+    DELTA_ITEMS,
 ];
 
 pub const SPECS: &[BoundSpec] = &[
@@ -163,6 +195,36 @@ pub const SPECS: &[BoundSpec] = &[
         literals: Literals::Authored,
         validate: valid_text,
     },
+    // items.id=895: the artifacts. Optional (absent until written, so a guard on
+    // a name is false and its token renders as nothing) and Authored (open text).
+    BoundSpec {
+        name: CONTENT_BRIEF,
+        source: Source::Artifact,
+        presence: Presence::Optional,
+        literals: Literals::Authored,
+        validate: valid_artifact,
+    },
+    BoundSpec {
+        name: VOICE_GUIDANCE,
+        source: Source::Artifact,
+        presence: Presence::Optional,
+        literals: Literals::Authored,
+        validate: valid_artifact,
+    },
+    BoundSpec {
+        name: VALIDATION_REPORT,
+        source: Source::Artifact,
+        presence: Presence::Optional,
+        literals: Literals::Authored,
+        validate: valid_artifact,
+    },
+    BoundSpec {
+        name: DELTA_ITEMS,
+        source: Source::Artifact,
+        presence: Presence::Optional,
+        literals: Literals::Authored,
+        validate: valid_artifact,
+    },
 ];
 
 /// The spec of a bound name, or None for any other name.
@@ -200,6 +262,15 @@ fn valid_case_id(s: &str) -> bool {
 /// derived name always exists and says "nothing" with an empty value.
 fn valid_text(s: &str) -> bool {
     s.len() <= DERIVED_TEXT_MAX_BYTES && !s.contains('\0')
+}
+
+/// An artifact value: at most pass_artifact_store::ARTIFACT_MAX_BYTES, no NUL,
+/// not blank. (Seeding cleans braces before it validates, so the cleaned text
+/// is what is checked.)
+fn valid_artifact(s: &str) -> bool {
+    !s.trim().is_empty()
+        && s.len() <= crate::persistence::pass_artifact_store::ARTIFACT_MAX_BYTES
+        && !s.contains('\0')
 }
 
 #[cfg(test)]
@@ -265,6 +336,9 @@ mod tests {
         ] {
             assert_eq!(row(n), (Source::Derived, Presence::Always, None), "{n}");
         }
+        for n in ARTIFACT_NAMES {
+            assert_eq!(row(n), (Source::Artifact, Presence::Optional, None), "{n}");
+        }
         assert_eq!(WRITE_MODE_VALUES, &["open", "suppressed"]);
         assert_eq!(OPEN_TICKET_STATE_VALUES, &["none", "one", "many"]);
         // A derived name is never absent.
@@ -312,5 +386,34 @@ mod tests {
         assert!(valid_text(""));
         assert!(!valid_text("a\0b"));
         assert!(!valid_text(&"a".repeat(DERIVED_TEXT_MAX_BYTES + 1)));
+    }
+
+    /// items.id=895: the artifact names are exactly the closed kinds of the
+    /// store, one name per kind and no other Artifact-source name.
+    #[test]
+    fn the_artifact_names_are_the_store_kinds() {
+        use crate::persistence::pass_artifact_store::ArtifactKind;
+        let kinds: Vec<&str> = ArtifactKind::ALL.iter().map(|k| k.as_str()).collect();
+        assert_eq!(kinds, ARTIFACT_NAMES);
+        let from_specs: Vec<&str> = SPECS
+            .iter()
+            .filter(|s| s.source == Source::Artifact)
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(from_specs, ARTIFACT_NAMES);
+        for n in ARTIFACT_NAMES {
+            assert!(ArtifactKind::parse(n).is_some(), "{n}");
+        }
+    }
+
+    #[test]
+    fn the_artifact_validator_matches_the_store_limits() {
+        use crate::persistence::pass_artifact_store::ARTIFACT_MAX_BYTES;
+        assert!(valid_artifact("a brief"));
+        assert!(valid_artifact(&"a".repeat(ARTIFACT_MAX_BYTES)));
+        assert!(!valid_artifact(&"a".repeat(ARTIFACT_MAX_BYTES + 1)));
+        assert!(!valid_artifact(""));
+        assert!(!valid_artifact("  \n"));
+        assert!(!valid_artifact("a\0b"));
     }
 }

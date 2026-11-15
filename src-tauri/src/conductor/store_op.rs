@@ -36,6 +36,25 @@
 //                          (conductor::device_fields) on an entity this pass
 //                          published. An unknown field fails the pass.
 //
+// items.id=895 (decisions.id=942 point 5) adds two more, the PER-PASS ARTIFACT
+// writers. They write pass_artifacts in the persona's outputs.db
+// (persistence::pass_artifact_store), the text a later chat pass reads back as a
+// bound name (bound_spec.rs, source Artifact):
+//
+//   artifact_put     pass_artifact_store::put_artifact: store_target is the
+//                    artifact's bound name (content_brief, voice_guidance,
+//                    validation_report or delta_items), the one slot `value` is
+//                    the variable that supplies the text (an earlier step's
+//                    output). Gated by the collection consent: it saves text
+//                    about what the user is writing.
+//   artifact_clear   pass_artifact_store::clear_artifact for that name, no
+//                    slots. Not gated, like session_clear: it removes data.
+//
+// A pass reads an artifact only through the bound name, once, at pass start
+// (seeding.rs), so a value written in a pass is read by the NEXT pass. The name
+// is the artifact's alone: LOAD refuses it as a row's output_var, as a
+// session_put target and as the argument of any writer.
+//
 // A model never names an entity id. Every entity slot of case_open, case_link,
 // delta_record, delta_changed and entity_fact_put must be the id PUBLISHED by an
 // earlier entity_find_or_create row (LOAD), the model picks an existing device by
@@ -129,11 +148,13 @@ pub enum Op {
     SessionClear,
     EntityFindOrCreate,
     EntityFactPut,
+    ArtifactPut,
+    ArtifactClear,
 }
 
 impl Op {
     /// The closed set, in documentation order.
-    pub const ALL: [Op; 14] = [
+    pub const ALL: [Op; 16] = [
         Op::Latch,
         Op::SessionPut,
         Op::CaseOpen,
@@ -148,6 +169,8 @@ impl Op {
         Op::SessionClear,
         Op::EntityFindOrCreate,
         Op::EntityFactPut,
+        Op::ArtifactPut,
+        Op::ArtifactClear,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -166,6 +189,8 @@ impl Op {
             Op::SessionClear => "session_clear",
             Op::EntityFindOrCreate => "entity_find_or_create",
             Op::EntityFactPut => "entity_fact_put",
+            Op::ArtifactPut => "artifact_put",
+            Op::ArtifactClear => "artifact_clear",
         }
     }
 
@@ -186,7 +211,9 @@ impl Op {
             | Op::CaseSelect
             | Op::CaseLink
             | Op::EntityChanged
-            | Op::SessionClear => false,
+            | Op::SessionClear
+            | Op::ArtifactPut
+            | Op::ArtifactClear => false,
         }
     }
 
@@ -209,7 +236,9 @@ impl Op {
             | Op::CaseSelect
             | Op::EntityChanged
             | Op::SessionClear
-            | Op::EntityFindOrCreate => false,
+            | Op::EntityFindOrCreate
+            | Op::ArtifactPut
+            | Op::ArtifactClear => false,
         }
     }
 
@@ -228,9 +257,12 @@ impl Op {
     ///   NOT gated: Latch (it SUPPRESSES writes, so refusing it would only widen
     ///   what a no-consent chat can save) and SessionClear (it REMOVES data, which
     ///   the user must always be able to cause).
+    ///
+    /// items.id=895: artifact_put saves text (a brief, voice guidance, a report)
+    /// and is gated. artifact_clear removes data, like session_clear, and is not.
     pub fn requires_collection_consent(self) -> bool {
         match self {
-            Op::Latch | Op::SessionClear => false,
+            Op::Latch | Op::SessionClear | Op::ArtifactClear => false,
             Op::SessionPut
             | Op::CaseOpen
             | Op::CaseUpdate
@@ -242,7 +274,8 @@ impl Op {
             | Op::CaseLink
             | Op::EntityChanged
             | Op::EntityFindOrCreate
-            | Op::EntityFactPut => true,
+            | Op::EntityFactPut
+            | Op::ArtifactPut => true,
         }
     }
 
@@ -342,6 +375,8 @@ pub enum TargetRule {
     /// Required: the pass variable the entity id is published under, because every
     /// later entity slot must name it (items.id=891).
     PublishIdRequired,
+    /// Required: an artifact bound name (bound_spec source Artifact), items.id=895.
+    ArtifactName,
 }
 
 pub struct OpSpec {
@@ -460,6 +495,20 @@ pub const OP_SPECS: &[OpSpec] = &[
         optional: &[],
         needs_an_optional: false,
     },
+    OpSpec {
+        op: Op::ArtifactPut,
+        target: TargetRule::ArtifactName,
+        required: &[Slot::Value],
+        optional: &[],
+        needs_an_optional: false,
+    },
+    OpSpec {
+        op: Op::ArtifactClear,
+        target: TargetRule::ArtifactName,
+        required: &[],
+        optional: &[],
+        needs_an_optional: false,
+    },
 ];
 
 /// Longest variable name a row may name.
@@ -482,7 +531,7 @@ pub struct StoreOp {
 pub enum StoreOpError {
     #[error("store_target or store_args is set without store_op (set: {0}): the three columns go together")]
     HalfSet(String),
-    #[error("unknown store_op '{0}' (expected one of latch, session_put, case_open, case_update, strategy_append, delta_record, delta_confirm, delta_changed, case_select, case_link, entity_changed, session_clear, entity_find_or_create, entity_fact_put)")]
+    #[error("unknown store_op '{0}' (expected one of latch, session_put, case_open, case_update, strategy_append, delta_record, delta_confirm, delta_changed, case_select, case_link, entity_changed, session_clear, entity_find_or_create, entity_fact_put, artifact_put, artifact_clear)")]
     UnknownOp(String),
     #[error("store_op '{0}' needs a store_target")]
     TargetRequired(&'static str),
@@ -562,6 +611,21 @@ pub enum StoreOpError {
     // -- items.id=891: the Focus-owned entity writers -------------------------
     #[error("step '{action_id}': slot '{slot}' names '{var}', which is not the id published by an EARLIER entity_find_or_create row: a model never names an entity id, so an entity slot must name the variable an earlier entity_find_or_create row publishes")]
     EntitySlotNotPublished {
+        action_id: String,
+        slot: &'static str,
+        var: String,
+    },
+    // -- items.id=895: the per-pass artifact writers ---------------------------
+    #[error("step '{action_id}': {op} target '{name}' is not an artifact name (the artifact names are content_brief, voice_guidance, validation_report and delta_items)")]
+    UnknownArtifactName {
+        action_id: String,
+        op: &'static str,
+        name: String,
+    },
+    #[error("step '{action_id}': session_put target '{name}' is a per-pass artifact, written only by artifact_put")]
+    ArtifactNotSessionName { action_id: String, name: String },
+    #[error("step '{action_id}': slot '{slot}' names '{var}', a per-pass artifact that a template reads as a bound name and a store writer never takes as an argument")]
+    ArgumentArtifact {
         action_id: String,
         slot: &'static str,
         var: String,
@@ -646,12 +710,13 @@ impl StoreOp {
         let target = match (spec.target, target) {
             (TargetRule::None, Some(_)) => return Err(StoreOpError::TargetNotAllowed(name)),
             (TargetRule::None, None) | (TargetRule::PublishId, None) => None,
-            (TargetRule::SessionName, None) | (TargetRule::PublishIdRequired, None) => {
-                return Err(StoreOpError::TargetRequired(name))
-            }
+            (TargetRule::SessionName, None)
+            | (TargetRule::PublishIdRequired, None)
+            | (TargetRule::ArtifactName, None) => return Err(StoreOpError::TargetRequired(name)),
             (TargetRule::SessionName, Some(t))
             | (TargetRule::PublishId, Some(t))
-            | (TargetRule::PublishIdRequired, Some(t)) => {
+            | (TargetRule::PublishIdRequired, Some(t))
+            | (TargetRule::ArtifactName, Some(t)) => {
                 let t = t.trim();
                 if !valid_var_name(t) {
                     return Err(StoreOpError::BadTarget(t.to_owned()));
@@ -787,6 +852,19 @@ pub fn check_composition(
             });
         }
 
+        // items.id=895: the target of an artifact writer is one of the artifact
+        // names, and nothing else.
+        if matches!(op.op, Op::ArtifactPut | Op::ArtifactClear) {
+            let name = op.target.as_deref().unwrap_or("");
+            if !bound_spec::spec(name).is_some_and(|s| s.source == Source::Artifact) {
+                return Err(StoreOpError::UnknownArtifactName {
+                    action_id,
+                    op: op.op.as_str(),
+                    name: name.to_owned(),
+                });
+            }
+        }
+
         // The target of session_put is a registered session name, and the latch
         // is out of its reach.
         if op.op == Op::SessionPut {
@@ -797,6 +875,12 @@ pub fn check_composition(
             match bound_spec::spec(name) {
                 None => {
                     return Err(StoreOpError::UnknownSessionName {
+                        action_id,
+                        name: name.to_owned(),
+                    })
+                }
+                Some(s) if s.source == Source::Artifact => {
+                    return Err(StoreOpError::ArtifactNotSessionName {
                         action_id,
                         name: name.to_owned(),
                     })
@@ -880,6 +964,13 @@ pub fn check_composition(
                 });
             }
             if let Some(s) = bound_spec::spec(var) {
+                if s.source == Source::Artifact {
+                    return Err(StoreOpError::ArgumentArtifact {
+                        action_id,
+                        slot,
+                        var: var.to_owned(),
+                    });
+                }
                 if s.source == Source::Derived {
                     return Err(StoreOpError::ArgumentDerived {
                         action_id,
@@ -1336,6 +1427,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_artifact_operations_are_pinned_and_parse() {
+        assert_eq!(Op::ALL.len(), OP_SPECS.len());
+        let names = |s: &[Slot]| s.iter().map(|x| x.as_str()).collect::<Vec<_>>();
+        let spec = Op::ArtifactPut.spec();
+        assert_eq!(
+            (spec.target, names(spec.required), names(spec.optional)),
+            (TargetRule::ArtifactName, vec!["value"], vec![])
+        );
+        let spec = Op::ArtifactClear.spec();
+        assert_eq!(
+            (spec.target, names(spec.required), names(spec.optional)),
+            (TargetRule::ArtifactName, vec![], vec![])
+        );
+        let put = parse(
+            "artifact_put",
+            Some("content_brief"),
+            Some(r#"{"value":"brief_text"}"#),
+        )
+        .unwrap();
+        assert_eq!(put.target.as_deref(), Some("content_brief"));
+        assert_eq!(put.arg(Slot::Value), Some("brief_text"));
+        assert_eq!(put.published_var(), None);
+        let clear = parse("artifact_clear", Some("delta_items"), None).unwrap();
+        assert_eq!(clear.op, Op::ArtifactClear);
+        // The target is required, and clear takes no slots.
+        assert_eq!(
+            parse("artifact_put", None, Some(r#"{"value":"v"}"#)),
+            Err(StoreOpError::TargetRequired("artifact_put"))
+        );
+        assert_eq!(
+            parse("artifact_clear", None, None),
+            Err(StoreOpError::TargetRequired("artifact_clear"))
+        );
+        assert_eq!(
+            parse("artifact_clear", Some("delta_items"), Some("{}")),
+            Err(StoreOpError::ArgsNotAllowed("artifact_clear"))
+        );
+        assert_eq!(
+            parse("artifact_put", Some("content_brief"), None),
+            Err(StoreOpError::ArgsRequired("artifact_put"))
+        );
+        assert!(matches!(
+            parse(
+                "artifact_put",
+                Some("content_brief"),
+                Some(r#"{"value":"v","case":"c"}"#)
+            ),
+            Err(StoreOpError::UnknownSlot { .. })
+        ));
+        // Neither touches entities or the case.
+        for o in [Op::ArtifactPut, Op::ArtifactClear] {
+            assert!(!o.is_entity_op() && !o.takes_entity_ids() && !o.writes_case());
+        }
+        assert!(Op::ArtifactPut.requires_collection_consent());
+        assert!(!Op::ArtifactClear.requires_collection_consent());
+    }
+
     // -- composition checks ---------------------------------------------------
 
     fn base(id: &str) -> ActionDefinition {
@@ -1458,6 +1607,124 @@ mod tests {
         assert!(matches!(
             check(vec![model("a", "v"), put("anything_else", "v")]),
             Err(StoreOpError::UnknownSessionName { .. })
+        ));
+    }
+
+    fn artifact_put(target: &str, var: &str) -> (ActionDefinition, Option<String>) {
+        writer(
+            "aput",
+            "artifact_put",
+            Some(target),
+            Some(&format!(r#"{{"value":"{var}"}}"#)),
+            None,
+        )
+    }
+
+    /// items.id=895: an artifact_put to each artifact name, from an earlier
+    /// variable, loads, in a per_field Focus as well (no entity involved), and so
+    /// does a clear.
+    #[test]
+    fn an_artifact_put_and_clear_to_an_artifact_name_load() {
+        for name in crate::conductor::bound_spec::ARTIFACT_NAMES {
+            for posture in [CollectionPosture::FocusLevel, CollectionPosture::PerField] {
+                assert_eq!(
+                    check_with(vec![model("a", "v"), artifact_put(name, "v")], posture),
+                    Ok(()),
+                    "{name}"
+                );
+                assert_eq!(
+                    check_with(
+                        vec![writer("aclr", "artifact_clear", Some(name), None, None)],
+                        posture
+                    ),
+                    Ok(()),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_artifact_writer_cannot_target_anything_but_an_artifact_name() {
+        for bad in [
+            "locked_intent",
+            "active_case_id",
+            "write_mode",
+            "case_context",
+            "anything_else",
+        ] {
+            for row in [
+                artifact_put(bad, "v"),
+                writer("aclr", "artifact_clear", Some(bad), None, None),
+            ] {
+                let e = check(vec![model("a", "v"), row]).unwrap_err();
+                assert!(
+                    matches!(&e, StoreOpError::UnknownArtifactName { name, .. } if name == bad),
+                    "{bad}: {e:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn session_put_cannot_target_an_artifact_name() {
+        for name in crate::conductor::bound_spec::ARTIFACT_NAMES {
+            assert!(
+                matches!(
+                    check(vec![model("a", "v"), put(name, "v")]),
+                    Err(StoreOpError::ArtifactNotSessionName { .. })
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    /// An artifact name is read through a template and never copied back: it is
+    /// refused as the argument of any writer.
+    #[test]
+    fn an_artifact_name_is_never_a_writer_argument() {
+        for name in crate::conductor::bound_spec::ARTIFACT_NAMES {
+            for rows in [
+                vec![artifact_put("delta_items", name)],
+                vec![put("locked_intent", name)],
+                vec![
+                    model("c", "c"),
+                    writer(
+                        "w",
+                        "strategy_append",
+                        None,
+                        Some(&format!(
+                            r#"{{"case":"c","strategy":"{name}","outcome":"{name}"}}"#
+                        )),
+                        None,
+                    ),
+                ],
+            ] {
+                let e = check(rows).unwrap_err();
+                assert!(
+                    matches!(&e, StoreOpError::ArgumentArtifact { var, .. } if var == name),
+                    "{name}: {e:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_artifact_put_value_must_come_from_an_earlier_variable() {
+        assert!(matches!(
+            check(vec![artifact_put("content_brief", "v")]),
+            Err(StoreOpError::ArgumentUnknown { .. })
+        ));
+        assert!(matches!(
+            check(vec![artifact_put("content_brief", "v"), model("a", "v")]),
+            Err(StoreOpError::ArgumentFromLaterRow { .. })
+        ));
+        assert!(matches!(
+            check(vec![
+                model("a", "v"),
+                artifact_put("content_brief", "user_input")
+            ]),
+            Err(StoreOpError::ArgumentNotAllowed { .. })
         ));
     }
 

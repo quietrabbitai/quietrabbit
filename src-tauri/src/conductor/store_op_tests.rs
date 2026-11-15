@@ -513,6 +513,7 @@ fn every_writer() -> Vec<(StoreOp, HashMap<String, String>)> {
         ("did", "run-0:rec"),
         ("th", &handles::case_handle(FOCUS, "run-0:open")),
         ("dh", &handles::delta_handle(FOCUS, "run-0:rec")),
+        ("brief", "A brief text"),
     ]);
     vec![
         (
@@ -596,6 +597,15 @@ fn every_writer() -> Vec<(StoreOp, HashMap<String, String>)> {
             ),
             v.clone(),
         ),
+        (
+            op(
+                "artifact_put",
+                Some("content_brief"),
+                Some(serde_json::json!({"value": "brief"})),
+            ),
+            v.clone(),
+        ),
+        (op("artifact_clear", Some("content_brief"), None), v.clone()),
         (op("session_clear", None, None), v),
     ]
 }
@@ -609,6 +619,7 @@ async fn row_counts(conn: &mut SqliteConnection) -> Vec<i64> {
         "case_strategies",
         "config_deltas",
         "config_delta_entities",
+        "pass_artifacts",
     ] {
         out.push(count(conn, t).await);
     }
@@ -1046,7 +1057,7 @@ async fn one_personas_writes_are_invisible_in_another_personas_file() {
     .await
     .unwrap();
 
-    assert_eq!(row_counts(&mut two).await, [0, 0, 0, 0, 0, 0]);
+    assert_eq!(row_counts(&mut two).await, [0, 0, 0, 0, 0, 0, 0]);
     assert!(case_store::get_case(&mut two, &id).await.unwrap().is_none());
     assert_eq!(
         session_store::write_mode(&mut two, CHAT).await.unwrap(),
@@ -1832,7 +1843,7 @@ async fn the_new_operations_are_isolated_per_persona() {
     .await
     .unwrap();
     assert!(active_case(&mut one, FOCUS).await.is_some());
-    assert_eq!(row_counts(&mut two).await, [0, 0, 0, 0, 0, 0]);
+    assert_eq!(row_counts(&mut two).await, [0, 0, 0, 0, 0, 0, 0]);
 }
 
 /// A guard-false row writes nothing, and the new operations are no exception:
@@ -1962,12 +1973,12 @@ fn ctx_no_consent<'a>(focus: &'a str, run: &'a str, action: &'a str) -> WriterCo
     }
 }
 
-/// The twelve operations that save something, written out so the gate's own
+/// The thirteen operations that save something, written out so the gate's own
 /// classification (Op::requires_collection_consent) is checked against the
-/// decision and not against itself. The last two are the Focus-owned entity
-/// writers (items.id=891), exercised with real entity stores in
-/// entity_writer_tests.rs.
-const GATED_OPS: [&str; 12] = [
+/// decision and not against itself. entity_find_or_create and entity_fact_put are
+/// the Focus-owned entity writers (items.id=891), exercised with real entity
+/// stores in entity_writer_tests.rs. artifact_put (items.id=895) saves text.
+const GATED_OPS: [&str; 13] = [
     "session_put",
     "case_select",
     "case_link",
@@ -1980,6 +1991,7 @@ const GATED_OPS: [&str; 12] = [
     "delta_changed",
     "entity_find_or_create",
     "entity_fact_put",
+    "artifact_put",
 ];
 
 /// An open chat holding a case and a delta, so a writer that was NOT refused
@@ -2013,10 +2025,12 @@ fn the_gate_classifies_every_operation_as_the_decision_says() {
     expect.sort_unstable();
     got.sort_unstable();
     assert_eq!(got, expect);
-    // Latch suppresses writes and session_clear removes data: neither is gated.
+    // Latch suppresses writes, session_clear and artifact_clear remove data: none
+    // of them is gated.
     assert!(!Op::Latch.requires_collection_consent());
     assert!(!Op::SessionClear.requires_collection_consent());
-    assert_eq!(Op::ALL.len(), GATED_OPS.len() + 2, "every op is classified");
+    assert!(!Op::ArtifactClear.requires_collection_consent());
+    assert_eq!(Op::ALL.len(), GATED_OPS.len() + 3, "every op is classified");
 }
 
 /// Without the current consent EVERY gated operation is refused, writes nothing,
@@ -2046,8 +2060,10 @@ async fn without_consent_every_gated_writer_is_refused_and_writes_nothing() {
 
     for (writer, v) in &writers {
         let name = writer.op.as_str();
-        if name == "session_clear" {
-            continue; // below, last: it removes rows
+        // The two clears are not gated: they remove data, so they run without
+        // consent (their own tests below and in session_clear_runs_without_consent).
+        if name == "session_clear" || name == "artifact_clear" {
+            continue;
         }
         let d = run(&mut conn, &ctx_no_consent(FOCUS, "run-2", "w"), writer, v)
             .await
@@ -2338,5 +2354,369 @@ fn only_the_users_consent_commands_call_the_setter_and_the_audit_store() {
                 .collect();
             assert!(hits.is_empty(), "{rel}: `{forbidden}`: {hits:?}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// items.id=895: the per-pass artifact writers, against real encrypted files
+// ---------------------------------------------------------------------------
+
+use crate::persistence::pass_artifact_store::{
+    get_artifact, put_artifact, ArtifactKind, ArtifactWrite, ARTIFACT_MAX_BYTES,
+};
+
+/// Distinctive text no error, log call or refusal may carry.
+const ARTIFACT_SECRET: &str = "ZX9-ARTIFACT-WRITER-SECRET";
+
+fn put_op(name: &str) -> StoreOp {
+    op(
+        "artifact_put",
+        Some(name),
+        Some(serde_json::json!({"value": "text"})),
+    )
+}
+
+async fn stored(conn: &mut SqliteConnection, focus: &str, kind: ArtifactKind) -> Option<String> {
+    get_artifact(conn, CHAT, focus, kind)
+        .await
+        .unwrap()
+        .map(|a| a.content)
+}
+
+#[tokio::test]
+async fn artifact_put_creates_updates_and_replays_through_the_typed_store() {
+    let _root = TestRoot::new().await;
+    let mut conn = open(PERSONA).await;
+    let o = put_op("content_brief");
+
+    let d = run(
+        &mut conn,
+        &ctx(FOCUS, "run-1", "p"),
+        &o,
+        &vars(&[("text", "v1")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!((d.outcome, d.published), (Outcome::Applied, None));
+    assert_eq!(
+        stored(&mut conn, FOCUS, ArtifactKind::ContentBrief)
+            .await
+            .as_deref(),
+        Some("v1")
+    );
+    // The same write again (a retry or resume of the same row).
+    let d = run(
+        &mut conn,
+        &ctx(FOCUS, "run-1", "p"),
+        &o,
+        &vars(&[("text", "v1")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(d.outcome, Outcome::AlreadyApplied);
+    // A later pass replaces the text and moves the version.
+    let d = run(
+        &mut conn,
+        &ctx(FOCUS, "run-2", "p"),
+        &o,
+        &vars(&[("text", "v2")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(d.outcome, Outcome::Applied);
+    let a = get_artifact(&mut conn, CHAT, FOCUS, ArtifactKind::ContentBrief)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((a.content.as_str(), a.version), ("v2", 2));
+    assert_eq!(a.written_by_run, "run-2");
+    // Identical text from a later run is a no-op.
+    let d = run(
+        &mut conn,
+        &ctx(FOCUS, "run-3", "p"),
+        &o,
+        &vars(&[("text", "v2")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(d.outcome, Outcome::AlreadyApplied);
+    // The value is trimmed like every writer argument.
+    run(
+        &mut conn,
+        &ctx(FOCUS, "run-4", "p"),
+        &o,
+        &vars(&[("text", "  v3 \n")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        stored(&mut conn, FOCUS, ArtifactKind::ContentBrief)
+            .await
+            .as_deref(),
+        Some("v3")
+    );
+}
+
+#[tokio::test]
+async fn each_artifact_name_writes_its_own_kind_scoped_to_the_running_focus() {
+    let _root = TestRoot::new().await;
+    let mut conn = open(PERSONA).await;
+    for k in ArtifactKind::ALL {
+        run(
+            &mut conn,
+            &ctx(FOCUS, "run-1", "p"),
+            &put_op(k.as_str()),
+            &vars(&[("text", k.as_str())]),
+        )
+        .await
+        .unwrap();
+    }
+    run(
+        &mut conn,
+        &ctx(OTHER_FOCUS, "run-1", "p"),
+        &put_op("content_brief"),
+        &vars(&[("text", "other focus brief")]),
+    )
+    .await
+    .unwrap();
+    for k in ArtifactKind::ALL {
+        assert_eq!(
+            stored(&mut conn, FOCUS, k).await.as_deref(),
+            Some(k.as_str())
+        );
+    }
+    assert_eq!(
+        stored(&mut conn, OTHER_FOCUS, ArtifactKind::ContentBrief)
+            .await
+            .as_deref(),
+        Some("other focus brief")
+    );
+    assert_eq!(
+        stored(&mut conn, OTHER_FOCUS, ArtifactKind::VoiceGuidance).await,
+        None,
+        "another Focus wrote only its own"
+    );
+    // A run with no chat writes nothing.
+    let mut no_chat = ctx(FOCUS, "run-9", "p");
+    no_chat.context_key = None;
+    let err = run(
+        &mut conn,
+        &no_chat,
+        &put_op("content_brief"),
+        &vars(&[("text", "x")]),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, StoreWriteError::NoContextKey), "{err:?}");
+}
+
+#[tokio::test]
+async fn artifact_put_fails_closed_on_a_bad_value_and_never_names_the_text() {
+    let _root = TestRoot::new().await;
+    let mut conn = open(PERSONA).await;
+    let o = put_op("content_brief");
+    let too_long = format!("{ARTIFACT_SECRET}{}", "a".repeat(ARTIFACT_MAX_BYTES));
+    let mut messages = Vec::new();
+    for (v, why) in [
+        (vars(&[("text", "")]), "empty"),
+        (vars(&[("text", "   ")]), "blank"),
+        (vars(&[("text", &too_long)]), "over the cap"),
+        (vars(&[("text", &format!("{ARTIFACT_SECRET}\0"))]), "NUL"),
+        (vars(&[]), "unset"),
+    ] {
+        let err = run(&mut conn, &ctx(FOCUS, "run-1", "p"), &o, &v)
+            .await
+            .expect_err(why);
+        messages.push(format!("{why}: {err} | {err:?}"));
+    }
+    for m in &messages {
+        assert!(!m.contains(ARTIFACT_SECRET), "{m}");
+    }
+    assert_eq!(count(&mut conn, "pass_artifacts").await, 0);
+}
+
+#[tokio::test]
+async fn artifact_clear_removes_one_kind_runs_without_consent_and_replays() {
+    let _root = TestRoot::new().await;
+    let mut conn = open(PERSONA).await;
+    for k in [ArtifactKind::ContentBrief, ArtifactKind::DeltaItems] {
+        run(
+            &mut conn,
+            &ctx(FOCUS, "run-1", "p"),
+            &put_op(k.as_str()),
+            &vars(&[("text", "t")]),
+        )
+        .await
+        .unwrap();
+    }
+    let clear = op("artifact_clear", Some("content_brief"), None);
+    let d = run(
+        &mut conn,
+        &ctx_no_consent(FOCUS, "run-2", "c"),
+        &clear,
+        &vars(&[]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(d.outcome, Outcome::Applied, "clearing needs no consent");
+    assert_eq!(
+        stored(&mut conn, FOCUS, ArtifactKind::ContentBrief).await,
+        None
+    );
+    assert_eq!(
+        stored(&mut conn, FOCUS, ArtifactKind::DeltaItems)
+            .await
+            .as_deref(),
+        Some("t"),
+        "the other kind stays"
+    );
+    let d = run(&mut conn, &ctx(FOCUS, "run-3", "c"), &clear, &vars(&[]))
+        .await
+        .unwrap();
+    assert_eq!(d.outcome, Outcome::AlreadyApplied);
+}
+
+#[tokio::test]
+async fn artifact_put_without_consent_or_in_a_latched_chat_writes_nothing() {
+    let _root = TestRoot::new().await;
+    let mut conn = open(PERSONA).await;
+    let o = put_op("content_brief");
+    let d = run(
+        &mut conn,
+        &ctx_no_consent(FOCUS, "run-1", "p"),
+        &o,
+        &vars(&[("text", "x")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(d.outcome, Outcome::RefusedNoConsent);
+    assert_eq!(count(&mut conn, "pass_artifacts").await, 0);
+
+    run(
+        &mut conn,
+        &ctx(FOCUS, "run-2", "p"),
+        &o,
+        &vars(&[("text", "kept")]),
+    )
+    .await
+    .unwrap();
+    run(
+        &mut conn,
+        &ctx(FOCUS, "run-3", "l"),
+        &op("latch", None, None),
+        &vars(&[]),
+    )
+    .await
+    .unwrap();
+    // Latched: refused, whatever the value (even one that would not validate),
+    // and a clear is refused too.
+    for v in [
+        vars(&[("text", "changed")]),
+        vars(&[("text", "")]),
+        vars(&[]),
+    ] {
+        let d = run(&mut conn, &ctx(FOCUS, "run-4", "p"), &o, &v)
+            .await
+            .unwrap();
+        assert_eq!(d.outcome, Outcome::RefusedOneTime);
+    }
+    let d = run(
+        &mut conn,
+        &ctx(FOCUS, "run-4", "c"),
+        &op("artifact_clear", Some("content_brief"), None),
+        &vars(&[]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(d.outcome, Outcome::RefusedOneTime);
+    assert_eq!(
+        stored(&mut conn, FOCUS, ArtifactKind::ContentBrief)
+            .await
+            .as_deref(),
+        Some("kept")
+    );
+}
+
+/// Two passes holding the same version: the store's compare-and-set keeps exactly
+/// one of them. (The writer reads the version it writes with, as put_session does,
+/// so only a write landing between that read and the put loses. That window is not
+/// reproducible in one connection, so this pins the store's side of it.)
+#[tokio::test]
+async fn a_stale_artifact_write_through_the_store_is_a_version_conflict() {
+    let _root = TestRoot::new().await;
+    let mut conn = open(PERSONA).await;
+    run(
+        &mut conn,
+        &ctx(FOCUS, "run-1", "p"),
+        &put_op("content_brief"),
+        &vars(&[("text", "v1")]),
+    )
+    .await
+    .unwrap();
+    // Another pass moves it to version 2.
+    put_artifact(
+        &mut conn,
+        &ArtifactWrite {
+            context_key: CHAT,
+            focus_id: FOCUS,
+            kind: ArtifactKind::ContentBrief,
+            content: "v2",
+            written_by_run: "run-2",
+            expected_version: Some(1),
+        },
+    )
+    .await
+    .unwrap();
+    // The store refuses a writer that still holds version 1.
+    let err = put_artifact(
+        &mut conn,
+        &ArtifactWrite {
+            context_key: CHAT,
+            focus_id: FOCUS,
+            kind: ArtifactKind::ContentBrief,
+            content: "v3",
+            written_by_run: "run-3",
+            expected_version: Some(1),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::persistence::pass_artifact_store::PassArtifactError::VersionConflict { .. }
+    ));
+    assert_eq!(
+        stored(&mut conn, FOCUS, ArtifactKind::ContentBrief)
+            .await
+            .as_deref(),
+        Some("v2")
+    );
+}
+
+/// The only log call of the writer is the artifact one, it takes a Fingerprint and
+/// no text, and nothing in the module logs through any other path. A source scan,
+/// because the rule is about what the code does (log::set_logger is once per test
+/// process and commands::auth already installs its capture logger).
+#[test]
+fn the_writer_logs_artifacts_only_as_a_count_and_a_hash() {
+    let src = production_source("src/conductor/store_writer.rs");
+    let log_lines: Vec<&str> = src.lines().filter(|l| l.contains("log::")).collect();
+    assert_eq!(log_lines.len(), 1, "{log_lines:?}");
+    assert!(src
+        .contains("fn log_artifact_write(kind: ArtifactKind, outcome: Outcome, fp: &Fingerprint)"));
+    for banned in ["println!", "eprintln!", "dbg!", "tracing::"] {
+        assert!(!src.contains(banned), "{banned}");
+    }
+    // The call site passes the fingerprint of the value, never the value.
+    assert!(
+        src.contains("log_artifact_write(kind, outcome, &pass_artifact_store::fingerprint(value))")
+    );
+    // The seeding reader and the store log nothing at all.
+    for rel in [
+        "src/conductor/seeding.rs",
+        "src/persistence/pass_artifact_store.rs",
+    ] {
+        let code = production_source(rel);
+        assert!(!code.contains("log::"), "{rel} logs");
     }
 }

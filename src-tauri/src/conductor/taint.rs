@@ -339,4 +339,41 @@ mod tests {
             assert!(!t.actions.contains("clean"), "{name}");
         }
     }
+
+    /// items.id=895: a step naming an artifact name is tainted like one naming any
+    /// store name, its variable with it, and so is every step downstream, so none
+    /// of them reaches extraction.
+    #[test]
+    fn a_step_naming_an_artifact_name_is_tainted_with_its_variable_and_downstream() {
+        let names = crate::conductor::bound_spec::NAMES;
+        for name in crate::conductor::bound_spec::ARTIFACT_NAMES {
+            let steps = [
+                step("clean", "hello {user_input}", Some("c")),
+                step("root", &format!("brief: {{{name}}}"), Some("v1")),
+                step("down", "from {v1}", Some("v2")),
+                step("after", "{previous_output}", Some("v3")),
+            ];
+            let t = closure(&steps, names);
+            assert_eq!(actions(&t), ["after", "down", "root"], "{name}");
+            assert!(t.vars.contains("v1") && t.vars.contains("v2"), "{name}");
+            assert!(!t.actions.contains("clean"), "{name}");
+        }
+    }
+
+    #[test]
+    fn an_artifact_name_is_restricted_to_the_step_that_names_it() {
+        for name in crate::conductor::bound_spec::ARTIFACT_NAMES {
+            let st = store(&[(name, "ARTIFACT TEXT")], &[name]);
+            let mut named = toks(&[]);
+            st.apply(&format!("uses {{{name}}}"), &mut named);
+            assert_eq!(
+                named.get(name).map(String::as_str),
+                Some("ARTIFACT TEXT"),
+                "{name}"
+            );
+            let mut unnamed = toks(&[(name, "ARTIFACT TEXT")]);
+            st.apply("no names here", &mut unnamed);
+            assert!(!unnamed.contains_key(name), "{name}");
+        }
+    }
 }

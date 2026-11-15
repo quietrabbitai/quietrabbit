@@ -39,6 +39,18 @@
 // internally to find the case; that read is part of the derived name, and
 // active_case_id itself is seeded only when something asks for it.
 //
+// ARTIFACTS (items.id=895): content_brief, voice_guidance, validation_report and
+// delta_items are session-style names read from pass_artifacts
+// (persistence::pass_artifact_store), ABSENT until an artifact_put row wrote the
+// kind for this chat and Focus. The text is read ONCE here, at pass start, so a
+// value written during a pass is seen by the NEXT pass. They follow every rule
+// of a store-backed name: restricted per step (taint::StoreTokens), tainting a
+// step that names one (so it stays out of extraction), refused in an external
+// step while STORE_NAMES_EXTERNAL_ALLOWED is false, and declared in
+// declared_inputs when an external step may one day name one. A stored text
+// that fails its validator (an over-long or blank row) fails the pass closed.
+// Nothing here logs a value.
+//
 // VALUES ARE CLEANED: '{' and '}' become '(' and ')'. render_template() would
 // otherwise strip a stored "{code}" as an unresolved token and substitute a
 // stored "{persona_context}" with the persona context.
@@ -60,6 +72,7 @@ use crate::conductor::taint::{taint_closure, StoreTokens};
 use crate::conductor::tokens::ActionDefinition;
 use crate::persistence::case_store::{self, CaseRecord, EntityConfigDelta};
 use crate::persistence::handles;
+use crate::persistence::pass_artifact_store::{self, ArtifactKind};
 use crate::persistence::session_store::{self, WriteMode};
 
 /// Most open cases open_tickets_brief lists.
@@ -214,6 +227,14 @@ pub async fn read_seeds(
         }
     }
 
+    for kind in ArtifactKind::ALL {
+        if wants(kind.as_str()) {
+            if let Some(v) = read_artifact(conn, context_key, focus_id, kind).await? {
+                out.insert(kind.as_str().to_owned(), v);
+            }
+        }
+    }
+
     let need_case = wants(CASE_CONTEXT) || wants(DELTA_CONTEXT);
     let mut active_case: Option<String> = None;
     if wants(ACTIVE_CASE_ID) || need_case {
@@ -297,6 +318,38 @@ pub async fn read_seeds(
         }
     }
     Ok(out)
+}
+
+/// One artifact of this Focus in this chat, braces neutralised (clean) and
+/// validated. No chat means nothing to read: absent. Any store error, and a text
+/// that fails its validator, is an error and fails the pass closed.
+async fn read_artifact(
+    conn: &mut SqliteConnection,
+    context_key: Option<&str>,
+    focus_id: &str,
+    kind: ArtifactKind,
+) -> Result<Option<String>, SeedError> {
+    let name = kind.as_str();
+    let name: &'static str = spec::ARTIFACT_NAMES
+        .iter()
+        .copied()
+        .find(|n| *n == name)
+        .expect("every artifact kind has a bound name");
+    debug_assert_eq!(spec::spec(name).map(|s| s.source), Some(Source::Artifact));
+    let Some(key) = context_key else {
+        return Ok(None);
+    };
+    let row = pass_artifact_store::get_artifact(conn, key, focus_id, kind)
+        .await
+        .map_err(|e| store_err(name, e))?;
+    let Some(row) = row else { return Ok(None) };
+    let text = clean(&row.content);
+    let s = spec::spec(name).expect("artifact names are in the registry");
+    if (s.validate)(&text) {
+        Ok(Some(text))
+    } else {
+        Err(SeedError::InvalidValue(name))
+    }
 }
 
 /// One session variable of this Focus in this chat, validated. No chat means
@@ -975,5 +1028,198 @@ mod tests {
         let capped = cap(long);
         assert!(capped.len() <= DERIVED_TEXT_MAX_BYTES);
         assert!(capped.is_char_boundary(capped.len()));
+    }
+
+    // -- items.id=895: the per-pass artifacts -----------------------------------
+
+    async fn put_art(
+        conn: &mut SqliteConnection,
+        chat: &str,
+        focus: &str,
+        k: ArtifactKind,
+        text: &str,
+    ) {
+        pass_artifact_store::put_artifact(
+            conn,
+            &pass_artifact_store::ArtifactWrite {
+                context_key: chat,
+                focus_id: focus,
+                kind: k,
+                content: text,
+                written_by_run: "run-1",
+                expected_version: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn artifact_names_are_absent_until_written_and_have_no_entry() {
+        let mut conn = mem_outputs_conn().await;
+        let s = read_seeds(
+            &mut conn,
+            Some(CHAT),
+            FOCUS,
+            &spec::ARTIFACT_NAMES,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            s.is_empty(),
+            "no entry, so a guard is false and a token renders nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifacts_are_seeded_for_this_chat_and_focus_only_and_cleaned() {
+        let mut conn = mem_outputs_conn().await;
+        put_art(
+            &mut conn,
+            CHAT,
+            FOCUS,
+            ArtifactKind::ContentBrief,
+            "Brief: {user_input} and {x}",
+        )
+        .await;
+        put_art(
+            &mut conn,
+            CHAT,
+            FOCUS,
+            ArtifactKind::DeltaItems,
+            "[{\"a\": 1}]",
+        )
+        .await;
+        put_art(
+            &mut conn,
+            CHAT,
+            "other-focus",
+            ArtifactKind::VoiceGuidance,
+            "OTHER FOCUS",
+        )
+        .await;
+        put_art(
+            &mut conn,
+            "chat-other",
+            FOCUS,
+            ArtifactKind::VoiceGuidance,
+            "OTHER CHAT",
+        )
+        .await;
+
+        let s = read_seeds(
+            &mut conn,
+            Some(CHAT),
+            FOCUS,
+            &spec::ARTIFACT_NAMES,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.len(), 2, "{s:?}");
+        // Braces cannot become tokens in a prompt.
+        assert_eq!(s["content_brief"], "Brief: (user_input) and (x)");
+        assert_eq!(s["delta_items"], "[(\"a\": 1)]");
+        assert!(
+            !s.contains_key("voice_guidance"),
+            "another Focus and chat are invisible"
+        );
+        // Only the requested names are read.
+        let only = read_seeds(
+            &mut conn,
+            Some(CHAT),
+            FOCUS,
+            &[spec::DELTA_ITEMS],
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(only.len(), 1);
+        // No chat means nothing to read.
+        let none = read_seeds(&mut conn, None, FOCUS, &spec::ARTIFACT_NAMES, Utc::now())
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_or_invalid_artifact_fails_the_pass_without_naming_text() {
+        let mut conn = mem_outputs_conn().await;
+        // The store refuses a blank artifact, so plant one past it, as a corrupt row.
+        sqlx::query(
+            "INSERT INTO pass_artifacts
+             (context_key, focus_id, kind, content, written_by_run, created_at, updated_at)
+             VALUES (?, ?, 'content_brief', '   ', 'r', 't', 't')",
+        )
+        .bind(CHAT)
+        .bind(FOCUS)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        let e = read_seeds(
+            &mut conn,
+            Some(CHAT),
+            FOCUS,
+            &[spec::CONTENT_BRIEF],
+            Utc::now(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e, SeedError::InvalidValue(spec::CONTENT_BRIEF));
+
+        let mut conn = mem_outputs_conn().await;
+        put_art(
+            &mut conn,
+            CHAT,
+            FOCUS,
+            ArtifactKind::ContentBrief,
+            "SECRET-BRIEF-TEXT",
+        )
+        .await;
+        sqlx::query("ALTER TABLE pass_artifacts RENAME TO pass_artifacts_gone")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let e = read_seeds(
+            &mut conn,
+            Some(CHAT),
+            FOCUS,
+            &[spec::CONTENT_BRIEF],
+            Utc::now(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                e,
+                SeedError::Store {
+                    name: "content_brief",
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
+        assert!(!format!("{e} {e:?}").contains("SECRET-BRIEF-TEXT"));
+    }
+
+    #[test]
+    fn an_artifact_name_in_a_template_a_declared_input_or_a_guard_is_a_required_name() {
+        let templ = step("t", "Write from {content_brief}");
+        let mut declared = step("d", "plain");
+        declared.declared_inputs = vec!["voice_guidance".to_owned()];
+        let mut guarded = step("g", "plain");
+        guarded.guard =
+            Guard::from_columns(Some("validation_report"), Some("present"), None).unwrap();
+        assert_eq!(
+            required_names(&[templ, declared, guarded]),
+            [
+                spec::CONTENT_BRIEF,
+                spec::VOICE_GUIDANCE,
+                spec::VALIDATION_REPORT
+            ]
+        );
+        // A pass that names none of them reads none of them.
+        assert!(required_names(&[step("x", "{user_input}")]).is_empty());
     }
 }

@@ -170,7 +170,10 @@ mod tests {
 
     fn refine() -> Value {
         let mut v = example();
-        v["common"]["output_var"] = json!("voice_guidance");
+        // items.id=895: voice_guidance is the NAME of a per-pass artifact (a bound
+        // name), so the refine step's output variable is another name and an
+        // artifact_put row stores it under voice_guidance.
+        v["common"]["output_var"] = json!("refined_guidance");
         v["common"]["declared_inputs"] = json!(["voice_profile"]);
         v["spec"]["mode"] = json!("refine");
         v["spec"]["input_var"] = Value::Null;

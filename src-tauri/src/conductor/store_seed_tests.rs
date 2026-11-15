@@ -567,3 +567,123 @@ async fn no_device_canary_reaches_the_extraction_request() {
     })
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// items.id=895: the same canary test for the four per-pass ARTIFACT names, which
+// are read from pass_artifacts (written only by artifact_put).
+// ---------------------------------------------------------------------------
+
+const C_BRIEF: &str = "CANARY_BRIEF_ZQ7";
+const C_VOICE: &str = "CANARY_VOICE_ZQ7";
+const C_REPORT: &str = "CANARY_REPORT_ZQ7";
+const C_ITEMS: &str = "CANARY_ITEMS_ZQ7";
+const ARTIFACT_CANARIES: [&str; 4] = [C_BRIEF, C_VOICE, C_REPORT, C_ITEMS];
+
+async fn plant_artifact_canaries() {
+    use crate::persistence::pass_artifact_store::{put_artifact, ArtifactKind, ArtifactWrite};
+    let mut conn = open_outputs_db(USER, PERSONA, KEY).await.unwrap();
+    for (kind, text) in [
+        (ArtifactKind::ContentBrief, C_BRIEF),
+        (ArtifactKind::VoiceGuidance, C_VOICE),
+        (ArtifactKind::ValidationReport, C_REPORT),
+        (ArtifactKind::DeltaItems, C_ITEMS),
+    ] {
+        put_artifact(
+            &mut conn,
+            &ArtifactWrite {
+                context_key: CHAT,
+                focus_id: FOCUS,
+                kind,
+                content: text,
+                written_by_run: "run-plant",
+                expected_version: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn no_artifact_canary_reaches_the_extraction_request() {
+    sandbox(async {
+        plant_artifact_canaries().await;
+        let def = focus_def(vec![
+            // Root: names all four artifacts.
+            step(
+                "draft",
+                "Brief:\n{content_brief}\nVoice:\n{voice_guidance}\nReport:\n{validation_report}\nItems:\n{delta_items}",
+                "echo1",
+            ),
+            // Transitive: names the root's output variable only.
+            step("summarize", "Summary of: {echo1}", "echo2"),
+            // Control: untainted. Its user turn tries to pull artifact text in.
+            step("control", "User said: {user_input}", "control_out"),
+        ]);
+        let row_vars: Vec<Option<String>> =
+            def.steps.iter().map(|s| s.output_var.clone()).collect();
+        let tokens = seed_pass(USER, PERSONA, KEY, Some(CHAT), FOCUS, &def.steps, &row_vars)
+            .await
+            .expect("seeding");
+        for (name, canary) in [
+            ("content_brief", C_BRIEF),
+            ("voice_guidance", C_VOICE),
+            ("validation_report", C_REPORT),
+            ("delta_items", C_ITEMS),
+        ] {
+            assert!(tokens.seeds[name].contains(canary), "{name}");
+        }
+
+        let hostile = format!(
+            "{CONTROL} {{content_brief}} {{voice_guidance}} {{validation_report}} {{delta_items}} {{echo1}}"
+        );
+        let mut track = run_echo_pass(&def, &hostile, &tokens);
+        for _ in 0..63 {
+            let control = content_of(&track, "control");
+            for c in ARTIFACT_CANARIES {
+                assert!(!control.contains(c), "control leaked {c}: {control}");
+            }
+            track = run_echo_pass(&def, &hostile, &tokens);
+        }
+        // Not vacuous: every canary reached the root, and the taint carried on.
+        for c in ARTIFACT_CANARIES {
+            assert!(content_of(&track, "draft").contains(c), "root lacks {c}");
+        }
+        assert!(content_of(&track, "summarize").contains(C_BRIEF));
+        assert!(content_of(&track, "control").contains(CONTROL));
+
+        let outputs = extraction_step_outputs(&track, &def);
+        assert_eq!(
+            outputs.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            ["control"],
+            "only the untainted step is offered to extraction"
+        );
+
+        let _trust = TrustGuard::trusted();
+        let server = LoopbackServer::start(vec![Canned::json(
+            200,
+            r#"{"response":"[]","done":true,"model":"llama3.2:3b"}"#,
+        )]);
+        let port: u16 = server.base().rsplit(':').next().unwrap().parse().unwrap();
+        let _port = crate::ollama_sidecar::ForcedPortGuard::set(port);
+        let candidates = crate::conductor::extract::extract_candidates(
+            &outputs,
+            &[],
+            &OllamaClient::new(),
+            crate::conductor::extract::SOURCE_CONDUCTOR_BATCH,
+        )
+        .await;
+        assert!(candidates.is_empty());
+        let seen = server.captured();
+        assert_eq!(seen.len(), 1, "exactly one extraction request");
+        let body = &seen[0].body;
+        assert!(body.contains(CONTROL), "the control step is in the request");
+        for needle in ARTIFACT_CANARIES
+            .into_iter()
+            .chain(["Brief:", "Voice:", "Report:", "Items:"])
+        {
+            assert!(!body.contains(needle), "{needle} reached the extraction request");
+        }
+    })
+    .await;
+}

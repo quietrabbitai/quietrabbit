@@ -12708,6 +12708,113 @@ steps:
         .await;
     }
 
+    /// items.id=895: an artifact_put row stores a step's output under an artifact
+    /// name, and a LATER pass reads it as a bound name: a guard on the name is
+    /// false in the pass that has not seen it yet (absent), true in the next, and
+    /// the stored text never reaches the track, the ledger or the emitted events.
+    #[tokio::test]
+    async fn an_artifact_written_in_one_pass_is_a_bound_name_in_the_next() {
+        with_temp_data_root(async {
+            let put = |id: &str| {
+                writer_step(
+                    id,
+                    "artifact_put",
+                    Some("content_brief"),
+                    serde_json::json!({"value": "brief_out"}),
+                    None,
+                )
+            };
+            // A row that only runs once the brief exists (the seed is read at pass
+            // start, so it is absent for the pass that writes it).
+            let marker = writer_step(
+                "mark",
+                "session_put",
+                Some("locked_intent"),
+                serde_json::json!({"value": "intent_out"}),
+                Some(("content_brief", "present", None)),
+            );
+            let mut first = writer_run(
+                vec![marker.clone(), put("store")],
+                Some("chat-art"),
+                &[("brief_out", "ZX9-BRIEF-TEXT"), ("intent_out", "drafting")],
+            );
+            assert!(first.execute().await.unwrap().is_none());
+            let mut conn = outputs(&first).await;
+            let art = crate::persistence::pass_artifact_store::get_artifact(
+                &mut conn,
+                "chat-art",
+                "f",
+                crate::persistence::pass_artifact_store::ArtifactKind::ContentBrief,
+            )
+            .await
+            .unwrap()
+            .expect("artifact_put wrote through the typed store");
+            assert_eq!(art.content, "ZX9-BRIEF-TEXT");
+            assert_eq!(art.written_by_run, first.focus_run_id.clone().unwrap());
+            assert!(
+                crate::persistence::session_store::get_session_variable(
+                    &mut conn,
+                    "chat-art",
+                    "f",
+                    "locked_intent"
+                )
+                .await
+                .unwrap()
+                .is_none(),
+                "the guard on an absent artifact was false in the writing pass"
+            );
+            // The writer recorded nothing: only the two seeded values are on the track.
+            assert_eq!(ran_ids(&first), ["seed0", "seed1"]);
+            assert!(first.emitted_for_test.lock().unwrap().is_empty());
+            let ledger: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM focus_run_steps")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(ledger, 0);
+
+            // The next pass of the same chat sees the artifact as a bound name.
+            let mut second = writer_run(
+                vec![marker],
+                Some("chat-art"),
+                &[("intent_out", "drafting")],
+            );
+            assert!(second.execute().await.unwrap().is_none());
+            let intent = crate::persistence::session_store::get_session_variable(
+                &mut conn,
+                "chat-art",
+                "f",
+                "locked_intent",
+            )
+            .await
+            .unwrap()
+            .expect("the guard on the artifact was true in the next pass");
+            assert_eq!(intent.value, "drafting");
+            assert_eq!(
+                second
+                    .store_tokens
+                    .seeds
+                    .get("content_brief")
+                    .map(String::as_str),
+                Some("ZX9-BRIEF-TEXT")
+            );
+            // Another chat never sees it.
+            let mut other = writer_run(
+                vec![writer_step(
+                    "mark",
+                    "session_put",
+                    Some("locked_intent"),
+                    serde_json::json!({"value": "intent_out"}),
+                    Some(("content_brief", "present", None)),
+                )],
+                Some("chat-other"),
+                &[("intent_out", "drafting")],
+            );
+            assert!(other.execute().await.unwrap().is_none());
+            assert!(other.store_tokens.seeds.is_empty());
+        })
+        .await;
+    }
+
     /// A session-bound name is seeded because a writer names it as an argument
     /// (seeding.required_names), and reaches the writer.
     #[tokio::test]

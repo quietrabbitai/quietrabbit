@@ -71,6 +71,15 @@
 // source scan pins that no production code names it: the lifecycle always
 // supplies the connection.
 //
+// ARTIFACTS (items.id=895). artifact_put and artifact_clear write pass_artifacts
+// through persistence::pass_artifact_store only (the same latch, the same version
+// compare-and-set, scoped to the running chat and Focus, never a row's choice).
+// artifact_put reads the version just stored and writes with it, as put_session
+// does. Artifact TEXT NEVER REACHES A LOG OR AN ERROR: the one log line of this
+// module (log_artifact_write) takes the kind, the outcome and a Fingerprint (a
+// byte count and a short hash), and a source scan pins that it is the only log
+// call here and that nothing else is passed to it.
+//
 // OUTCOMES.
 //   Applied         the store wrote.
 //   AlreadyApplied  the store found the write already there (an idempotent
@@ -106,6 +115,9 @@ use crate::persistence::case_store::{
 };
 use crate::persistence::handles::{self, HandleError};
 use crate::persistence::owned_entity_store::OwnedEntityError;
+use crate::persistence::pass_artifact_store::{
+    self, ArtifactKind, ArtifactWrite, ClearOutcome, Fingerprint, PassArtifactError,
+};
 use crate::persistence::session_store::{
     self, LatchError, LatchOutcome, PutOutcome, SessionStoreError, SessionWrite, WriteMode,
 };
@@ -212,6 +224,12 @@ pub enum StoreWriteError {
     CaseHasNoEntity,
     #[error("{0}")]
     Handle(#[from] HandleError),
+    /// items.id=895: the value does not fit the artifact it is written under (a
+    /// blank, over-long or NUL-carrying text). Names the artifact, never the text.
+    #[error("artifact '{0}' does not accept that value")]
+    InvalidArtifactValue(String),
+    #[error("{0}")]
+    Artifact(#[from] PassArtifactError),
     #[error("{0}")]
     Session(#[from] SessionStoreError),
     #[error("{0}")]
@@ -227,6 +245,7 @@ impl StoreWriteError {
             self,
             StoreWriteError::Session(SessionStoreError::Latch(LatchError::Suppressed))
                 | StoreWriteError::Case(CaseStoreError::Latch(LatchError::Suppressed))
+                | StoreWriteError::Artifact(PassArtifactError::Latch(LatchError::Suppressed))
         )
     }
 }
@@ -342,6 +361,45 @@ async fn run_inner(
                 own_case(conn, ctx, value).await?;
             }
             put_session(conn, key, ctx, name, value).await
+        }
+
+        Op::ArtifactPut => {
+            let name = op.target.as_deref().unwrap_or("");
+            let kind = artifact_kind(name)?;
+            let value = a.required(Slot::Value)?;
+            // The value must satisfy the spec of the name it is written under.
+            let valid = bound_spec::spec(name).is_some_and(|s| (s.validate)(value));
+            if !valid {
+                return Err(StoreWriteError::InvalidArtifactValue(name.to_owned()));
+            }
+            let current = pass_artifact_store::get_artifact(conn, key, ctx.focus_id, kind).await?;
+            let out = pass_artifact_store::put_artifact(
+                conn,
+                &ArtifactWrite {
+                    context_key: key,
+                    focus_id: ctx.focus_id,
+                    kind,
+                    content: value,
+                    written_by_run: ctx.run_id,
+                    expected_version: current.map(|a| a.version),
+                },
+            )
+            .await?;
+            let outcome = match out {
+                PutOutcome::Created { .. } | PutOutcome::Updated { .. } => Outcome::Applied,
+                PutOutcome::Unchanged { .. } => Outcome::AlreadyApplied,
+            };
+            log_artifact_write(kind, outcome, &pass_artifact_store::fingerprint(value));
+            Ok(done(outcome))
+        }
+
+        Op::ArtifactClear => {
+            let kind = artifact_kind(op.target.as_deref().unwrap_or(""))?;
+            let out = pass_artifact_store::clear_artifact(conn, key, ctx.focus_id, kind).await?;
+            Ok(done(match out {
+                ClearOutcome::Cleared => Outcome::Applied,
+                ClearOutcome::AlreadyAbsent => Outcome::AlreadyApplied,
+            }))
         }
 
         Op::CaseSelect => {
@@ -558,6 +616,23 @@ async fn run_inner(
             Ok(done(Outcome::Applied))
         }
     }
+}
+
+/// The artifact kind of an artifact writer's target. LOAD checks the target, so a
+/// miss here is a FocusDefinition that skipped the loader.
+fn artifact_kind(name: &str) -> Result<ArtifactKind, StoreWriteError> {
+    ArtifactKind::parse(name).ok_or_else(|| StoreWriteError::InvalidArtifactValue(name.to_owned()))
+}
+
+/// THE ONE LOG CALL of an artifact write: the kind, the outcome, a byte count and
+/// a short hash. It takes no text, so none can reach a log.
+fn log_artifact_write(kind: ArtifactKind, outcome: Outcome, fp: &Fingerprint) {
+    log::debug!(
+        "store writer: artifact '{}' -> {:?} ({})",
+        kind.as_str(),
+        outcome,
+        fp
+    );
 }
 
 /// One session variable write through the typed store: read the current version

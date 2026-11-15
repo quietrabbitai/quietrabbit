@@ -679,4 +679,74 @@ mod tests {
             assert!(e.contains(&format!("output_var '{name}'")), "{e}");
         }
     }
+
+    /// items.id=895 (pin test, handoff 632): the four per-pass artifact names are
+    /// store-backed bound names. While the interim invariant holds an external step
+    /// may neither name nor declare one, and the name cannot be a row's output
+    /// variable. items.id=884 flips the constant, and only then does the
+    /// declaration rule below decide.
+    #[test]
+    fn an_external_step_cannot_name_or_declare_an_artifact_name() {
+        const { assert!(!STORE_NAMES_EXTERNAL_ALLOWED) };
+        let bound = bound_names();
+        assert_eq!(
+            crate::conductor::bound_spec::ARTIFACT_NAMES.len(),
+            4,
+            "the pin covers all four"
+        );
+        for name in crate::conductor::bound_spec::ARTIFACT_NAMES {
+            assert!(bound.contains(&name), "{name} is a registered bound name");
+            let template = format!("{{{name}}}");
+            // Named and declared.
+            let e = run(&[(step("e", EXT, &template, &[name], &[]), None)], bound).unwrap_err();
+            assert!(
+                e.contains("step 'e'")
+                    && e.contains(&format!("'{name}'"))
+                    && e.contains("items.id=884"),
+                "{e}"
+            );
+            // Declared without being named.
+            let e = run(&[(step("e", EXT, "no tokens", &[name], &[]), None)], bound).unwrap_err();
+            assert!(
+                e.contains(&format!("'{name}'")) && e.contains("items.id=884"),
+                "{e}"
+            );
+            // Named without being declared.
+            assert!(run(&[(step("e", EXT, &template, &[], &[]), None)], bound).is_err());
+            // A LOCAL step may name it freely.
+            assert!(run(&[(step("a", LOCAL, &template, &[], &[]), Some("v"))], bound).is_ok());
+            // A step whose template is tainted by it is itself store-backed: an
+            // external step that names the local step's output variable fails too.
+            let chain = [
+                (step("a", LOCAL, &template, &[], &[]), Some("v1")),
+                (step("e", EXT, "{v1}", &["v1"], &[]), None),
+            ];
+            assert!(
+                run(&chain, bound).is_err(),
+                "{name}: tainted variable in an external step"
+            );
+            // And the name cannot be a row's output variable.
+            let e = run(&[(step("a", LOCAL, "x", &[], &[]), Some(name))], bound).unwrap_err();
+            assert!(e.contains(&format!("output_var '{name}'")), "{e}");
+        }
+    }
+
+    /// With the invariant lifted (a parameter here, never in production) the
+    /// declaration rule is what governs an artifact name in an external step.
+    #[test]
+    fn once_the_invariant_is_lifted_an_external_step_must_declare_an_artifact_name() {
+        let bound = bound_names();
+        for name in crate::conductor::bound_spec::ARTIFACT_NAMES {
+            let template = format!("{{{name}}}");
+            assert!(
+                run_open(&[(step("e", EXT, &template, &[name], &[]), None)], bound).is_ok(),
+                "{name}"
+            );
+            let e = run_open(&[(step("e", EXT, &template, &[], &[]), None)], bound).unwrap_err();
+            assert!(
+                e.contains(&format!("'{{{name}}}'")) && e.contains("declared_inputs"),
+                "{e}"
+            );
+        }
+    }
 }
