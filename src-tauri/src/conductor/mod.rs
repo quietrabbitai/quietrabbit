@@ -35,6 +35,7 @@ pub mod quality;
 pub mod reentry;
 pub mod scheduled_sweep;
 pub mod seeding;
+pub mod step_treatment;
 pub mod store_op;
 #[cfg(test)]
 mod store_op_tests;

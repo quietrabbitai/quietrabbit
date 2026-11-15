@@ -368,7 +368,7 @@ fn external_access_from_routing_tier_yaml(raw: u8) -> Result<ExternalAccess, Str
 /// now fires AnonymousRequired -> AnonymousPreferred, and no longer fires
 /// AnonymousPreferred -> Unrestricted, since reach is equal and nothing
 /// widens). See items.id=537's description for the full audit.
-fn execution_tier_ordinal(access: ExternalAccess) -> u8 {
+pub(crate) fn execution_tier_ordinal(access: ExternalAccess) -> u8 {
     match access {
         ExternalAccess::LocalOnly => 1,
         ExternalAccess::AnonymousRequired => 2,
