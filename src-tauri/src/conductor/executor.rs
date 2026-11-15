@@ -8417,6 +8417,306 @@ mod tests {
         );
     }
 
+    // -- items.id=921 stage 3: retries and resumed runs --------------------------
+    //
+    // Characterization first: a hosted pick that parks on floor consent and is
+    // resumed must behave exactly like an ordinary external step at the same
+    // ceiling. A resume and a retry both re-enter execute_once from the top (the
+    // lifecycle rebuilds the StepContext, the retry loop calls the attempt again),
+    // so each attempt selects, derives its treatment and runs Gate 1 afresh. These
+    // tests drive execute_once the way a resume does. The ceiling values are the
+    // ones lifecycle computes for anonymous_preferred (execution tier 3, floor
+    // clamp to abstraction 2 over a raw 1).
+
+    /// What an attempt left in the disclosure log, comparable across runs: the
+    /// event, the tiers, the provider and the field lists (never a value).
+    fn entry_signature(gateway: &PrivacyGateway<TestLogger>) -> Vec<String> {
+        gateway
+            .logger
+            .entries()
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}|exec={}|abs={:?}|provider={:?}|shared={:?}|abstracted={:?}|withheld={:?}",
+                    e.event_type,
+                    e.execution_tier,
+                    e.abstraction_tier,
+                    e.provider,
+                    e.fields_shared,
+                    e.fields_abstracted,
+                    e.fields_withheld
+                )
+            })
+            .collect()
+    }
+
+    /// The outcome of an attempt as a comparable string.
+    fn outcome_shape(out: &Result<Option<FailureResult>, ConductorError>) -> String {
+        match out {
+            Ok(None) => "done".to_owned(),
+            Ok(Some(f)) => format!(
+                "{:?}|{:?}|{:?}|{}",
+                f.action, f.failure_mode, f.severity, f.plain_language
+            ),
+            Err(e) => format!("err:{e:?}"),
+        }
+    }
+
+    /// The same pair of contexts every characterization uses: a resolved step whose
+    /// range is hosted-only (so the resolver can only pick the fixture host) and an
+    /// ordinary step with that host as its preference, both at lifecycle's values.
+    fn resumable_pair(key_hex: &str) -> (StepContext, StepContext) {
+        let mut resolved = resolved_ctx(
+            Some(requirement(
+                QualityBar::Basic,
+                &[Destination::HostedApi],
+                ExternalAccess::AnonymousPreferred,
+            )),
+            ExternalAccess::AnonymousPreferred,
+            Some("rma_letter"),
+            "Write it.",
+        );
+        resolved.key_hex = key_hex.to_owned();
+        resolved.execution_tier = 3;
+        let mut ordinary_ctx =
+            resolved_ctx(None, ExternalAccess::AnonymousPreferred, None, "Write it.");
+        ordinary_ctx.key_hex = key_hex.to_owned();
+        ordinary_ctx.qr_hosted_provider_preference = Some("fixture-host-a".to_owned());
+        ordinary_ctx.execution_tier = 3;
+        (resolved, ordinary_ctx)
+    }
+
+    /// A resume with no saved preference: a one-time "proceed" is recorded in
+    /// consent_decisions but nothing reads it on resume (only the saved
+    /// preference in the Persona's personal.db is read, by lifecycle), so the step
+    /// parks on floor consent again. This is today's behaviour for every external
+    /// step; the hosted pick must match it, attempt after attempt, with one
+    /// gate1_pass row per attempt and identical rows for the two kinds of step.
+    #[tokio::test]
+    async fn a_resumed_hosted_pick_parks_on_floor_consent_exactly_like_an_ordinary_step() {
+        with_temp_shared_db(|pool| async move {
+            let key_hex = hosted_pick_rig(&pool).await;
+            let (resolved, ordinary_ctx) = resumable_pair(&key_hex);
+            for attempt in 0..2 {
+                let (a, ta, ga) = run_once_with(&resolved, &pool, &clamping_track()).await;
+                let (b, tb, gb) = run_once_with(&ordinary_ctx, &pool, &clamping_track()).await;
+                assert_eq!(outcome_shape(&a), outcome_shape(&b), "attempt {attempt}");
+                assert_eq!(
+                    a.as_ref().unwrap().as_ref().unwrap().action,
+                    FailureAction::AwaitFloorConsent
+                );
+                assert_eq!(
+                    a.unwrap().unwrap().metadata,
+                    b.unwrap().unwrap().metadata,
+                    "the prompt metadata is identical, tiers included"
+                );
+                assert_eq!(
+                    entry_signature(&ga),
+                    entry_signature(&gb),
+                    "attempt {attempt}"
+                );
+                assert_eq!(gate1_entries(&ga).len(), 1, "one Gate 1 row per attempt");
+                assert!(ta.steps().is_empty() && tb.steps().is_empty());
+            }
+        })
+        .await;
+    }
+
+    /// A resume WITH the saved "modified" preference (what lifecycle reads from the
+    /// Persona's personal.db when the user chose to remember): the floor prompt is
+    /// skipped and a floor_consent_auto row is written, and what follows (the hosted
+    /// call) is the same for the resolved pick and the ordinary step.
+    #[tokio::test]
+    async fn a_resumed_hosted_pick_with_a_saved_floor_consent_proceeds_like_an_ordinary_step() {
+        with_temp_shared_db(|pool| async move {
+            let key_hex = hosted_pick_rig(&pool).await;
+            let (mut resolved, mut ordinary_ctx) = resumable_pair(&key_hex);
+            resolved.floor_consent_preference = Some("modified".to_owned());
+            ordinary_ctx.floor_consent_preference = Some("modified".to_owned());
+            let (a, _, ga) = run_once_with(&resolved, &pool, &clamping_track()).await;
+            let (b, _, gb) = run_once_with(&ordinary_ctx, &pool, &clamping_track()).await;
+            assert_eq!(outcome_shape(&a), outcome_shape(&b));
+            assert_ne!(
+                a.as_ref()
+                    .ok()
+                    .and_then(|o| o.as_ref())
+                    .map(|f| f.action.clone()),
+                Some(FailureAction::AwaitFloorConsent),
+                "the saved consent skips the prompt"
+            );
+            let sig = entry_signature(&ga);
+            assert_eq!(sig, entry_signature(&gb));
+            assert!(sig.iter().any(|e| e.starts_with("gate1_pass|")));
+            assert!(sig.iter().any(|e| e.starts_with("floor_consent_auto|")));
+            assert!(
+                sig.iter()
+                    .filter(|e| e.starts_with("floor_consent_auto|"))
+                    .all(|e| e.contains("provider=Some(\"fixture-host-a\")")),
+                "{sig:?}"
+            );
+        })
+        .await;
+    }
+
+    /// Each retry resolves again: an attempt that parked on a hosted pick is
+    /// followed, once a local model is ready, by an attempt that picks LOCAL and
+    /// is gated as local. Nothing is carried from the first attempt.
+    #[tokio::test]
+    async fn each_attempt_selects_and_derives_its_treatment_again() {
+        with_temp_shared_db(|pool| async move {
+            let key_hex = hosted_pick_rig(&pool).await;
+            let mut ctx = resolved_ctx(
+                Some(requirement(
+                    QualityBar::Basic,
+                    &[Destination::Local, Destination::HostedApi],
+                    ExternalAccess::AnonymousPreferred,
+                )),
+                ExternalAccess::AnonymousPreferred,
+                Some("rma_letter"),
+                "Write it.",
+            );
+            ctx.key_hex = key_hex;
+            ctx.execution_tier = 3;
+            // Attempt 1: no local model is ready, so the resolver picks the host.
+            let (first, _, g1) = run_once_with(&ctx, &pool, &clamping_track()).await;
+            assert_eq!(
+                first.unwrap().unwrap().action,
+                FailureAction::AwaitFloorConsent
+            );
+            let first_rows = gate1_entries(&g1);
+            assert_eq!(first_rows[0].provider.as_deref(), Some("fixture-host-a"));
+            assert_eq!(first_rows[0].execution_tier, 3);
+
+            // A local model becomes ready: the SAME context, the next attempt.
+            install_local_models(&pool).await;
+            let stub = LocalModelStub::start(1);
+            let (second, track, g2) = run_once_with(&ctx, &pool, &clamping_track()).await;
+            assert!(
+                second.unwrap().is_none(),
+                "no prompt: it stays on the device"
+            );
+            assert_eq!(stub.server.captured().len(), 1);
+            let second_rows = gate1_entries(&g2);
+            assert_eq!(second_rows.len(), 1);
+            assert!(second_rows[0].provider.is_none());
+            assert_eq!(second_rows[0].execution_tier, 1);
+            assert_eq!(second_rows[0].abstraction_tier, Some(1));
+            assert_eq!(track.steps()[0].routing_tier_used, 1);
+        })
+        .await;
+    }
+
+    /// The retry loop calls the attempt (a fresh execute_once) every time and holds
+    /// nothing of the previous one: execute_once is the only place a treatment is
+    /// derived, and retry_loop never names it.
+    #[test]
+    fn the_retry_loop_holds_no_treatment() {
+        let src = include_str!("executor.rs");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let retry = code
+            .split("async fn retry_loop<")
+            .nth(1)
+            .and_then(|r| r.split("\n}\n").next())
+            .expect("retry_loop");
+        assert!(!retry.contains("treatment") && !retry.contains("StepTreatment"));
+        assert!(retry.contains("attempt.once(retry_count)"));
+        assert_eq!(
+            code.matches("derive_treatment(ctx, resolver_req").count(),
+            1
+        );
+    }
+
+    // -- items.id=921: Gate 3 follows the tier the step really ran at ------------
+
+    /// A resolved step whose range allows hosted, with a local model ready, an
+    /// external ceiling at lifecycle's values (execution tier 3), and `next` as the
+    /// look-ahead tier of the step after it.
+    fn local_pick_ctx(template: &str, next: Option<u8>) -> StepContext {
+        let mut ctx = resolved_ctx(
+            Some(requirement(
+                QualityBar::Basic,
+                &[Destination::Local, Destination::HostedApi],
+                ExternalAccess::AnonymousPreferred,
+            )),
+            ExternalAccess::AnonymousPreferred,
+            Some("rma_letter"),
+            template,
+        );
+        ctx.execution_tier = 3;
+        ctx.next_execution_tier = next;
+        ctx
+    }
+
+    fn gate3_events(gateway: &PrivacyGateway<TestLogger>) -> Vec<String> {
+        gateway
+            .logger
+            .entries()
+            .into_iter()
+            .filter(|e| e.event_type.starts_with("gate3"))
+            .map(|e| e.event_type)
+            .collect()
+    }
+
+    /// A local pick under an external ceiling ran on the device (tier 1). When the
+    /// next step may go out (look-ahead tier 3), its output is a cross-tier
+    /// promotion and Gate 3 reviews it. Keyed on the ceiling (tier 3 against 3) it
+    /// would have been skipped, which is what the old behaviour did.
+    #[tokio::test]
+    async fn the_output_of_a_local_pick_is_reviewed_by_gate_3_before_an_external_next_step() {
+        with_temp_shared_db(|pool| async move {
+            install_local_models(&pool).await;
+            let _stub = LocalModelStub::start(1);
+            let ctx = local_pick_ctx("Write it.", Some(3));
+            let (out, track, gateway) = run_once(&ctx, &pool).await;
+            assert!(out.unwrap().is_none(), "approved: nothing sensitive in it");
+            assert_eq!(track.steps()[0].routing_tier_used, 1);
+            assert_eq!(
+                gate3_events(&gateway),
+                vec!["gate3_promotion_approved".to_owned()],
+                "Gate 3 ran for the promotion from tier 1 to tier 3"
+            );
+        })
+        .await;
+    }
+
+    /// The same, with a sensitive field named by the template: Gate 3 holds the
+    /// content back, so a local draft built from a severe field cannot flow to an
+    /// external step unreviewed.
+    #[tokio::test]
+    async fn a_sensitive_local_output_is_held_back_from_an_external_next_step() {
+        with_temp_shared_db(|pool| async move {
+            install_local_models(&pool).await;
+            let _stub = LocalModelStub::start(1);
+            let ctx = local_pick_ctx("Write about {diagnosis}.", Some(3));
+            let (out, track, gateway) = run_once_with(&ctx, &pool, &clamping_track()).await;
+            let failure = out.unwrap().expect("Gate 3 stops the step");
+            assert_ne!(failure.action, FailureAction::AwaitFloorConsent);
+            assert_eq!(
+                gate3_events(&gateway),
+                vec!["gate3_sensitivity_block".to_owned()]
+            );
+            assert_eq!(track.steps()[0].sensitivity_severity, 3);
+        })
+        .await;
+    }
+
+    /// No promotion, no Gate 3: a local pick followed by a local step (look-ahead
+    /// tier 1) or by nothing at all leaves Gate 3 alone.
+    #[tokio::test]
+    async fn a_local_pick_followed_by_a_local_step_or_nothing_is_not_reviewed() {
+        with_temp_shared_db(|pool| async move {
+            install_local_models(&pool).await;
+            let _stub = LocalModelStub::start(2);
+            for next in [Some(1), None] {
+                let ctx = local_pick_ctx("Write it.", next);
+                let (out, _, gateway) = run_once(&ctx, &pool).await;
+                assert!(out.unwrap().is_none());
+                assert!(gate3_events(&gateway).is_empty(), "{next:?}");
+            }
+        })
+        .await;
+    }
+
     /// The three sites keyed on the network predicate, pinned in the source of
     /// execute_once itself. Since items.id=921 two of them follow the derived
     /// treatment: hosted_step and the render branch both read `treatment.hosted`

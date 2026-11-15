@@ -1,5 +1,8 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: November 15, 2026 (items.id=387: new "Manual hand-off" section, the fourth
+# Last updated: November 15, 2026 (items.id=921: new "Privacy treatment of a step attempt"
+# section, the render sentence in the NETWORK PREDICATE bullet and KNOWN BEHAVIOURS item 1
+# under "Model resolver", nothing else).
+# Before that, November 15, 2026 (items.id=387: new "Manual hand-off" section, the fourth
 # block kind in "Model blocks", and the one line under it that said B5 changes the re-park).
 # Before that, November 15, 2026 (items.id=896: new "Model resolver" section, and the
 # one line under "Model blocks" that said the executor did not read `requirement`).
@@ -438,9 +441,11 @@ is select_model_for_block in executor.rs.
   (selected_model.hosted_model, selected_model.provider_id), not the ceiling or the user's
   preference. SelectedModel::local and ::hosted are the only constructors the resolver glue
   uses, so a hosted selection always carries its provider and its row together, which is
-  why the generation branch's `unreachable!` stays unreachable. select_model_for_block
-  refuses a hosted choice under a LocalOnly ceiling before any gate. The render branch is
-  unchanged and still keys on the ceiling. executor.rs has a source-scan test pinning the
+  why the generation branch's `unreachable!` stays unreachable. A hosted choice under a
+  LocalOnly ceiling is refused before any gate by step_treatment::derive (items.id=921
+  moved the refusal there from select_model_for_block, wording unchanged). Since items.id=921
+  the render branch also follows the destination (`treatment.hosted`, see "Privacy
+  treatment of a step attempt" below). executor.rs has a source-scan test pinning the
   three sites.
 - CONTEXT FALLBACK. If a resolved local step overflows its window after the render, it
   moves to the next ranked local candidate that fits. It does NOT re-render and does NOT
@@ -449,12 +454,11 @@ is select_model_for_block in executor.rs.
   not a model tag, so it is the same with or without a fallback; the switch is logged only
   as an info line with the two local tags. A step that sets its own num_ctx never falls back.
 - KNOWN BEHAVIOURS LATER BUILDS MUST RESPECT:
-  1. Gate 1, the abstraction floor and the render key off the run's CEILING
-     (effective_access), not the chosen model (spec Parts 6e, 6g, 7b). A local model chosen
-     under an external ceiling is therefore gated and rendered as if it were external, which
-     is stricter, not weaker. Jason ruled that the privacy gate must change before R1; the
-     work is items.id=921 (Plan Mode first, after items.id=896 lands). Do not change it in
-     the resolver or the executor before then.
+  1. (items.id=921, landed) Gate 1, the floor consent gate, the render, the voice scan,
+     Gate 2, the sensitivity score, the recorded tier and Gate 3 key off the SELECTED
+     destination for a resolved step, not the ceiling. See "Privacy treatment of a step
+     attempt" below. The ceiling still decides what a step MAY reach (AUTHORIZE, Step 3,
+     the resolver's candidate set); it no longer decides how a chosen local model is gated.
   2. Until items.id=897 registers the document-type name, every model-block step parks with
      resolver.too_weak (nothing runs model blocks today).
   3. PlanIncluded is never produced (nothing records which plan a user holds): a hosted
@@ -477,6 +481,71 @@ is select_model_for_block in executor.rs.
   the capability data, and Part 8h's per-user hosted ranking (verification status,
   qr_recommendation_rank, key-configured) is NOT used by the resolver, which ranks by cost
   tier, anonymity at anonymous_preferred, model class, estimated cost and ids.
+
+## Privacy treatment of a step attempt (items.id=921, decisions.id=942 addendum 5 (e), decisions.id=943 as amended)
+A model-block step is gated by where it GOES, not by what it may reach. conductor/step_treatment.rs
+is the one pure function (`derive`, no I/O); execute_once calls it once per attempt, right after
+selection and before Gate 1, through `derive_treatment(ctx, resolver_req, &selected_model)`.
+- INPUT: the ceiling values lifecycle computed into StepContext (effective_access, execution_tier,
+  abstraction_tier with the floor clamp, raw_abstraction) and the basis: Ordinary (no requirement,
+  or a bound API Chat run) or Resolved (the requirement's highest tier and whether the pick is
+  local or hosted).
+- RULE: Ordinary passes the ceiling values through UNCHANGED (hosted = access != LocalOnly). A
+  local pick under any ceiling is the LOCAL treatment: LocalOnly, tier 1, raw and abstraction 1,
+  nothing clamped. A hosted pick is EXTERNAL at the reach, min(ceiling, requirement highest
+  tier), with each tier the max of the derived and the ceiling value (never looser than an
+  ordinary external step). Disagreements are refused, never skipped: a hosted pick under a
+  local-only ceiling (the wording items.id=896 shipped), a hosted pick from a range that reaches
+  only the device, a selection that is half local and half hosted, a broken floor invariant. The
+  refusal goes through the failure handler as a TierBoundaryViolation before any gate.
+- WHAT READS THE TREATMENT: Gate 1 (its arguments, and so its fatal-versus-swallowed disclosure
+  log split), the floor consent block (the prompt, the floor_consent_auto row, the prompt
+  metadata), scan_voice_profile (a local pick strips a contaminated attribute and continues, a
+  hosted call halts), the render branch, hosted_step, reply_gate2, compute_step_sensitivity,
+  completed_step (routing_tier_used) and Gate 3. `treatment.hosted` is the ONE predicate for the
+  network branch, the render and, for items.id=884, the outbound review: 884 triggers on
+  `treatment.hosted` and takes its ceiling argument from `treatment.access`, not
+  ctx.effective_access. The disagreement 884's amendment names is already an error before its hook.
+- WHAT STILL READS THE CEILING (pinned by the_ceiling_values_are_read_only_where_reviewed): the
+  bound-run stop, Step 4.5 and select_model (before selection), the resolver's candidate set, the
+  floor-invariant check on the ceiling values, derive_treatment's own input, step_streams.
+  A new read of ctx.effective_access, execution_tier, abstraction_tier or raw_abstraction fails
+  that test and needs a decision.
+- DISCLOSURE LOG (open question a): a local pick writes its gate1_pass row like any local step
+  (tier 1, no provider, fields shared, non-fatal on failure), so every executed step keeps a row
+  and the row says nothing left the device. The log still records no model tag.
+- FLOOR CONSENT (open question b): the prompt exists because the clamp changed what leaves. A local
+  pick has no clamp, so it never prompts and the saved "modified" preference is not consulted.
+- TIER OF A HOSTED PICK (open question c): the lower of the ceiling and the requirement's highest
+  tier. In production this equals the step's own override (model-block expansion sets
+  routing_tier and external_access_override to the clamped highest tier), so the choice only fixes
+  the pure function's contract.
+- NOT STORED: the treatment is a local of one execute_once attempt (a scan pins that nothing in
+  lifecycle.rs, types.rs, tokens.rs or StepContext holds it), so each retry and each resumed run
+  selects and derives again; the disclosure buffer is overwritten each attempt. Characterized and
+  pinned: a resumed hosted pick parks on floor consent exactly like an ordinary external step, and
+  proceeds exactly like one when the saved preference is present.
+- GATE 3: a local pick records tier 1, so Gate 3 reviews its output when the next step may go out
+  (next_execution_tier > 1). next_execution_tier is the static ceiling look-ahead and cannot know
+  the next step's own pick, so Gate 3 may also fire when that step resolves local. Accepted for
+  now (fail closed); the run plan (items.id=901) can refine it.
+- STREAMING: a resolved step never streams (step_streams has `!is_resolved(ctx)`, because
+  retry_loop asks it without a selection). R1 streams only bound API Chat runs, which are never
+  resolved. Streaming a resolved step needs a decision.
+- THREE BEHAVIOURS LATER BUILDS MUST RESPECT:
+  1. A one-time floor-consent "proceed" is written to consent_decisions but nothing reads it on
+     resume: only the saved preference in personal.db is read (lifecycle.rs, "modified" when
+     stored_tier <= abstraction_tier). A resumed external step, resolved or ordinary, therefore
+     parks on floor consent again until the user saves the preference. Existing behaviour,
+     left alone; the hosted pick matches it.
+  2. Two other run-level reads still key off the Focus ceiling, not the pick: the persona_context
+     memory slice is assembled once per run at the Focus's max tier (lifecycle.rs
+     assemble_persona_context) and scan_output at output creation uses _focus_max_permitted_tier.
+     A local pick in an external-ceiling Focus therefore still gets the tier-limited memory slice.
+     Not part of items.id=921; its own item.
+  3. A floor-consent "use local" answer cannot re-route a resolved step: the resolver never reads
+     that preference. A hosted pick that parks on floor consent stays a hosted pick on resume
+     unless readiness changes.
 
 ## Per-pass artifact store (items.id=895, decisions.id=942 point 5, decisions.id=938 ruling 2)
 Multi-turn work rides on chat-level passes, so text a later pass needs from an earlier one
