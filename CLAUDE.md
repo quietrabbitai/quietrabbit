@@ -1,5 +1,10 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: November 16, 2026 (items.id=884: STORE_NAMES_EXTERNAL_ALLOWED is true and
+# Last updated: November 16, 2026 (items.id=897: new "Launch questions and run-start settings"
+# section; the DOCUMENT PROFILE bullet and KNOWN BEHAVIOURS item 2 under "Model resolver", which
+# said items.id=897 would register the document-type name; the two pending pointers -- the
+# device-names note now says its closed-list refusal is temporary and names items.id=924, and the
+# external-model-step gap note names items.id=922; nothing else.).
+# Before that, November 16, 2026 (items.id=884: STORE_NAMES_EXTERNAL_ALLOWED is true and
 # the two device names stay out by a closed list -- the artifact-store, Manual hand-off and
 # Focus-owned entities bullets that stated the flag, the render row's inheritance rule and the
 # user_input taint note; nothing else. The outbound review itself has no section here yet.).
@@ -352,7 +357,9 @@ with no requirement still goes through select_model.
   (quality floor, highest tier, destinations, declared inputs); only those four are
   tighten-only. Latitude and the voice settings are the user's to move both ways
   (document_type::resolve_settings). flag_unsupplied_references is tighten-only
-  against based_on (decisions.id=548).
+  against based_on (decisions.id=548). A run re-expands every model block when it starts, with
+  the user's launch answers and the three setting layers, and applies a mode profile through
+  tighten() (see "Launch questions and run-start settings").
 - Every sentence a block emits is DATA in src-tauri/block_data/document_types.json
   (phrases, scales, shipped document types), validated by the same function a custom
   type will use, with no {token} allowed. Rust holds only the template skeleton.
@@ -428,10 +435,13 @@ is select_model_for_block in executor.rs.
   the pass's seeds under the bound name `document_type` (DOCUMENT_TYPE_NAME in
   model_resolver_input.rs), never from the block's own configuration. A custom type
   resolves through `based_on` to its shipped type (profile_for_document_type; custom types
-  are not built yet, items.id=905, so the glue passes none). items.id=897 registers the
-  name in bound_spec and guarantees it a value (a Focus preset that fixes its type seeds
-  the same name at seed time). An absent or unmappable name means no profile, the resolver
-  reads only the task-type-wide cell, the shipped data has none, and the step parks with
+  are not built yet, items.id=905, so the glue passes none). The name is registered in
+  bound_spec (DOCUMENT_TYPE, Source::Launch, "Launch questions and run-start settings"
+  below) and a Focus with a model block always has a value: LOAD refuses one that declares no
+  document_type question, and the question's default is one of its options. An absent or
+  unmappable name (a caller that supplied no launch resolution fails the pass closed before
+  this; an id that maps to no shipped profile) means no profile, the resolver reads only
+  the task-type-wide cell, the shipped data has none, and the step parks with
   resolver.too_weak: fail closed on purpose. The exact profile's cell wins, then the
   task-type-wide cell, never another profile's.
 - READINESS (the gatherer only marks Ready or not). Local: a curated focus-eligible row,
@@ -463,8 +473,10 @@ is select_model_for_block in executor.rs.
      destination for a resolved step, not the ceiling. See "Privacy treatment of a step
      attempt" below. The ceiling still decides what a step MAY reach (AUTHORIZE, Step 3,
      the resolver's candidate set); it no longer decides how a chosen local model is gated.
-  2. Until items.id=897 registers the document-type name, every model-block step parks with
-     resolver.too_weak (nothing runs model blocks today).
+  2. No shipped Focus declares a launch question yet (items.id=903 ships Writing
+     Assistant's, with its rebuild), and no shipped Focus uses a model block, so nothing runs
+     model blocks through the app today. A Focus that does must declare a document_type question,
+     and its run resolves the value once at LOAD ("Launch questions and run-start settings").
   3. PlanIncluded is never produced (nothing records which plan a user holds): a hosted
      model is Free or Metered. A hosted model is never chosen until it has a measured cell
      (items.id=788, 726), and EXTERNAL_MODEL_BLOCKS_ALLOWED is still false (items.id=913).
@@ -643,8 +655,8 @@ in a run, so nothing depends on resume. The legacy requires_user_handoff pause i
     (3) any other declared name (the {user_input} token with no return row, a field name)
     contributes nothing. Items.id=884's rider; only declared inputs count. routing_tier_used
     stays 1: the render itself calls nothing. (An EXTERNAL MODEL step's record still scores only
-    Gate 1 projected fields, so a store-backed input it names is not marked personal: a
-    candidate follow-up, not built.)
+    Gate 1 projected fields, so a store-backed input it names is not marked personal: items.id=922
+    closes this gap, not built, and it must land before items.id=913 turns hosted blocks on.)
   - handoff_pending (Session bound name, `h_` plus 12 lowercase hex of SHA-256 over run and
     row) is written by the render through the typed session store: latch-gated (a one-time
     chat still shows the starter and records nothing), NOT collection-consent gated (no user
@@ -725,6 +737,117 @@ in a run, so nothing depends on resume. The legacy requires_user_handoff pause i
   Derived handoff_draft name, multiple hand-offs inside one pass (the return pass's row order is
   the Focus's), file or document replies beyond a plain paste, any model step after the return
   row (B7c delta validation reads the reply by handle).
+
+## Launch questions and run-start settings (items.id=897, decisions.id=942 point 8 and addendum 3 (g), decisions.id=948)
+A Focus may ask up to five closed-choice questions before a run, or none. The answers feed
+guards, the model resolver's document profile and the settings of every model block. No real
+question or mode ships for any Focus yet (items.id=903 ships Writing Assistant's); the
+mechanism is exercised by fixture Focuses in tests.
+- DATA (schema/shared_047.sql, shipped data only, identical for every install, no foreign keys,
+  classified GlobalCatalog in shared_db_residual.rs; items.id=633 must absorb it): focus_launch_
+  questions (slot, kind mode or choice, asked, default_option, prompt), focus_launch_options
+  (label, hint), focus_mode_profiles (envelope JSON) and focus_launch_display (ui_one_liner, at
+  most 80 characters). Prompt, label, hint and ui_one_liner are placeholder wording owned by
+  Chat-BRAND (items.id=506). ui_one_liner rows exist for writing-assistant, research-and-buy and
+  role-assessment only. `asked` = 0 is a preset: the default is the value and nothing is submitted.
+  The mode list of a Focus is the options of its one question of kind `mode` (slot launch_mode).
+- DISPLAY DATA IS NOT COPIED. A Focus's display name and description stay in their one existing
+  home and conductor/focus_display.rs read() is the single reader (load_focus_definition: the
+  focuses row, else the .focus file; plus the one-liner). Writing Assistant's name and description
+  are in both shared_038.sql and its .focus file and are pinned equal by a drift test; neither copy is
+  removed. FocusInfo is unchanged.
+- THE ONLY READER (conductor/launch_config.rs): validate() is the one rule set (at most 5
+  questions, one question per slot, only the mode question on launch_mode, every question has at
+  least one option and a default that is one of them, an asked question has two options, a
+  document_type question offers shipped document types only, exactly one profile per mode option
+  and none elsewhere, no empty destination set, no brace or {token} in wording). The reader of the
+  rows is private (read_unvalidated); read_validated() runs validate() and is the only way out,
+  pinned by a source scan (nothing else names the private reader or reads the three tables, LOAD
+  calls read_validated and lint). A row this build cannot read is an error, never skipped.
+- SIX BOUND NAMES (bound_spec.rs, Source::Launch): document_type, launch_mode, launch_answer_1 to 3
+  (Presence::Always, Literals::Authored, a shape-only validator of 1 to 40 characters) and run_change
+  (Presence::Optional, parses only as a SettingsPatch, at most 2048 bytes, so an envelope key, a
+  tier, a destination or a gate does not parse). Rules: answers are stored as session variables of
+  the chat but a run reads them ONCE at LOAD and every pass seeds that resolution; a Focus row
+  never writes one (refused as a session_put target, a writer argument and an output_var); each
+  is a registered store-backed name for an external step (it must declare one it names, a step that
+  names one is tainted and so is its variable and every step downstream, so it stays out of
+  extraction, and a cb-15 starter that declares one counts as personal); none is in
+  DEVICE_NAMES_NEVER_EXTERNAL. DOCUMENT_TYPE_NAME (model_resolver_input.rs) equals DOCUMENT_TYPE.
+- LOAD LINT (launch_config::lint, both load paths): a step that names a slot needs a question on it, a
+  guard literal on a slot is one of that question's options, and a step with a `requirement` needs a
+  document_type question (asked or fixed). run_change needs no question. On the DB path
+  run_settings::trial_expand also expands every model row against every document-type option and
+  every mode profile, so a combination that cannot be applied refuses the Focus.
+- GUARD ANALYSIS. A slot is Authored, so a guard on it supplies its literals plus one implicit
+  OTHER, exactly as for a model-produced router: a Focus guarded on a slot needs a fallback row (an
+  `ne` or `present` guard), even though the run's value is always one of the options, and every
+  guarded slot multiplies the enumerated paths, which count toward the 256-path cap
+  (guard::MAX_PATHS).
+- RUN-START HOOK (FocusRun::load() calls apply_launch_settings(), before authorize() and
+  resolve_tier_config(), so the tier check sees the expanded steps; rehydrate_focus_run reaches it
+  through load()). It resolves, in conductor/run_settings.rs: every question's value (the stored
+  answer, else the default; always the default for a question that is not asked), the mode and its
+  envelope override, the selected document type and the settings. It then re-expands every
+  ModelOrigin (kept on FocusDefinition.model_origins) with the selected type (ExpandInput::
+  document_type replaces the type the row names), the settings and the mode's envelope override,
+  keeping each row's guards and schedule trigger. The mode profile is applied through tighten()
+  inside the block's own finish(), after the Focus-ceiling clamp, and applies to EVERY model row of
+  its Focus; a profile that removes a declared input or leaves no destination is refused (at LOAD by
+  the trial expansion). The resolution lives on the FocusRun in memory only, so a retry and a
+  resumed run resolve again.
+- THREE SETTING LAYERS (resolve_settings, field by field, either direction): (1) the shipped default
+  of the selected type, (2) the user's saved adjustments, (3) run_change. Layer 2 is one function,
+  run_settings::saved_settings_patch(), which returns nothing until items.id=905. items.id=905
+  provides: a per-persona ENCRYPTED store (never shared.db), validation through SettingsPatch and
+  Scales::check_settings, custom document types fed into resolve_type and run_profile (executor.rs
+  passes none today), the persona's custom ids in the submit command's allowed document_type set,
+  and this function.
+- SEEDING. seed_pass takes the run's LaunchResolution and seeds the launch names from it, opening no
+  database for them (braces in run_change become parentheses). A caller that supplies none for a name a
+  step needs fails the pass closed (SeedError::LaunchNotResolved), and so does the store reader if asked
+  for a launch name. required_names adds document_type for any step with a `requirement`.
+- STALE OR UNREADABLE. A stored answer that is not one of the question's options, a stored run_change
+  that does not parse, an unreadable store or a config that does not validate fails the run
+  (LifecycleError::LaunchAnswers), naming the question and never the value; no default replaces it.
+- RESUME. rehydrate_focus_run sets `rehydrated` and has no context_key, so it cannot read the
+  chat's answers, and the defaults could be looser than what the user chose. A resumed run of a Focus
+  with an ASKED launch question therefore fails with LifecycleError::LaunchAnswersUnavailableOnResume
+  until items.id=888 carries context_key on rehydrate (items.id=913 depends on it: a review park
+  resumes through rehydrate). A Focus whose questions are all fixed, and a run with no chat
+  (submit_focus_run), use the defaults. A run_change is lost on a resumed run.
+- ANSWER STORE AND THE ONE-TIME LATCH (persistence/launch_answer_store.rs; no new table: rows of
+  session_variables under the six names). The only writer is put_answers(), which accepts only the
+  ValidatedAnswers that launch_config::validate_submission() builds (every answer one of its
+  question's options, a question that is not asked refused, a run_change parsed as a SettingsPatch
+  whose named steps exist) and writes all of a submit in one BEGIN IMMEDIATE transaction. The
+  latch is obeyed with no exemption: a latched chat refuses the whole submit (PutError::OneTimeChat,
+  code one_time_chat), a latch that cannot be read fails it closed, and the run uses the Focus
+  defaults. Answers stored BEFORE the latch was set stay (setting it deletes nothing), reads are not
+  latch-gated, and so they keep seeding later passes of that chat. No clear_chat or retention sweep
+  exists yet, so they stay until items.id=888 (session_variables rows are covered by it).
+- RETRYING OPENER. The run-start read (read_answers_for_run) and the launch commands open outputs.db
+  with output_store::open_outputs_db_retrying (commit 8d8d66f measured lock failures on the plain
+  opener under contention, and a failed read here fails the run start closed). The scan test
+  only_the_review_paths_open_with_the_retry lists persistence/launch_answer_store.rs.
+- NOTHING APPROVES A HOSTED OR METERED STEP (decisions.id=942 Q3). A mode profile is an
+  EnvelopeOverride (four keys, pinned) and only narrows (property-tested); a source scan pins that
+  spend, review, treatment, provider-selection and executor code never name a launch name or the
+  run-start module (the resolver names document_type only). EXTERNAL_MODEL_BLOCKS_ALLOWED is
+  unchanged.
+- IPC (commands/launch.rs, Group 38 of HANDOFF_IPC_SURFACE.md; ipc.rs comments number it as the
+  next group after the outbound review): get_focus_launch_config(focus_id) (shipped data only, never a
+  mode profile), get_launch_state(persona_id, context_key, focus_id) (read only, works in a latched
+  chat: per question the stored answer, the effective value, from_default and stale, plus run_change,
+  one_time_chat and defaults_apply) and submit_launch_answers(persona_id, context_key, focus_id,
+  answers [{question_id, value}], run_change string or null) (returns the new state). Error codes,
+  each with a placeholder key launch.error.<code> in en.json that a test requires: persona_not_found,
+  invalid_focus_id, invalid_context_key, no_launch_config, unknown_question, question_not_asked,
+  invalid_answer, invalid_run_change, one_time_chat, launch_unavailable. The keys are in the orphan
+  allowlist of styleAndI18nConsistency.test.ts until items.id=902 shows them. No screen is built.
+- NOT BUILT: saved adjustments and custom document types (items.id=905), carrying context_key on
+  rehydrate (items.id=888), a per-row mode selector, any real Focus question (items.id=903), the
+  generic launch screen (items.id=902).
 
 ## Collection consent (items.id=920 stage 1, decisions.id=944, decisions.id=509)
 A focus_level Focus (Tech Support) collects silently after ONE informed consent at
@@ -854,8 +977,10 @@ Focus and items.id=916 flips it; the hard purge ships before that.
   serial number, warranty contact and access location not_permitted at tiers 2 and 3 (never, even
   with consent), the brief carries the user's device names and two free-text fields with no secret
   detector, the outbound review detects and asks (it does not enforce the catalogue), and
-  decisions.id=513's redaction needs flags decisions.id=945 defers. Opening them later is a design
-  (a tier-aware render of the catalogue's policies), not a flag. They stay tainted like every store
+  decisions.id=513's redaction needs flags decisions.id=945 defers. The closed-list refusal is
+  TEMPORARY: items.id=924 (a design, not built) replaces it with a per-field policy (never, ask,
+  pass) and a tier-aware render of the catalogue's policies, and removes the refusal for the fields
+  it allows. Opening the names is that design, not a flag. They stay tainted like every store
   name. Seeds are read once per pass, so a device's facts appear one pass
   late. The wording is provisional (Chat-PM reviewed; items.id=914 owns the other three texts and
   edits seeding.rs/bound_spec.rs after this item).
