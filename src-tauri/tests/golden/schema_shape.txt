@@ -851,6 +851,29 @@ TABLE focus_block_customization
   customization TEXT notnull=1 pk=0 default=Some("'{}'")
   created_at TEXT notnull=1 pk=0 default=None
   updated_at TEXT notnull=1 pk=0 default=None
+TABLE focus_launch_display
+  focus_id TEXT notnull=0 pk=1 default=None
+  ui_one_liner TEXT notnull=1 pk=0 default=None
+TABLE focus_launch_options
+  focus_id TEXT notnull=1 pk=1 default=None
+  question_id TEXT notnull=1 pk=2 default=None
+  option_id TEXT notnull=1 pk=3 default=None
+  sort_order INTEGER notnull=1 pk=0 default=None
+  label TEXT notnull=1 pk=0 default=None
+  hint TEXT notnull=1 pk=0 default=Some("''")
+TABLE focus_launch_questions
+  focus_id TEXT notnull=1 pk=1 default=None
+  question_id TEXT notnull=1 pk=2 default=None
+  slot TEXT notnull=1 pk=0 default=None
+  kind TEXT notnull=1 pk=0 default=None
+  sort_order INTEGER notnull=1 pk=0 default=None
+  asked INTEGER notnull=1 pk=0 default=Some("1")
+  default_option TEXT notnull=1 pk=0 default=None
+  prompt TEXT notnull=1 pk=0 default=None
+TABLE focus_mode_profiles
+  focus_id TEXT notnull=1 pk=1 default=None
+  option_id TEXT notnull=1 pk=2 default=None
+  envelope TEXT notnull=1 pk=0 default=Some("'{}'")
 TABLE focus_provider_criteria
   focus_id TEXT notnull=0 pk=1 default=None
   require_is_local INTEGER notnull=1 pk=0 default=Some("0")

@@ -306,6 +306,46 @@ pub const RESIDUAL_SHARED_SCHEMA: &[ResidualTable] = &[
         ],
     },
     ResidualTable {
+        // items.id=897 (shared_047.sql): per-Focus launch questions, their options,
+        // mode profiles and one short display line. Shipped data, identical for every
+        // install, no user content: answers live in the persona's encrypted
+        // outputs.db, never here.
+        name: "focus_launch_questions",
+        class: ResidualClass::GlobalCatalog,
+        columns: &[
+            "focus_id",
+            "question_id",
+            "slot",
+            "kind",
+            "sort_order",
+            "asked",
+            "default_option",
+            "prompt",
+        ],
+    },
+    ResidualTable {
+        name: "focus_launch_options",
+        class: ResidualClass::GlobalCatalog,
+        columns: &[
+            "focus_id",
+            "question_id",
+            "option_id",
+            "sort_order",
+            "label",
+            "hint",
+        ],
+    },
+    ResidualTable {
+        name: "focus_mode_profiles",
+        class: ResidualClass::GlobalCatalog,
+        columns: &["focus_id", "option_id", "envelope"],
+    },
+    ResidualTable {
+        name: "focus_launch_display",
+        class: ResidualClass::GlobalCatalog,
+        columns: &["focus_id", "ui_one_liner"],
+    },
+    ResidualTable {
         name: "provider_models",
         class: ResidualClass::GlobalCatalog,
         columns: &[
