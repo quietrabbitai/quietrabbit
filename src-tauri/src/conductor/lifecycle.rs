@@ -1077,6 +1077,17 @@ fn guarded_composition_paths(
     focus_id: &str,
     steps: &[ActionDefinition],
 ) -> Result<Vec<guard::Path>, LifecycleError> {
+    composition_paths(steps)
+        .map_err(|e| LifecycleError::ValidationFailed(format!("Focus '{focus_id}' {e}")))
+}
+
+/// guarded_composition_paths() with the analysis error left typed, so the run plan
+/// (items.id=901, conductor::run_plan) can tell a path-cap failure from the others and
+/// fail closed with its own code. The same enumeration LOAD runs, over the same row
+/// shapes: the plan re-runs it and filters the result, it never changes it.
+pub(crate) fn composition_paths(
+    steps: &[ActionDefinition],
+) -> Result<Vec<guard::Path>, guard::CompositionError> {
     let row_vars = row_output_vars(steps);
     let shapes: Vec<guard::RowShape> = steps
         .iter()
@@ -1102,7 +1113,6 @@ fn guarded_composition_paths(
         })
         .collect();
     guard::analyze_composition_paths(&shapes)
-        .map_err(|e| LifecycleError::ValidationFailed(format!("Focus '{focus_id}' {e}")))
 }
 
 /// The variable each row records when it runs, in row order: an ordinary

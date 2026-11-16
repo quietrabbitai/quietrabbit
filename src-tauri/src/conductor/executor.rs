@@ -1587,13 +1587,19 @@ struct BlockSelection {
 /// text with every {token} stripped, which is what the render keeps whatever the
 /// tokens hold. The post-render context check stays the authority.
 fn fixed_prompt_tokens(ctx: &StepContext) -> u32 {
+    fixed_tokens_of_step(&ctx.step, &ctx.focus_id)
+}
+
+/// fixed_prompt_tokens() for a step and a Focus id, so the run plan (items.id=901) and the
+/// executor read the same lower bound.
+pub(crate) fn fixed_tokens_of_step(step: &ActionDefinition, focus_id: &str) -> u32 {
     let fixed = render_template(
-        &ctx.step.prompt_template,
+        &step.prompt_template,
         &HashMap::new(),
-        &ctx.step.action_id,
-        &ctx.focus_id,
+        &step.action_id,
+        focus_id,
     );
-    crate::providers::ollama_client::estimate_token_count(&fixed, &ctx.step.task_type)
+    crate::providers::ollama_client::estimate_token_count(&fixed, &step.task_type)
 }
 
 /// The run's shipped document profile: the selected document type, read ONLY from
@@ -1684,15 +1690,15 @@ async fn select_model_for_block(
     ctx: &StepContext,
     req: &crate::conductor::model_block::config::ModelRequirement,
 ) -> Result<BlockSelection, ConductorError> {
-    use crate::conductor::model_block::config::Destination;
     use crate::conductor::model_capability::CapabilitySubject;
     use crate::conductor::model_resolver::{resolve, Resolution, ResolveInput};
     use crate::conductor::model_resolver_input::{gather, GatherInput};
 
-    let ceiling = ctx.effective_access.min(req.range.highest_tier);
-    let local_allowed = req.range.destinations.contains(&Destination::Local);
-    let hosted_allowed = req.range.destinations.contains(&Destination::HostedApi)
-        && ceiling >= ExternalAccess::AnonymousPreferred;
+    let crate::conductor::model_resolver_input::Reach {
+        ceiling,
+        local_allowed,
+        hosted_allowed,
+    } = crate::conductor::model_resolver_input::reach(req, ctx.effective_access);
     let fixed_tokens = fixed_prompt_tokens(ctx);
     let est_output = ctx
         .step
@@ -1709,7 +1715,7 @@ async fn select_model_for_block(
         local_allowed,
         hosted_allowed,
         est_input_tokens: fixed_tokens,
-        est_output_tokens: est_output,
+        est_output_tokens: Some(est_output),
     })
     .await;
     let profile = run_profile(ctx);

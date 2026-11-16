@@ -85,7 +85,46 @@ pub struct GatherInput<'a> {
     pub hosted_allowed: bool,
     /// The input tokens the cost estimate prices.
     pub est_input_tokens: u32,
-    pub est_output_tokens: u32,
+    /// The output tokens the cost estimate prices. Some: that many for every hosted
+    /// model (the executor passes the step's own `num_predict`, else its 1024 default).
+    /// None: each hosted model's OWN output limit from its catalog row, which is the
+    /// limit a call is really sent with when the step sets none (the run plan,
+    /// items.id=901); a metered model with no such limit has no estimate (u64::MAX)
+    /// because the call would fail closed.
+    pub est_output_tokens: Option<u32>,
+}
+
+/// What a requirement may reach under a step's effective access: the ceiling the
+/// resolver works under and whether each destination is open. ONE function, used by
+/// the executor's selection and by the run plan, so the two cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reach {
+    pub ceiling: ExternalAccess,
+    pub local_allowed: bool,
+    pub hosted_allowed: bool,
+}
+
+pub fn reach(
+    req: &crate::conductor::model_block::config::ModelRequirement,
+    effective_access: ExternalAccess,
+) -> Reach {
+    use crate::conductor::model_block::config::Destination;
+    let ceiling = effective_access.min(req.range.highest_tier);
+    Reach {
+        ceiling,
+        local_allowed: req.range.destinations.contains(&Destination::Local),
+        hosted_allowed: req.range.destinations.contains(&Destination::HostedApi)
+            && ceiling >= ExternalAccess::AnonymousPreferred,
+    }
+}
+
+/// The output token limit a hosted model's catalog row carries (the same keys the
+/// hosted client reads from `request_options`), if any.
+pub fn row_output_limit(model: &ProviderModel) -> Option<u64> {
+    let options = model.request_options.as_ref()?.as_object()?;
+    ["max_completion_tokens", "max_tokens"]
+        .iter()
+        .find_map(|k| options.get(*k).and_then(serde_json::Value::as_u64))
 }
 
 #[derive(Debug, Default)]
@@ -257,21 +296,23 @@ async fn gather_hosted(input: &GatherInput<'_>, out: &mut Gathered) {
             } else {
                 Readiness::Ready
             };
-            let (cost_tier, est_cost_micros) = match &quote {
-                PriceQuote::Known(price) if price.is_free() => (CostTier::Free, 0),
-                PriceQuote::Known(price) => {
-                    let e = worst_case(
-                        price,
-                        u64::from(input.est_input_tokens),
-                        u64::from(input.est_output_tokens),
-                    );
+            let out_tokens = input
+                .est_output_tokens
+                .or_else(|| row_output_limit(&model).and_then(|v| u32::try_from(v).ok()));
+            let (cost_tier, est_cost_micros) = match (&quote, out_tokens) {
+                (PriceQuote::Known(price), _) if price.is_free() => (CostTier::Free, 0),
+                (PriceQuote::Known(price), Some(out)) => {
+                    let e = worst_case(price, u64::from(input.est_input_tokens), u64::from(out));
                     (
                         CostTier::Metered,
                         u64::try_from(e.worst_case_micros).unwrap_or(u64::MAX),
                     )
                 }
+                // A priced model with no output limit anywhere has no estimate: the
+                // call would fail closed, so it is not offered a figure it cannot honour.
+                (PriceQuote::Known(_), None) => (CostTier::Metered, u64::MAX),
                 // Not Ready anyway: the tier only orders the options list.
-                PriceQuote::Unknown => (CostTier::Metered, u64::MAX),
+                (PriceQuote::Unknown, _) => (CostTier::Metered, u64::MAX),
             };
             out.candidates.push(Candidate {
                 subject: CapabilitySubject::Hosted,
