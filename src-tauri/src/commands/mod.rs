@@ -79,4 +79,5 @@ pub mod provider_credentials;
 pub mod provider_models;
 pub mod provider_spend;
 pub mod qr_hosted;
+pub mod step_review;
 pub mod system;

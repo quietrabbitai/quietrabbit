@@ -1052,6 +1052,19 @@ export const commands = {
 	setDeviceFact: (personaId: string, focusId: string, device: string, field: string, value: string) => typedError<DeviceFact, string>(__TAURI_INVOKE("set_device_fact", { personaId, focusId, device, field, value })),
 	clearDeviceFact: (personaId: string, focusId: string, device: string, field: string) => typedError<null, string>(__TAURI_INVOKE("clear_device_fact", { personaId, focusId, device, field })),
 	getHandoffState: (personaId: string, contextKey: string, focusId: string) => typedError<HandoffState, string>(__TAURI_INVOKE("get_handoff_state", { personaId, contextKey, focusId })),
+	getPendingStepReview: (request: StepReviewRunRequest) => typedError<{
+	review_id: string,
+	run_id: string,
+	action_id: string,
+	/**
+	 *  "ready": `spans` can be shown. "needs_resume": the text of the flagged
+	 *  spans is not held (the app restarted), so `spans` is empty and a resume asks
+	 *  again.
+	 */
+	state: string,
+	spans: PendingStepReviewSpan[],
+} | null, string>(__TAURI_INVOKE("get_pending_step_review", { request })),
+	declineStepReview: (request: StepReviewRunRequest) => typedError<boolean, string>(__TAURI_INVOKE("decline_step_review", { request })),
 };
 
 /* Types */
@@ -2136,6 +2149,38 @@ export type PendingCrossPersonaFact = {
 	origin_persona_id: string | null,
 };
 
+/**  A review waiting for the user's answers, as the front end gets it. */
+export type PendingStepReview = {
+	review_id: string,
+	run_id: string,
+	action_id: string,
+	/**
+	 *  "ready": `spans` can be shown. "needs_resume": the text of the flagged
+	 *  spans is not held (the app restarted), so `spans` is empty and a resume asks
+	 *  again.
+	 */
+	state: string,
+	spans: PendingStepReviewSpan[],
+};
+
+/**
+ *  One flagged span as the front end gets it: ConsentSpanItem with u32 byte
+ *  offsets, because specta forbids exporting usize across IPC (the event payload,
+ *  which is not exported, keeps the original).
+ */
+export type PendingStepReviewSpan = {
+	span_id: string,
+	category: string,
+	user_label: string,
+	original_text: string,
+	suggestion: string | null,
+	start_byte: number,
+	end_byte: number,
+	score: number | null,
+	review_tier: ReviewTier,
+	fact_key: string | null,
+};
+
 /**
  *  IPC gap: privacy defaults still missing (post-Release 1, not this item's
  *  scope -- see module header). color/focus_count closed by items.id=237.
@@ -2543,6 +2588,29 @@ export type ResumeRunRequest = {
 	persona_id: string,
 };
 
+/**
+ *  Review tier assigned by gate3 based on confidence scores, sensitivity, and
+ *  destination risk. Determines the visual weight of the consent modal
+ *  section a span is grouped into.
+ *  Serialises as "low" | "medium" | "high".
+ * 
+ *  items.id=406 (decisions.id=754): renamed from Easy/Medium/High to
+ *  Low/Medium/High -- Jason approved this as the full terminology (not just
+ *  a display-string swap) so code doesn't say "easy" while the UI says "Low
+ *  risk". Now assigned per-span (see gate3.rs::assign_review_tier_for_span),
+ *  not once for a whole batch of spans.
+ */
+export type ReviewTier = 
+/**  High-confidence structural PII (score >= 0.90). Minimal friction. */
+"low" | 
+/**  Moderate confidence or contextual content (score >= 0.70). */
+"medium" | 
+/**
+ *  Low confidence, Medical-mapped category, or high destination risk.
+ *  Err toward High when uncertain (D6-362).
+ */
+"high";
+
 /**  Where a rotation stands, for a webview that reloaded or mounted late. */
 export type RotationStatus = {
 	/**  A rotation is running in this process right now. */
@@ -2721,6 +2789,11 @@ export type SetPriceOverrideRequest = {
 	 *  explicit confirmation.
 	 */
 	confirmed_free: boolean,
+};
+
+export type StepReviewRunRequest = {
+	persona_id: string,
+	run_id: string,
 };
 
 export type StoreIngestedDocumentResponse = {

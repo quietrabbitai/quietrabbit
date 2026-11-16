@@ -72,6 +72,7 @@ use crate::conductor::privacy::types::{
     AbstractionPolicy, PersonalField as GateField, PersonalTrack as GateTrack, Sensitivity,
 };
 use crate::conductor::privacy::PrivacyGateway;
+use crate::conductor::step_review::{self, ReviewedPrompt};
 use crate::conductor::step_treatment::{
     self, floor_invariant_violation, Basis, CeilingValues, Chosen, StepTreatment,
 };
@@ -685,6 +686,37 @@ impl StepExecutor {
             render_prompt(ctx, &output_vars, &previous_output, &voice_profile_str)
         };
 
+        // -- items.id=884 — outbound review of the rendered prompt --
+        // Fires iff the selected model is hosted (`treatment.hosted`, the one
+        // predicate that also picks the render and the network branch,
+        // decisions.id=947). A local pick is not reviewed. A bound API Chat run
+        // takes its prompt as reviewed already (send_api_chat_message). After the
+        // render and before the context-window check, the inference slot and the
+        // spend gate, so what is measured and sent is the released text. A park
+        // (the user must answer, the filter is unavailable, anything fail-closed)
+        // is returned as the step's result and never retried.
+        let reviewed: Option<ReviewedPrompt> = if treatment.hosted {
+            match step_review::review_hosted_step(
+                ctx,
+                &treatment,
+                selected_model.provider_id.as_deref(),
+                &prompt,
+                privacy_gateway,
+                app_handle,
+            )
+            .await
+            {
+                Ok(p) => Some(p),
+                Err(parked) => return Ok(Some(parked)),
+            }
+        } else {
+            None
+        };
+        let prompt = match &reviewed {
+            Some(p) => p.as_str().to_owned(),
+            None => prompt,
+        };
+
         // -- Step 5 — context window check (after prompt assembly, matching oracle) --
         let options_raw: HashMap<String, serde_json::Value> = {
             let mut m = HashMap::new();
@@ -847,8 +879,12 @@ impl StepExecutor {
                     Some(_) => selected_model.provider_id.as_deref(),
                     None => ctx.qr_hosted_provider_preference.as_deref(),
                 };
-                match (provider_for_call, selected_model.hosted_model.as_ref()) {
-                    (Some(provider_id), Some(model)) => {
+                match (
+                    provider_for_call,
+                    selected_model.hosted_model.as_ref(),
+                    reviewed.as_ref(),
+                ) {
+                    (Some(provider_id), Some(model), Some(reviewed_prompt)) => {
                         let parts = match (&ctx.stream, stream_sink.as_deref()) {
                             (Some(handle), Some(sink)) => Some(StreamParts {
                                 sink,
@@ -864,6 +900,7 @@ impl StepExecutor {
                             provider_id,
                             model,
                             &request,
+                            reviewed_prompt,
                             &chrono::Local,
                             HostedInputs::build_call,
                             parts,
@@ -871,9 +908,9 @@ impl StepExecutor {
                         .await
                     }
                     _ => unreachable!(
-                        "effective_access != LocalOnly with no qr_hosted_provider_preference \
-                     or no resolved model -- the Step 4.5 guard and select_model() must \
-                     already have short-circuited"
+                        "a hosted step with no provider, no resolved model or no reviewed \
+                     prompt -- the Step 4.5 guard, select_model() and the outbound review \
+                     (items.id=884) must already have short-circuited"
                     ),
                 }
             } else {
@@ -1748,10 +1785,14 @@ fn model_error(e: &ModelError) -> ConductorError {
 fn hosted_request_from(
     options_override: &HashMap<String, serde_json::Value>,
     request: &GenerateRequest,
+    reviewed: &ReviewedPrompt,
 ) -> HostedRequest {
     HostedRequest {
+        // items.id=884: never any text of its own. Any system text added here later
+        // goes through step_review as well.
         system: None,
-        prompt: request.prompt.clone(),
+        // The text the outbound review released, not the request's own field.
+        prompt: reviewed.as_str().to_owned(),
         temperature: request.options.as_ref().map(|o| o.temperature),
         max_output_tokens: options_override
             .get("num_predict")
@@ -2119,11 +2160,25 @@ async fn hosted_step_call<Tz: chrono::TimeZone>(
     provider_id: &str,
     model: &ProviderModel,
     request: &GenerateRequest,
+    reviewed: &ReviewedPrompt,
     tz: &Tz,
     build: fn(&HostedInputs) -> Result<CallContext, ProviderError>,
     stream: Option<StreamParts<'_>>,
 ) -> Result<GenerateResponse, ConductorError> {
-    let hosted_request = hosted_request_from(&ctx.step.options_override, request);
+    // items.id=884: the one place a hosted step's text reaches a request. The
+    // request's own prompt was set to the released text before the context-window
+    // check, so the two are the same string. A difference means someone built the
+    // request from other text: nothing is sent.
+    if request.prompt != reviewed.as_str() {
+        return Err(ConductorError::TierBoundaryViolation {
+            plain_language: format!(
+                "Step '{}' was about to send text other than the text that was reviewed. \
+                 Nothing was sent. [Get help]",
+                ctx.step.action_id
+            ),
+        });
+    }
+    let hosted_request = hosted_request_from(&ctx.step.options_override, request, reviewed);
     let inputs = resolve_hosted_inputs(pool, &ctx.user_id, &ctx.key_hex, provider_id, model)
         .await
         .map_err(ConductorError::from)?;
@@ -3609,8 +3664,11 @@ mod tests {
                 &inputs.key.extra_metadata,
             )
             .unwrap();
-            let request =
-                hosted_request_from(&std::collections::HashMap::new(), &generate_request("hi"));
+            let request = hosted_request_from(
+                &std::collections::HashMap::new(),
+                &generate_request("hi"),
+                &ReviewedPrompt::for_test("hi"),
+            );
             let out = loopback_client().generate(&call, &request).await.unwrap();
             assert_eq!(out.response.content, "ok");
 
@@ -3686,8 +3744,11 @@ mod tests {
                 &inputs.key.extra_metadata,
             )
             .unwrap();
-            let request =
-                hosted_request_from(&std::collections::HashMap::new(), &generate_request("hi"));
+            let request = hosted_request_from(
+                &std::collections::HashMap::new(),
+                &generate_request("hi"),
+                &ReviewedPrompt::for_test("hi"),
+            );
             loopback_client().generate(&call, &request).await.unwrap();
             assert_eq!(
                 server.captured()[0].path,
@@ -3810,7 +3871,11 @@ mod tests {
     #[test]
     fn hosted_request_forwards_a_budget_only_when_the_step_set_one() {
         let request = generate_request("p");
-        let none = hosted_request_from(&std::collections::HashMap::new(), &request);
+        let none = hosted_request_from(
+            &std::collections::HashMap::new(),
+            &request,
+            &ReviewedPrompt::for_test(&request.prompt),
+        );
         assert_eq!(none.max_output_tokens, None);
         assert_eq!(none.temperature, Some(0.5));
         assert_eq!(none.prompt, "p");
@@ -3818,13 +3883,22 @@ mod tests {
 
         let mut overrides = std::collections::HashMap::new();
         overrides.insert("num_predict".to_owned(), serde_json::json!(777));
-        let some = hosted_request_from(&overrides, &request);
+        let some = hosted_request_from(
+            &overrides,
+            &request,
+            &ReviewedPrompt::for_test(&request.prompt),
+        );
         assert_eq!(some.max_output_tokens, Some(777));
 
         // A value that is not a usable number is not a budget.
         overrides.insert("num_predict".to_owned(), serde_json::json!("lots"));
         assert_eq!(
-            hosted_request_from(&overrides, &request).max_output_tokens,
+            hosted_request_from(
+                &overrides,
+                &request,
+                &ReviewedPrompt::for_test(&request.prompt)
+            )
+            .max_output_tokens,
             None
         );
     }
@@ -4391,6 +4465,7 @@ mod tests {
             "fixture-host-a",
             model,
             &generate_request("hello there"),
+            &ReviewedPrompt::for_test("hello there"),
             &chrono::Utc,
             loopback_build,
             None,
@@ -4555,6 +4630,7 @@ mod tests {
             "fixture-host-a",
             &model,
             &generate_request("hello there"),
+            &ReviewedPrompt::for_test("hello there"),
             &chrono::Utc,
             loopback_build,
             None,
@@ -6434,6 +6510,7 @@ mod tests {
                 "fixture-host-a",
                 model,
                 &generate_request("hello there"),
+                &ReviewedPrompt::for_test("hello there"),
                 &chrono::Utc,
                 loopback_build,
                 Some(StreamParts {
@@ -6700,6 +6777,7 @@ mod tests {
                     "fixture-host-a",
                     &model,
                     &generate_request("hello there"),
+                    &ReviewedPrompt::for_test("hello there"),
                     &chrono::Utc,
                     loopback_build,
                     Some(StreamParts {
@@ -8734,15 +8812,17 @@ mod tests {
         assert!(flat.contains(
             "let prompt = if treatment.hosted { let disclosure = shared_state.read_disclosure_buffer(&ctx.step.action_id);"
         ));
-        // Site 3: unchanged.
+        // Site 3: the provider still comes from the selection for a resolved step and
+        // from the preference otherwise. items.id=884 added a third element to the
+        // match, the reviewed prompt, and nothing else: a hosted call cannot be made
+        // without one.
         assert!(flat.contains(
-            "let provider_for_call = match resolver_req { Some(_) => selected_model.provider_id.as_deref(), None => ctx.qr_hosted_provider_preference.as_deref(), }; match (provider_for_call, selected_model.hosted_model.as_ref()) {"
+            "let provider_for_call = match resolver_req { Some(_) => selected_model.provider_id.as_deref(), None => ctx.qr_hosted_provider_preference.as_deref(), }; match ( provider_for_call, selected_model.hosted_model.as_ref(), reviewed.as_ref(), ) {"
         ));
-        // The panic arm is the original one, once, with its original message.
+        // The panic arm is the original one, once, with its message extended by the
+        // review (items.id=884).
         assert_eq!(code.matches("unreachable!(").count(), 2);
-        assert!(
-            code.contains("effective_access != LocalOnly with no qr_hosted_provider_preference")
-        );
+        assert!(code.contains("a hosted step with no provider, no resolved model or no reviewed"));
         // A hosted selection under a local-only ceiling is refused before any gate,
         // by the derivation.
         assert!(flat.contains(
@@ -8750,5 +8830,321 @@ mod tests {
         ));
         let derive_src = include_str!("step_treatment.rs");
         assert!(derive_src.contains("return Err(TreatmentError::HostedUnderLocalOnly);"));
+    }
+
+    // -- items.id=884: the outbound review through execute_once ---------------------
+
+    fn hosted_pick_ctx(key_hex: &str, template: &str) -> StepContext {
+        let mut ctx = resolved_ctx(
+            Some(requirement(
+                QualityBar::Basic,
+                &[Destination::HostedApi],
+                ExternalAccess::AnonymousPreferred,
+            )),
+            ExternalAccess::AnonymousPreferred,
+            Some("rma_letter"),
+            template,
+        );
+        ctx.key_hex = key_hex.to_owned();
+        ctx
+    }
+
+    async fn review_rows(
+        ctx: &StepContext,
+    ) -> Vec<crate::persistence::step_review_store::StepReviewRow> {
+        let mut conn = crate::persistence::output_store::open_outputs_db(
+            &ctx.user_id,
+            &ctx.persona_id,
+            &ctx.key_hex,
+        )
+        .await
+        .unwrap();
+        crate::persistence::step_review_store::list_reviews(
+            &mut conn,
+            &ctx.focus_run_id,
+            &ctx.step.action_id,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn code_of(r: &FailureResult) -> String {
+        r.metadata.as_ref().unwrap()["code"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// No filter, no external step: an unbound hosted pick parks before the context
+    /// check, the inference slot and the spend gate, and nothing is sent.
+    #[tokio::test]
+    async fn an_unbound_hosted_step_with_no_filter_parks_before_the_spend_gate() {
+        with_temp_shared_db(|pool| async move {
+            let key_hex = hosted_pick_rig(&pool).await;
+            let ctx = hosted_pick_ctx(&key_hex, "Write it.");
+            let mut forced = step_review::forced::clean();
+            forced.available = false;
+            let _g = step_review::forced::arm(&ctx, forced).await;
+
+            let (out, track, _) = run_once(&ctx, &pool).await;
+            let failure = out.unwrap().expect("the step parks");
+            assert_eq!(failure.action, FailureAction::AwaitUser);
+            assert_eq!(failure.failure_mode.as_deref(), Some("F4"));
+            assert_eq!(code_of(&failure), "step_review.privacy_filter_unavailable");
+            assert!(track.steps().is_empty(), "nothing ran");
+            let rows = review_rows(&ctx).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].outcome,
+                crate::persistence::step_review_store::ReviewOutcome::Blocked
+            );
+        })
+        .await;
+    }
+
+    /// A clean review lets the step on to the hosted call (here the production
+    /// client refuses the loopback rig's non-https address before any traffic): the
+    /// review row exists, so the review ran first.
+    #[tokio::test]
+    async fn a_clean_review_runs_first_and_the_step_goes_on_to_the_hosted_call() {
+        with_temp_shared_db(|pool| async move {
+            let key_hex = hosted_pick_rig(&pool).await;
+            let ctx = hosted_pick_ctx(&key_hex, "Write it.");
+            let _g = step_review::forced::arm(&ctx, step_review::forced::clean()).await;
+
+            let (out, track, _) = run_once(&ctx, &pool).await;
+            // Past the review the production client refuses a loopback (non-https)
+            // address before any traffic: the step got as far as the hosted call.
+            let failure = out.unwrap().expect("the call fails past the review");
+            assert!(
+                failure
+                    .plain_language
+                    .contains("not a secure (https) address"),
+                "{failure:?}"
+            );
+            assert!(track.steps().is_empty());
+            let rows = review_rows(&ctx).await;
+            assert_eq!(rows.len(), 1, "one review, before the gate");
+            assert_eq!(
+                rows[0].outcome,
+                crate::persistence::step_review_store::ReviewOutcome::Clean
+            );
+            assert_eq!(rows[0].provider_id.as_deref(), Some("fixture-host-a"));
+        })
+        .await;
+    }
+
+    /// Flagged text parks the step for the user (AwaitConsent), and a resume with the
+    /// recorded answers applies them, asks nobody again and goes on to the hosted call.
+    #[tokio::test]
+    async fn flagged_text_parks_the_step_and_a_resume_applies_the_answers() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        with_temp_shared_db(|pool| async move {
+            let key_hex = hosted_pick_rig(&pool).await;
+            let ctx = hosted_pick_ctx(&key_hex, "Write it for Ann Smith.");
+            let scans = Rc::new(Cell::new(0usize));
+            let counted = Rc::clone(&scans);
+            let mut forced = step_review::forced::clean();
+            forced.result = Rc::new(move |content: &str| {
+                counted.set(counted.get() + 1);
+                Ok(crate::conductor::privacy::types::Gate3Result {
+                    pending_consent: true,
+                    review_spans: vec![step_review::fake::asked_span(
+                        "s-ann",
+                        content,
+                        "Ann Smith",
+                    )],
+                    ..Default::default()
+                })
+            });
+            let _g = step_review::forced::arm(&ctx, forced).await;
+
+            let (out, _, _) = run_once(&ctx, &pool).await;
+            let failure = out.unwrap().expect("parked for the user");
+            assert_eq!(failure.action, FailureAction::AwaitConsent);
+            assert_eq!(code_of(&failure), "step_review.required");
+            assert_eq!(scans.get(), 1);
+
+            // The user answers (as submit_element_consent_decision records it).
+            let mut conn = crate::persistence::output_store::open_outputs_db(
+                &ctx.user_id,
+                &ctx.persona_id,
+                &ctx.key_hex,
+            )
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO consent_decisions
+                 (id, focus_run_id, decision_type, decision, span_id, created_at)
+                 VALUES ('d1', ?, 'element_consent', 'keep_private', 's-ann', 't')",
+            )
+            .bind(&ctx.focus_run_id)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            drop(conn);
+
+            let (out, _, _) = run_once(&ctx, &pool).await;
+            let failure = out.unwrap().expect("the call fails past the review");
+            assert!(
+                failure
+                    .plain_language
+                    .contains("not a secure (https) address"),
+                "{failure:?}"
+            );
+            assert_eq!(scans.get(), 1, "nobody is asked again");
+            let rows = review_rows(&ctx).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].outcome,
+                crate::persistence::step_review_store::ReviewOutcome::Redacted
+            );
+        })
+        .await;
+    }
+
+    /// A local pick under an external ceiling is not reviewed (decisions.id=947): the
+    /// scanner is never consulted (it would park the step if it were), and no review
+    /// row is written.
+    #[tokio::test]
+    async fn a_local_pick_under_an_external_ceiling_is_not_reviewed() {
+        with_temp_shared_db(|pool| async move {
+            install_local_models(&pool).await;
+            let stub = LocalModelStub::start(1);
+            let ctx = resolved_ctx(
+                Some(requirement(
+                    QualityBar::Basic,
+                    &[Destination::Local, Destination::HostedApi],
+                    ExternalAccess::AnonymousPreferred,
+                )),
+                ExternalAccess::AnonymousPreferred,
+                Some("rma_letter"),
+                "Write it.",
+            );
+            let mut forced = step_review::forced::clean();
+            forced.available = false;
+            let _g = step_review::forced::arm(&ctx, forced).await;
+
+            let (out, track, _) = run_once(&ctx, &pool).await;
+            assert!(out.unwrap().is_none(), "the local step ran");
+            assert_eq!(stub.server.captured().len(), 1);
+            assert_eq!(track.steps().len(), 1);
+            assert!(
+                review_rows(&ctx).await.is_empty(),
+                "no review of a local pick"
+            );
+        })
+        .await;
+    }
+
+    /// The text that reaches the network is the text the review released: its hash
+    /// matches the stored outbound hash, and the original words are not in it.
+    #[tokio::test]
+    async fn the_text_sent_hashes_to_the_stored_outbound_hash() {
+        use crate::conductor::step_review::{
+            fake::{asked_span, FakeScanner},
+            review_prompt, ReviewDecision, ReviewInput,
+        };
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            let (key_hex, model) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+            grant_consent(&pool, &key_hex, true).await;
+            let ctx = hosted_ctx(RunAttendance::Attended, &key_hex);
+            let prompt = "Write to Ann Smith about the invoice";
+            let _g = step_review::forced::arm(&ctx, step_review::forced::clean()).await;
+
+            let mut conn = crate::persistence::output_store::open_outputs_db(
+                &ctx.user_id,
+                &ctx.persona_id,
+                &ctx.key_hex,
+            )
+            .await
+            .unwrap();
+            let scanner = FakeScanner::pending(vec![asked_span("s1", prompt, "Ann Smith")]);
+            let input = ReviewInput {
+                run_id: &ctx.focus_run_id,
+                action_id: &ctx.step.action_id,
+                prompt,
+                provider_id: Some("fixture-host-a"),
+            };
+            assert!(matches!(
+                review_prompt(&mut conn, &scanner, &input).await,
+                ReviewDecision::Park(_)
+            ));
+            sqlx::query(
+                "INSERT INTO consent_decisions
+                 (id, focus_run_id, decision_type, decision, span_id, suggestion_text, created_at)
+                 VALUES ('d1', ?, 'element_consent', 'generalize', 's1', '[person]', 't')",
+            )
+            .bind(&ctx.focus_run_id)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            let ReviewDecision::Send(reviewed) = review_prompt(&mut conn, &scanner, &input).await
+            else {
+                panic!("the answered review sends")
+            };
+
+            hosted_step_call(
+                &loopback_client(),
+                &pool,
+                &ctx,
+                "fixture-host-a",
+                &model,
+                &generate_request(reviewed.as_str()),
+                &reviewed,
+                &chrono::Utc,
+                loopback_build,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let sent = server.captured()[0].json();
+            let body_text = sent["messages"][0]["content"].as_str().unwrap().to_owned();
+            assert_eq!(body_text, "Write to [person] about the invoice");
+            assert!(!body_text.contains("Ann"));
+            let rows = crate::persistence::step_review_store::list_reviews(
+                &mut conn,
+                &ctx.focus_run_id,
+                &ctx.step.action_id,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                rows[0].outbound_sha.as_deref(),
+                Some(step_review::sha256_hex(&body_text).as_str())
+            );
+            assert_eq!(rows[0].outbound_len, Some(body_text.len()));
+        })
+        .await;
+    }
+
+    /// Text other than the reviewed text never reaches a request: the call refuses.
+    #[tokio::test]
+    async fn a_request_that_differs_from_the_reviewed_text_is_refused() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            let (key_hex, model) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+            grant_consent(&pool, &key_hex, true).await;
+            let err = hosted_step_call(
+                &loopback_client(),
+                &pool,
+                &hosted_ctx(RunAttendance::Attended, &key_hex),
+                "fixture-host-a",
+                &model,
+                &generate_request("the original, unreviewed words"),
+                &ReviewedPrompt::for_test("the reviewed words"),
+                &chrono::Utc,
+                loopback_build,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, ConductorError::TierBoundaryViolation { .. }));
+            assert!(server.captured().is_empty(), "nothing was sent");
+        })
+        .await;
     }
 }

@@ -248,6 +248,10 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         // Group 33 -- Manual hand-off state, read only (items.id=387,
         // decisions.id=942 point 7; the panel is items.id=912)
         commands::handoff::get_handoff_state,
+        // Group 34 -- Outbound review of an external step's prompt: the review a
+        // run is parked on, and the refusal (items.id=884, decisions.id=943)
+        commands::step_review::get_pending_step_review,
+        commands::step_review::decline_step_review,
     ])
 }
 

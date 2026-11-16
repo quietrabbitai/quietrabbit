@@ -380,7 +380,7 @@ pub async fn cancel_run(
 /// 3. The row is marked cancelled and its snapshots deleted. A run not live
 ///    here (parked awaiting_user) gets just this; a finished or already
 ///    cancelled run is a no-op; an unknown run is RunNotFound.
-async fn cancel_run_for_session(
+pub(crate) async fn cancel_run_for_session(
     session_user: &str,
     user_id: &str,
     persona_id: &str,
@@ -391,6 +391,16 @@ async fn cancel_run_for_session(
         return Err(output_store::OutputStoreError::RunNotFound(run_id.to_owned()).to_string());
     }
     crate::auth::writer_gate::request_stop_for_run(session_user, run_id);
+    // items.id=884: a review the run was parked on is superseded (and the text of
+    // its flagged spans dropped from memory) before the run is marked cancelled.
+    // cancel_focus_run supersedes at the store level too, so a failure here costs
+    // only the cache.
+    if let Ok(mut conn) = output_store::open_outputs_db(session_user, persona_id, key_hex).await {
+        if let Err(e) = crate::conductor::step_review::supersede_for_cancel(&mut conn, run_id).await
+        {
+            log::warn!("cancel_run: step review supersede failed: {e}");
+        }
+    }
     output_store::cancel_focus_run(session_user, persona_id, key_hex, run_id)
         .await
         .map_err(|e| e.to_string())

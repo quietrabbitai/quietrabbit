@@ -1049,6 +1049,16 @@ pub async fn cancel_focus_run(
             .bind(run_id)
             .execute(&mut conn)
             .await?;
+        // items.id=884: a cancelled run is not waiting for an answer, so a step
+        // review it was parked on is superseded (decisions.id=943 point 4).
+        crate::persistence::step_review_store::supersede_pending_for_run(&mut conn, run_id)
+            .await
+            .map_err(|e| match e {
+                crate::persistence::step_review_store::StepReviewStoreError::Database(d) => {
+                    OutputStoreError::from(d)
+                }
+                other => OutputStoreError::Validation(other.to_string()),
+            })?;
     }
 
     Ok(())
@@ -1290,6 +1300,16 @@ pub async fn list_element_decisions_for_run(
         return Ok(Vec::new());
     }
     let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+    list_element_decisions_on_conn(&mut conn, run_id).await
+}
+
+/// The body of `list_element_decisions_for_run` on a connection the caller
+/// already holds (items.id=884: the step review reads its answers on the same
+/// connection as its review record). One query, one meaning.
+pub async fn list_element_decisions_on_conn(
+    conn: &mut SqliteConnection,
+    run_id: &str,
+) -> Result<Vec<RecordedSpanDecision>, OutputStoreError> {
     let rows = sqlx::query(
         "SELECT span_id, decision, suggestion_text, user_modified_text
          FROM consent_decisions
@@ -1297,7 +1317,7 @@ pub async fn list_element_decisions_for_run(
          ORDER BY created_at DESC, rowid DESC",
     )
     .bind(run_id)
-    .fetch_all(&mut conn)
+    .fetch_all(conn)
     .await?;
 
     let mut seen = std::collections::HashSet::new();
