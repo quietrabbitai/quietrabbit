@@ -1066,6 +1066,9 @@ export const commands = {
 } | null, string>(__TAURI_INVOKE("get_pending_step_review", { request })),
 	listPendingStepReviews: (personaId: string) => typedError<PendingStepReview[], string>(__TAURI_INVOKE("list_pending_step_reviews", { personaId })),
 	declineStepReview: (request: StepReviewRunRequest) => typedError<boolean, string>(__TAURI_INVOKE("decline_step_review", { request })),
+	getFocusLaunchConfig: (focusId: string) => typedError<FocusLaunchConfig, string>(__TAURI_INVOKE("get_focus_launch_config", { focusId })),
+	getLaunchState: (personaId: string, contextKey: string, focusId: string) => typedError<LaunchState, string>(__TAURI_INVOKE("get_launch_state", { personaId, contextKey, focusId })),
+	submitLaunchAnswers: (personaId: string, contextKey: string, focusId: string, answers: LaunchAnswerInput[], runChange: string | null) => typedError<LaunchState, string>(__TAURI_INVOKE("submit_launch_answers", { personaId, contextKey, focusId, answers, runChange })),
 };
 
 /* Types */
@@ -1573,6 +1576,15 @@ export type FocusInfo = {
 	last_used: string | null,
 };
 
+export type FocusLaunchConfig = {
+	focus_id: string,
+	display_name: string,
+	description: string,
+	/**  The optional short line for a one-line row. */
+	ui_one_liner: string | null,
+	questions: LaunchQuestionView[],
+};
+
 export type FreeTierDto = {
 	provider_id: string,
 	requests_per_minute: number | null,
@@ -1839,6 +1851,64 @@ export type LastRotationOutcome =
  *  or the recovery phrase (or a cancel, if it was not yet promoted).
  */
 "failed";
+
+/**  One answer in a submit: ids only, no free text. */
+export type LaunchAnswerInput = {
+	question_id: string,
+	value: string,
+};
+
+/**  One option of a question. Placeholder wording, Chat-BRAND's. */
+export type LaunchOptionView = {
+	id: string,
+	label: string,
+	hint: string,
+};
+
+export type LaunchQuestionKindView = 
+/**  Its options are the Focus's modes. */
+"mode" | "choice";
+
+export type LaunchQuestionState = {
+	question_id: string,
+	/**  The stored answer, if one is stored and the question is asked. */
+	answer: string | null,
+	/**  What applies now: the answer, or the question's default. */
+	effective: string,
+	from_default: boolean,
+	/**
+	 *  An answer is stored but is no longer one of the question's options. A run
+	 *  would stop on it: ask the question again.
+	 */
+	stale: boolean,
+};
+
+export type LaunchQuestionView = {
+	id: string,
+	kind: LaunchQuestionKindView,
+	/**  false: a preset that fixes the value. Show nothing to answer. */
+	asked: boolean,
+	prompt: string,
+	default_option: string,
+	options: LaunchOptionView[],
+};
+
+export type LaunchState = {
+	focus_id: string,
+	questions: LaunchQuestionState[],
+	/**  The stored per-run change (a small JSON object of the visible settings). */
+	run_change: string | null,
+	/**
+	 *  The chat is a one-time session: nothing is saved in it, so a submit is
+	 *  refused with `one_time_chat`.
+	 */
+	one_time_chat: boolean,
+	/**
+	 *  One-time chat and no answer was stored before it began: the Focus defaults
+	 *  apply. (Answers stored before the latch still apply.)
+	 */
+	defaults_apply: boolean,
+};
 
 export type LimitDto = {
 	id: string,

@@ -569,6 +569,20 @@
       "handoff_state_unavailable": "Couldn't check where your hand-off stands. Try again in a moment."
     }
   },
+  "launch": {
+    "error": {
+      "persona_not_found": "This persona is not available.",
+      "invalid_focus_id": "This assistant is not available.",
+      "invalid_context_key": "This chat is not available.",
+      "no_launch_config": "This assistant has no setup questions.",
+      "unknown_question": "That setup question is not available.",
+      "question_not_asked": "That setting is fixed for this assistant.",
+      "invalid_answer": "That choice is not one of the options.",
+      "invalid_run_change": "Those settings could not be applied.",
+      "one_time_chat": "This is a one-time session, so your choices were not saved. The assistant's usual settings apply.",
+      "launch_unavailable": "Couldn't check your setup choices. Try again in a moment."
+    }
+  },
   "resolver": {
     "stop": {
       "too_weak": "None of the AI models available for this task is good enough for it yet, so nothing was run.",

@@ -254,6 +254,13 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::step_review::get_pending_step_review,
         commands::step_review::list_pending_step_reviews,
         commands::step_review::decline_step_review,
+        // Group 35 in this list (Group 38 of HANDOFF_IPC_SURFACE.md, whose numbers
+        // differ from these comments from Group 28 on) -- Launch questions and mode
+        // profiles of a Focus: the shipped config, a chat's answers, and the typed
+        // submit (items.id=897, decisions.id=942 point 8, decisions.id=948)
+        commands::launch::get_focus_launch_config,
+        commands::launch::get_launch_state,
+        commands::launch::submit_launch_answers,
     ])
 }
 

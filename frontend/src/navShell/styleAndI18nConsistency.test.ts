@@ -72,6 +72,16 @@ const PRE_EXISTING_ORPHAN_KEYS: string[] = [
   'handoff.error.invalid_focus_id', // same
   'handoff.error.invalid_context_key', // same
   'handoff.error.handoff_state_unavailable', // same
+  'launch.error.persona_not_found', // items.id=897: the codes of the launch commands; the screen that shows them is items.id=902
+  'launch.error.invalid_focus_id', // same
+  'launch.error.invalid_context_key', // same
+  'launch.error.no_launch_config', // same
+  'launch.error.unknown_question', // same
+  'launch.error.question_not_asked', // same
+  'launch.error.invalid_answer', // same
+  'launch.error.invalid_run_change', // same
+  'launch.error.one_time_chat', // same: the data hook for "not saved, one-time session, defaults apply"
+  'launch.error.launch_unavailable', // same
 ]
 
 function walk(dir: string, exts: string[], out: string[] = []): string[] {
