@@ -1213,9 +1213,11 @@ fn render_prompt_with_disclosure(
     tokens.insert("focus_context".to_owned(), ctx.focus_id.clone());
     tokens.insert("persona_context".to_owned(), ctx.persona_context.clone());
     tokens.insert("voice_profile".to_owned(), voice_profile_str.to_owned());
-    // items.id=886: as in render_prompt. (While STORE_NAMES_EXTERNAL_ALLOWED is
-    // false no external step names a bound name, so for an external step this
-    // only strips store-derived variables a user turn tried to pull in.)
+    // items.id=886: as in render_prompt. (Since items.id=884 flipped
+    // STORE_NAMES_EXTERNAL_ALLOWED an external step may name a bound name it declares:
+    // its seed is put in here, and the text then goes through the outbound review
+    // (step_review). The device names are never in an external template: the lint
+    // refuses them, DEVICE_NAMES_NEVER_EXTERNAL.)
     ctx.store_tokens
         .apply(&ctx.step.prompt_template, &mut tokens);
     render_template(

@@ -137,8 +137,9 @@
 // summary written by a step whose prompt held case_context is tainted), and the
 // value goes back into the same persona's store, scoped to the running Focus
 // (store_writer). The extraction exclusion of the producing step is unchanged,
-// and nothing here lets a tainted value reach an external prompt: that is still
-// STORE_NAMES_EXTERNAL_ALLOWED (declared_inputs.rs). A published id is derived
+// and nothing here lets a tainted value reach an external prompt: that is the
+// declared-inputs lint (declared_inputs.rs: STORE_NAMES_EXTERNAL_ALLOWED, true since
+// items.id=884, and the closed device list) and the outbound review. A published id is derived
 // from the run, not from content, and is not tainted.
 
 use std::collections::HashSet;

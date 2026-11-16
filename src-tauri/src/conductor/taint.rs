@@ -27,8 +27,10 @@
 //     outside. A step that names it could copy that text into its own output, which
 //     extraction reads, so such a step is dropped from extraction like any other
 //     tainted step. A Focus without a handoff_ingest row is unchanged. The side
-//     effect, accepted: while STORE_NAMES_EXTERNAL_ALLOWED is false, an EXTERNAL
-//     step of such a Focus cannot name {user_input}.
+//     effect, accepted: while STORE_NAMES_EXTERNAL_ALLOWED was false, an EXTERNAL
+//     step of such a Focus could not name {user_input}. Items.id=884 flipped the
+//     flag: it may now, behind the outbound review, and a render row that declares
+//     it counts as personal on its record (handoff_render::inherit_from_inputs).
 // The fixpoint ignores row order on purpose: a template that names a variable
 // only a LATER row produces would otherwise escape.
 //
@@ -84,10 +86,25 @@ pub fn taint_closure(
     row_vars: &[Option<String>],
     bound: &[&str],
 ) -> Taint {
+    taint_closure_of(steps, row_vars, bound, true)
+}
+
+/// The closure over a chosen set of seed names. `include_user_input` is whether
+/// `user_input` is a tainting name in a Focus that has a handoff_ingest row (the
+/// store-content closure above). The closure of a CLOSED LIST of names (the device
+/// names the outbound review never lets out, declared_inputs.rs) passes false: a
+/// pasted reply is not device content, so a step that names `user_input` must not be
+/// reported as carrying a device name.
+pub fn taint_closure_of(
+    steps: &[ActionDefinition],
+    row_vars: &[Option<String>],
+    bound: &[&str],
+    include_user_input: bool,
+) -> Taint {
     debug_assert_eq!(steps.len(), row_vars.len());
     let names: Vec<Vec<String>> = steps.iter().map(template_names).collect();
     let mut taint = Taint {
-        user_input: has_handoff_ingest(steps),
+        user_input: include_user_input && has_handoff_ingest(steps),
         ..Taint::default()
     };
     let mut tainted_rows = vec![false; steps.len()];

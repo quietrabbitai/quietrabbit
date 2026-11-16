@@ -3208,11 +3208,25 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         }
 
         let output_var = step.output_var.clone().filter(|v| !v.is_empty());
-        let track = self.task_track.as_mut().expect("checked above");
         // The starter carries its declared inputs' content out of the device when the
         // user copies it, so its record is at least as sensitive as the steps that
         // produced them (highest severity, any personal flag).
-        let inherited = crate::conductor::handoff_render::inherit_from_inputs(step, track);
+        // items.id=884's rider: a declared input that is store-backed (a bound name, a
+        // variable derived from one, or user_input in a Focus that ingests a pasted
+        // reply) counts as personal (handoff_render::inherit_from_inputs, rule 2).
+        let store_backed = self
+            .focus_def
+            .as_ref()
+            .map(|def| {
+                crate::conductor::handoff_render::store_backed_inputs(
+                    &def.steps,
+                    &row_output_vars(&def.steps),
+                )
+            })
+            .unwrap_or_default();
+        let track = self.task_track.as_mut().expect("checked above");
+        let inherited =
+            crate::conductor::handoff_render::inherit_from_inputs(step, track, &store_backed);
         track.add_step(TaskStep {
             action_id: step.action_id.clone(),
             output_var,
@@ -10057,11 +10071,10 @@ mod tests {
     // LOAD (database path): the interim invariant, collisions, guards.
 
     #[tokio::test]
-    async fn store_names_db_an_external_step_cannot_name_or_declare_one() {
+    async fn store_names_db_an_external_step_may_declare_a_store_name_but_never_a_device_name() {
         with_temp_data_root(async {
-            // Declared, so the declared-inputs rule is met: the interim
-            // invariant is what refuses it.
-            let m = declared_load(
+            // A declared store name loads (items.id=884 flipped the flag).
+            declared_load(
                 "sn-declared",
                 vec![dstep(
                     "e",
@@ -10073,15 +10086,9 @@ mod tests {
                 )],
             )
             .await
-            .unwrap_err();
-            assert!(m.contains("Focus 'sn-declared'"), "{m}");
-            assert!(
-                m.contains("step 'e'") && m.contains("'case_context'"),
-                "{m}"
-            );
-            assert!(m.contains("items.id=884"), "{m}");
+            .unwrap();
 
-            // Undeclared: the declared-inputs rule speaks first.
+            // Undeclared: the declared-inputs rule speaks.
             let m = declared_load(
                 "sn-undeclared",
                 vec![dstep("e", 2, "{delta_context}", &[], &[], None)],
@@ -10090,9 +10097,8 @@ mod tests {
             .unwrap_err();
             assert!(m.contains("session-bound"), "{m}");
 
-            // Transitive: an external step naming a variable a local step
-            // derived from a store name.
-            let m = declared_load(
+            // Transitive through a local step that read a plain store name: loads.
+            declared_load(
                 "sn-transitive",
                 vec![
                     dstep("a", 1, "{locked_intent}", &[], &[], Some("echo1")),
@@ -10101,9 +10107,38 @@ mod tests {
                 ],
             )
             .await
+            .unwrap();
+
+            // A DEVICE name, declared: refused with the explicit message, for each.
+            for name in ["subject_context", "device_library_brief"] {
+                let m = declared_load(
+                    &format!("sn-device-{name}"),
+                    vec![dstep("e", 2, &format!("{{{name}}}"), &[name], &[], None)],
+                )
+                .await
+                .unwrap_err();
+                assert!(m.contains(&format!("Focus 'sn-device-{name}'")), "{m}");
+                assert!(
+                    m.contains("step 'e'")
+                        && m.contains(&format!("'{name}'"))
+                        && m.contains("device's catalogued facts"),
+                    "{m}"
+                );
+            }
+
+            // Transitive through a local step that read a device name.
+            let m = declared_load(
+                "sn-device-transitive",
+                vec![
+                    dstep("a", 1, "{subject_context}", &[], &[], Some("echo1")),
+                    dstep("b", 1, "{echo1}", &[], &[], Some("echo2")),
+                    dstep("e", 2, "{echo2}", &["echo2"], &[], None),
+                ],
+            )
+            .await
             .unwrap_err();
             assert!(m.contains("step 'e'") && m.contains("'echo2'"), "{m}");
-            assert!(m.contains("items.id=884"), "{m}");
+            assert!(m.contains("device's catalogued facts"), "{m}");
         })
         .await;
     }
@@ -10188,32 +10223,43 @@ mod tests {
         .await;
     }
 
-    /// The YAML loader runs the same lint, so a Focus file cannot smuggle a
-    /// store name to an external step either.
+    /// The YAML loader runs the same lint. Items.id=884 flipped the store-name flag, so
+    /// a declared store name loads in an external step; a DEVICE name still cannot
+    /// reach one, whatever the flag says, and neither can a variable derived from it.
     #[test]
-    fn store_names_yaml_an_external_step_cannot_name_one() {
-        let text = r#"
+    fn store_names_yaml_an_external_step_cannot_name_a_device_name() {
+        let text = |name: &str| {
+            format!(
+                r#"
 id: sn-yaml
 max_routing_tier: 2
 steps:
   first:
     routing_tier: 1
     output_var: v
-    prompt_template: "{case_context}"
+    prompt_template: "{{{name}}}"
   second:
     routing_tier: 2
-    prompt_template: "use {v}"
+    prompt_template: "use {{v}}"
     declared_inputs:
       - v
-"#;
-        let def = parse_focus_text(text).unwrap();
-        let LifecycleError::ValidationFailed(m) =
-            lint_declared_inputs(&def.focus_id, &def.steps).unwrap_err()
-        else {
-            panic!("expected ValidationFailed");
+"#
+            )
         };
-        assert!(m.contains("step 'second'") && m.contains("'v'"), "{m}");
-        assert!(m.contains("items.id=884"), "{m}");
+        // A store name that is not a device name: the declared variable loads.
+        let def = parse_focus_text(&text("case_context")).unwrap();
+        lint_declared_inputs(&def.focus_id, &def.steps).unwrap();
+        // A device name: refused, for each of the two, with the explicit message.
+        for name in ["subject_context", "device_library_brief"] {
+            let def = parse_focus_text(&text(name)).unwrap();
+            let LifecycleError::ValidationFailed(m) =
+                lint_declared_inputs(&def.focus_id, &def.steps).unwrap_err()
+            else {
+                panic!("expected ValidationFailed");
+            };
+            assert!(m.contains("step 'second'") && m.contains("'v'"), "{m}");
+            assert!(m.contains("device's catalogued facts"), "{m}");
+        }
     }
 
     // -- items.id=879: declared-inputs LOAD lint -----------------------------
@@ -11309,9 +11355,9 @@ steps:
 
     /// THE FIXTURE FOCUS of the hand-off (items.id=387): the outbound row, the return
     /// rows and nothing else, all in one Focus because the two session names are keyed
-    /// by (chat, Focus). Static text only: until items.id=884's frontend half flips
-    /// STORE_NAMES_EXTERNAL_ALLOWED a starter cannot name a store-backed name, and in a
-    /// Focus with a return row it cannot name {user_input} either.
+    /// by (chat, Focus). Static text only (items.id=884 flipped
+    /// STORE_NAMES_EXTERNAL_ALLOWED, so a starter may now declare a store-backed name
+    /// and {user_input}; this fixture does not need to).
     ///   offer  a render row, guarded on no hand-off pending: the starter
     ///   ack    a render row, guarded on a hand-off pending: the reply of the return
     ///          pass. It sits BEFORE the return row because the ingest row records
@@ -11431,29 +11477,21 @@ steps:
                     "ghost",
                 ),
                 (
-                    "a store-backed bound name while the interim invariant holds",
+                    "a device name (never external, whatever the flag says)",
                     vec![srender(
                         "offer",
-                        starter_cfg("Brief: {content_brief}", &["content_brief"]),
+                        starter_cfg("Device: {subject_context}", &["subject_context"]),
                     )],
-                    "cannot name or declare 'content_brief'",
+                    "cannot name or declare 'subject_context'",
                 ),
                 (
-                    "a hand-off name",
-                    vec![srender(
-                        "offer",
-                        starter_cfg("Id {handoff_pending}", &["handoff_pending"]),
-                    )],
-                    "handoff_pending",
-                ),
-                (
-                    "a variable a tainted step produced",
+                    "a variable a step that read a device name produced",
                     vec![
                         {
                             let mut m = smodel("tainted", "tainted_v");
                             m.custom = serde_json::json!({
                                 "routing_tier": 1,
-                                "prompt_template": "Context: {case_context}",
+                                "prompt_template": "Context: {subject_context}",
                                 "output_var": "tainted_v"
                             })
                             .to_string();
@@ -11491,17 +11529,19 @@ steps:
         .await;
     }
 
-    /// The S2 consequence, pinned: {user_input} is declarable by a starter in a Focus
-    /// with no return row, and refused in a Focus that has one (the paste-bearing
-    /// window never leaves in a prompt) until the interim invariant is lifted.
+    /// The S2 consequence, after items.id=884's flip: {user_input} is declarable by a
+    /// starter in a Focus with no return row, and now also in a Focus that has one (the
+    /// paste-bearing window is the user's own text, and the outbound review and the
+    /// copy-time review are the gates). A store-backed declared input counts as
+    /// personal on the starter's record (handoff_render::inherit_from_inputs, rule 2).
     #[tokio::test]
-    async fn store_load_user_input_in_a_starter_depends_on_the_return_row() {
+    async fn store_load_user_input_in_a_starter_loads_with_and_without_the_return_row() {
         with_temp_data_root(async {
             let starter = || srender("offer", starter_cfg("Q: {user_input}", &["user_input"]));
             store_load("rb-ui-plain", vec![starter()])
                 .await
                 .unwrap_or_else(|m| panic!("without a return row it loads: {m}"));
-            let m = store_load(
+            store_load(
                 "rb-ui-ret",
                 vec![
                     starter().guarded("handoff_pending", "absent", None),
@@ -11514,8 +11554,27 @@ steps:
                 ],
             )
             .await
-            .unwrap_err();
-            assert!(m.contains("user_input"), "{m}");
+            .unwrap_or_else(|m| panic!("with a return row it loads too: {m}"));
+            // And a starter may declare a store-backed bound name (content_brief).
+            store_load(
+                "rb-brief",
+                vec![srender(
+                    "offer",
+                    starter_cfg("Brief: {content_brief}", &["content_brief"]),
+                )],
+            )
+            .await
+            .unwrap_or_else(|m| panic!("a declared bound name loads: {m}"));
+            // The hand-off marker is a bound name too, and loads the same way.
+            store_load(
+                "rb-handoff-name",
+                vec![srender(
+                    "offer",
+                    starter_cfg("Id {handoff_pending}", &["handoff_pending"]),
+                )],
+            )
+            .await
+            .unwrap_or_else(|m| panic!("a declared hand-off name loads: {m}"));
         })
         .await;
     }
@@ -11645,6 +11704,64 @@ steps:
             let rec = record_of(&run);
             assert_eq!(rec.sensitivity_severity, 1);
             assert!(!rec.personal_flagged && !rec.audit_unavailable);
+        })
+        .await;
+    }
+
+    /// THE RIDER (items.id=884's flip, 2026-11-15): a render row's DECLARED input that
+    /// is store-backed counts as personal on the starter's record, though no step
+    /// produced it. A bound name seeded from the artifact store (content_brief) here;
+    /// an ordinary declared variable beside it adds nothing.
+    #[tokio::test]
+    async fn a_declared_store_backed_input_makes_the_starter_record_personal() {
+        use crate::persistence::pass_artifact_store::{put_artifact, ArtifactKind, ArtifactWrite};
+        with_temp_data_root(async {
+            let mut run = writer_run(
+                vec![render_step(
+                    "offer",
+                    "Brief: {content_brief}",
+                    &["content_brief"],
+                )],
+                Some("chat-rider"),
+                &[],
+            );
+            {
+                let mut conn = outputs(&run).await;
+                put_artifact(
+                    &mut conn,
+                    &ArtifactWrite {
+                        context_key: "chat-rider",
+                        focus_id: "f",
+                        kind: ArtifactKind::ContentBrief,
+                        content: "THE BRIEF",
+                        written_by_run: "r0",
+                        expected_version: None,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            assert!(run.execute().await.unwrap().is_none());
+            let rec = run
+                .task_track
+                .as_ref()
+                .unwrap()
+                .steps()
+                .iter()
+                .find(|s| s.action_id == "offer")
+                .cloned()
+                .expect("the starter was recorded");
+            assert_eq!(rec.content, "Brief: THE BRIEF");
+            assert_eq!(
+                rec.sensitivity_severity, 2,
+                "personal, from the store-backed input"
+            );
+            assert!(rec.personal_flagged, "flagged personal");
+            assert!(
+                !rec.audit_unavailable,
+                "a store read has no audit entry to lose"
+            );
+            assert_eq!(rec.routing_tier_used, 1);
         })
         .await;
     }

@@ -5,10 +5,11 @@
 // device_library_brief (bound_spec.rs: Source::Derived, Presence::Always, text).
 // Like case_context and the other derived names they are READ at pass start
 // (seeding::seed_pass), never written, never a TaskStep, and never in the
-// extraction input: every row that names one is tainted (conductor::taint), and
-// while declared_inputs::STORE_NAMES_EXTERNAL_ALLOWED is false (it stays false:
-// items.id=884 flips it) an external step may not name either. Both are LOCAL
-// prompt text.
+// extraction input: every row that names one is tainted (conductor::taint), and an
+// external step may not name or declare either, whatever STORE_NAMES_EXTERNAL_ALLOWED
+// says (items.id=884 flipped that flag to true and kept these two out by a closed
+// list, declared_inputs::DEVICE_NAMES_NEVER_EXTERNAL, with an explicit LOAD refusal).
+// Both are LOCAL prompt text.
 //
 // WHAT EACH IS
 //   subject_context      the device the ACTIVE CASE is about, and what is recorded

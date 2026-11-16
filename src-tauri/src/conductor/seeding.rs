@@ -45,9 +45,9 @@
 // kind for this chat and Focus. The text is read ONCE here, at pass start, so a
 // value written during a pass is seen by the NEXT pass. They follow every rule
 // of a store-backed name: restricted per step (taint::StoreTokens), tainting a
-// step that names one (so it stays out of extraction), refused in an external
-// step while STORE_NAMES_EXTERNAL_ALLOWED is false, and declared in
-// declared_inputs when an external step may one day name one. A stored text
+// step that names one (so it stays out of extraction), allowed in an external step
+// only when that step declares it (STORE_NAMES_EXTERNAL_ALLOWED, true since
+// items.id=884, behind the outbound review), and never the device names. A stored text
 // that fails its validator (an over-long or blank row) fails the pass closed.
 // Nothing here logs a value.
 //

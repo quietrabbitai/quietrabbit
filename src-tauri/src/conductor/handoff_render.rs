@@ -26,11 +26,14 @@
 //     {user_input}. {persona_context}, {voice_profile}, {previous_output} and
 //     {focus_context} are refused outright, declared or not (parse below);
 //   * it carries no field_requirements (it has none: nothing personal reaches it);
-//   * while STORE_NAMES_EXTERNAL_ALLOWED is false it may not name or declare a
-//     store-backed name (a bound name, or a variable a tainted step produced). So
-//     until items.id=884's frontend half flips that flag, a starter cannot carry
-//     content_brief, and a Focus that also has a handoff_ingest row cannot name
-//     {user_input} either (conductor::taint).
+//   * while STORE_NAMES_EXTERNAL_ALLOWED was false it could not name or declare a
+//     store-backed name (a bound name, or a variable a tainted step produced).
+//     Items.id=884 flipped that flag, so a starter may now carry content_brief, and a
+//     Focus that also has a handoff_ingest row may name {user_input} (the pasted
+//     reply is in it: conductor::taint). The two DEVICE names are the exception
+//     the flag never relaxes (declared_inputs::DEVICE_NAMES_NEVER_EXTERNAL). What a
+//     starter built from a store-backed input means for its RECORD is the rule of
+//     inherit_from_inputs below.
 // It does NOT flip EXTERNAL_MODEL_BLOCKS_ALLOWED: that flag is about model calls
 // (hosted_api, and a manual_handoff DESTINATION of a model block, which waits for
 // the run plan, items.id=901 and B10). A Focus row cites cb-15 directly.
@@ -289,13 +292,56 @@ pub struct Inherited {
     pub audit_unavailable: bool,
 }
 
-/// The record a render row inherits: over each DECLARED input, the step that
-/// produced the value the render uses (the LAST step recorded under that variable,
-/// as the variable view resolves it). An input with no producing step (the
-/// {user_input} token, a name seeded from the store) contributes nothing: it has no
-/// record to inherit. Only declared inputs count, so a sensitive variable the row
-/// does not read does not mark its starter.
-pub fn inherit_from_inputs(step: &ActionDefinition, track: &TaskTrack) -> Inherited {
+/// The severity a store-backed declared input counts for: Sensitivity::Personal.
+pub fn store_backed_input_severity() -> i32 {
+    i32::from(crate::conductor::privacy::types::Sensitivity::Personal.severity())
+}
+
+/// The names that are STORE-BACKED in a Focus, for the rule below: every registered
+/// bound name (bound_spec::NAMES: a session, case, artifact, hand-off or derived
+/// name), every variable a step the taint closure marks as tainted by one produces,
+/// and `user_input` in a Focus that has a handoff_ingest row (the pasted reply is in
+/// the turn window). `row_vars[i]` is what row `i` records (lifecycle::row_output_vars).
+pub fn store_backed_inputs(
+    steps: &[ActionDefinition],
+    row_vars: &[Option<String>],
+) -> std::collections::HashSet<String> {
+    let mut set = crate::conductor::seeding::restricted_names(steps, row_vars);
+    if crate::conductor::taint::taint_closure(steps, row_vars, bound_spec::NAMES).user_input {
+        set.insert("user_input".to_owned());
+    }
+    set
+}
+
+/// The record a render row inherits (items.id=387 S4, and the rider of items.id=884's
+/// flip, 2026-11-15).
+///
+/// RULE. Over each name in the row's `declared_inputs` (only declared inputs count, so
+/// a sensitive variable the row does not read does not mark its starter):
+///   1. PRODUCERS. If a step produced the value the render uses (the LAST step
+///      recorded under that variable, as the variable view resolves it), the starter
+///      takes that step's sensitivity_severity (highest wins), its personal_flagged (OR)
+///      and its audit_unavailable (OR).
+///   2. STORE-BACKED INPUTS COUNT AS PERSONAL. If the name is in `store_backed`
+///      (store_backed_inputs: a registered bound name, a variable derived from one, or
+///      `user_input` in a Focus that ingests a pasted reply), the starter's
+///      sensitivity_severity is at least store_backed_input_severity() (2, personal) and
+///      its personal_flagged is true, whether or not a producer exists and whatever the
+///      producer recorded. This is a floor: it never lowers rule 1. audit_unavailable
+///      comes only from producers (a store read has no disclosure-log entry to lose).
+///   3. A declared name that is neither produced nor store-backed (the {user_input}
+///      token in a Focus with no hand-off return, a field name) contributes nothing: it
+///      has no record to inherit and nothing store-backed in it.
+///
+/// Why: the starter carries these values out of the device when the user copies it, and
+/// before items.id=884 let a store-backed name be declared, an input with no producing
+/// step could not be one. Now it can, and a seeded session or case value is the user's
+/// own content, so the record says so.
+pub fn inherit_from_inputs(
+    step: &ActionDefinition,
+    track: &TaskTrack,
+    store_backed: &std::collections::HashSet<String>,
+) -> Inherited {
     let mut out = Inherited {
         sensitivity_severity: 1,
         personal_flagged: false,
@@ -311,6 +357,10 @@ pub fn inherit_from_inputs(step: &ActionDefinition, track: &TaskTrack) -> Inheri
             out.sensitivity_severity = out.sensitivity_severity.max(p.sensitivity_severity);
             out.personal_flagged |= p.personal_flagged;
             out.audit_unavailable |= p.audit_unavailable;
+        }
+        if store_backed.contains(name) {
+            out.sensitivity_severity = out.sensitivity_severity.max(store_backed_input_severity());
+            out.personal_flagged = true;
         }
     }
     out
@@ -568,6 +618,14 @@ mod tests {
 
     // -- inheritance of sensitivity and the personal flag ---------------------------
 
+    fn nb() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
+    fn backed(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
     fn produced(
         id: &str,
         var: &str,
@@ -594,7 +652,7 @@ mod tests {
         let mut track = TaskTrack::new();
         // No producers yet: nothing to inherit.
         assert_eq!(
-            inherit_from_inputs(&step, &track),
+            inherit_from_inputs(&step, &track, &nb()),
             Inherited {
                 sensitivity_severity: 1,
                 personal_flagged: false,
@@ -605,7 +663,7 @@ mod tests {
         track.add_step(produced("pb", "b", 4, true, true));
         // A sensitive variable the row does not declare never marks the starter.
         track.add_step(produced("px", "undeclared", 4, true, true));
-        let got = inherit_from_inputs(&step, &track);
+        let got = inherit_from_inputs(&step, &track, &nb());
         assert_eq!(
             got,
             Inherited {
@@ -618,12 +676,116 @@ mod tests {
         let only_a = step_of(json!({"display_name":"n","output_var":"o","template":"{a}",
                                    "declared_inputs":["a"]}));
         assert_eq!(
-            inherit_from_inputs(&only_a, &track),
+            inherit_from_inputs(&only_a, &track, &nb()),
             Inherited {
                 sensitivity_severity: 2,
                 personal_flagged: false,
                 audit_unavailable: false
             }
+        );
+    }
+
+    /// THE RIDER (items.id=884 flip): a declared input that is store-backed counts as
+    /// personal, producer or not, and the floor never lowers a producer's record.
+    #[test]
+    fn a_declared_store_backed_input_counts_as_personal() {
+        let step = step_of(json!({"display_name":"n","output_var":"o",
+                                  "template":"{content_brief} {a}",
+                                  "declared_inputs":["content_brief","a"]}));
+        let mut track = TaskTrack::new();
+        // No producer for content_brief (a seeded name): it still counts.
+        let got = inherit_from_inputs(&step, &track, &backed(&["content_brief"]));
+        assert_eq!(
+            got,
+            Inherited {
+                sensitivity_severity: 2,
+                personal_flagged: true,
+                audit_unavailable: false
+            },
+            "personal severity (2), flagged, no audit loss"
+        );
+        assert_eq!(store_backed_input_severity(), 2);
+
+        // Not store-backed and not produced: nothing, as before.
+        assert_eq!(
+            inherit_from_inputs(&step, &track, &nb()),
+            Inherited {
+                sensitivity_severity: 1,
+                personal_flagged: false,
+                audit_unavailable: false
+            }
+        );
+
+        // A producer that recorded MORE keeps its record: the rule is a floor.
+        track.add_step(produced("pa", "a", 4, false, true));
+        let got = inherit_from_inputs(&step, &track, &backed(&["content_brief", "a"]));
+        assert_eq!(
+            got,
+            Inherited {
+                sensitivity_severity: 4,
+                personal_flagged: true,
+                audit_unavailable: true
+            }
+        );
+        // A store-backed variable whose producer recorded LESS is raised to the floor.
+        let mut low = TaskTrack::new();
+        low.add_step(produced("pa", "a", 1, false, false));
+        let got = inherit_from_inputs(&step, &low, &backed(&["a"]));
+        assert_eq!(got.sensitivity_severity, 2);
+        assert!(got.personal_flagged);
+        // Only DECLARED inputs count: a store-backed name the row does not declare
+        // does not mark its starter.
+        let only_a = step_of(json!({"display_name":"n","output_var":"o","template":"{a}",
+                                   "declared_inputs":["a"]}));
+        let got = inherit_from_inputs(&only_a, &nb_track(), &backed(&["content_brief"]));
+        assert!(!got.personal_flagged && got.sensitivity_severity == 1);
+    }
+
+    fn nb_track() -> TaskTrack {
+        TaskTrack::new()
+    }
+
+    /// store_backed_inputs: every bound name, every variable a tainted step produces,
+    /// and user_input in a Focus that ingests a pasted reply.
+    #[test]
+    fn the_store_backed_set_is_bound_names_derived_variables_and_a_pasted_user_input() {
+        use crate::conductor::tokens::ExternalAccess;
+        let local = |id: &str, tpl: &str| {
+            let mut s = step_of(json!({"display_name":"n","output_var":"o","template":"t",
+                                       "declared_inputs":[]}));
+            s.action_id = id.to_owned();
+            s.prompt_template = tpl.to_owned();
+            s.routing_tier = ExternalAccess::LocalOnly;
+            s.block_stable_id = None;
+            s
+        };
+        let steps = vec![
+            local("a", "read {content_brief}"),
+            local("b", "plain"),
+            local("c", "also {derived}"),
+        ];
+        let vars = vec![
+            Some("derived".to_owned()),
+            Some("clean".to_owned()),
+            Some("second".to_owned()),
+        ];
+        let set = store_backed_inputs(&steps, &vars);
+        assert!(set.contains("content_brief"), "a bound name");
+        assert!(
+            set.contains("derived"),
+            "a variable a tainted step produced"
+        );
+        assert!(
+            set.contains("second"),
+            "taint closes over derived variables"
+        );
+        assert!(
+            !set.contains("clean"),
+            "an untainted variable is not store-backed"
+        );
+        assert!(
+            !set.contains("user_input"),
+            "no hand-off return row in this Focus"
         );
     }
 
@@ -636,7 +798,7 @@ mod tests {
         track.add_step(produced("second", "a", 2, false, false));
         // The renderer uses the value of the later step, so it inherits from that one.
         assert_eq!(
-            inherit_from_inputs(&step, &track),
+            inherit_from_inputs(&step, &track, &nb()),
             Inherited {
                 sensitivity_severity: 2,
                 personal_flagged: false,
@@ -654,7 +816,7 @@ mod tests {
         let mut track = TaskTrack::new();
         track.add_step(produced("p", "something", 4, true, true));
         assert_eq!(
-            inherit_from_inputs(&step, &track),
+            inherit_from_inputs(&step, &track, &nb()),
             Inherited {
                 sensitivity_severity: 1,
                 personal_flagged: false,

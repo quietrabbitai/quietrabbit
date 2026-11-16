@@ -110,9 +110,10 @@ pub const DELTA_ITEMS: &str = "delta_items";
 /// They are written only by the hand-off operations (the outbound render, S3, and
 /// handoff_ingest): LOAD refuses them as a session_put target and as the argument of
 /// any writer. Both are ordinary Session-source bound names otherwise: restricted to
-/// the step whose own template names them, tainting such a step, and refused in an
-/// external step while STORE_NAMES_EXTERNAL_ALLOWED is false. Their normal use is a
-/// guard (`present`, `absent`), so a pass routes on them.
+/// the step whose own template names them, tainting such a step, and (since items.id=884
+/// flipped STORE_NAMES_EXTERNAL_ALLOWED) allowed in an external step that declares
+/// them, behind the outbound review. Their normal use is a guard (`present`,
+/// `absent`), so a pass routes on them.
 pub const HANDOFF_PENDING: &str = "handoff_pending";
 pub const HANDOFF_RECEIVED: &str = "handoff_received";
 
