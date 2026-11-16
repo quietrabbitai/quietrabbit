@@ -1772,14 +1772,33 @@ async fn select_model_for_block(
     }
 }
 
-/// The approved choice (a pin) of this step, if the run's approval has one. One of the
-/// two sites that read ctx.plan (the other is check_plan_envelope); a scan pins that.
+/// The approved choice (a pin) of this step, if the run's approval has one. The first of
+/// the three sites that read ctx.plan (the others are check_plan_envelope and
+/// plan_cap_micros); a scan pins that.
 fn plan_pin(ctx: &StepContext) -> Option<&crate::conductor::run_plan::Pin> {
     ctx.plan
         .as_deref()?
         .pins
         .iter()
         .find(|p| p.action_id == ctx.step.action_id)
+}
+
+/// The run plan's cost ceiling for THIS call (items.id=901), for the spend gate: the ceiling
+/// of the approval the run acts under, in micro-USD, for a call of a RESOLVED (model-block)
+/// step; None for every other call (an ordinary external step, a bound API Chat run), which
+/// the gate then decides exactly as before. A resolved step that somehow reaches a hosted
+/// call with no approval gets a ceiling of ZERO, so the gate refuses anything that can cost
+/// money (a pick like that is already stopped by check_plan_envelope; this is the second
+/// line, the stricter direction). The third site that reads ctx.plan.
+fn plan_cap_micros(ctx: &StepContext) -> Option<i64> {
+    if !is_resolved(ctx) {
+        return None;
+    }
+    Some(
+        ctx.plan
+            .as_deref()
+            .map_or(0, |a| i64::try_from(a.ceiling_micros).unwrap_or(i64::MAX)),
+    )
 }
 
 /// A plan stop as the error the failure handler parks (F10, like a resolver stop): the
@@ -1797,8 +1816,8 @@ fn plan_exceeded(ctx: &StepContext, reason: &str) -> ConductorError {
 /// model may be picked without an approved choice. A hosted pick is beyond the envelope:
 /// no_approval when the run has no approval at all (a rehydrated run, a run that needed none)
 /// and model_not_planned when it has one that does not name this model for this step (a
-/// zero-pin approval permits resolver local picks only). The second of the two sites that
-/// read ctx.plan.
+/// zero-pin approval permits resolver local picks only). The second of the three
+/// sites that read ctx.plan.
 fn check_plan_envelope(ctx: &StepContext, selected: &SelectedModel) -> Result<(), ConductorError> {
     if selected.provider_id.is_none() {
         return Ok(());
@@ -2377,6 +2396,7 @@ async fn hosted_step_call<Tz: chrono::TimeZone>(
         focus_id: focus_id.as_deref(),
         run_id: run_id.as_deref(),
         attendance: ctx.attendance,
+        plan_cap_micros: plan_cap_micros(ctx),
     };
 
     let result = match stream {
@@ -9636,11 +9656,27 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let flat: String = live.split_whitespace().collect::<Vec<_>>().join(" ");
-        // The two readers.
+        // The three readers: the approved pin, the envelope check, and the cost ceiling
+        // handed to the spend gate.
         assert_eq!(
             flat.matches("ctx.plan").count(),
-            2,
-            "plan_pin and check_plan_envelope"
+            3,
+            "plan_pin, check_plan_envelope and plan_cap_micros"
+        );
+        let cap_fn = flat
+            .split("fn plan_cap_micros(")
+            .nth(1)
+            .unwrap()
+            .split("/// A plan stop as the error")
+            .next()
+            .unwrap();
+        assert!(cap_fn.contains("if !is_resolved(ctx) { return None; }"));
+        assert!(cap_fn.contains("ctx.plan .as_deref() .map_or(0,"));
+        // The one place a SpendCall takes it.
+        assert_eq!(
+            flat.matches("plan_cap_micros: plan_cap_micros(ctx)")
+                .count(),
+            1
         );
         let pin_fn = flat
             .split("fn plan_pin(")
@@ -9678,5 +9714,109 @@ mod tests {
         assert!(!body.contains("select_model_for_block(pool, ctx, req)"));
         // A bound run and an ordinary step never reach the plan.
         assert!(flat.contains("(Some(bound), _) => select_bound_model(pool, ctx, bound).await?"));
+    }
+    /// The ceiling handed to the spend gate: the approval's ceiling for a call of a resolved
+    /// step; ZERO for a resolved step with no approval (the stricter direction); None for
+    /// every other call (an ordinary step, a bound API Chat run), which the gate then decides
+    /// exactly as before.
+    #[test]
+    fn the_spend_gate_gets_a_ceiling_only_for_a_resolved_step() {
+        let req = requirement(
+            QualityBar::Basic,
+            &[Destination::HostedApi],
+            ExternalAccess::AnonymousPreferred,
+        );
+        let mut resolved = resolved_ctx(
+            Some(req),
+            ExternalAccess::AnonymousPreferred,
+            None,
+            "Write it.",
+        );
+        assert_eq!(plan_cap_micros(&resolved), Some(0), "no approval, no spend");
+        resolved.plan = approval_with(vec![]);
+        assert_eq!(plan_cap_micros(&resolved), Some(1_000));
+        // An ordinary step of the same run never carries the cap.
+        let mut ordinary = resolved_ctx(None, ExternalAccess::AnonymousPreferred, None, "x");
+        ordinary.plan = approval_with(vec![]);
+        assert_eq!(plan_cap_micros(&ordinary), None);
+        // Neither does a bound API Chat run, whatever the step carries.
+        resolved.bound = Some(crate::api_chat::BoundDestination {
+            provider_id: "fixture-host-a".to_owned(),
+            model_id: "fixture-model-a".to_owned(),
+        });
+        assert_eq!(plan_cap_micros(&resolved), None);
+    }
+
+    /// End to end through the hosted call: a resolved step under an approval is held to its
+    /// ceiling by the spend gate (nothing sent when over), and an ordinary step carrying an
+    /// approval with a zero ceiling is not.
+    #[tokio::test]
+    async fn the_spend_gate_holds_a_resolved_step_to_the_approved_ceiling() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok(), loopback_chat_ok()]);
+            let (key_hex, model) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+            grant_consent(&pool, &key_hex, true).await;
+            let req = requirement(
+                QualityBar::Basic,
+                &[Destination::HostedApi],
+                ExternalAccess::AnonymousPreferred,
+            );
+            let mut resolved = resolved_ctx(
+                Some(req),
+                ExternalAccess::AnonymousPreferred,
+                Some("rma_letter"),
+                "Write it.",
+            );
+            resolved.key_hex = key_hex.clone();
+            let with_ceiling = |ceiling_micros: u64| {
+                Some(Arc::new(Approval {
+                    digest: "d".repeat(64),
+                    ceiling_micros,
+                    pins: vec![],
+                }))
+            };
+            async fn call(
+                pool: &sqlx::SqlitePool,
+                model: &ProviderModel,
+                ctx: &StepContext,
+            ) -> Result<GenerateResponse, ConductorError> {
+                hosted_step_call(
+                    &loopback_client(),
+                    pool,
+                    ctx,
+                    "fixture-host-a",
+                    model,
+                    &generate_request("hello there"),
+                    &ReviewedPrompt::for_test("hello there"),
+                    &chrono::Utc,
+                    loopback_build,
+                    None,
+                )
+                .await
+            }
+
+            // Over the approved ceiling (zero): refused by the gate, nothing sent.
+            resolved.plan = with_ceiling(0);
+            let err = call(&pool, &model, &resolved).await.unwrap_err();
+            assert_eq!(block_code(&err), "plan.exceeded");
+            let ConductorError::SpendBlock { params, .. } = &err else {
+                panic!("{err:?}")
+            };
+            assert_eq!(params["reason"], "over_ceiling");
+            assert_eq!(server.connections(), 0, "the mock listener saw nothing");
+
+            // Under a generous ceiling the same call goes through.
+            resolved.plan = with_ceiling(1_000_000);
+            assert!(call(&pool, &model, &resolved).await.is_ok());
+            assert_eq!(server.captured().len(), 1);
+
+            // An ordinary external step is not held to the plan's ceiling, even if its
+            // context carries an approval with a zero ceiling.
+            let mut ordinary = hosted_ctx(RunAttendance::Attended, &key_hex);
+            ordinary.plan = with_ceiling(0);
+            assert!(call(&pool, &model, &ordinary).await.is_ok());
+            assert_eq!(server.captured().len(), 2);
+        })
+        .await;
     }
 }

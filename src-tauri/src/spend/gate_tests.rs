@@ -949,6 +949,15 @@ impl Rig {
             focus_id: Some("focus-1"),
             run_id: run,
             attendance,
+            plan_cap_micros: None,
+        }
+    }
+
+    /// The same call under an approved run plan whose ceiling is `cap` micro-USD.
+    fn call_capped<'a>(&'a self, run: Option<&'a str>, cap: i64) -> SpendCall<'a> {
+        SpendCall {
+            plan_cap_micros: Some(cap),
+            ..self.call(RunAttendance::Attended, run)
         }
     }
 
@@ -1665,4 +1674,329 @@ fn recovery_window_is_longer_than_the_generate_timeout() {
     // that may belong to a live call.
     const { assert!(store::STALE_PENDING_MINUTES * 60 > 60) };
     let _ = Duration::minutes(store::STALE_PENDING_MINUTES);
+}
+
+// ---------------------------------------------------------------------------
+// items.id=901: the approved run plan's ceiling (check 5b). A further refusal only.
+// ---------------------------------------------------------------------------
+
+/// A pending reservation of `cost` micro-USD for a run, as an earlier call of the run
+/// would have left it.
+async fn run_spend(conn: &mut SqliteConnection, run: &str, cost: i64) -> String {
+    store::insert_reservation_conn(
+        conn,
+        &NewReservation {
+            provider_id: "fixture-host-a",
+            model_id: "fixture-model-a",
+            persona_id: Some("persona-1"),
+            focus_id: Some("focus-1"),
+            run_id: Some(run),
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_micros: cost,
+            price_source: "curated",
+        },
+        t0(),
+    )
+    .await
+    .unwrap()
+}
+
+#[test]
+fn the_plan_cap_is_a_pure_comparison_that_counts_the_run_and_the_call() {
+    // Within, and exactly at the ceiling (a call that fits to the micro-dollar clears).
+    assert!(plan_cap_block(5000, 0, 2000).is_none());
+    assert!(plan_cap_block(2000, 0, 2000).is_none());
+    assert!(plan_cap_block(5000, 3000, 2000).is_none());
+    // One micro over.
+    let b = plan_cap_block(1999, 0, 2000).expect("over");
+    assert_eq!(b.code, Code::PlanExceeded);
+    assert_eq!(b.params["reason"], "over_ceiling");
+    assert_eq!(b.params["spent_micros"], 0);
+    assert_eq!(b.params["estimate_micros"], 2000);
+    assert_eq!(b.params["ceiling_micros"], 1999);
+    assert!(plan_cap_block(5000, 3001, 2000).is_some());
+    // An overflowing projection is over any ceiling.
+    assert!(plan_cap_block(i64::MAX, i64::MAX, 1).is_some());
+    // A free call under a zero ceiling clears; a costing one does not.
+    assert!(plan_cap_block(0, 0, 0).is_none());
+    assert!(plan_cap_block(0, 0, 1).is_some());
+}
+
+#[tokio::test]
+async fn a_call_within_or_exactly_at_the_ceiling_clears_and_reserves() {
+    with_store(|mut conn| async move {
+        let rig = Rig::new(Some(PRICE_TEXT));
+        consent_now(&mut conn, &rig, true).await;
+        // The worst case is 2000 micro (PROMPT_BYTES, OUT_LIMIT).
+        for (run, cap) in [("run-within", 5000), ("run-exact", 2000)] {
+            let call = rig.call_capped(Some(run), cap);
+            let r = preflight(&mut conn, &call, PROMPT_BYTES, OUT_LIMIT, &utc_tz(), t0())
+                .await
+                .unwrap_or_else(|b| panic!("{run}: {b:?}"));
+            assert_eq!(r.worst_case_micros, 2000);
+        }
+        assert_eq!(ledger_rows(&mut conn).await, 2);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_call_over_the_ceiling_is_refused_and_leaves_no_reservation() {
+    with_store(|mut conn| async move {
+        let rig = Rig::new(Some(PRICE_TEXT));
+        consent_now(&mut conn, &rig, true).await;
+        let call = rig.call_capped(Some("run-1"), 1999);
+        let b = preflight(&mut conn, &call, PROMPT_BYTES, OUT_LIMIT, &utc_tz(), t0())
+            .await
+            .unwrap_err();
+        assert_eq!(b.code, Code::PlanExceeded);
+        assert_eq!(b.params["reason"], "over_ceiling");
+        assert_eq!(b.params["spent_micros"], 0);
+        assert_eq!(b.params["estimate_micros"], 2000);
+        assert_eq!(b.params["ceiling_micros"], 1999);
+        assert_eq!(
+            ledger_rows(&mut conn).await,
+            0,
+            "a rejected call reserves nothing"
+        );
+    })
+    .await;
+}
+
+/// The run's earlier calls count: a pending reservation (a retry's predecessor) and a settled
+/// row, but not another run's spend and not a reservation that was released.
+#[tokio::test]
+async fn a_retried_reservation_counts_against_the_ceiling_and_another_runs_spend_does_not() {
+    with_store(|mut conn| async move {
+        let rig = Rig::new(Some(PRICE_TEXT));
+        consent_now(&mut conn, &rig, true).await;
+        let call = rig.call_capped(Some("run-1"), 3000);
+
+        // The first attempt reserves 2000.
+        let first = preflight(&mut conn, &call, PROMPT_BYTES, OUT_LIMIT, &utc_tz(), t0())
+            .await
+            .unwrap();
+        // Its retry would reach 4000 > 3000: refused, and the refusal reserves nothing more.
+        let b = preflight(&mut conn, &call, PROMPT_BYTES, OUT_LIMIT, &utc_tz(), t0())
+            .await
+            .unwrap_err();
+        assert_eq!(b.code, Code::PlanExceeded);
+        assert_eq!(b.params["spent_micros"], 2000);
+        assert_eq!(ledger_rows(&mut conn).await, 1);
+
+        // The first attempt never left the machine: released, it no longer counts.
+        store::release_reservation_conn(&mut conn, &first.reservation_id)
+            .await
+            .unwrap();
+        assert!(
+            preflight(&mut conn, &call, PROMPT_BYTES, OUT_LIMIT, &utc_tz(), t0())
+                .await
+                .is_ok()
+        );
+
+        // Another run's spend does not count against this run's ceiling.
+        run_spend(&mut conn, "run-2", 1_000_000).await;
+        let third = rig.call_capped(Some("run-3"), 2000);
+        assert!(
+            preflight(&mut conn, &third, PROMPT_BYTES, OUT_LIMIT, &utc_tz(), t0())
+                .await
+                .is_ok()
+        );
+    })
+    .await;
+}
+
+/// A settled call counts at what it actually cost, so a cheap first answer leaves room.
+#[tokio::test]
+async fn a_settled_call_counts_at_its_settled_cost() {
+    with_store(|mut conn| async move {
+        let rig = Rig::new(Some(PRICE_TEXT));
+        consent_now(&mut conn, &rig, true).await;
+        let call = rig.call_capped(Some("run-1"), 3000);
+        let first = preflight(&mut conn, &call, PROMPT_BYTES, OUT_LIMIT, &utc_tz(), t0())
+            .await
+            .unwrap();
+        // Settled at 100 micro: 100 + 2000 <= 3000.
+        store::settle_conn(
+            &mut conn,
+            &first.reservation_id,
+            &Settlement {
+                tokens_in: 10,
+                tokens_out: 10,
+                reasoning_tokens: None,
+                cost_micros: 100,
+                outcome: LedgerOutcome::Ok,
+                usage_source: UsageSource::Reported,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            preflight(&mut conn, &call, PROMPT_BYTES, OUT_LIMIT, &utc_tz(), t0())
+                .await
+                .is_ok()
+        );
+    })
+    .await;
+}
+
+/// None is the call every existing caller makes: no plan check, no extra read, nothing
+/// changed, whatever the run has already spent.
+#[tokio::test]
+async fn a_call_with_no_plan_cap_is_decided_exactly_as_before() {
+    with_store(|mut conn| async move {
+        let rig = Rig::new(Some(PRICE_TEXT));
+        consent_now(&mut conn, &rig, true).await;
+        run_spend(&mut conn, "run-1", 1_000_000_000).await;
+        let call = rig.call(RunAttendance::Attended, Some("run-1"));
+        assert_eq!(call.plan_cap_micros, None);
+        assert!(
+            preflight(&mut conn, &call, PROMPT_BYTES, OUT_LIMIT, &utc_tz(), t0())
+                .await
+                .is_ok(),
+            "no ceiling, no check"
+        );
+        // The same call with a ceiling is refused, so the difference is the cap alone.
+        let capped = rig.call_capped(Some("run-1"), 5000);
+        assert_eq!(
+            preflight(&mut conn, &capped, PROMPT_BYTES, OUT_LIMIT, &utc_tz(), t0())
+                .await
+                .unwrap_err()
+                .code,
+            Code::PlanExceeded
+        );
+    })
+    .await;
+}
+
+/// The plan cap comes AFTER every other check and never replaces one: a call that is
+/// stopped for any other reason is stopped for that reason, cap or no cap.
+#[tokio::test]
+async fn every_other_check_still_comes_first_and_the_cap_replaces_none_of_them() {
+    with_store(|mut conn| async move {
+        let rig = Rig::new(Some(PRICE_TEXT));
+        // No consent: consent_required, though the cap would also refuse.
+        let call = rig.call_capped(Some("run-1"), 0);
+        let b = preflight(&mut conn, &call, PROMPT_BYTES, OUT_LIMIT, &utc_tz(), t0())
+            .await
+            .unwrap_err();
+        assert_eq!(b.code, Code::BlockConsentRequired);
+
+        // A regular limit that is also exceeded wins over the plan cap.
+        consent_now(&mut conn, &rig, false).await;
+        set_limit(
+            &mut conn,
+            spec(
+                LimitMetric::CostUsd,
+                LimitPeriod::Month,
+                ScopeKind::All,
+                None,
+                1000,
+            ),
+        )
+        .await;
+        let b = preflight(&mut conn, &call, PROMPT_BYTES, OUT_LIMIT, &utc_tz(), t0())
+            .await
+            .unwrap_err();
+        assert_eq!(b.code, Code::BlockLimitReached);
+
+        // A generous ceiling does not clear what a limit refuses.
+        let generous = rig.call_capped(Some("run-1"), i64::MAX);
+        let b = preflight(
+            &mut conn,
+            &generous,
+            PROMPT_BYTES,
+            OUT_LIMIT,
+            &utc_tz(),
+            t0(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(b.code, Code::BlockLimitReached);
+        assert_eq!(ledger_rows(&mut conn).await, 0);
+    })
+    .await;
+}
+
+/// A ceiling with no run to total cannot be checked: refused, nothing reserved. A free model
+/// clears even a zero ceiling.
+#[tokio::test]
+async fn a_ceiling_with_no_run_is_refused_and_a_free_call_clears_a_zero_ceiling() {
+    with_store(|mut conn| async move {
+        let rig = Rig::new(Some(PRICE_TEXT));
+        consent_now(&mut conn, &rig, true).await;
+        let b = preflight(
+            &mut conn,
+            &rig.call_capped(None, 1_000_000),
+            PROMPT_BYTES,
+            OUT_LIMIT,
+            &utc_tz(),
+            t0(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(b.code, Code::PlanExceeded);
+        assert_eq!(b.params["reason"], "no_run_id");
+        assert_eq!(ledger_rows(&mut conn).await, 0);
+    })
+    .await;
+    with_store(|mut conn| async move {
+        let rig = Rig::new(Some(FREE_TEXT));
+        consent_now(&mut conn, &rig, true).await;
+        assert!(preflight(
+            &mut conn,
+            &rig.call_capped(Some("run-1"), 0),
+            PROMPT_BYTES,
+            OUT_LIMIT,
+            &utc_tz(),
+            t0()
+        )
+        .await
+        .is_ok());
+    })
+    .await;
+}
+
+/// Where the check sits, and that it can only refuse: after evaluate(), before the reserve,
+/// inside gather_and_decide (which preflight runs between BEGIN IMMEDIATE and COMMIT), and
+/// nothing in it returns success or changes a limit.
+#[test]
+fn the_plan_cap_sits_after_the_checks_before_the_reserve_and_can_only_refuse() {
+    let src = include_str!("gate.rs");
+    let code = src.split("#[cfg(test)]").next().unwrap();
+    let decide = code
+        .split("async fn gather_and_decide")
+        .nth(1)
+        .unwrap()
+        .split("/// The pre-flight: decide and, when cleared, reserve")
+        .next()
+        .unwrap();
+    let evaluate = decide.find("evaluate(&Facts").expect("evaluate");
+    let cap = decide
+        .find("if let Some(cap) = call.plan_cap_micros")
+        .expect("cap");
+    let reserve = decide.find("insert_reservation_conn(").expect("reserve");
+    assert!(evaluate < cap && cap < reserve);
+    let block = &decide[cap..reserve];
+    assert!(!block.contains("Ok("), "the cap check can only refuse");
+    assert!(!block.contains("limit_value"), "and changes no limit");
+    // The transaction brackets the decision.
+    let pre = code
+        .split("pub async fn preflight<")
+        .nth(1)
+        .unwrap()
+        .split("// Settlement")
+        .next()
+        .unwrap();
+    assert!(
+        pre.find("begin_immediate").unwrap() < pre.find("gather_and_decide").unwrap()
+            && pre.find("gather_and_decide").unwrap() < pre.find("store::commit").unwrap()
+    );
+    // The field is read nowhere else in the gate.
+    assert_eq!(
+        code.matches("plan_cap_micros").count(),
+        2,
+        "the field and the one check"
+    );
 }

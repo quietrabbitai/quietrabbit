@@ -25,6 +25,14 @@
 //                    At or above the warn threshold it still proceeds and is
 //                    reported as a notice. The most restrictive limit governs
 //                    because all of them must pass.
+//   5b. plan cap     ONLY for a call of a model-block step under an approved run plan
+//                    (items.id=901): the run's ledger total (held plus settled) plus
+//                    this call's worst case must stay within the ceiling the user
+//                    approved, else plan.exceeded (reason over_ceiling). It runs after
+//                    every check above has passed and before the reserve, in the same
+//                    transaction, and it can only REFUSE: a call with no plan cap
+//                    (None, every other call) is decided exactly as before, and no
+//                    path here loosens any of the checks above.
 //   6. reserve       a ledger row holding the worst-case amounts is written in
 //                    the SAME `BEGIN IMMEDIATE` transaction as the reads above,
 //                    so two concurrent calls cannot both slip under a cap.
@@ -276,6 +284,30 @@ pub struct SpendCall<'a> {
     pub focus_id: Option<&'a str>,
     pub run_id: Option<&'a str>,
     pub attendance: RunAttendance,
+    /// items.id=901 (the run plan): the most the user approved this RUN to cost, in
+    /// micro-USD, set only for a call of a model-block step. The gate refuses a call that
+    /// would take the run's ledger total (held plus settled) plus its own worst case over
+    /// it. None for every other call: no plan check, no extra read, nothing changed. It is
+    /// a further REFUSAL only; it never replaces or relaxes a consent, price, cap, budget
+    /// or limit check.
+    pub plan_cap_micros: Option<i64>,
+}
+
+/// The plan-cap refusal: a call whose worst case would take the run past the approved
+/// ceiling. Pure. `spent` is the run's ledger total so far (held plus settled) and `worst`
+/// this call's gate worst case. An overflowing sum is over any ceiling.
+pub fn plan_cap_block(cap: i64, spent: i64, worst: i64) -> Option<SpendBlock> {
+    let projected = spent.checked_add(worst);
+    if projected.is_none_or(|p| p > cap) {
+        return Some(
+            SpendBlock::new(Code::PlanExceeded)
+                .with("reason", "over_ceiling")
+                .with("spent_micros", spent)
+                .with("estimate_micros", worst)
+                .with("ceiling_micros", cap),
+        );
+    }
+    None
 }
 
 /// A held reservation plus the figures settlement needs.
@@ -402,6 +434,31 @@ async fn gather_and_decide<Tz: TimeZone>(
 
     // Cleared: hold the worst case. `estimate` is Some here (a Known price).
     let estimate = estimate.ok_or_else(|| SpendBlock::new(Code::BlockPriceUnknown))?;
+
+    // 5b. The approved run plan's ceiling (items.id=901), only when the call carries one:
+    // the run's ledger total (pending reservations and settled rows, as for a per-run limit)
+    // plus this call's worst case, inside this transaction and before the reserve. A cap
+    // with no run id to total is refused (it cannot be checked). A ledger read that fails
+    // is a ledger block, as everywhere else in the gate.
+    if let Some(cap) = call.plan_cap_micros {
+        let Some(run) = call.run_id else {
+            return Err(SpendBlock::new(Code::PlanExceeded).with("reason", "no_run_id"));
+        };
+        let spent = store::usage_totals_conn(
+            conn,
+            &UsageFilter {
+                run_id: Some(run),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(ledger_down)?
+        .cost_micros;
+        if let Some(block) = plan_cap_block(cap, spent, estimate.worst_case_micros) {
+            return Err(block);
+        }
+    }
+
     let id = store::insert_reservation_conn(
         conn,
         &NewReservation {

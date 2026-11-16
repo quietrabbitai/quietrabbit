@@ -158,10 +158,11 @@ pub enum Code {
     // -- the run plan's approved envelope (items.id=901) -----------------------
     /// A model-block step's pick is beyond what the user approved in the run plan:
     /// a hosted or pinned model with no matching approved choice, an approved
-    /// choice that is no longer available, or (stage 5) a cost over the approved
-    /// ceiling. Nothing was sent and no other model was used. The parameters carry
-    /// the action id and a reason code (no_approval, model_not_planned,
-    /// pin_unavailable, over_ceiling).
+    /// choice that is no longer available, or a cost over the approved ceiling.
+    /// Nothing was sent and no other model was used. The parameters carry a reason
+    /// code (no_approval, model_not_planned, pin_unavailable from the executor, with
+    /// the action id, and over_ceiling or no_run_id from the spend gate, with the
+    /// run's spend so far, the call's worst case and the ceiling in micro-USD).
     PlanExceeded,
 
     // -- the outbound review of an external step's prompt (items.id=884) -------
