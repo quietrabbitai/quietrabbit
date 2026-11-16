@@ -265,6 +265,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/outputs_016.sql"),
     },
     SchemaFile {
+        prefix: "outputs",
+        version: 17,
+        sql: include_str!("../../schema/outputs_017.sql"),
+    },
+    SchemaFile {
         prefix: "personal",
         version: 1,
         sql: include_str!("../../schema/personal_001.sql"),
@@ -3929,11 +3934,11 @@ mod tests {
 
         assert_eq!(
             result.expect("migration must apply cleanly"),
-            16,
+            17,
             "outputs_001 + outputs_002 + outputs_003 + outputs_004 + outputs_005 + \
              outputs_006 + outputs_007 + outputs_008 + outputs_009 + outputs_010 + \
              outputs_011 + outputs_012 + outputs_013 + outputs_014 + outputs_015 + \
-             outputs_016 must all apply in one pass"
+             outputs_016 + outputs_017 must all apply in one pass"
         );
 
         let mut conn =
@@ -5497,9 +5502,9 @@ mod tests {
             .await
             .expect("v11 must apply to a populated outputs.db");
         assert_eq!(
-            applied, 6,
-            "outputs_011, outputs_012, outputs_013, outputs_014, outputs_015 and outputs_016 \
-             were pending"
+            applied, 7,
+            "outputs_011, outputs_012, outputs_013, outputs_014, outputs_015, outputs_016 and \
+             outputs_017 were pending"
         );
 
         for (table, expected) in FOCUS_RUN_TABLES.iter().zip(before) {
@@ -5552,8 +5557,9 @@ mod tests {
             .await
             .expect("v12 must apply to a populated outputs.db");
         assert_eq!(
-            applied, 5,
-            "outputs_012, outputs_013, outputs_014, outputs_015 and outputs_016 were pending"
+            applied, 6,
+            "outputs_012, outputs_013, outputs_014, outputs_015, outputs_016 and outputs_017 \
+             were pending"
         );
 
         let row: (i64, i64, i64) = sqlx::query_as(
@@ -5611,8 +5617,8 @@ mod tests {
             .await
             .expect("v13 must apply to a populated outputs.db");
         assert_eq!(
-            applied, 4,
-            "outputs_013, outputs_014, outputs_015 and outputs_016 were pending"
+            applied, 5,
+            "outputs_013, outputs_014, outputs_015, outputs_016 and outputs_017 were pending"
         );
         assert_eq!(row_count(&mut conn, "outputs").await, 1);
         assert_eq!(row_count(&mut conn, "focus_runs").await, 1);
@@ -5690,8 +5696,8 @@ mod tests {
             .await
             .expect("v14 must apply to a populated outputs.db");
         assert_eq!(
-            applied, 3,
-            "outputs_014, outputs_015 and outputs_016 were pending"
+            applied, 4,
+            "outputs_014, outputs_015, outputs_016 and outputs_017 were pending"
         );
 
         for table in [
@@ -5829,7 +5835,10 @@ mod tests {
         let applied = run_migrations(&mut conn, "outputs", Some(TEST_KEY_HEX))
             .await
             .expect("v15 must apply to a populated outputs.db");
-        assert_eq!(applied, 2, "outputs_015 and outputs_016 were pending");
+        assert_eq!(
+            applied, 3,
+            "outputs_015, outputs_016 and outputs_017 were pending"
+        );
 
         assert_eq!(row_count(&mut conn, "focus_runs").await, 1);
         assert_eq!(row_count(&mut conn, "session_variables").await, 1);
@@ -5900,7 +5909,7 @@ mod tests {
         let applied = run_migrations(&mut conn, "outputs", Some(TEST_KEY_HEX))
             .await
             .expect("v16 must apply to a populated outputs.db");
-        assert_eq!(applied, 1, "only outputs_016 was pending");
+        assert_eq!(applied, 2, "outputs_016 and outputs_017 were pending");
 
         assert_eq!(row_count(&mut conn, "focus_runs").await, 1);
         assert_eq!(row_count(&mut conn, "pass_artifacts").await, 1);
@@ -5939,6 +5948,81 @@ mod tests {
         assert!(short_hash.is_err(), "prompt_sha is a 64 character hash");
         let version: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM schema_version WHERE version = 16")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(version, 1);
+        assert!(
+            fk_violations(&mut conn).await.is_empty(),
+            "foreign_key_check must be clean"
+        );
+    }
+
+    /// items.id=901: outputs_017 adds plan_approvals and run_parks. A populated v16
+    /// database keeps its rows and gains two empty tables with no foreign key and no
+    /// trigger (items.id=633 rebuilds focus_runs and must not have to carry them), and the
+    /// checks refuse a short digest and a negative ceiling.
+    #[tokio::test]
+    async fn outputs_v16_to_v17_adds_the_run_plan_tables_and_preserves_a_populated_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = open_keyed_scratch(&tmp.path().join("outputs.db")).await;
+        apply_versions_up_to(&mut conn, "outputs", 16).await;
+        exec_all(
+            &mut conn,
+            &[
+                "INSERT INTO focus_runs (id, focus_id, started_at) \
+                 VALUES ('run1', 'f', '2026-01-01T00:00:00Z')",
+                "INSERT INTO pass_artifacts \
+                 (context_key, focus_id, kind, content, written_by_run, created_at, updated_at) \
+                 VALUES ('c', 'f', 'content_brief', 'x', 'run1', \
+                         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            ],
+        )
+        .await;
+
+        let applied = run_migrations(&mut conn, "outputs", Some(TEST_KEY_HEX))
+            .await
+            .expect("v17 must apply to a populated outputs.db");
+        assert_eq!(applied, 1, "only outputs_017 was pending");
+
+        assert_eq!(row_count(&mut conn, "focus_runs").await, 1);
+        assert_eq!(row_count(&mut conn, "pass_artifacts").await, 1);
+        assert_eq!(row_count(&mut conn, "plan_approvals").await, 0);
+        assert_eq!(row_count(&mut conn, "run_parks").await, 0);
+
+        for table in ["plan_approvals", "run_parks"] {
+            let fks: Vec<(String,)> = sqlx::query_as(&format!(
+                "SELECT \"table\" FROM pragma_foreign_key_list('{table}')"
+            ))
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+            assert!(fks.is_empty(), "{table} has no foreign key: {fks:?}");
+            let triggers: Vec<(String,)> = sqlx::query_as(&format!(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = '{table}'"
+            ))
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+            assert!(triggers.is_empty(), "{table} has no trigger: {triggers:?}");
+        }
+        let short_digest = sqlx::query(
+            "INSERT INTO plan_approvals (context_key, focus_id, digest, ceiling_micros, \
+             created_at, updated_at) VALUES ('c', 'f', 'short', 1, 't', 't')",
+        )
+        .execute(&mut conn)
+        .await;
+        assert!(short_digest.is_err(), "the digest is 64 characters");
+        let negative = sqlx::query(
+            "INSERT INTO plan_approvals (context_key, focus_id, digest, ceiling_micros, \
+             created_at, updated_at) VALUES ('c', 'f', ?, -1, 't', 't')",
+        )
+        .bind("a".repeat(64))
+        .execute(&mut conn)
+        .await;
+        assert!(negative.is_err(), "the ceiling is not negative");
+        let version: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_version WHERE version = 17")
                 .fetch_one(&mut conn)
                 .await
                 .unwrap();

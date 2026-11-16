@@ -34,11 +34,13 @@ pub mod pass_artifact_store;
 pub mod persona_registry_store;
 pub mod persona_store;
 pub mod personal_store;
+pub mod plan_approval_store;
 pub mod plan_state_store;
 pub mod provider_catalog_store;
 pub mod provider_models_store;
 pub mod provider_spend_store;
 pub mod provider_store;
+pub mod run_park_store;
 pub mod savepoint;
 #[cfg(test)]
 mod session_case_tests;

@@ -494,6 +494,15 @@ TABLE pf_fact_mentions
   fact_key TEXT notnull=1 pk=0 default=None
   original_text TEXT notnull=1 pk=0 default=None
   created_at TEXT notnull=1 pk=0 default=None
+TABLE plan_approvals
+  context_key TEXT notnull=1 pk=1 default=None
+  focus_id TEXT notnull=1 pk=2 default=None
+  digest TEXT notnull=1 pk=0 default=None
+  ceiling_micros INTEGER notnull=1 pk=0 default=None
+  choices_json TEXT notnull=1 pk=0 default=Some("'[]'")
+  version INTEGER notnull=1 pk=0 default=Some("1")
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
 TABLE run_history
   id TEXT notnull=0 pk=1 default=None
   focus_run_id TEXT notnull=1 pk=0 default=None
@@ -506,6 +515,12 @@ TABLE run_history
   promote_window_expires_at TEXT notnull=0 pk=0 default=None
   created_at TEXT notnull=1 pk=0 default=None
   extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE run_parks
+  run_id TEXT notnull=1 pk=1 default=None
+  action_id TEXT notnull=1 pk=0 default=None
+  code TEXT notnull=1 pk=0 default=None
+  params_json TEXT notnull=1 pk=0 default=Some("'{}'")
+  created_at TEXT notnull=1 pk=0 default=None
 TABLE schema_version
   version INTEGER notnull=0 pk=1 default=None
   applied_at TEXT notnull=1 pk=0 default=None
