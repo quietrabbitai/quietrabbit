@@ -589,6 +589,11 @@
       "no_candidate": "There is no AI model this task is allowed to use right now, so nothing was run."
     }
   },
+  "plan": {
+    "stop": {
+      "exceeded": "This step would go beyond what you approved for this run, so nothing was sent."
+    }
+  },
   "stepReview": {
     "focusContext": "This came up while preparing a request to an outside AI service.",
     "declineButton": "Don't send",

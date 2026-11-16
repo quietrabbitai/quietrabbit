@@ -303,6 +303,12 @@ pub struct StepContext {
     /// template names them. Applied in render_prompt* beside the system tokens;
     /// see conductor::taint. Empty for a Focus that uses no bound name.
     pub store_tokens: crate::conductor::taint::StoreTokens,
+    /// items.id=901 (the run plan): the approval this run acts under, set by the plan gate
+    /// at the start of the run only when a stored approval was read and verified against
+    /// the plan the run recomputed. None: no approval, so a resolved step may run only on
+    /// a local model the resolver itself picks. Read ONLY by plan_pin() and
+    /// check_plan_envelope() below (a source scan pins that).
+    pub plan: Option<Arc<crate::conductor::plan_approval::Approval>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -498,7 +504,10 @@ impl StepExecutor {
         let mut local_fallbacks: Vec<LocalFallback> = Vec::new();
         let mut selected_model = match (&ctx.bound, resolver_req) {
             (Some(bound), _) => select_bound_model(pool, ctx, bound).await?,
-            (None, Some(req)) => match select_model_for_block(pool, ctx, req).await {
+            // items.id=901: under the run's approval. A pinned choice replaces the resolver;
+            // any other pick must be a local model (plan_exceeded otherwise). Either way the
+            // refusal is made here, BEFORE derive_treatment and every gate below.
+            (None, Some(req)) => match select_under_plan(pool, ctx, req).await {
                 Ok(sel) => {
                     local_fallbacks = sel.fallbacks;
                     sel.selected
@@ -1758,6 +1767,152 @@ async fn select_model_for_block(
                 None => Err(spend_block_error(&SpendBlock::new(
                     Code::BlockModelUnavailable,
                 ))),
+            }
+        }
+    }
+}
+
+/// The approved choice (a pin) of this step, if the run's approval has one. One of the
+/// two sites that read ctx.plan (the other is check_plan_envelope); a scan pins that.
+fn plan_pin(ctx: &StepContext) -> Option<&crate::conductor::run_plan::Pin> {
+    ctx.plan
+        .as_deref()?
+        .pins
+        .iter()
+        .find(|p| p.action_id == ctx.step.action_id)
+}
+
+/// A plan stop as the error the failure handler parks (F10, like a resolver stop): the
+/// code plan.exceeded with the action id and a reason (no_approval, model_not_planned,
+/// pin_unavailable). Nothing was sent and no other model was used in its place.
+fn plan_exceeded(ctx: &StepContext, reason: &str) -> ConductorError {
+    spend_block_error(
+        &SpendBlock::new(Code::PlanExceeded)
+            .with("action_id", ctx.step.action_id.clone())
+            .with("reason", reason),
+    )
+}
+
+/// The envelope check for a pick the resolver made (no pin for this step): only a LOCAL
+/// model may be picked without an approved choice. A hosted pick is beyond the envelope:
+/// no_approval when the run has no approval at all (a rehydrated run, a run that needed none)
+/// and model_not_planned when it has one that does not name this model for this step (a
+/// zero-pin approval permits resolver local picks only). The second of the two sites that
+/// read ctx.plan.
+fn check_plan_envelope(ctx: &StepContext, selected: &SelectedModel) -> Result<(), ConductorError> {
+    if selected.provider_id.is_none() {
+        return Ok(());
+    }
+    Err(plan_exceeded(
+        ctx,
+        if ctx.plan.is_none() {
+            "no_approval"
+        } else {
+            "model_not_planned"
+        },
+    ))
+}
+
+/// select_model_for_block() under the run's approval (items.id=901): the approved pin if
+/// the step has one, else the resolver's choice checked against the envelope.
+async fn select_under_plan(
+    pool: &sqlx::SqlitePool,
+    ctx: &StepContext,
+    req: &crate::conductor::model_block::config::ModelRequirement,
+) -> Result<BlockSelection, ConductorError> {
+    match plan_pin(ctx) {
+        Some(pin) => select_pinned_model(pool, ctx, req, pin).await,
+        None => {
+            let selection = select_model_for_block(pool, ctx, req).await?;
+            check_plan_envelope(ctx, &selection.selected)?;
+            Ok(selection)
+        }
+    }
+}
+
+/// The model of an approved pin. The resolver is NOT asked to choose: the user chose, and
+/// the only question left is whether the pinned model may still be used. It must be a
+/// candidate the gatherer finds now, of the pinned kind (a paid model hosted, an unmeasured
+/// local model local), and eligible exactly as the resolver judges it (destination under the
+/// step's range and ceiling, ready, window large enough). Its standing is not re-decided
+/// except in one direction: a model that has since been measured BELOW the required bar is
+/// not used (nothing below the bar is ever selected). Anything else is pin_unavailable: no
+/// silent switch to another model or strategy.
+async fn select_pinned_model(
+    pool: &sqlx::SqlitePool,
+    ctx: &StepContext,
+    req: &crate::conductor::model_block::config::ModelRequirement,
+    pin: &crate::conductor::run_plan::Pin,
+) -> Result<BlockSelection, ConductorError> {
+    use crate::conductor::model_capability::CapabilitySubject;
+    use crate::conductor::model_resolver::{resolve, Resolution, ResolveInput, Standing};
+    use crate::conductor::model_resolver_input::{gather, GatherInput, Reach};
+    use crate::conductor::run_plan::OfferStrategy;
+
+    let unavailable = || plan_exceeded(ctx, "pin_unavailable");
+    let subject = match pin.strategy {
+        OfferStrategy::PaidApi => CapabilitySubject::Hosted,
+        OfferStrategy::LocalUnmeasured => CapabilitySubject::Local,
+        // A model the resolver picks anyway is never pinned.
+        OfferStrategy::Local => return Err(unavailable()),
+    };
+    let Reach {
+        ceiling,
+        local_allowed,
+        hosted_allowed,
+    } = crate::conductor::model_resolver_input::reach(req, ctx.effective_access);
+    let fixed_tokens = fixed_prompt_tokens(ctx);
+    let gathered = gather(&GatherInput {
+        pool,
+        user_id: &ctx.user_id,
+        key_hex: &ctx.key_hex,
+        ceiling,
+        local_allowed,
+        hosted_allowed,
+        est_input_tokens: fixed_tokens,
+        est_output_tokens: None,
+    })
+    .await;
+    let candidate = gathered
+        .candidates
+        .iter()
+        .find(|c| {
+            c.subject == subject && c.provider_id == pin.provider_id && c.model_id == pin.model_id
+        })
+        .ok_or_else(unavailable)?;
+    let profile = run_profile(ctx);
+    let judged = resolve(&ResolveInput {
+        requirement: req,
+        profile: profile.as_deref(),
+        ceiling: ctx.effective_access,
+        min_context_tokens: fixed_tokens,
+        candidates: std::slice::from_ref(candidate),
+        capabilities: &gathered.capabilities,
+    });
+    match judged {
+        Resolution::NoCandidate(_) => return Err(unavailable()),
+        Resolution::TooWeak { options, .. }
+            if options
+                .first()
+                .is_some_and(|o| matches!(o.standing, Standing::BelowBar(_))) =>
+        {
+            return Err(unavailable())
+        }
+        _ => {}
+    }
+    match subject {
+        CapabilitySubject::Local => Ok(BlockSelection {
+            selected: SelectedModel::local(pin.model_id.clone()),
+            fallbacks: Vec::new(),
+        }),
+        CapabilitySubject::Hosted => {
+            let key = (pin.provider_id.clone(), pin.model_id.clone());
+            match gathered.hosted_models.get(&key) {
+                Some(row) => Ok(BlockSelection {
+                    selected: SelectedModel::hosted(row.clone()),
+                    fallbacks: Vec::new(),
+                }),
+                None => Err(unavailable()),
             }
         }
     }
@@ -4164,6 +4319,7 @@ mod tests {
             stream: None,
             bound: None,
             store_tokens: Default::default(),
+            plan: None,
         };
         let mut projected = HashMap::new();
         projected.insert("name".to_owned(), "Alice (abstracted)".to_owned());
@@ -4236,6 +4392,7 @@ mod tests {
             stream: None,
             bound: None,
             store_tokens: Default::default(),
+            plan: None,
         };
         assert_eq!(
             compute_step_sensitivity(&ctx, &ordinary(&ctx), &pt, &HashMap::new()),
@@ -4294,6 +4451,7 @@ mod tests {
             stream: None,
             bound: None,
             store_tokens: Default::default(),
+            plan: None,
         };
         assert_eq!(
             compute_step_sensitivity(&ctx, &ordinary(&ctx), &pt, &HashMap::new()),
@@ -4364,6 +4522,7 @@ mod tests {
             stream: None,
             bound: None,
             store_tokens: Default::default(),
+            plan: None,
         }
     }
 
@@ -8223,6 +8382,7 @@ mod tests {
                 "Write it.",
             );
             ctx.key_hex = key_hex;
+            ctx.plan = hosted_pin_approval();
             let (out, track, gateway) = run_once_with(&ctx, &pool, &clamping_track()).await;
             let failure = out.unwrap().expect("the step parks");
             assert_eq!(failure.action, FailureAction::AwaitFloorConsent);
@@ -8265,6 +8425,7 @@ mod tests {
                 "Write it.",
             );
             resolved.key_hex = key_hex.clone();
+            resolved.plan = hosted_pin_approval();
             let mut ordinary_ctx =
                 resolved_ctx(None, ExternalAccess::AnonymousPreferred, None, "Write it.");
             ordinary_ctx.key_hex = key_hex;
@@ -8485,8 +8646,10 @@ mod tests {
         assert_eq!(body.matches("ctx.execution_tier").count(), 1);
         assert_eq!(body.matches("ctx.abstraction_tier").count(), 1);
         assert_eq!(body.matches("ctx.raw_abstraction").count(), 1);
-        // The whole production file.
-        assert_eq!(live.matches("ctx.effective_access").count(), 7);
+        // The whole production file. items.id=901 added two reads in select_pinned_model
+        // (the reach and the resolver's ceiling): the same use as select_model_for_block's,
+        // the resolver's candidate set, outside execute_once.
+        assert_eq!(live.matches("ctx.effective_access").count(), 9);
         assert_eq!(live.matches("ctx.execution_tier").count(), 2);
         assert_eq!(live.matches("ctx.abstraction_tier").count(), 2);
         assert_eq!(live.matches("ctx.raw_abstraction").count(), 2);
@@ -8563,6 +8726,7 @@ mod tests {
             "Write it.",
         );
         resolved.key_hex = key_hex.to_owned();
+        resolved.plan = hosted_pin_approval();
         resolved.execution_tier = 3;
         let mut ordinary_ctx =
             resolved_ctx(None, ExternalAccess::AnonymousPreferred, None, "Write it.");
@@ -8663,7 +8827,11 @@ mod tests {
             );
             ctx.key_hex = key_hex;
             ctx.execution_tier = 3;
-            // Attempt 1: no local model is ready, so the resolver picks the host.
+            // items.id=901: attempt 1 runs under an approved pin of the host (a hosted pick
+            // needs one); attempt 2 under a zero-pin approval, which permits resolver LOCAL
+            // picks only, so it shows the retry selecting again.
+            ctx.plan = hosted_pin_approval();
+            // Attempt 1: no local model is ready, so the pinned host is used.
             let (first, _, g1) = run_once_with(&ctx, &pool, &clamping_track()).await;
             assert_eq!(
                 first.unwrap().unwrap().action,
@@ -8673,8 +8841,9 @@ mod tests {
             assert_eq!(first_rows[0].provider.as_deref(), Some("fixture-host-a"));
             assert_eq!(first_rows[0].execution_tier, 3);
 
-            // A local model becomes ready: the SAME context, the next attempt.
+            // A local model becomes ready: the next attempt.
             install_local_models(&pool).await;
+            ctx.plan = approval_with(vec![]);
             let stub = LocalModelStub::start(1);
             let (second, track, g2) = run_once_with(&ctx, &pool, &clamping_track()).await;
             assert!(
@@ -8854,6 +9023,7 @@ mod tests {
             template,
         );
         ctx.key_hex = key_hex.to_owned();
+        ctx.plan = hosted_pin_approval();
         ctx
     }
 
@@ -9154,5 +9324,359 @@ mod tests {
             assert!(server.captured().is_empty(), "nothing was sent");
         })
         .await;
+    }
+    // -----------------------------------------------------------------------
+    // items.id=901: the run plan's envelope. A resolved step may run on a local model
+    // the resolver itself picks, or on the model an approved pin names. Any other pick
+    // stops with plan.exceeded BEFORE the treatment and every gate, with nothing sent.
+    // -----------------------------------------------------------------------
+
+    use crate::conductor::plan_approval::Approval;
+    use crate::conductor::run_plan::{OfferStrategy, Pin};
+
+    fn approval_with(pins: Vec<Pin>) -> Option<Arc<Approval>> {
+        Some(Arc::new(Approval {
+            digest: "d".repeat(64),
+            ceiling_micros: 1_000,
+            pins,
+        }))
+    }
+
+    fn pin_of(strategy: OfferStrategy, provider: &str, model: &str) -> Pin {
+        Pin {
+            action_id: "s1".to_owned(),
+            strategy,
+            provider_id: provider.to_owned(),
+            model_id: model.to_owned(),
+        }
+    }
+
+    /// An approval whose one pin is the fixture host's model, for the tests that exercise a
+    /// hosted pick under the downstream gates.
+    fn hosted_pin_approval() -> Option<Arc<Approval>> {
+        approval_with(vec![pin_of(
+            OfferStrategy::PaidApi,
+            "fixture-host-a",
+            "fixture-model-a",
+        )])
+    }
+
+    fn plan_reason(r: &FailureResult) -> String {
+        assert_eq!(parked_code(r), "plan.exceeded");
+        r.metadata.as_ref().unwrap()["reason"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// A hosted-only resolved step on a measured hosted model, so the resolver itself
+    /// picks the hosted model. Returns the context with the fixture key.
+    async fn measured_hosted_ctx(pool: &sqlx::SqlitePool, server: &LoopbackServer) -> StepContext {
+        let (key_hex, _model) = spend_rig(pool, server, Some(PRICE_TEXT)).await;
+        grant_consent(pool, &key_hex, true).await;
+        sqlx::query(
+            "INSERT INTO model_capabilities
+               (subject_kind, provider_id, model_id, task_type, profile, attained_bar,
+                model_class, sample_count, measured_at, provenance)
+             VALUES ('hosted', 'fixture-host-a', 'fixture-model-a', 'creative_writing',
+                     'rma_letter', 'basic', 'large', 1, '2026-11-13', 'harness_hosted')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let req = requirement(
+            QualityBar::Basic,
+            &[Destination::HostedApi],
+            ExternalAccess::AnonymousPreferred,
+        );
+        let mut ctx = resolved_ctx(
+            Some(req),
+            ExternalAccess::AnonymousPreferred,
+            Some("rma_letter"),
+            "Write it.",
+        );
+        ctx.key_hex = key_hex;
+        ctx
+    }
+
+    /// The resolver picks a hosted model and the run has no approval: the step stops
+    /// before the treatment, Gate 1, the review and the spend gate, and no request is made.
+    #[tokio::test]
+    async fn a_hosted_pick_with_no_approval_stops_before_any_gate_and_nothing_is_sent() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            let ctx = measured_hosted_ctx(&pool, &server).await;
+            assert!(ctx.plan.is_none());
+            // The resolver does pick it: this is the plan's check, not the resolver's.
+            let sel = select_model_for_block(&pool, &ctx, ctx.step.requirement.as_ref().unwrap())
+                .await
+                .map_err(|e| format!("{e:?}"))
+                .unwrap();
+            assert!(sel.selected.provider_id.is_some());
+
+            let (out, track, gateway) = run_once(&ctx, &pool).await;
+            let failure = out.unwrap().expect("the step parked");
+            assert_eq!(plan_reason(&failure), "no_approval");
+            assert_eq!(failure.action, FailureAction::AwaitUser);
+            assert_eq!(gateway.logger.entry_count(), 0, "no gate ran");
+            assert!(track.steps().is_empty());
+            assert_eq!(server.connections(), 0, "the mock listener saw nothing");
+            assert!(server.captured().is_empty());
+        })
+        .await;
+    }
+
+    /// A zero-pin approval permits resolver LOCAL picks only: a hosted pick is still not
+    /// planned.
+    #[tokio::test]
+    async fn a_zero_pin_approval_does_not_permit_a_hosted_pick() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            let mut ctx = measured_hosted_ctx(&pool, &server).await;
+            ctx.plan = approval_with(vec![]);
+            let (out, track, gateway) = run_once(&ctx, &pool).await;
+            assert_eq!(plan_reason(&out.unwrap().unwrap()), "model_not_planned");
+            assert_eq!(gateway.logger.entry_count(), 0);
+            assert!(track.steps().is_empty());
+            assert_eq!(server.connections(), 0);
+
+            // A pin on ANOTHER step does not cover this one either.
+            ctx.plan = approval_with(vec![Pin {
+                action_id: "another-step".to_owned(),
+                ..pin_of(OfferStrategy::PaidApi, "fixture-host-a", "fixture-model-a")
+            }]);
+            let (out, _, _) = run_once(&ctx, &pool).await;
+            assert_eq!(plan_reason(&out.unwrap().unwrap()), "model_not_planned");
+            assert_eq!(server.connections(), 0);
+        })
+        .await;
+    }
+
+    /// The resolver's own local pick runs under a zero-pin approval, and with no approval
+    /// at all (the run needed none).
+    #[tokio::test]
+    async fn a_resolver_local_pick_runs_with_or_without_a_zero_pin_approval() {
+        with_temp_shared_db(|pool| async move {
+            install_local_models(&pool).await;
+            for plan in [None, approval_with(vec![])] {
+                let stub = LocalModelStub::start(1);
+                let mut ctx = resolved_ctx(
+                    Some(requirement(
+                        QualityBar::Basic,
+                        &[Destination::Local, Destination::HostedApi],
+                        ExternalAccess::AnonymousPreferred,
+                    )),
+                    ExternalAccess::AnonymousPreferred,
+                    Some("rma_letter"),
+                    "Write it.",
+                );
+                ctx.plan = plan;
+                let (out, track, _) = run_once(&ctx, &pool).await;
+                assert!(out.unwrap().is_none(), "the local step ran");
+                assert_eq!(stub.server.captured().len(), 1);
+                assert_eq!(track.steps().len(), 1);
+            }
+        })
+        .await;
+    }
+
+    /// An approved pin replaces the resolver. A hosted model nobody has measured, which the
+    /// resolver would refuse (TooWeak), is selected whole when the user pinned it.
+    #[tokio::test]
+    async fn an_approved_pin_selects_the_model_the_resolver_would_refuse() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            let (key_hex, _m) = spend_rig(&pool, &server, Some(PRICE_TEXT)).await;
+            grant_consent(&pool, &key_hex, true).await;
+            let req = requirement(
+                QualityBar::Basic,
+                &[Destination::HostedApi],
+                ExternalAccess::AnonymousPreferred,
+            );
+            let mut ctx = resolved_ctx(
+                Some(req.clone()),
+                ExternalAccess::AnonymousPreferred,
+                Some("rma_letter"),
+                "Write it.",
+            );
+            ctx.key_hex = key_hex;
+            // Unpinned: the resolver refuses (no measured score).
+            let err = select_under_plan(&pool, &ctx, &req).await.err().unwrap();
+            assert_eq!(block_code(&err), "resolver.too_weak");
+
+            ctx.plan = approval_with(vec![pin_of(
+                OfferStrategy::PaidApi,
+                "fixture-host-a",
+                "fixture-model-a",
+            )]);
+            let sel = select_under_plan(&pool, &ctx, &req)
+                .await
+                .map_err(|e| format!("{e:?}"))
+                .unwrap();
+            assert_eq!(sel.selected.provider_id.as_deref(), Some("fixture-host-a"));
+            let row = sel.selected.hosted_model.as_ref().expect("the model row");
+            assert_eq!(sel.selected.model_id, row.model_id);
+            assert!(sel.fallbacks.is_empty());
+            assert_eq!(server.connections(), 0, "choosing sends nothing");
+        })
+        .await;
+    }
+
+    /// An approved pin of an uncalibrated LOCAL model is used where the resolver parks.
+    #[tokio::test]
+    async fn an_approved_pin_selects_an_unmeasured_local_model() {
+        with_temp_shared_db(|pool| async move {
+            install_local_models(&pool).await;
+            let req = local_req();
+            let ctx = resolved_ctx(
+                Some(req.clone()),
+                ExternalAccess::LocalOnly,
+                None,
+                "Write it.",
+            );
+            // No document profile and no task-wide cell: every local model is unmeasured.
+            let err = select_under_plan(&pool, &ctx, &req).await.err().unwrap();
+            assert_eq!(block_code(&err), "resolver.too_weak");
+            let ConductorError::SpendBlock { params, .. } = &err else {
+                panic!()
+            };
+            let tag = params["options"][0]["model_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+
+            let mut ctx = ctx;
+            ctx.plan = approval_with(vec![pin_of(OfferStrategy::LocalUnmeasured, "", &tag)]);
+            let sel = select_under_plan(&pool, &ctx, &req)
+                .await
+                .map_err(|e| format!("{e:?}"))
+                .unwrap();
+            assert_eq!(sel.selected.model_id, tag);
+            assert!(sel.selected.provider_id.is_none() && sel.selected.hosted_model.is_none());
+
+            // Measured BELOW the bar since: never selected, pin or not.
+            sqlx::query(
+                "INSERT INTO model_capabilities
+                   (subject_kind, provider_id, model_id, task_type, profile, attained_bar,
+                    model_class, sample_count, measured_at, provenance)
+                 VALUES ('local', '', ?, 'creative_writing', '', 'below_basic', 'small', 1,
+                         '2026-11-13', 'jason_read')",
+            )
+            .bind(&tag)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let err = select_under_plan(&pool, &ctx, &req).await.err().unwrap();
+            assert_eq!(block_code(&err), "plan.exceeded");
+        })
+        .await;
+    }
+
+    /// A pin that cannot be used stops the step: no silent switch to another model or
+    /// strategy, and nothing reaches the listener.
+    #[tokio::test]
+    async fn a_pin_that_is_no_longer_available_stops_the_step() {
+        with_temp_shared_db(|pool| async move {
+            let server = LoopbackServer::start(vec![loopback_chat_ok()]);
+            let mut ctx = measured_hosted_ctx(&pool, &server).await;
+            install_local_models(&pool).await;
+            let good_key = ctx.key_hex.clone();
+
+            let cases: Vec<(&str, Pin, &str)> = vec![
+                (
+                    "a model that is not a candidate",
+                    pin_of(OfferStrategy::PaidApi, "fixture-host-a", "no-such-model"),
+                    &good_key,
+                ),
+                (
+                    "a paid pin whose provider has no candidate",
+                    pin_of(OfferStrategy::PaidApi, "no-such-host", "fixture-model-a"),
+                    &good_key,
+                ),
+                (
+                    "a hosted model with no key",
+                    pin_of(OfferStrategy::PaidApi, "fixture-host-a", "fixture-model-a"),
+                    "",
+                ),
+                (
+                    "a local pin naming a hosted model",
+                    pin_of(OfferStrategy::LocalUnmeasured, "", "fixture-model-a"),
+                    &good_key,
+                ),
+                (
+                    "a pin of a model the resolver picks anyway",
+                    pin_of(OfferStrategy::Local, "", "anything"),
+                    &good_key,
+                ),
+            ];
+            for (label, pin, key) in cases {
+                ctx.plan = approval_with(vec![pin]);
+                ctx.key_hex = key.to_owned();
+                let (out, track, gateway) = run_once(&ctx, &pool).await;
+                let failure = out.unwrap().unwrap_or_else(|| panic!("{label}: it ran"));
+                assert_eq!(plan_reason(&failure), "pin_unavailable", "{label}");
+                assert_eq!(gateway.logger.entry_count(), 0, "{label}: no gate ran");
+                assert!(track.steps().is_empty(), "{label}");
+            }
+            assert_eq!(server.connections(), 0, "no request, whatever the pin");
+        })
+        .await;
+    }
+
+    /// The plan's refusal is made in the selection, before the treatment and before any
+    /// gate; ctx.plan is read only by the two reviewed functions; Code::PlanExceeded is built
+    /// in one place.
+    #[test]
+    fn the_plan_is_read_only_in_the_selection_and_checked_before_the_treatment() {
+        let src = include_str!("executor.rs");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let live: String = code
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let flat: String = live.split_whitespace().collect::<Vec<_>>().join(" ");
+        // The two readers.
+        assert_eq!(
+            flat.matches("ctx.plan").count(),
+            2,
+            "plan_pin and check_plan_envelope"
+        );
+        let pin_fn = flat
+            .split("fn plan_pin(")
+            .nth(1)
+            .unwrap()
+            .split("fn plan_exceeded(")
+            .next()
+            .unwrap();
+        assert!(pin_fn.contains("ctx.plan .as_deref()"));
+        let env_fn = flat
+            .split("fn check_plan_envelope(")
+            .nth(1)
+            .unwrap()
+            .split("async fn select_under_plan(")
+            .next()
+            .unwrap();
+        assert!(env_fn.contains("ctx.plan.is_none()"));
+        // One place builds the stop.
+        assert_eq!(flat.matches("Code::PlanExceeded").count(), 1);
+        // execute_once: the selection under the plan, then the treatment, then Gate 1.
+        let body = live
+            .split("async fn execute_once<")
+            .nth(1)
+            .and_then(|r| r.split("pub(crate) fn render_template(").next())
+            .expect("execute_once");
+        let sel = body
+            .find("select_under_plan(pool, ctx, req)")
+            .expect("selection");
+        let treat = body
+            .find("derive_treatment(ctx, resolver_req, &selected_model)")
+            .unwrap();
+        let g1 = body.find(".gate1(").unwrap();
+        assert!(sel < treat && treat < g1);
+        // The plain resolver call is not used by execute_once any more.
+        assert!(!body.contains("select_model_for_block(pool, ctx, req)"));
+        // A bound run and an ordinary step never reach the plan.
+        assert!(flat.contains("(Some(bound), _) => select_bound_model(pool, ctx, bound).await?"));
     }
 }

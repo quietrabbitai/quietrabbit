@@ -2935,6 +2935,15 @@ export type SubmitFocusRunRequest = {
 	 *  Empty vec is valid -- most runs have no pending cross-Persona facts.
 	 */
 	confirmed_cross_persona_fact_ids: string[],
+	/**
+	 *  items.id=901 (the run plan): the opaque token get_run_plan returned for THIS run's
+	 *  offer, when the user has approved it (approve_run_plan). A run with no chat has no
+	 *  chat to hang an approval on, so the approval is named by this token, taken and
+	 *  consumed by the run that presents it. It names an approval the user made in this
+	 *  session; it grants nothing by itself (the run still recomputes the plan and verifies
+	 *  the approval against it). None for a Focus with no model block and for a first call.
+	 */
+	plan_token: string | null,
 };
 
 export type SubmitFocusRunResponse = {

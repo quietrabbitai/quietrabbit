@@ -126,6 +126,7 @@ fn ctx(
         stream: None,
         bound: None,
         store_tokens: store_tokens.clone(),
+        plan: None,
     }
 }
 

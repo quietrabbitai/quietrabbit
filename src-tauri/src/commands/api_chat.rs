@@ -410,6 +410,8 @@ async fn review_new_turn<L: crate::conductor::privacy::logger::DisclosureLogger>
         .await
 }
 
+// Tauri-injected state (items.id=901 added the plan memory) plus the request.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 #[specta::specta]
 pub async fn send_api_chat_message(
@@ -419,6 +421,7 @@ pub async fn send_api_chat_message(
     key_registry: State<'_, KeyRegistry>,
     chat_registry: State<'_, ChatStreamRegistry>,
     review_registry: State<'_, ReviewRegistry>,
+    plan_memory: State<'_, crate::conductor::plan_memory::PlanMemory>,
     request: SendApiChatRequest,
 ) -> Result<SendApiChatOutcome, String> {
     let SendApiChatRequest {
@@ -551,8 +554,9 @@ pub async fn send_api_chat_message(
         persona_id: persona_id.clone(),
         topic_id: None,
         confirmed_cross_persona_fact_ids,
+        plan_token: None,
     };
-    let mut run = execution::load_and_authorize_run(
+    let mut run = match execution::load_and_authorize_run(
         app_handle,
         scheduler,
         pool,
@@ -560,9 +564,17 @@ pub async fn send_api_chat_message(
         crisis_detected,
         Some(destination.clone()),
         Some(context_key.clone()),
+        plan_memory.inner().clone(),
         run_request,
     )
-    .await?;
+    .await?
+    {
+        execution::LoadOutcome::Ready(run) => *run,
+        // items.id=901: API Chat is not plan-gated (a bound run keeps its bound destination
+        // and the api-chat Focus has no model block), so the plan gate never returns this
+        // here. If it ever did, the send is refused, never started.
+        execution::LoadOutcome::PlanRequired(_) => return Err(execution::plan_required_error()),
+    };
     run.attach_lease(lease).map_err(|e| e.to_string())?;
     let run_id = run
         .focus_run_id

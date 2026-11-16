@@ -64,6 +64,7 @@ const PRE_EXISTING_ORPHAN_KEYS: string[] = [
   'privacyGuardianModal.selectedCount', // defined, no t() call site anywhere
   'resolver.stop.too_weak', // items.id=896: the backend parks a model-block step with this code; the screen that shows it is items.id=902 or 904
   'resolver.stop.no_candidate', // same
+  'plan.stop.exceeded', // items.id=901: the backend parks a model-block step beyond the approved plan with this code; the screen that shows it is items.id=902 or 904
   'step_review.stop.required', // items.id=884: the backend parks an external step with this code. The run status event carries no park reason, so no surface shows these four yet (the run plan, items.id=901, or the chooser, items.id=900, would)
   'step_review.stop.privacy_filter_unavailable', // same
   'step_review.stop.blocked', // same

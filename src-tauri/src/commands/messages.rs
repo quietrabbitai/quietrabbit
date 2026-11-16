@@ -596,6 +596,7 @@ pub async fn send_message(
     scheduler: tauri::State<'_, Arc<ConductorScheduler>>,
     pool: tauri::State<'_, sqlx::SqlitePool>,
     key_registry: State<'_, KeyRegistry>,
+    plan_memory: State<'_, crate::conductor::plan_memory::PlanMemory>,
     request: SendMessageRequest,
 ) -> Result<Vec<MessageInfo>, String> {
     let SendMessageRequest {
@@ -633,6 +634,23 @@ pub async fn send_message(
                 .to_owned())
         }
     }
+
+    // 0.5. items.id=901 (the run plan): the plan preflight, BEFORE the turn is saved. A
+    // Focus whose plan needs an approval this chat does not have is refused with
+    // `plan_required` here, so the turn is not saved and the call-again (after
+    // approve_run_plan) cannot duplicate it. A Focus with no model block costs one indexed
+    // read of shared.db and nothing else.
+    execution::plan_preflight(
+        Arc::clone(&*scheduler),
+        pool.inner().clone(),
+        plan_memory.inner().clone(),
+        key_hex_str.clone(),
+        user_id.clone(),
+        persona_id.clone(),
+        focus_id.clone(),
+        context_key.clone(),
+    )
+    .await?;
 
     // 1. Persist the user's turn. items.id=587 (decisions.id=844): the
     // owning chat row is no longer created/bumped here -- that now happens
@@ -677,8 +695,9 @@ pub async fn send_message(
         persona_id: persona_id.clone(),
         topic_id: None,
         confirmed_cross_persona_fact_ids,
+        plan_token: None,
     };
-    let mut run = execution::load_and_authorize_run(
+    let mut run = match execution::load_and_authorize_run(
         app_handle,
         scheduler,
         pool,
@@ -686,9 +705,17 @@ pub async fn send_message(
         crisis_detected,
         None,
         Some(context_key.clone()),
+        plan_memory.inner().clone(),
         request,
     )
-    .await?;
+    .await?
+    {
+        execution::LoadOutcome::Ready(run) => *run,
+        // The preflight above said this plan was approved; it no longer is (an approval
+        // cleared, the answers changed, a latch set in between). The turn is saved and
+        // nothing was started. items.id=901 stage 6 leaves the duplicate-turn marker here.
+        execution::LoadOutcome::PlanRequired(_) => return Err(execution::plan_required_error()),
+    };
     run.attach_lease(lease).map_err(|e| e.to_string())?;
     // items.id=387: the raw turn, for the hand-off return writer alone (never
     // persisted or logged; see conductor::handoff_writer).

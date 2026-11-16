@@ -201,6 +201,12 @@ pub enum LifecycleError {
     /// on rehydrate.
     #[error("Launch answers are not available when resuming Focus '{0}': start the run again")]
     LaunchAnswersUnavailableOnResume(String),
+    /// items.id=901: the run plan of a Focus with a model block could not be worked
+    /// out (the guard paths could not be analysed, no path is reachable, or the
+    /// launch configuration could not be read). The run does not start: fail
+    /// closed, and no hosted step runs. The code is the whole message, never detail.
+    #[error("plan_unavailable")]
+    PlanUnavailable,
     /// items.id=887: a store writer row failed, so the pass stops and nothing
     /// after it runs (fail closed). A one-time chat's refusal is not this: it
     /// is an Ok outcome that writes nothing.
@@ -1864,7 +1870,25 @@ pub struct FocusRun<L: DisclosureLoggerForRun = SqliteDisclosureLogger> {
     /// through `attach_lease` (a source-scan test in auth/writer_gate.rs
     /// enforces it), which also binds the lease to this run's id.
     pub(crate) lease: Option<crate::auth::writer_gate::WriterLease>,
+    /// items.id=901: the memory-only home of the run plan (conductor::plan_memory), set by
+    /// the SERVER (commands::execution::load_and_authorize_run). None for a rehydrated or
+    /// swept run, which therefore can read no approval: every approval check then fails
+    /// closed to "ask again".
+    pub(crate) plan_memory: Option<crate::conductor::plan_memory::PlanMemory>,
+    /// items.id=901: the opaque token of a run with no chat, naming the offer the user
+    /// approved. Taken (and consumed) by plan_gate(). Never logged.
+    pub(crate) plan_token: Option<String>,
+    /// items.id=901: the approval this run is allowed to act under, set by plan_gate() only
+    /// when a stored approval was read AND verified against the plan the run recomputed.
+    /// None means no approval: only a resolver pick of a local model may run. In memory
+    /// only, never checkpointed, serialized or logged (a source scan pins its readers).
+    pub(crate) plan: Option<Arc<crate::conductor::plan_approval::Approval>>,
 }
+
+/// items.id=901 stage 4: the plan gate of a run start (see plan_gate.rs).
+#[path = "plan_gate.rs"]
+mod plan_gate;
+pub(crate) use plan_gate::{focus_has_model_block, PlanGate};
 
 impl<L: DisclosureLoggerForRun> FocusRun<L> {
     #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
@@ -1922,6 +1946,9 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             launch: crate::conductor::run_settings::LaunchResolution::default(),
             rehydrated: false,
             lease: None,
+            plan_memory: None,
+            plan_token: None,
+            plan: None,
         }
     }
 
@@ -2177,7 +2204,21 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
 
     /// Verify tier permissions and key; create focus_run record at status=initializing.
     /// Python oracle: FocusRun.authorize()
+    ///
+    /// items.id=901: exactly authorize_checks() then open_record() (a test pins both the
+    /// order and that nothing else is here). The two halves are separate so the run plan
+    /// can be computed BETWEEN them: after the authorization checks and BEFORE the
+    /// focus_runs row is written, because a PlanRequired result after the write would
+    /// leave an `initializing` row that demote_interrupted_runs() turns into a resumable
+    /// paused run.
     pub async fn authorize(&mut self) -> Result<(), LifecycleError> {
+        self.authorize_checks().await?;
+        self.open_record().await
+    }
+
+    /// The checks half of AUTHORIZE: the key, the tier ceiling and the failure handler.
+    /// Writes nothing.
+    pub(crate) async fn authorize_checks(&mut self) -> Result<(), LifecycleError> {
         let _ = self
             .focus_def
             .as_ref()
@@ -2191,6 +2232,12 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
 
         self.resolve_tier_config().await?;
         self.failure_handler = Some(self.build_failure_handler().await);
+        Ok(())
+    }
+
+    /// The record half of AUTHORIZE: mint the run id and write the focus_runs row at
+    /// status=initializing.
+    pub(crate) async fn open_record(&mut self) -> Result<(), LifecycleError> {
         self.focus_run_id = Some(Uuid::new_v4().to_string());
         self.write_focus_run_record("initializing").await?;
         Ok(())
@@ -3684,6 +3731,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             stop: self.lease.as_ref().map(|l| l.stop_token().clone()),
             bound: self.chat_binding.clone(),
             store_tokens: self.store_tokens.clone(),
+            plan: self.plan.clone(),
         };
 
         // Borrow distinct fields of self simultaneously — Rust borrow checker allows

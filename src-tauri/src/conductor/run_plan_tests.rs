@@ -955,17 +955,17 @@ use crate::spend::disclosure::attributes_hash;
 use crate::spend::estimate::worst_case;
 use crate::spend::price::{resolve_price, PriceQuote};
 
-const SPEND_USER: &str = "user-plan";
-const PRICE_TEXT: &str =
+pub(crate) const SPEND_USER: &str = "user-plan";
+pub(crate) const PRICE_TEXT: &str =
     r#"{"input_per_mtok":0.50,"output_per_mtok":1.50,"as_of":"2026-10-11","source":"curated"}"#;
-const HOST: &str = "fixture-host-a";
-const MODEL: &str = "fixture-model-a";
+pub(crate) const HOST: &str = "fixture-host-a";
+pub(crate) const MODEL: &str = "fixture-model-a";
 
-fn fixture_key_hex() -> String {
+pub(crate) fn fixture_key_hex() -> String {
     crate::auth::registry::key_hex(&[0x77; crate::auth::kdf::MASTER_KEY_LEN])
 }
 
-async fn with_temp_shared_db<F, Fut>(f: F) -> Fut::Output
+pub(crate) async fn with_temp_shared_db<F, Fut>(f: F) -> Fut::Output
 where
     F: FnOnce(sqlx::SqlitePool) -> Fut,
     Fut: std::future::Future,
@@ -994,7 +994,7 @@ where
 
 /// A hosted fixture provider and model with a price, a stored key and a current consent,
 /// plus every curated local model marked installed.
-async fn hosted_rig(pool: &sqlx::SqlitePool, price: Option<&str>) -> String {
+pub(crate) async fn hosted_rig(pool: &sqlx::SqlitePool, price: Option<&str>) -> String {
     use crate::persistence::provider_store::{
         create_provider, NewProvider, PrivacyGuardianDefaultLevel, ProviderMode,
     };

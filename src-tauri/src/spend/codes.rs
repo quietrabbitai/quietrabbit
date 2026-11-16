@@ -20,6 +20,8 @@
 //                  for a reason that is not spend (items.id=716)
 //   resolver.*     the model resolver stopped a model-block step before any
 //                  model was called (items.id=896)
+//   plan.*         the run plan's approved envelope stopped a model-block step before
+//                  any model was called (items.id=901)
 //   step_review.*  the outbound review of an external step's rendered prompt
 //                  parked or ended the step before any network traffic
 //                  (items.id=884, decisions.id=943)
@@ -153,6 +155,15 @@ pub enum Code {
     /// the reason.
     ResolverNoCandidate,
 
+    // -- the run plan's approved envelope (items.id=901) -----------------------
+    /// A model-block step's pick is beyond what the user approved in the run plan:
+    /// a hosted or pinned model with no matching approved choice, an approved
+    /// choice that is no longer available, or (stage 5) a cost over the approved
+    /// ceiling. Nothing was sent and no other model was used. The parameters carry
+    /// the action id and a reason code (no_approval, model_not_planned,
+    /// pin_unavailable, over_ceiling).
+    PlanExceeded,
+
     // -- the outbound review of an external step's prompt (items.id=884) -------
     /// The review found text the user must decide on, and the step is parked
     /// until they answer. Nothing was sent. The parameters carry the review id
@@ -223,6 +234,7 @@ impl Code {
         Code::ApiChatPrivacyFilterUnavailable,
         Code::ResolverTooWeak,
         Code::ResolverNoCandidate,
+        Code::PlanExceeded,
         Code::StepReviewRequired,
         Code::StepReviewPrivacyFilterUnavailable,
         Code::StepReviewBlocked,
@@ -279,6 +291,7 @@ impl Code {
             Code::ApiChatPrivacyFilterUnavailable => "api_chat.privacy_filter_unavailable",
             Code::ResolverTooWeak => "resolver.too_weak",
             Code::ResolverNoCandidate => "resolver.no_candidate",
+            Code::PlanExceeded => "plan.exceeded",
             Code::StepReviewRequired => "step_review.required",
             Code::StepReviewPrivacyFilterUnavailable => "step_review.privacy_filter_unavailable",
             Code::StepReviewBlocked => "step_review.blocked",
@@ -369,6 +382,7 @@ mod tests {
             "api_chat.privacy_filter_unavailable",
             "resolver.too_weak",
             "resolver.no_candidate",
+            "plan.exceeded",
             "step_review.required",
             "step_review.privacy_filter_unavailable",
             "step_review.blocked",
@@ -400,10 +414,10 @@ mod tests {
     /// this length check keeps the two in step.
     #[test]
     fn all_lists_every_variant() {
-        // 17 warnings + 11 blocks + 6 API Chat stops + 2 resolver stops + 4 step
-        // review codes + 1 cost basis + 3 price states + 3 limit states + 4
-        // consent states.
-        assert_eq!(Code::ALL.len(), 51);
+        // 17 warnings + 11 blocks + 6 API Chat stops + 2 resolver stops + 1 plan
+        // stop + 4 step review codes + 1 cost basis + 3 price states + 3 limit
+        // states + 4 consent states.
+        assert_eq!(Code::ALL.len(), 52);
     }
 
     #[test]

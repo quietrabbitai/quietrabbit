@@ -52,8 +52,10 @@ use tauri::State;
 
 use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::conductor::concurrency::ConductorScheduler;
-use crate::conductor::lifecycle::{rehydrate_focus_run, FocusRun, LifecycleError};
+use crate::conductor::lifecycle::{rehydrate_focus_run, FocusRun, LifecycleError, PlanGate};
+use crate::conductor::plan_memory::PlanMemory;
 use crate::conductor::reentry::ReentryError;
+use crate::conductor::run_plan::RunPlan;
 use crate::persistence::output_store;
 
 // ---------------------------------------------------------------------------
@@ -75,6 +77,35 @@ pub struct SubmitFocusRunRequest {
     /// here is omitted from context, not blocked (declined-or-unasked case).
     /// Empty vec is valid -- most runs have no pending cross-Persona facts.
     pub confirmed_cross_persona_fact_ids: Vec<String>,
+    /// items.id=901 (the run plan): the opaque token get_run_plan returned for THIS run's
+    /// offer, when the user has approved it (approve_run_plan). A run with no chat has no
+    /// chat to hang an approval on, so the approval is named by this token, taken and
+    /// consumed by the run that presents it. It names an approval the user made in this
+    /// session; it grants nothing by itself (the run still recomputes the plan and verifies
+    /// the approval against it). None for a Focus with no model block and for a first call.
+    pub plan_token: Option<String>,
+}
+
+/// items.id=901: the stable error string of a run start that needs a plan approval it
+/// does not have (approve-then-call-again, the shape of API Chat's ReviewRequired). The
+/// frontend reads the offer with get_run_plan, approves with approve_run_plan and calls
+/// again. Pinned by a test like API Chat's stop codes.
+pub const PLAN_REQUIRED_CODE: &str = "plan_required";
+
+pub(crate) fn plan_required_error() -> String {
+    PLAN_REQUIRED_CODE.to_owned()
+}
+
+/// What starting a run produced (items.id=901): the authorized run, or the plan it needs
+/// approved first. In the second case NOTHING was written (no focus_runs row), so there is
+/// nothing to clean up and no run is parked for the plan.
+pub(crate) enum LoadOutcome {
+    Ready(Box<FocusRun>),
+    /// The plan the run needs approved. The commands answer `plan_required` and do not
+    /// read it: the screen reads the same offer with get_run_plan (a later stage), which
+    /// recomputes it, so a stale copy is never shown.
+    #[allow(dead_code)]
+    PlanRequired(Box<RunPlan>),
 }
 
 #[derive(Debug, Serialize, Type)]
@@ -159,6 +190,12 @@ pub struct ReenterStepResponse {
 /// was written) across this call and moves it into `run.lease` afterwards, so
 /// the run keeps it until it is dropped. If LOAD or AUTHORIZE fails the lease
 /// is dropped with the error.
+///
+/// items.id=901 (the run plan): between the authorization checks and the write of the
+/// focus_runs row the PLAN GATE runs (FocusRun::plan_gate). A Focus with a model block that
+/// may go hosted and has no verified approval returns LoadOutcome::PlanRequired and writes
+/// nothing. `plan_memory` is the memory-only home the gate reads an approval from; the
+/// request's `plan_token` names the approval of a run with no chat.
 // 8 arguments: the Tauri-injected state, the caller's key, crisis flag, API Chat
 // binding and chat key, and the request. Bundling them would hide which are
 // server-side (never the DTO), which is the point of the signature.
@@ -171,9 +208,11 @@ pub(crate) async fn load_and_authorize_run(
     crisis_detected: bool,
     bound: Option<crate::api_chat::BoundDestination>,
     context_key: Option<String>,
+    plan_memory: PlanMemory,
     request: SubmitFocusRunRequest,
-) -> Result<FocusRun, String> {
+) -> Result<LoadOutcome, String> {
     let is_quick_ask = is_quick_ask_focus(&request.focus_id);
+    let plan_token = request.plan_token.clone();
     let scheduler = Arc::clone(&*scheduler);
     let confirmed_cross_persona_fact_ids: std::collections::HashSet<String> = request
         .confirmed_cross_persona_fact_ids
@@ -203,15 +242,77 @@ pub(crate) async fn load_and_authorize_run(
     run.crisis_floor_triggered = crisis_detected;
     run.chat_binding = bound;
     run.context_key = context_key;
+    run.plan_memory = Some(plan_memory);
+    run.plan_token = plan_token;
     // A user started this run from the app (items.id=710): attended.
     run.attendance = crate::spend::gate::RunAttendance::Attended;
 
     // Phase 1 LOAD and Phase 2 AUTHORIZE run synchronously before returning,
-    // guaranteeing a valid run_id is available to the caller.
+    // guaranteeing a valid run_id is available to the caller. AUTHORIZE is its two halves
+    // (authorize() is exactly these two calls in this order), with the plan gate between
+    // them: the focus_runs row is written only for a run that may start.
     run.load().await.map_err(|e| e.to_string())?;
-    run.authorize().await.map_err(|e| e.to_string())?;
+    run.authorize_checks().await.map_err(|e| e.to_string())?;
+    match run.plan_gate().await.map_err(|e| e.to_string())? {
+        PlanGate::Required(plan) => return Ok(LoadOutcome::PlanRequired(plan)),
+        PlanGate::Proceed => {}
+    }
+    run.open_record().await.map_err(|e| e.to_string())?;
 
-    Ok(run)
+    Ok(LoadOutcome::Ready(Box::new(run)))
+}
+
+/// The plan preflight of a chat send (items.id=901): run BEFORE the user's turn is saved,
+/// so a plan that needs approval is refused without a turn that the call-again would then
+/// duplicate. It is the same plan gate, over a throwaway run built from the same inputs, and
+/// it writes nothing and consumes nothing (a chat reads its approval, it never takes a token).
+///
+/// A Focus with no model block costs ONE indexed read of shared.db (focus_has_model_block)
+/// and nothing else: no Focus is loaded, no database of the persona is opened, no plan is
+/// built. Any error other than PlanRequired is left for the real start to report as it
+/// always has, so this adds no new failure to a send.
+// 8 arguments, as load_and_authorize_run: the server-side state and the caller's ids, none
+// of them the request DTO.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn plan_preflight(
+    scheduler: Arc<ConductorScheduler>,
+    pool: sqlx::SqlitePool,
+    plan_memory: PlanMemory,
+    key_hex: String,
+    user_id: String,
+    persona_id: String,
+    focus_id: String,
+    context_key: String,
+) -> Result<(), String> {
+    // A read that fails is answered by running the full preflight.
+    if let Ok(false) = crate::conductor::lifecycle::focus_has_model_block(&pool, &focus_id).await {
+        return Ok(());
+    }
+    let is_quick_ask = is_quick_ask_focus(&focus_id);
+    let mut run: FocusRun = FocusRun::new(
+        user_id,
+        persona_id,
+        focus_id,
+        pool,
+        scheduler,
+        String::new(),
+        false,
+        Some(key_hex),
+        None,
+        is_quick_ask,
+        std::collections::HashSet::new(),
+        None,
+    );
+    run.context_key = Some(context_key);
+    run.plan_memory = Some(plan_memory);
+    if run.load().await.is_err() || run.authorize_checks().await.is_err() {
+        return Ok(());
+    }
+    match run.plan_gate().await {
+        Ok(PlanGate::Required(_)) => Err(plan_required_error()),
+        // Proceed, or an error the real start will report itself.
+        _ => Ok(()),
+    }
 }
 
 /// Whether a run's Focus id is the retired Quick Ask Focus. Pulled out so a
@@ -228,6 +329,7 @@ pub async fn submit_focus_run(
     scheduler: tauri::State<'_, Arc<ConductorScheduler>>,
     pool: tauri::State<'_, sqlx::SqlitePool>,
     key_registry: State<'_, KeyRegistry>,
+    plan_memory: State<'_, PlanMemory>,
     request: SubmitFocusRunRequest,
 ) -> Result<SubmitFocusRunResponse, String> {
     let key_hex_str = key_registry
@@ -246,7 +348,7 @@ pub async fn submit_focus_run(
     // blended with any history here, so this is already the "fresh turn".
     let crisis_detected = crate::conductor::crisis::detect(&request.user_input);
 
-    let mut run = load_and_authorize_run(
+    let mut run = match load_and_authorize_run(
         app_handle,
         scheduler,
         pool,
@@ -254,9 +356,15 @@ pub async fn submit_focus_run(
         crisis_detected,
         None,
         None, // submit_focus_run belongs to no chat
+        plan_memory.inner().clone(),
         request,
     )
-    .await?;
+    .await?
+    {
+        LoadOutcome::Ready(run) => *run,
+        // items.id=901: nothing was written and no run was parked.
+        LoadOutcome::PlanRequired(_) => return Err(plan_required_error()),
+    };
     run.attach_lease(lease).map_err(|e| e.to_string())?;
 
     let run_id = run
