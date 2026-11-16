@@ -1,4 +1,4 @@
-// The four backend calls the step review host makes (items.id=884 stage 2), kept
+// The five backend calls the step review host makes (items.id=884 stage 2), kept
 // apart from the hook so each is one obvious call. Every one answers with a value,
 // never throws: a rejected invoke becomes an error result.
 import { commands, type PendingStepReview } from '../bindings'
@@ -19,6 +19,22 @@ export async function pullPendingReview(personaId: string, runId: string): Promi
   try {
     const r = await commands.getPendingStepReview({ persona_id: personaId, run_id: runId })
     return r.status === 'ok' ? { status: 'ok', review: r.data } : { status: 'error', error: r.error }
+  } catch (e) {
+    return { status: 'error', error: message(e) }
+  }
+}
+
+export type Listed =
+  | { status: 'ok'; reviews: PendingStepReview[] }
+  | { status: 'error'; error: string }
+
+/** Every review of the persona whose run is open and waiting, oldest first
+ *  (list_pending_step_reviews). Read on mount, so a review whose event was missed is
+ *  found without being told which run to look at. */
+export async function listPendingReviews(personaId: string): Promise<Listed> {
+  try {
+    const r = await commands.listPendingStepReviews(personaId)
+    return r.status === 'ok' ? { status: 'ok', reviews: r.data } : { status: 'error', error: r.error }
   } catch (e) {
     return { status: 'error', error: message(e) }
   }

@@ -1064,6 +1064,7 @@ export const commands = {
 	state: string,
 	spans: PendingStepReviewSpan[],
 } | null, string>(__TAURI_INVOKE("get_pending_step_review", { request })),
+	listPendingStepReviews: (personaId: string) => typedError<PendingStepReview[], string>(__TAURI_INVOKE("list_pending_step_reviews", { personaId })),
 	declineStepReview: (request: StepReviewRunRequest) => typedError<boolean, string>(__TAURI_INVOKE("decline_step_review", { request })),
 };
 

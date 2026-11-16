@@ -12,6 +12,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { ElementDecision } from '../cloudChatAccess/consentDecisions'
 import {
   declinePendingReview,
+  listPendingReviews,
   pullPendingReview,
   resumeParkedRun,
   sendAnswers,
@@ -50,18 +51,9 @@ export interface StepReviewController {
 export interface UseStepReviewOptions {
   userId: string
   personaId: string
-  /** Runs a surface already knows are parked (a chat's active run, say): asked about
-   *  once on mount. The host cannot discover a run it was never told of -- there is no
-   *  list command -- so after a restart a review is found only through such a run id
-   *  or the run's next status event. */
-  knownRunIds?: readonly string[]
 }
 
-export function useStepReview({
-  userId,
-  personaId,
-  knownRunIds,
-}: UseStepReviewOptions): StepReviewController {
+export function useStepReview({ userId, personaId }: UseStepReviewOptions): StepReviewController {
   const [state, setState] = useState<HostState>(INITIAL_STATE)
   const stateRef = useRef<HostState>(INITIAL_STATE)
   const aliveRef = useRef(true)
@@ -160,14 +152,25 @@ export function useStepReview({
     }
   }, [dispatch])
 
-  // Runs a surface knows about: asked once. The event type is the hint that makes the
-  // state machine pull; the backend's answer decides whether anything opens.
-  const knownKey = (knownRunIds ?? []).join('|')
+  // Once on mount: every review of this Persona whose run is open and waiting
+  // (list_pending_step_reviews). The listeners above are attached first, so an event
+  // that arrives meanwhile is not lost, and each review found goes through the same
+  // state machine as a pulled one (a ready one opens the modal, a needs_resume one
+  // resumes its run). This is what finds a review after a restart, when no event will
+  // ever come for it. A failed read leaves the host as it is: the next event still
+  // finds a review.
   useEffect(() => {
-    for (const runId of knownKey === '' ? [] : knownKey.split('|')) {
-      dispatch({ type: 'consent_request', runId })
+    let cancelled = false
+    void listPendingReviews(personaId).then((r) => {
+      if (cancelled || r.status !== 'ok') return
+      for (const review of r.reviews) {
+        dispatchRef.current({ type: 'pulled', runId: review.run_id, review })
+      }
+    })
+    return () => {
+      cancelled = true
     }
-  }, [knownKey, dispatch])
+  }, [personaId])
 
   return {
     shown: shown(state),

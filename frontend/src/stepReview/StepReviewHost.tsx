@@ -10,7 +10,9 @@
 //     to the text it renders and sends. "Don't send" refuses: the run is cancelled.
 //   * a small notice when the answers could not be recorded (Try again / Don't send),
 //     or when the review could not be brought back up (Check again).
-// A review the backend reports as needing a resume (the app restarted) is resumed
+// On mount the host reads every open review of its Persona once
+// (list_pending_step_reviews), so a review it never saw an event for (the app
+// restarted) is found. A review the backend reports as needing a resume (the app restarted) is resumed
 // automatically so it is asked again, and a modal whose run has no pending review any
 // more is dismissed. Neither shows anything.
 //
@@ -31,13 +33,11 @@ import { useStepReview } from './useStepReview'
 export interface StepReviewHostProps {
   userId: string
   personaId: string
-  /** Runs a surface already knows are parked; see useStepReview. */
-  knownRunIds?: readonly string[]
 }
 
-export function StepReviewHost({ userId, personaId, knownRunIds }: StepReviewHostProps) {
+export function StepReviewHost({ userId, personaId }: StepReviewHostProps) {
   const { t } = useTranslation()
-  const review = useStepReview({ userId, personaId, knownRunIds })
+  const review = useStepReview({ userId, personaId })
   const current = review.shown
   const visible = current !== null
 

@@ -16,7 +16,10 @@
 // prefix) and a Gate 3 promotion's. So an event only makes the host ask the backend
 // (get_pending_step_review), and the backend's answer is the only thing that opens
 // the modal. The same pull runs when a run's status becomes awaiting_user, which is
-// the moment after the record exists (run-status-update carries no park reason).
+// the moment after the record exists (run-status-update carries no park reason). On
+// mount the host reads every open review of its Persona in one call
+// (list_pending_step_reviews) and feeds each through the same `pulled` event, which
+// is what finds a review after a restart.
 //
 // THREE RULES THE STATE MACHINE KEEPS:
 //   * needs_resume (the app restarted: the backend no longer holds the flagged

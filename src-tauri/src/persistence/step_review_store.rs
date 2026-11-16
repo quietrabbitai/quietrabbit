@@ -465,6 +465,30 @@ pub async fn pending_review_for_run(
     row.as_ref().map(row_of).transpose()
 }
 
+/// Every PENDING review of the persona whose run is still open (not failed,
+/// cancelled or complete), oldest first. A run that has ended has no one to answer
+/// for: cancel_run supersedes its pending rows, and a run that ended any other way
+/// is left out here rather than shown. The persona is the file, so this is the
+/// persona's.
+pub async fn list_open_pending_reviews(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<StepReviewRow>, StepReviewStoreError> {
+    let columns = COLUMNS
+        .split(',')
+        .map(|c| format!("r.{}", c.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT {columns} FROM step_reviews r
+         JOIN focus_runs f ON f.id = r.focus_run_id
+         WHERE r.outcome = 'pending'
+           AND f.status NOT IN ('failed', 'cancelled', 'complete')
+         ORDER BY r.created_at ASC, r.rowid ASC"
+    );
+    let rows = sqlx::query(&sql).fetch_all(conn).await?;
+    rows.iter().map(row_of).collect()
+}
+
 /// Every review of one action of a run, oldest first (for items.id=901 and 913).
 pub async fn list_reviews(
     conn: &mut SqliteConnection,
@@ -787,6 +811,55 @@ mod tests {
             ReviewOutcome::Clean,
             "a final row is never superseded"
         );
+    }
+
+    #[tokio::test]
+    async fn the_open_pending_list_holds_only_pending_rows_of_open_runs() {
+        let mut conn = conn_with_run("run1").await;
+        for (id, status) in [
+            ("run2", "awaiting_user"),
+            ("run3", "cancelled"),
+            ("run4", "failed"),
+            ("run5", "complete"),
+        ] {
+            sqlx::query(
+                "INSERT INTO focus_runs (id, focus_id, status, started_at) VALUES (?, 'f', ?, 't')",
+            )
+            .bind(id)
+            .bind(status)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+        let s = StoredSpans::default();
+        let first = insert_review(&mut conn, &pending("run1", "a", SHA_A, &s))
+            .await
+            .unwrap();
+        let second = insert_review(&mut conn, &pending("run2", "b", SHA_A, &s))
+            .await
+            .unwrap();
+        for run in ["run3", "run4", "run5"] {
+            insert_review(&mut conn, &pending(run, "a", SHA_A, &s))
+                .await
+                .unwrap();
+        }
+        // A final row and a blocked row of an open run are not pending.
+        let mut done = pending("run1", "c", SHA_A, &s);
+        done.outcome = ReviewOutcome::Clean;
+        done.outbound_sha = Some(SHA_A);
+        done.outbound_len = Some(20);
+        insert_review(&mut conn, &done).await.unwrap();
+        let blocked = insert_review(&mut conn, &pending("run2", "d", SHA_A, &s))
+            .await
+            .unwrap();
+        assert!(block_pending_review(&mut conn, &blocked, "x")
+            .await
+            .unwrap());
+
+        let listed = list_open_pending_reviews(&mut conn).await.unwrap();
+        let ids: Vec<&str> = listed.iter().map(|r| r.review_id.as_str()).collect();
+        assert_eq!(ids, [first.as_str(), second.as_str()], "oldest first");
+        assert_eq!(listed[1].focus_run_id, "run2");
     }
 
     #[tokio::test]

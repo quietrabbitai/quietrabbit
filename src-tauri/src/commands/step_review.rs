@@ -11,6 +11,13 @@
 //       consent_request event (it mounted late, the run was started elsewhere)
 //       can still show the review. READ ONLY.
 //
+//   list_pending_step_reviews(persona_id)
+//       Every review of the persona whose run is still open and waiting for an
+//       answer, oldest first, each as get_pending_step_review would give it. It is
+//       what the host asks once on mount, so a review whose consent_request event
+//       was missed (the app restarted, the host mounted late) is found without being
+//       told which run to look at. READ ONLY.
+//
 //   decline_step_review(persona_id, run_id)
 //       The user refused to send. The pending review becomes `refused` and the run
 //       is cancelled, as for cancel_run (a use-local-instead path belongs to the
@@ -30,6 +37,7 @@
 // ERROR CODES (ERROR_CODES, each with a placeholder key step_review.error.<code> in
 // the frontend's en.json, a test requires it): persona_not_found, invalid_run_id,
 // step_review_unavailable. The last is any store failure and carries no detail.
+// (The list command takes no run id, so it answers only the first and the last.)
 
 use serde::Deserialize;
 use specta::Type;
@@ -126,6 +134,33 @@ pub(crate) async fn get_pending_step_review_for_session(
     step_review::pending_view(&mut conn, run_id)
         .await
         .map_err(|e| unavailable("read pending review", e))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_pending_step_reviews(
+    persona_id: String,
+    key_registry: State<'_, KeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
+) -> Result<Vec<PendingStepReview>, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
+    let (user_id, key_hex) = session_user_and_key(&key_registry).await?;
+    list_pending_step_reviews_for_session(&pool, &user_id, &key_hex, &persona_id).await
+}
+
+pub(crate) async fn list_pending_step_reviews_for_session(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    key_hex: &str,
+    persona_id: &str,
+) -> Result<Vec<PendingStepReview>, String> {
+    require_persona(pool, user_id, persona_id).await?;
+    let mut conn = output_store::open_outputs_db(user_id, persona_id, key_hex)
+        .await
+        .map_err(|e| unavailable("open outputs.db", e))?;
+    step_review::pending_views(&mut conn)
+        .await
+        .map_err(|e| unavailable("list pending reviews", e))
 }
 
 #[tauri::command]
@@ -370,6 +405,146 @@ mod tests {
         assert!(view.spans.is_empty(), "no text without the held spans");
     }
 
+    async fn list(e: &Env, persona: &str) -> Result<Vec<PendingStepReview>, String> {
+        list_pending_step_reviews_for_session(&e.pool, &e.user, &e.key, persona).await
+    }
+
+    #[tokio::test]
+    async fn the_list_is_empty_with_nothing_pending() {
+        let e = env().await;
+        assert!(list(&e, &e.persona).await.unwrap().is_empty());
+        let run = uuid::Uuid::new_v4().to_string();
+        run_row(&e, &run).await;
+        assert!(list(&e, &e.persona).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_list_holds_every_open_pending_review_oldest_first() {
+        let e = env().await;
+        let first = uuid::Uuid::new_v4().to_string();
+        let second = uuid::Uuid::new_v4().to_string();
+        run_row(&e, &first).await;
+        run_row(&e, &second).await;
+        let id1 = park(&e, &first).await;
+        let id2 = park(&e, &second).await;
+
+        let listed = list(&e, &e.persona).await.unwrap();
+        let ids: Vec<&str> = listed.iter().map(|r| r.review_id.as_str()).collect();
+        assert_eq!(ids, [id1.as_str(), id2.as_str()]);
+        assert_eq!(listed[0].run_id, first);
+        assert_eq!(listed[1].run_id, second);
+        // The text is held, so each is ready with its spans, as the per-run read says.
+        for r in &listed {
+            assert_eq!(r.state, STATE_READY);
+            assert_eq!(r.spans[0].original_text, "Ann Smith");
+        }
+        let single = get(&e, &e.persona, &first).await.unwrap().unwrap();
+        assert_eq!(single.review_id, listed[0].review_id);
+        assert_eq!(single.state, listed[0].state);
+    }
+
+    #[tokio::test]
+    async fn the_list_omits_ended_runs_and_answered_reviews() {
+        let e = env().await;
+        let open = uuid::Uuid::new_v4().to_string();
+        let ended = uuid::Uuid::new_v4().to_string();
+        let declined = uuid::Uuid::new_v4().to_string();
+        for r in [&open, &ended, &declined] {
+            run_row(&e, r).await;
+        }
+        let keep = park(&e, &open).await;
+        park(&e, &ended).await;
+        park(&e, &declined).await;
+        // One run failed without cancelling (its row is still pending), one review
+        // was refused.
+        let mut c = conn(&e).await;
+        sqlx::query("UPDATE focus_runs SET status = 'failed' WHERE id = ?")
+            .bind(&ended)
+            .execute(&mut c)
+            .await
+            .unwrap();
+        drop(c);
+        assert!(
+            decline_step_review_for_session(&e.pool, &e.user, &e.key, &e.persona, &declined)
+                .await
+                .unwrap()
+        );
+        let listed = list(&e, &e.persona).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].review_id, keep);
+    }
+
+    #[tokio::test]
+    async fn the_list_reports_needs_resume_when_the_text_is_not_held() {
+        let e = env().await;
+        let run = uuid::Uuid::new_v4().to_string();
+        run_row(&e, &run).await;
+        let mut c = conn(&e).await;
+        let spans = store::StoredSpans {
+            asked: vec![store::AskedSpan {
+                span_id: "gone".into(),
+                start_byte: 9,
+                end_byte: 18,
+                category: "private_person".into(),
+                review_tier: "high".into(),
+            }],
+            settled: vec![],
+        };
+        store::insert_review(
+            &mut c,
+            &store::NewReview {
+                focus_run_id: &run,
+                action_id: "draft",
+                prompt_sha: &step_review::sha256_hex(PROMPT),
+                prompt_len: PROMPT.len(),
+                spans: &spans,
+                counts: store::Counts::default(),
+                outcome: ReviewOutcome::Pending,
+                reason: None,
+                outbound_sha: None,
+                outbound_len: None,
+                provider_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        drop(c);
+        let listed = list(&e, &e.persona).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].state, STATE_NEEDS_RESUME);
+        assert!(listed[0].spans.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_list_checks_the_persona_and_never_reads_another_users() {
+        let e = env().await;
+        let run = uuid::Uuid::new_v4().to_string();
+        run_row(&e, &run).await;
+        park(&e, &run).await;
+        let other_user = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            list(&e, "persona-1").await.unwrap_err(),
+            "persona_not_found"
+        );
+        assert_eq!(
+            list(&e, &e.persona.to_uppercase()).await.unwrap_err(),
+            "persona_not_found"
+        );
+        assert_eq!(
+            list_pending_step_reviews_for_session(&e.pool, &other_user, &e.key, &e.persona)
+                .await
+                .unwrap_err(),
+            "persona_not_found"
+        );
+        // Another persona of the same user has its own file and sees none of it.
+        let second = uuid::Uuid::new_v4().to_string();
+        persona_store::create_persona(&e.pool, &second, "Q", "personal", &e.user, &e.key, None)
+            .await
+            .unwrap();
+        assert!(list(&e, &second).await.unwrap().is_empty());
+        assert_eq!(list(&e, &e.persona).await.unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn declining_refuses_the_review_and_cancels_the_run() {
         let e = env().await;
@@ -451,6 +626,37 @@ mod tests {
             .keys()
             .collect();
         assert_eq!(keys.len(), ERROR_CODES.len(), "{keys:?}");
+    }
+
+    /// The list is read only: its body names no writer.
+    #[test]
+    fn the_list_command_is_read_only() {
+        let src = include_str!("step_review.rs");
+        let body = src.split("#[cfg(test)]").next().unwrap();
+        let start = body
+            .find("pub(crate) async fn list_pending_step_reviews_for_session")
+            .unwrap();
+        let end = body
+            .find("#[tauri::command]\n#[specta::specta]\npub async fn decline_step_review")
+            .unwrap();
+        let list = &body[start..end];
+        for banned in [
+            "decline_pending",
+            "cancel_run",
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "resume",
+        ] {
+            assert!(!list.contains(banned), "the list command names {banned}");
+        }
+        // The command itself takes the writer gate first, like its siblings.
+        let cmd_start = body
+            .find("pub async fn list_pending_step_reviews(")
+            .unwrap();
+        let cmd = &body[cmd_start..start];
+        assert!(cmd.contains("crate::auth::writer_gate::command(&key_registry).await?"));
+        assert!(cmd.contains("session_user_and_key(&key_registry)"));
     }
 
     /// The commands never read or return a prompt: production code names no

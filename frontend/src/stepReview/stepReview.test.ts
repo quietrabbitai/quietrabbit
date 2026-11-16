@@ -225,6 +225,41 @@ assert.deepEqual(reduce(INITIAL_STATE, { type: 'run_status', runId: 'api-chat-se
   assert.equal(t?.kind === 'modal' && t.runId, OTHER)
 }
 
+// -- the mount read: each review the list finds goes through the same `pulled` event
+{
+  // After a restart: one review's text is gone (needs_resume), another's is held.
+  const listed = [review('r1', 'needs_resume', RUN), review('r2', 'ready', OTHER)]
+  const { state, effects } = run(
+    listed.map((r) => ({ type: 'pulled', runId: r.run_id, review: r }) as HostEvent),
+  )
+  assert.deepEqual(effects, [{ kind: 'resume', runId: RUN }], 'only the one that needs it is resumed')
+  const s = shown(state)
+  assert.equal(s?.kind === 'modal' && s.runId, OTHER, 'the ready one is shown meanwhile')
+  assert.equal(state.runs[RUN].phase, 'resuming')
+  // The resumed run's review comes back ready and takes its place in the queue.
+  const after = reduce(state, { type: 'pulled', runId: RUN, review: review('r3', 'ready', RUN) }).state
+  assert.equal(after.runs[RUN].phase, 'review')
+  // An empty list changes nothing.
+  assert.equal(run([]).state, INITIAL_STATE)
+}
+
+// -- the hook reads the list once on mount, after its listeners are attached ------------
+{
+  const dir = path.dirname(fileURLToPath(import.meta.url))
+  const hook = fs
+    .readFileSync(path.join(dir, 'useStepReview.ts'), 'utf8')
+    .split('\n')
+    .filter((l) => !l.trim().startsWith('//'))
+    .join('\n')
+  assert.equal(hook.match(/listPendingReviews\(/g)?.length, 1, 'one list call, on mount')
+  assert.ok(
+    hook.indexOf("listen<ConsentRequestEvent>('consent_request'") < hook.indexOf('listPendingReviews('),
+    'the listeners are attached before the list is read',
+  )
+  assert.ok(hook.includes("type: 'pulled', runId: review.run_id, review"))
+  assert.equal(hook.includes('knownRunIds'), false, 'no run id has to be known any more')
+}
+
 // -- the modal's payload ---------------------------------------------------------
 {
   const p = modalPayload({ ...review('r1'), spans: [span('a', 'low'), span('b', 'medium')] }, 'a request')

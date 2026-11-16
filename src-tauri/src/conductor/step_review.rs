@@ -1136,16 +1136,10 @@ pub struct PendingStepReview {
 pub const STATE_READY: &str = "ready";
 pub const STATE_NEEDS_RESUME: &str = "needs_resume";
 
-/// The newest pending review of a run, with the text of its flagged spans when it
-/// is held in memory and still matches the stored descriptors (same prompt hash,
-/// same ids and offsets). Anything else is `needs_resume`.
-pub async fn pending_view(
-    conn: &mut SqliteConnection,
-    run_id: &str,
-) -> Result<Option<PendingStepReview>, store::StepReviewStoreError> {
-    let Some(row) = store::pending_review_for_run(conn, run_id).await? else {
-        return Ok(None);
-    };
+/// A pending review as the front end gets it: with the text of its flagged spans
+/// when that is held in memory and still matches the stored descriptors (same
+/// prompt hash, same ids and offsets), otherwise `needs_resume`.
+fn view_of(row: StepReviewRow) -> PendingStepReview {
     let held = held_spans(&row.review_id).filter(|(sha, spans)| {
         *sha == row.prompt_sha
             && spans.len() == row.spans.asked.len()
@@ -1160,13 +1154,36 @@ pub async fn pending_view(
         ),
         None => (STATE_NEEDS_RESUME, Vec::new()),
     };
-    Ok(Some(PendingStepReview {
+    PendingStepReview {
         review_id: row.review_id,
         run_id: row.focus_run_id,
         action_id: row.action_id,
         state: state.to_owned(),
         spans,
-    }))
+    }
+}
+
+/// The newest pending review of a run.
+pub async fn pending_view(
+    conn: &mut SqliteConnection,
+    run_id: &str,
+) -> Result<Option<PendingStepReview>, store::StepReviewStoreError> {
+    Ok(store::pending_review_for_run(conn, run_id)
+        .await?
+        .map(view_of))
+}
+
+/// Every pending review of the persona whose run is still open, oldest first: what
+/// a front end that has just started needs to find a review it never saw an event
+/// for (list_pending_step_reviews).
+pub async fn pending_views(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<PendingStepReview>, store::StepReviewStoreError> {
+    Ok(store::list_open_pending_reviews(conn)
+        .await?
+        .into_iter()
+        .map(view_of)
+        .collect())
 }
 
 /// The user refused to send: the newest pending review of the run becomes
