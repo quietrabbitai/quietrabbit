@@ -68,6 +68,26 @@ pub enum MigrationError {
     Subkey(#[from] crate::auth::subkeys::SubkeyError),
 }
 
+impl MigrationError {
+    /// True when the failure is another connection holding the database's write
+    /// lock (SQLITE_BUSY, "database is locked"): the migration lost a race for the
+    /// write lock and nothing was applied, so running it again is safe. Anything
+    /// else (a real schema fault, a bad key, an I/O error) is not contention.
+    /// items.id=884: output_store::open_outputs_db retries on exactly this.
+    pub fn is_lock_contention(&self) -> bool {
+        const BUSY: &str = "database is locked";
+        match self {
+            MigrationError::Locked => true,
+            MigrationError::Failed {
+                diagnostic: Some(d),
+                ..
+            } => d.contains(BUSY),
+            MigrationError::Sqlx(e) => e.to_string().contains(BUSY),
+            _ => false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Embedded schema files
 // ---------------------------------------------------------------------------

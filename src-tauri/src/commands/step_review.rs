@@ -128,7 +128,7 @@ pub(crate) async fn get_pending_step_review_for_session(
 ) -> Result<Option<PendingStepReview>, String> {
     require_persona(pool, user_id, persona_id).await?;
     require_run_id(run_id)?;
-    let mut conn = output_store::open_outputs_db(user_id, persona_id, key_hex)
+    let mut conn = output_store::open_outputs_db_retrying(user_id, persona_id, key_hex)
         .await
         .map_err(|e| unavailable("open outputs.db", e))?;
     step_review::pending_view(&mut conn, run_id)
@@ -155,7 +155,7 @@ pub(crate) async fn list_pending_step_reviews_for_session(
     persona_id: &str,
 ) -> Result<Vec<PendingStepReview>, String> {
     require_persona(pool, user_id, persona_id).await?;
-    let mut conn = output_store::open_outputs_db(user_id, persona_id, key_hex)
+    let mut conn = output_store::open_outputs_db_retrying(user_id, persona_id, key_hex)
         .await
         .map_err(|e| unavailable("open outputs.db", e))?;
     step_review::pending_views(&mut conn)
@@ -192,7 +192,7 @@ pub(crate) async fn decline_step_review_for_session(
     require_persona(pool, user_id, persona_id).await?;
     require_run_id(run_id)?;
     let refused = {
-        let mut conn = output_store::open_outputs_db(user_id, persona_id, key_hex)
+        let mut conn = output_store::open_outputs_db_retrying(user_id, persona_id, key_hex)
             .await
             .map_err(|e| unavailable("open outputs.db", e))?;
         step_review::decline_pending(&mut conn, run_id)

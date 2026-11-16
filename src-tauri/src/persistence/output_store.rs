@@ -195,10 +195,73 @@ fn get_outputs_db_path(user_id: &str, persona_id: &str) -> PathBuf {
 // connection for consent_decisions prior-decision lookups and
 // pf_fact_mentions reads/writes, matching personal_store::open_personal_db's
 // existing pub(crate) visibility (already cross-imported by 3+ modules).
+/// items.id=884: every open re-runs the v1 schema (run_migrations: v1 files always
+/// re-run), which is a WRITE inside a deferred transaction. In WAL mode a
+/// transaction that read first and then tries to write fails AT ONCE with
+/// "database is locked" when another connection committed in between, and the
+/// 5 s busy_timeout never applies to that upgrade. A run holding the file and the
+/// review host's pulls therefore collided: a pull failed, and in one case a
+/// resume was blocked (record_unavailable). The migration applies nothing when it
+/// loses that race, so it is simply tried again, a few times, with a short
+/// back-off (about 1.5 s in all) and only for that error.
+///
+/// SCOPE: only `open_outputs_db_retrying`, which the review paths use (the review
+/// commands and the step review itself). `open_outputs_db` keeps failing at once,
+/// because other callers rely on it: the login-time sweeps hold a writer-gate lease
+/// for as long as their open takes, and a 1.5 s wait there is a behaviour change
+/// (login_returns_before_the_interrupted_run_demote_finishes pins the lease count).
+const MIGRATE_BUSY_RETRIES: u32 = 6;
+const MIGRATE_BUSY_BASE_DELAY_MS: u64 = 50;
+const MIGRATE_BUSY_MAX_DELAY_MS: u64 = 400;
+
+async fn migrate_with_busy_retry<F, Fut>(
+    base_delay_ms: u64,
+    mut attempt: F,
+) -> Result<u32, crate::persistence::migrations::MigrationError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<u32, crate::persistence::migrations::MigrationError>>,
+{
+    let mut delay = base_delay_ms;
+    let mut tries = 0;
+    loop {
+        match attempt().await {
+            Err(e) if e.is_lock_contention() && tries < MIGRATE_BUSY_RETRIES => {
+                tries += 1;
+                log::debug!("open_outputs_db: migration lost the write lock, retry {tries}");
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                delay = (delay * 2).min(MIGRATE_BUSY_MAX_DELAY_MS);
+            }
+            other => return other,
+        }
+    }
+}
+
 pub(crate) async fn open_outputs_db(
     user_id: &str,
     persona_id: &str,
     key_hex: &str,
+) -> Result<SqliteConnection, OutputStoreError> {
+    open_outputs_db_with(user_id, persona_id, key_hex, false).await
+}
+
+/// `open_outputs_db` that waits out a migration which loses the write lock to
+/// another connection (see MIGRATE_BUSY_RETRIES). For callers that open while a run
+/// is writing and that must not fail on that race: the outbound review and its
+/// commands (items.id=884).
+pub(crate) async fn open_outputs_db_retrying(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+) -> Result<SqliteConnection, OutputStoreError> {
+    open_outputs_db_with(user_id, persona_id, key_hex, true).await
+}
+
+async fn open_outputs_db_with(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    retry_on_lock: bool,
 ) -> Result<SqliteConnection, OutputStoreError> {
     crate::auth::epoch_guard::ensure_current(user_id).await?;
     let db_path = get_outputs_db_path(user_id, persona_id);
@@ -218,7 +281,14 @@ pub(crate) async fn open_outputs_db(
     // Fix: always call migrate_outputs_db, relying on run_migrations' own
     // idempotent/pending-only behavior (schema_version-tracked) rather than
     // a file-existence guess about whether anything is pending.
-    crate::persistence::migrations::migrate_outputs_db(user_id, persona_id, key_hex).await?;
+    if retry_on_lock {
+        migrate_with_busy_retry(MIGRATE_BUSY_BASE_DELAY_MS, || {
+            crate::persistence::migrations::migrate_outputs_db(user_id, persona_id, key_hex)
+        })
+        .await?;
+    } else {
+        crate::persistence::migrations::migrate_outputs_db(user_id, persona_id, key_hex).await?;
+    }
     let db_key = crate::auth::subkeys::db_key_hex(
         user_id,
         key_hex,
@@ -3984,6 +4054,142 @@ mod tests {
             std::env::set_var("QR_DATA_ROOT", v);
         } else {
             std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    // -- items.id=884: the migration on open loses a race for the write lock -------
+
+    fn busy() -> crate::persistence::migrations::MigrationError {
+        crate::persistence::migrations::MigrationError::Failed {
+            db_path: "outputs".to_owned(),
+            plain_language: "Quiet Rabbit couldn't finish setting up.".to_owned(),
+            diagnostic: Some(
+                "error returned from database: (code: 5) database is locked".to_owned(),
+            ),
+        }
+    }
+
+    #[test]
+    fn only_a_held_write_lock_counts_as_contention() {
+        use crate::persistence::migrations::MigrationError;
+        assert!(busy().is_lock_contention());
+        assert!(MigrationError::Locked.is_lock_contention());
+        let other = MigrationError::Failed {
+            db_path: "outputs".to_owned(),
+            plain_language: "x".to_owned(),
+            diagnostic: Some("no such table: focus_runs".to_owned()),
+        };
+        assert!(!other.is_lock_contention());
+        let no_diag = MigrationError::Failed {
+            db_path: "outputs".to_owned(),
+            plain_language: "x".to_owned(),
+            diagnostic: None,
+        };
+        assert!(!no_diag.is_lock_contention());
+        assert!(!MigrationError::Io(std::io::Error::other("disk")).is_lock_contention());
+    }
+
+    #[tokio::test]
+    async fn a_migration_that_loses_the_lock_is_retried_until_it_wins() {
+        let calls = std::cell::Cell::new(0u32);
+        let out = migrate_with_busy_retry(0, || {
+            calls.set(calls.get() + 1);
+            let n = calls.get();
+            async move {
+                if n <= 3 {
+                    Err(busy())
+                } else {
+                    Ok(7)
+                }
+            }
+        })
+        .await;
+        assert_eq!(out.unwrap(), 7);
+        assert_eq!(calls.get(), 4, "three losses, then the win");
+    }
+
+    #[tokio::test]
+    async fn a_migration_error_that_is_not_contention_is_not_retried() {
+        let calls = std::cell::Cell::new(0u32);
+        let out = migrate_with_busy_retry(0, || {
+            calls.set(calls.get() + 1);
+            async {
+                Err(crate::persistence::migrations::MigrationError::Failed {
+                    db_path: "outputs".to_owned(),
+                    plain_language: "x".to_owned(),
+                    diagnostic: Some("no such table: focus_runs".to_owned()),
+                })
+            }
+        })
+        .await;
+        assert!(out.is_err());
+        assert_eq!(calls.get(), 1, "a real fault is reported at once");
+    }
+
+    #[tokio::test]
+    async fn the_retry_is_bounded_and_returns_the_last_contention_error() {
+        let calls = std::cell::Cell::new(0u32);
+        let out = migrate_with_busy_retry(0, || {
+            calls.set(calls.get() + 1);
+            async { Err(busy()) }
+        })
+        .await;
+        assert!(out.unwrap_err().is_lock_contention());
+        assert_eq!(
+            calls.get(),
+            MIGRATE_BUSY_RETRIES + 1,
+            "one try, then the retries, then stop"
+        );
+        // About 1.5 s of waiting in all at the production base delay.
+        let mut total = 0;
+        let mut d = MIGRATE_BUSY_BASE_DELAY_MS;
+        for _ in 0..MIGRATE_BUSY_RETRIES {
+            total += d;
+            d = (d * 2).min(MIGRATE_BUSY_MAX_DELAY_MS);
+        }
+        assert!((1000..=2000).contains(&total), "{total} ms");
+    }
+
+    /// Only the retrying open waits out the lock: the plain open migrates once, and
+    /// the review paths (commands::step_review and conductor::step_review) use the
+    /// retrying one.
+    #[test]
+    fn only_the_review_paths_open_with_the_retry() {
+        let src = include_str!("output_store.rs");
+        let prod = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_eq!(
+            prod.matches("migrate_with_busy_retry(MIGRATE_BUSY_BASE_DELAY_MS")
+                .count(),
+            1
+        );
+        let plain = prod
+            .split("pub(crate) async fn open_outputs_db(")
+            .nth(1)
+            .and_then(|r| r.split("\n}\n").next())
+            .unwrap();
+        assert!(plain.contains("open_outputs_db_with(user_id, persona_id, key_hex, false)"));
+        for (file, text) in [
+            (
+                "commands/step_review.rs",
+                include_str!("../commands/step_review.rs"),
+            ),
+            (
+                "conductor/step_review.rs",
+                include_str!("../conductor/step_review.rs"),
+            ),
+        ] {
+            let code = text
+                .split("// Test support: an injectable scanner")
+                .next()
+                .unwrap()
+                .split("#[cfg(test)]\nmod tests {")
+                .next()
+                .unwrap();
+            assert!(code.contains("open_outputs_db_retrying("), "{file}");
+            assert!(
+                !code.contains("output_store::open_outputs_db("),
+                "{file} opens without the retry"
+            );
         }
     }
 }

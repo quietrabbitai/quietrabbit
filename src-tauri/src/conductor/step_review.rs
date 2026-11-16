@@ -303,9 +303,10 @@ pub(crate) mod forced {
     /// until the guard drops. A test that drives execute_once for a hosted step
     /// needs both, because the review runs before the spend gate.
     pub async fn arm(ctx: &StepContext, forced: Forced) -> Guard {
-        let mut conn = output_store::open_outputs_db(&ctx.user_id, &ctx.persona_id, &ctx.key_hex)
-            .await
-            .expect("outputs.db for the review record");
+        let mut conn =
+            output_store::open_outputs_db_retrying(&ctx.user_id, &ctx.persona_id, &ctx.key_hex)
+                .await
+                .expect("outputs.db for the review record");
         sqlx::query(
             "INSERT OR IGNORE INTO focus_runs (id, focus_id, started_at) VALUES (?, ?, 't')",
         )
@@ -1018,7 +1019,9 @@ pub async fn review_hosted_step<L: DisclosureLogger>(
         provider_id,
     };
     let mut conn =
-        match output_store::open_outputs_db(&ctx.user_id, &ctx.persona_id, &ctx.key_hex).await {
+        match output_store::open_outputs_db_retrying(&ctx.user_id, &ctx.persona_id, &ctx.key_hex)
+            .await
+        {
             Ok(c) => c,
             Err(_) => {
                 log_blocked(&input, &sha256_hex(prompt), BlockReason::RecordUnavailable);
