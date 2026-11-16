@@ -1952,6 +1952,18 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         }
     }
 
+    /// items.id=901: the approval the Gate 3 look-ahead may use, or None. Only a run that
+    /// started through the plan gate holds one (`plan` is set there and nowhere else), so a
+    /// rehydrated or swept run has none; a bound API Chat run never resolves and is excluded
+    /// here too. Any doubt is None, and None is today's look-ahead (over-prompt, never
+    /// under-prompt).
+    fn look_ahead_plan(&self) -> Option<&crate::conductor::plan_approval::Approval> {
+        if self.rehydrated || self.chat_binding.is_some() {
+            return None;
+        }
+        self.plan.as_deref()
+    }
+
     /// items.id=387: hand the run the raw text of the chat turn it answers. Called
     /// by commands::messages::send_message with the turn as typed or pasted. See
     /// the field's doc: it is used by handoff_ingest alone and never persisted.
@@ -3597,13 +3609,14 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             self._focus_privacy_tier,
         );
 
-        // Gate3 look-ahead: next step's execution_tier (see next_execution_tier()).
+        // Gate3 look-ahead: next step's execution_tier (see next_execution_tier_under()).
         let next_execution_tier: Option<u8> = {
             let fd = self.focus_def.as_ref().unwrap();
-            next_execution_tier(
+            next_execution_tier_under(
                 &fd.steps,
                 step_index,
                 ExternalAccess::min(self._focus_max_permitted_tier, fd.max_routing_tier),
+                self.look_ahead_plan(),
             )
         };
 
@@ -4850,10 +4863,20 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
 /// first unguarded one. For a Focus with no guards that is exactly the single
 /// following row, as before. Never lower than the real next step, so Gate3 can
 /// fire when it need not but cannot be missed.
-fn next_execution_tier(
+///
+/// items.id=901 (the run plan): `plan` is the approval the run acts under, or None. With
+/// it, a following MODEL-BLOCK step (one that carries a requirement) the approval gives no
+/// PAID pin counts as tier 1: the executor stops a hosted pick on such a step
+/// (executor::check_plan_envelope, plan.exceeded), so it cannot go out, and Gate 3 need not
+/// fire for it. A step WITH an approved paid pin keeps its real tier, and so does every other
+/// step. With no plan (a plan-less run, a rehydrated run, a bound API Chat run: see
+/// FocusRun::look_ahead_plan) this is exactly the look-ahead of every earlier build, which
+/// over-prompts and never under-prompts. A test (executor.rs) pins the two facts together.
+pub(crate) fn next_execution_tier_under(
     steps: &[ActionDefinition],
     step_index: usize,
     ceiling: ExternalAccess,
+    plan: Option<&crate::conductor::plan_approval::Approval>,
 ) -> Option<u8> {
     let upcoming = steps.get(step_index + 1..).unwrap_or_default();
     let mut candidates = Vec::new();
@@ -4870,8 +4893,26 @@ fn next_execution_tier(
     }
     candidates
         .iter()
-        .map(|next| execution_tier_ordinal(ExternalAccess::min(ceiling, next.routing_tier)))
+        .map(|next| match plan {
+            Some(approval)
+                if next.requirement.is_some() && !approval.has_paid_pin(&next.action_id) =>
+            {
+                execution_tier_ordinal(ExternalAccess::LocalOnly)
+            }
+            _ => execution_tier_ordinal(ExternalAccess::min(ceiling, next.routing_tier)),
+        })
         .max()
+}
+
+/// The look-ahead without a plan: what every build before items.id=901 computed, kept for the
+/// tests that pin it.
+#[cfg(test)]
+fn next_execution_tier(
+    steps: &[ActionDefinition],
+    step_index: usize,
+    ceiling: ExternalAccess,
+) -> Option<u8> {
+    next_execution_tier_under(steps, step_index, ceiling, None)
 }
 
 /// Where a rehydrated run resumes: the index of the step after the
@@ -12404,6 +12445,129 @@ steps:
         assert_eq!(def.steps.len(), 1);
         assert!(def.steps[0].store_op.is_none());
         assert_eq!(def.steps[0].prompt_template, "hi");
+    }
+
+    /// items.id=901: with the approval a run acts under, a following model-block step that has
+    /// no PAID pin counts as tier 1 (the executor stops a hosted pick on it), one with a paid pin
+    /// keeps its real tier, and every other step is unchanged. With no approval it is the
+    /// look-ahead of every earlier build.
+    #[test]
+    fn gate3_look_ahead_under_a_plan_counts_only_a_step_the_executor_keeps_local() {
+        use crate::conductor::plan_approval::Approval;
+        use crate::conductor::run_plan::tests::{hosted_req, planned, step as plain_step};
+        use crate::conductor::run_plan::{OfferStrategy, Pin};
+
+        let approval = |pins: Vec<Pin>| Approval {
+            digest: "d".repeat(64),
+            ceiling_micros: 1_000,
+            pins,
+        };
+        let pin = |action: &str, strategy: OfferStrategy| Pin {
+            action_id: action.to_owned(),
+            strategy,
+            provider_id: if strategy == OfferStrategy::PaidApi {
+                "host-a".to_owned()
+            } else {
+                String::new()
+            },
+            model_id: "m".to_owned(),
+        };
+        let ceiling = ExternalAccess::AnonymousPreferred;
+        let hosted_tier = execution_tier_ordinal(ExternalAccess::AnonymousPreferred);
+        let steps = vec![
+            plain_step("now"),
+            planned("a", hosted_req()),
+            planned("b", hosted_req()),
+        ];
+
+        // No plan: the real tier of the model step, as before.
+        assert_eq!(
+            next_execution_tier_under(&steps, 0, ceiling, None),
+            Some(hosted_tier)
+        );
+        assert_eq!(
+            next_execution_tier_under(&steps, 0, ceiling, None),
+            next_execution_tier(&steps, 0, ceiling)
+        );
+        // A zero-pin approval, or a pin of an unmeasured LOCAL model: it stays on the device.
+        for pins in [vec![], vec![pin("a", OfferStrategy::LocalUnmeasured)]] {
+            let a = approval(pins);
+            assert_eq!(
+                next_execution_tier_under(&steps, 0, ceiling, Some(&a)),
+                Some(1)
+            );
+        }
+        // A PAID pin for that step keeps its real tier; a paid pin for another step does not.
+        let paid_a = approval(vec![pin("a", OfferStrategy::PaidApi)]);
+        assert_eq!(
+            next_execution_tier_under(&steps, 0, ceiling, Some(&paid_a)),
+            Some(hosted_tier)
+        );
+        assert_eq!(
+            next_execution_tier_under(&steps, 1, ceiling, Some(&paid_a)),
+            Some(1),
+            "step b has no paid pin"
+        );
+
+        // Steps that are not model-block steps are untouched by the plan.
+        let mut external = plain_step("ext");
+        external.routing_tier = ExternalAccess::AnonymousPreferred;
+        let mixed = vec![plain_step("now"), external];
+        assert_eq!(
+            next_execution_tier_under(&mixed, 0, ceiling, Some(&approval(vec![]))),
+            Some(hosted_tier)
+        );
+        // A guarded unpinned model step followed by an unguarded external one: either may run
+        // next, so the external one's tier still governs.
+        let mut guarded_model = planned("g", hosted_req());
+        guarded_model.guard = guard::Guard::from_columns(Some("v"), Some("present"), None).unwrap();
+        let mut ext = plain_step("ext");
+        ext.routing_tier = ExternalAccess::AnonymousPreferred;
+        let both = vec![plain_step("now"), guarded_model, ext];
+        assert_eq!(
+            next_execution_tier_under(&both, 0, ceiling, Some(&approval(vec![]))),
+            Some(hosted_tier)
+        );
+    }
+
+    /// Anything that is not a run started through the plan gate falls back to today's
+    /// look-ahead: no approval, a rehydrated run and a bound API Chat run all give None.
+    #[test]
+    fn the_look_ahead_uses_no_plan_for_a_rehydrated_or_bound_run() {
+        use crate::conductor::plan_approval::Approval;
+        let mut run: FocusRun = FocusRun::new(
+            "u".to_owned(),
+            "p".to_owned(),
+            "f".to_owned(),
+            dummy_pool(),
+            Arc::new(ConductorScheduler::new()),
+            String::new(),
+            false,
+            None,
+            None,
+            false,
+            std::collections::HashSet::new(),
+            None,
+        );
+        assert!(run.look_ahead_plan().is_none(), "no approval");
+        run.plan = Some(Arc::new(Approval {
+            digest: "d".repeat(64),
+            ceiling_micros: 0,
+            pins: vec![],
+        }));
+        assert!(run.look_ahead_plan().is_some(), "started through the gate");
+        run.rehydrated = true;
+        assert!(run.look_ahead_plan().is_none(), "a rehydrated run");
+        run.rehydrated = false;
+        run.chat_binding = Some(crate::api_chat::BoundDestination {
+            provider_id: "host".to_owned(),
+            model_id: "m".to_owned(),
+        });
+        assert!(run.look_ahead_plan().is_none(), "a bound API Chat run");
+        // The look-ahead's call site reads it and nothing else of the plan.
+        let src = include_str!("lifecycle.rs");
+        let code = src.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_eq!(code.matches("self.look_ahead_plan()").count(), 1);
     }
 
     /// Gate3's look-ahead sees through a writer: it makes no call and ends no scan.

@@ -70,6 +70,18 @@ impl std::fmt::Debug for Approval {
     }
 }
 
+impl Approval {
+    /// Whether the approval holds a PAID API pin for this step: the only way a model-block
+    /// step may go hosted (the executor stops every other hosted pick). The Gate 3
+    /// look-ahead (lifecycle::next_execution_tier_under) reads exactly this fact, and a test
+    /// pins it against the executor's own rule.
+    pub fn has_paid_pin(&self, action_id: &str) -> bool {
+        self.pins
+            .iter()
+            .any(|p| p.action_id == action_id && p.strategy == OfferStrategy::PaidApi)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ApprovalError {
     #[error("the plan changed since it was shown")]

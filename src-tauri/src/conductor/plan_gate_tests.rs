@@ -571,8 +571,12 @@ fn plan_required_is_a_stable_string_and_every_caller_maps_the_typed_outcome() {
     ] {
         let code = code_of(src);
         assert!(code.contains("LoadOutcome::Ready(run) => *run"), "{name}");
+        // send_message leaves the duplicate-turn marker first (stage 6), so its arm is a
+        // block that still ends in the same refusal.
         assert!(
-            code.contains("LoadOutcome::PlanRequired(_) => return Err("),
+            code.contains("LoadOutcome::PlanRequired(_) => return Err(")
+                || (code.contains("LoadOutcome::PlanRequired(_) => {")
+                    && code.contains("return Err(execution::plan_required_error());")),
             "{name}"
         );
     }
@@ -592,7 +596,7 @@ fn plan_required_is_a_stable_string_and_every_caller_maps_the_typed_outcome() {
     let send = msgs.split("pub async fn send_message").nth(1).unwrap();
     assert!(
         send.find("execution::plan_preflight(").unwrap()
-            < send.find("message_store::save_message(").unwrap()
+            < send.find("turn_marker::save_user_turn_once(").unwrap()
     );
     // The request carries the optional token.
     assert!(code_of(include_str!("../commands/execution.rs"))
@@ -625,7 +629,15 @@ fn the_plan_the_approval_and_the_memory_home_are_read_only_where_reviewed() {
             || name.ends_with("persistence/run_park_store.rs")
     };
     // (needle, allowed files). Production code only (before the first #[cfg(test)]).
-    let rules: [(&str, &[&str]); 6] = [
+    let rules: [(&str, &[&str]); 8] = [
+        // The run's own approval: set by the gate, read for the StepContext and the Gate 3
+        // look-ahead (lifecycle.rs) and nowhere else.
+        (
+            "self.plan",
+            &["conductor/plan_gate.rs", "conductor/lifecycle.rs"],
+        ),
+        // The look-ahead's one predicate.
+        ("has_paid_pin(", &["conductor/lifecycle.rs"]),
         // Who builds a plan.
         ("run_plan::build(", &["conductor/plan_gate.rs"]),
         // Who reads an approval of a chat, or takes an offer's.
@@ -644,6 +656,7 @@ fn the_plan_the_approval_and_the_memory_home_are_read_only_where_reviewed() {
                 "commands/messages.rs",
                 "commands/api_chat.rs",
                 "commands/chats.rs",
+                "commands/turn_marker.rs",
                 "main.rs",
             ],
         ),

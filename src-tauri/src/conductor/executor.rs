@@ -9819,4 +9819,116 @@ mod tests {
         })
         .await;
     }
+    /// THE COUPLING (items.id=901 stage 6): Gate 3's look-ahead may count a following planned
+    /// step as tier 1 ONLY because the executor stops a hosted pick on it. The two facts are
+    /// pinned together over every kind of approval: a step the look-ahead counts as local is
+    /// exactly a step on which the executor can produce no hosted selection, and a step with
+    /// a paid pin is exactly the one it can.
+    #[test]
+    fn the_look_ahead_counts_a_step_as_local_exactly_when_the_executor_stops_a_hosted_pick() {
+        use crate::conductor::lifecycle::next_execution_tier_under;
+        use crate::conductor::run_plan::tests::{hosted_req, planned, step as plain_step};
+
+        let ceiling = ExternalAccess::AnonymousPreferred;
+        let hosted_tier = crate::conductor::lifecycle::execution_tier_ordinal(ceiling);
+        let hosted_pick = || {
+            SelectedModel::hosted(ProviderModel {
+                id: "row".to_owned(),
+                provider_id: "fixture-host-a".to_owned(),
+                model_id: "fixture-model-a".to_owned(),
+                context_window_tokens: 4096,
+                is_default: true,
+                created_at: "t".to_owned(),
+                pricing: None,
+                request_options: None,
+                token_factor: 1.0,
+                output_overhead: 1.0,
+                status: crate::persistence::provider_store::ModelStatus::Active,
+                retires_at: None,
+                requires_paid: false,
+                qr_recommended: false,
+                qr_recommendation_rank: None,
+                retains_data_override: None,
+                trains_on_data_override: None,
+                retention_days_override: None,
+                context_window_source: None,
+                context_window_as_of: None,
+            })
+        };
+        let steps = vec![plain_step("now"), planned("s1", hosted_req())];
+        let cases: Vec<(&str, Vec<Pin>)> = vec![
+            ("no pin", vec![]),
+            (
+                "a pin of an unmeasured local model",
+                vec![pin_of(OfferStrategy::LocalUnmeasured, "", "some-local")],
+            ),
+            (
+                "a paid pin",
+                vec![pin_of(
+                    OfferStrategy::PaidApi,
+                    "fixture-host-a",
+                    "fixture-model-a",
+                )],
+            ),
+            (
+                "a paid pin for another step",
+                vec![Pin {
+                    action_id: "another".to_owned(),
+                    ..pin_of(OfferStrategy::PaidApi, "fixture-host-a", "fixture-model-a")
+                }],
+            ),
+        ];
+        for (label, pins) in cases {
+            let approval = Approval {
+                digest: "d".repeat(64),
+                ceiling_micros: 1_000,
+                pins,
+            };
+            // The look-ahead's answer for step s1.
+            let counted_local =
+                next_execution_tier_under(&steps, 0, ceiling, Some(&approval)) == Some(1);
+            // The executor's: can a hosted selection come out of the plan check for s1?
+            let mut ctx = resolved_ctx(
+                steps[1].requirement.clone(),
+                ExternalAccess::AnonymousPreferred,
+                None,
+                "x",
+            );
+            ctx.plan = Some(Arc::new(approval.clone()));
+            let executor_can_go_hosted = match plan_pin(&ctx) {
+                // A pin replaces the resolver: it yields hosted only for a paid pin.
+                Some(p) => p.strategy == OfferStrategy::PaidApi,
+                // No pin: the resolver's pick goes through the envelope check, which refuses
+                // every hosted selection.
+                None => {
+                    let refused = check_plan_envelope(&ctx, &hosted_pick()).is_err();
+                    assert!(
+                        refused,
+                        "{label}: a hosted pick must be refused without a pin"
+                    );
+                    false
+                }
+            };
+            assert_eq!(counted_local, !executor_can_go_hosted, "{label}");
+            // And the look-ahead's predicate is the pin the executor reads.
+            assert_eq!(
+                approval.has_paid_pin("s1"),
+                executor_can_go_hosted,
+                "{label}"
+            );
+            if executor_can_go_hosted {
+                assert_eq!(
+                    next_execution_tier_under(&steps, 0, ceiling, Some(&approval)),
+                    Some(hosted_tier),
+                    "{label}: a paid pin keeps the real tier"
+                );
+            }
+        }
+        // No approval at all: the look-ahead does not refine (today's over-prompt), even
+        // though the executor would also refuse.
+        assert_eq!(
+            next_execution_tier_under(&steps, 0, ceiling, None),
+            Some(hosted_tier)
+        );
+    }
 }

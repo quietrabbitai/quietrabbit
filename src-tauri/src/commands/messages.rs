@@ -28,6 +28,7 @@ use tauri::State;
 
 use crate::auth::registry::{key_hex, KeyRegistry};
 use crate::commands::execution::{self, SubmitFocusRunRequest};
+use crate::commands::turn_marker;
 use crate::conductor::concurrency::ConductorScheduler;
 use crate::conductor::lifecycle::{FocusRun, LifecycleError, RunResult};
 use crate::persistence::{chat_binding_store, chat_store, message_store, output_store};
@@ -657,17 +658,20 @@ pub async fn send_message(
     // only once a real reply is actually saved, in finalize_chat_reply
     // below (step 5), so a run that fails before ever producing a reply
     // leaves no History entry for it.
-    message_store::save_message(
+    //
+    // items.id=901 (the duplicate-turn marker, commands::turn_marker): the plain save is
+    // save_user_turn_once(), which saves exactly as before unless a marker from an earlier
+    // send of this same text (left at step 3 below) shows the turn is already saved, the
+    // newest message of the chat, and a user turn. The marker is memory-only.
+    let saved_turn = turn_marker::save_user_turn_once(
+        &plan_memory,
         &user_id,
         &persona_id,
         &key_hex_str,
         &context_key,
-        "user",
         &content,
-        None,
     )
-    .await
-    .map_err(|e| e.to_string())?;
+    .await?;
 
     // 1.5. R1 crisis-handling floor (decisions.id=607, items.id=265): local,
     // deterministic check on the raw fresh turn (`content`), NOT the blended
@@ -713,8 +717,19 @@ pub async fn send_message(
         execution::LoadOutcome::Ready(run) => *run,
         // The preflight above said this plan was approved; it no longer is (an approval
         // cleared, the answers changed, a latch set in between). The turn is saved and
-        // nothing was started. items.id=901 stage 6 leaves the duplicate-turn marker here.
-        execution::LoadOutcome::PlanRequired(_) => return Err(execution::plan_required_error()),
+        // nothing was started: leave the memory-only marker so the call-again, after the
+        // user approves, does not save the same turn a second time.
+        execution::LoadOutcome::PlanRequired(_) => {
+            turn_marker::remember_unstarted_turn(
+                &plan_memory,
+                &user_id,
+                &persona_id,
+                &context_key,
+                &saved_turn,
+                &content,
+            );
+            return Err(execution::plan_required_error());
+        }
     };
     run.attach_lease(lease).map_err(|e| e.to_string())?;
     // items.id=387: the raw turn, for the hand-off return writer alone (never
