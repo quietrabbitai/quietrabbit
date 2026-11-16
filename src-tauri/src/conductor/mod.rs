@@ -30,6 +30,8 @@ pub mod model_resolver;
 pub mod model_resolver_input;
 pub mod model_selection;
 pub mod nightly_batch;
+pub mod plan_approval;
+pub mod plan_memory;
 pub mod privacy;
 pub mod propose_route;
 pub mod provider_selection;

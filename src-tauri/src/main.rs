@@ -226,6 +226,11 @@ async fn async_main() {
         // the user's answers. Offsets and a text hash only, never message
         // text; single use, bound to user, Persona and conversation, expiring.
         .manage(quietrabbit_lib::api_chat::review::ReviewRegistry::default())
+        // PlanMemory (items.id=901): the run plan's memory-only home -- approvals of
+        // a latched or chatless run, the duplicate-turn marker. Never persisted,
+        // serialized or logged; cleared when the key leaves (setup() below) and when
+        // a chat is archived.
+        .manage(quietrabbit_lib::conductor::plan_memory::PlanMemory::default())
         // KeyRegistry: single-slot in-memory master-key registry (items.id=
         // 205, Architecture/AUTH_MULTIUSER_ARCHITECTURE.md Section 4.2).
         // Encapsulated type -- its own internal Mutex is not exposed
@@ -243,6 +248,16 @@ async fn async_main() {
         // / group-unlock path populates entries.
         .manage(quietrabbit_lib::auth::registry::GroupKeyRegistry::default())
         .setup(|app| {
+            // items.id=901: nothing the run plan holds in memory outlives the account's
+            // key (logout, an idle or ceiling lock, a changed account).
+            {
+                let memory = app
+                    .state::<quietrabbit_lib::conductor::plan_memory::PlanMemory>()
+                    .inner()
+                    .clone();
+                app.state::<quietrabbit_lib::auth::registry::KeyRegistry>()
+                    .on_key_leave(move |left| memory.clear_user(&left.user_id));
+            }
             // items.id=630: data-key rotation progress goes to the webview on
             // the shared task-progress event (kind key_rotation).
             quietrabbit_lib::commands::key_rotation::install_progress_sink(app.handle().clone());

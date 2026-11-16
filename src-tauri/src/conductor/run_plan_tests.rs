@@ -22,7 +22,7 @@ use crate::conductor::tokens::StepType;
 // Fixtures
 // ---------------------------------------------------------------------------
 
-fn requirement(
+pub(crate) fn requirement(
     min: QualityBar,
     max: QualityBar,
     destinations: &[Destination],
@@ -44,7 +44,7 @@ fn requirement(
     }
 }
 
-fn local_req() -> ModelRequirement {
+pub(crate) fn local_req() -> ModelRequirement {
     requirement(
         QualityBar::Basic,
         QualityBar::High,
@@ -53,7 +53,7 @@ fn local_req() -> ModelRequirement {
     )
 }
 
-fn hosted_req() -> ModelRequirement {
+pub(crate) fn hosted_req() -> ModelRequirement {
     requirement(
         QualityBar::Basic,
         QualityBar::High,
@@ -62,7 +62,7 @@ fn hosted_req() -> ModelRequirement {
     )
 }
 
-fn step(id: &str) -> ActionDefinition {
+pub(crate) fn step(id: &str) -> ActionDefinition {
     ActionDefinition {
         action_id: id.to_owned(),
         display_name: format!("Step {id}"),
@@ -88,7 +88,7 @@ fn step(id: &str) -> ActionDefinition {
     }
 }
 
-fn planned(id: &str, req: ModelRequirement) -> ActionDefinition {
+pub(crate) fn planned(id: &str, req: ModelRequirement) -> ActionDefinition {
     let mut s = step(id);
     let tier = req.range.highest_tier;
     s.routing_tier = tier;
@@ -98,24 +98,29 @@ fn planned(id: &str, req: ModelRequirement) -> ActionDefinition {
 }
 
 /// A cb-15 starter row: a render block, no model call.
-fn starter(id: &str) -> ActionDefinition {
+pub(crate) fn starter(id: &str) -> ActionDefinition {
     let mut s = step(id);
     s.block_stable_id = Some(crate::conductor::handoff_render::STABLE_ID.to_owned());
     s.output_var = Some("starter_text".to_owned());
     s
 }
 
-fn guarded(mut s: ActionDefinition, var: &str, op: &str, value: &str) -> ActionDefinition {
+pub(crate) fn guarded(
+    mut s: ActionDefinition,
+    var: &str,
+    op: &str,
+    value: &str,
+) -> ActionDefinition {
     s.guard = Guard::from_columns(Some(var), Some(op), Some(value)).unwrap();
     s
 }
 
-fn with_output(mut s: ActionDefinition, var: &str) -> ActionDefinition {
+pub(crate) fn with_output(mut s: ActionDefinition, var: &str) -> ActionDefinition {
     s.output_var = Some(var.to_owned());
     s
 }
 
-fn def_of(steps: Vec<ActionDefinition>) -> FocusDefinition {
+pub(crate) fn def_of(steps: Vec<ActionDefinition>) -> FocusDefinition {
     FocusDefinition {
         focus_id: "fixture-focus".to_owned(),
         display_name: "Fixture".to_owned(),
@@ -133,7 +138,7 @@ fn def_of(steps: Vec<ActionDefinition>) -> FocusDefinition {
     }
 }
 
-fn launch(mode: Option<&str>) -> LaunchResolution {
+pub(crate) fn launch(mode: Option<&str>) -> LaunchResolution {
     let mut values = BTreeMap::new();
     if let Some(m) = mode {
         values.insert(bound_spec::LAUNCH_MODE, m.to_owned());
@@ -146,7 +151,7 @@ fn launch(mode: Option<&str>) -> LaunchResolution {
     }
 }
 
-fn local_cand(model: &str) -> Candidate {
+pub(crate) fn local_cand(model: &str) -> Candidate {
     Candidate {
         subject: CapabilitySubject::Local,
         provider_id: String::new(),
@@ -159,7 +164,7 @@ fn local_cand(model: &str) -> Candidate {
     }
 }
 
-fn hosted_cand(provider: &str, model: &str, est: u64) -> Candidate {
+pub(crate) fn hosted_cand(provider: &str, model: &str, est: u64) -> Candidate {
     Candidate {
         subject: CapabilitySubject::Hosted,
         provider_id: provider.to_owned(),
@@ -172,7 +177,7 @@ fn hosted_cand(provider: &str, model: &str, est: u64) -> Candidate {
     }
 }
 
-fn cell(c: &Candidate, bar: AttainedBar) -> CapabilityRow {
+pub(crate) fn cell(c: &Candidate, bar: AttainedBar) -> CapabilityRow {
     CapabilityRow {
         subject: c.subject,
         provider_id: c.provider_id.clone(),
@@ -188,7 +193,7 @@ fn cell(c: &Candidate, bar: AttainedBar) -> CapabilityRow {
     }
 }
 
-fn inputs_for(
+pub(crate) fn inputs_for(
     ids: &[&str],
     cands: &[Candidate],
     caps: &[CapabilityRow],
@@ -210,7 +215,7 @@ fn inputs_for(
         .collect()
 }
 
-fn plan_of(
+pub(crate) fn plan_of(
     steps: Vec<ActionDefinition>,
     launch: &LaunchResolution,
     inputs: &HashMap<String, StepInputs>,

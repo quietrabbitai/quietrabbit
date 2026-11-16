@@ -179,6 +179,7 @@ impl OfferStanding {
 /// One explicit choice of a user: use this model for this step instead of letting the
 /// resolver choose. Only an unmeasured local model or a paid API model can be pinned.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Pin {
     pub action_id: String,
     pub strategy: OfferStrategy,
@@ -1013,4 +1014,4 @@ pub fn step_estimates(plan: &RunPlan, pins: &[Pin]) -> BTreeMap<String, u64> {
 
 #[cfg(test)]
 #[path = "run_plan_tests.rs"]
-mod tests;
+pub(crate) mod tests;

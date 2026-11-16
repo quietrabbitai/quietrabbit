@@ -116,6 +116,7 @@ pub async fn archive_chat(
     persona_id: String,
     chat_id: String,
     key_registry: State<'_, KeyRegistry>,
+    plan_memory: State<'_, crate::conductor::plan_memory::PlanMemory>,
 ) -> Result<(), String> {
     let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let key_hex_str = key_registry
@@ -125,5 +126,10 @@ pub async fn archive_chat(
 
     chat_store::archive_chat(&user_id, &persona_id, &key_hex_str, &chat_id)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // items.id=901: what the run plan held in memory for this chat (approvals of a
+    // latched chat, the duplicate-turn marker) goes with it. A chat deletion, when
+    // items.id=888 builds one, must make the same call.
+    plan_memory.clear_chat(&user_id, &persona_id, &chat_id);
+    Ok(())
 }
