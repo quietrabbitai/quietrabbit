@@ -1,5 +1,9 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: November 15, 2026 (items.id=921: new "Privacy treatment of a step attempt"
+# Last updated: November 16, 2026 (items.id=884: STORE_NAMES_EXTERNAL_ALLOWED is true and
+# the two device names stay out by a closed list -- the artifact-store, Manual hand-off and
+# Focus-owned entities bullets that stated the flag, the render row's inheritance rule and the
+# user_input taint note; nothing else. The outbound review itself has no section here yet.).
+# Before that, November 15, 2026 (items.id=921: new "Privacy treatment of a step attempt"
 # section, the render sentence in the NETWORK PREDICATE bullet and KNOWN BEHAVIOURS item 1
 # under "Model resolver", nothing else).
 # Before that, November 15, 2026 (items.id=387: new "Manual hand-off" section, the fourth
@@ -342,8 +346,8 @@ resolves `requirement` through the model resolver (see "Model resolver" below); 
 with no requirement still goes through select_model.
 - EXTERNAL_MODEL_BLOCKS_ALLOWED = false (model_block/mod.rs): LOAD refuses any
   destination but local and any tier above local_only. A block allowing hosted_api
-  names neither {user_input} nor {persona_context}. B10 flips the constant after the
-  outbound review (items.id=884).
+  names neither {user_input} nor {persona_context}. B10 flips the constant (the outbound
+  review of items.id=884 has landed).
 - tighten() (model_block/config.rs) is the one function that narrows an envelope
   (quality floor, highest tier, destinations, declared inputs); only those four are
   tighten-only. Latitude and the voice settings are the user's to move both ways
@@ -463,8 +467,8 @@ is select_model_for_block in executor.rs.
      resolver.too_weak (nothing runs model blocks today).
   3. PlanIncluded is never produced (nothing records which plan a user holds): a hosted
      model is Free or Metered. A hosted model is never chosen until it has a measured cell
-     (items.id=788, 726), and EXTERNAL_MODEL_BLOCKS_ALLOWED is still false (items.id=884,
-     913). The hosted call through execute_once is not tested end to end (the real client is
+     (items.id=788, 726), and EXTERNAL_MODEL_BLOCKS_ALLOWED is still false (items.id=913).
+     The hosted call through execute_once is not tested end to end (the real client is
      HTTPS only); hosted selection and the call site are tested separately.
   4. Local context windows still come from get_context_window's hardcoded tag map in
      executor.rs, which names models in code; the gatherer and the fallback reuse it.
@@ -577,10 +581,11 @@ outputs_015 with the other outputs files.
   put_session does.
 - Reads: ONLY as bound names, seeded once at pass start (seeding.rs read_artifact). They are
   store-backed like every bound name: restricted to the step whose own template names them,
-  tainting a step that names one (so it stays out of extraction), and refused in an external
-  step, named or declared, while STORE_NAMES_EXTERNAL_ALLOWED is false (declared_inputs.rs
-  pin test; items.id=884 flips it, and only then does the declaration rule decide). A stored
-  text that fails its validator fails the pass closed.
+  tainting a step that names one (so it stays out of extraction), and, since items.id=884
+  flipped STORE_NAMES_EXTERNAL_ALLOWED to true (declared_inputs.rs, pin test
+  the_store_name_flag_ships_true_and_the_device_list_does_not_depend_on_it), allowed in an
+  external step that DECLARES it (the declaration rule decides, and the outbound review sees
+  the text). A stored text that fails its validator fails the pass closed.
 - TWO BEHAVIOURS LATER BUILDS MUST RESPECT (items.id=903 and 907 carry the same note):
   1. Seeded artifact text has `{` and `}` turned into `(` and `)` (seeding::clean, as for the
      derived names, so stored text cannot become a prompt token). The stored text is exact,
@@ -620,16 +625,26 @@ in a run, so nothing depends on resume. The legacy requires_user_handoff pause i
   - It is a block row to the registry and an EXTERNAL step to the declared-inputs lint
     (ActionDefinition::is_external_for_lint): declared inputs only, no persona_context,
     voice_profile, previous_output or focus_context (refused at parse, declared or not),
-    only {user_input} among the system tokens, no field_requirements. While
-    STORE_NAMES_EXTERNAL_ALLOWED is false it may not name or declare a store-backed name, so
-    THE REAL STARTER NAMING content_brief WAITS FOR items.id=884's flag flip; until then it is
-    built and tested with the fixture Focus (static text or untainted earlier variables). In a
-    Focus that also has a handoff_ingest row it cannot name {user_input} either (taint below).
-  - Its record inherits the highest sensitivity_severity, any personal_flagged and
-    audit_unavailable of the steps that produced its DECLARED inputs (last producer of each
-    variable); an input with no producing step (user_input, a seeded name) contributes
-    nothing, a known gap to close when the flag flips and a store-backed name can be declared.
-    routing_tier_used stays 1: the render itself calls nothing.
+    only {user_input} among the system tokens, no field_requirements. STORE_NAMES_EXTERNAL_ALLOWED
+    is true (items.id=884 flipped it), so a starter may declare a store-backed name, content_brief
+    included, and {user_input} even in a Focus that also has a handoff_ingest row (taint below).
+    It may NOT name or declare the two device names (subject_context, device_library_brief): the
+    closed list DEVICE_NAMES_NEVER_EXTERNAL refuses them whatever the flag says (see "Focus-owned
+    entities"). The real starter naming content_brief is therefore no longer blocked by the flag;
+    it is built with the Writing Assistant (still not built).
+  - Its record (handoff_render::inherit_from_inputs), over each DECLARED input: (1) takes the
+    highest sensitivity_severity and ORs personal_flagged and audit_unavailable of the step that
+    produced it (the last producer of the variable); (2) a STORE-BACKED declared input counts as
+    PERSONAL: the record's sensitivity_severity is at least 2 (Sensitivity::Personal) and
+    personal_flagged is true, whether or not a producer exists and whatever it recorded (a floor,
+    it never lowers rule 1; audit_unavailable still comes only from producers). Store-backed =
+    a registered bound name, a variable a step the taint closure marks as tainted produced, or
+    user_input in a Focus that has a handoff_ingest row (handoff_render::store_backed_inputs);
+    (3) any other declared name (the {user_input} token with no return row, a field name)
+    contributes nothing. Items.id=884's rider; only declared inputs count. routing_tier_used
+    stays 1: the render itself calls nothing. (An EXTERNAL MODEL step's record still scores only
+    Gate 1 projected fields, so a store-backed input it names is not marked personal: a
+    candidate follow-up, not built.)
   - handoff_pending (Session bound name, `h_` plus 12 lowercase hex of SHA-256 over run and
     row) is written by the render through the typed session store: latch-gated (a one-time
     chat still shows the starter and records nothing), NOT collection-consent gated (no user
@@ -667,12 +682,15 @@ in a run, so nothing depends on resume. The legacy requires_user_handoff pause i
   - TAINT (conductor/taint.rs): in a Focus that has a handoff_ingest row, `user_input` is a
     tainting name, because the blended chat window ({user_input}, focus_runs.user_input) carries
     the paste as its newest message for up to HISTORY_WINDOW messages. A step naming it is left
-    out of extraction (and so is a step naming its output), and while
-    STORE_NAMES_EXTERNAL_ALLOWED is false an external step of that Focus cannot name it.
+    out of extraction (and so is a step naming its output). Since items.id=884 flipped
+    STORE_NAMES_EXTERNAL_ALLOWED an external step of that Focus MAY name and declare it, behind
+    the outbound review; a render row that declares it counts as personal (the rule above). A
+    pasted reply is not device content: the device closure leaves user_input out.
   - handoff_pending and handoff_received are reserved: never a session_put target, never a
     writer's argument, never an output_var. Both are seeded at pass start and are ordinary
     store-backed names otherwise (restricted to the step whose template names them, tainting
-    it, refused in an external step while the flag is false). Their normal use is a guard.
+    it, and allowed in an external step only when declared, since the flag is true). Their
+    normal use is a guard.
 - CONSENT, FOR A FOCUS AUTHOR. In a focus_level Focus WITHOUT the current consent,
   handoff_ingest is SILENTLY SKIPPED by the collection-consent gate (declining is not a block:
   the Focus keeps working and saves nothing). A reply row such as an acknowledgement would
@@ -703,7 +721,7 @@ in a run, so nothing depends on resume. The legacy requires_user_handoff pause i
   existing behaviour for every imported document and was left alone here.
 - SCHEMA: shared_046.sql (data only, the cb-15 mirror row; the migration tests re-pinned to 46).
   No new table or column. items.id=633 must absorb shared_046.sql with the other shared files.
-- NOT BUILT: the real Writing Assistant starter (waits for items.id=884's flag flip), a
+- NOT BUILT: the real Writing Assistant starter (the flag flip it waited for has landed), a
   Derived handoff_draft name, multiple hand-offs inside one pass (the return pass's row order is
   the Focus's), file or document replies beyond a plain paste, any model step after the return
   row (B7c delta validation reads the reply by handle).
@@ -827,9 +845,18 @@ Focus and items.id=916 flips it; the hard purge ships before that.
   catalogued fact in catalogue order, 200 bytes a value, 1800 total, whole lines dropped) and
   device_library_brief ("- E-XXXXXXXX: name (class) | Label: value ..." up to 8 devices newest first,
   up to 3 headline facts that the catalogue marks pass at tier 2, 60 bytes a value, "- and N more").
-  subject_context renders EVERY catalogued fact, serial number and address included, as LOCAL text:
-  STORE_NAMES_EXTERNAL_ALLOWED stays false (items.id=884), so both names are refused in external steps
-  and tainted like every store name. Seeds are read once per pass, so a device's facts appear one pass
+  subject_context renders EVERY catalogued fact, serial number and address included, as LOCAL text.
+  CLOSED LIST (items.id=884, declared_inputs.rs DEVICE_NAMES_NEVER_EXTERNAL = subject_context and
+  device_library_brief, pinned equal to the two bound_spec names): LOAD refuses an external step that
+  names or declares either name, a variable derived from one, or a step that follows one through
+  {previous_output}, with its own error (DeviceNameInExternalStep), checked first on every Focus and
+  NOT relaxed by STORE_NAMES_EXTERNAL_ALLOWED (true since items.id=884). Why: the catalogue marks
+  serial number, warranty contact and access location not_permitted at tiers 2 and 3 (never, even
+  with consent), the brief carries the user's device names and two free-text fields with no secret
+  detector, the outbound review detects and asks (it does not enforce the catalogue), and
+  decisions.id=513's redaction needs flags decisions.id=945 defers. Opening them later is a design
+  (a tier-aware render of the catalogue's policies), not a flag. They stay tainted like every store
+  name. Seeds are read once per pass, so a device's facts appear one pass
   late. The wording is provisional (Chat-PM reviewed; items.id=914 owns the other three texts and
   edits seeding.rs/bound_spec.rs after this item).
 - HARD PURGE (persistence/entity_purge.rs, the ONLY module that deletes the entity, case and delta
