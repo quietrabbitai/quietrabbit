@@ -1888,7 +1888,7 @@ pub struct FocusRun<L: DisclosureLoggerForRun = SqliteDisclosureLogger> {
 /// items.id=901 stage 4: the plan gate of a run start (see plan_gate.rs).
 #[path = "plan_gate.rs"]
 mod plan_gate;
-pub(crate) use plan_gate::{focus_has_model_block, PlanGate};
+pub(crate) use plan_gate::{focus_has_model_block, PlanGate, PlanOfferError};
 
 impl<L: DisclosureLoggerForRun> FocusRun<L> {
     #[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.

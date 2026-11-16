@@ -288,6 +288,44 @@ pub(crate) async fn plan_preflight(
     if let Ok(false) = crate::conductor::lifecycle::focus_has_model_block(&pool, &focus_id).await {
         return Ok(());
     }
+    let mut run = plan_probe_run(
+        scheduler,
+        pool,
+        plan_memory,
+        key_hex,
+        user_id,
+        persona_id,
+        focus_id,
+        Some(context_key),
+    );
+    if run.load().await.is_err() || run.authorize_checks().await.is_err() {
+        return Ok(());
+    }
+    match run.plan_gate().await {
+        Ok(PlanGate::Required(_)) => Err(plan_required_error()),
+        // Proceed, or an error the real start will report itself.
+        _ => Ok(()),
+    }
+}
+
+/// A throwaway FocusRun built exactly as the plan preflight and get_run_plan need it
+/// (items.id=901): the same inputs as the real start, no user input, no topic, no binding,
+/// no plan token. ONE constructor, so the plan a screen is shown and the plan the run
+/// recomputes come from the same inputs and so have the same digest. `context_key` is the
+/// chat's (its launch answers are read), or None for a run with no chat. The caller runs
+/// load() and authorize_checks(); nothing is written by building it.
+// 8 arguments, as plan_preflight: the server-side state and the caller's ids.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_probe_run(
+    scheduler: Arc<ConductorScheduler>,
+    pool: sqlx::SqlitePool,
+    plan_memory: PlanMemory,
+    key_hex: String,
+    user_id: String,
+    persona_id: String,
+    focus_id: String,
+    context_key: Option<String>,
+) -> FocusRun {
     let is_quick_ask = is_quick_ask_focus(&focus_id);
     let mut run: FocusRun = FocusRun::new(
         user_id,
@@ -303,16 +341,9 @@ pub(crate) async fn plan_preflight(
         std::collections::HashSet::new(),
         None,
     );
-    run.context_key = Some(context_key);
+    run.context_key = context_key;
     run.plan_memory = Some(plan_memory);
-    if run.load().await.is_err() || run.authorize_checks().await.is_err() {
-        return Ok(());
-    }
-    match run.plan_gate().await {
-        Ok(PlanGate::Required(_)) => Err(plan_required_error()),
-        // Proceed, or an error the real start will report itself.
-        _ => Ok(()),
-    }
+    run
 }
 
 /// Whether a run's Focus id is the retired Quick Ask Focus. Pulled out so a

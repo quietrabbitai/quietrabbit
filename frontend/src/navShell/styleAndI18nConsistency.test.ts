@@ -65,6 +65,17 @@ const PRE_EXISTING_ORPHAN_KEYS: string[] = [
   'resolver.stop.too_weak', // items.id=896: the backend parks a model-block step with this code; the screen that shows it is items.id=902 or 904
   'resolver.stop.no_candidate', // same
   'plan.stop.exceeded', // items.id=901: the backend parks a model-block step beyond the approved plan with this code; the screen that shows it is items.id=902 or 904
+  'plan.error.persona_not_found', // items.id=901 stage 8: the codes of the run plan commands; the screen that shows them is items.id=902 or 904
+  'plan.error.invalid_focus_id', // items.id=901 stage 8: the codes of the run plan commands; the screen that shows them is items.id=902 or 904
+  'plan.error.invalid_context_key', // items.id=901 stage 8: the codes of the run plan commands; the screen that shows them is items.id=902 or 904
+  'plan.error.invalid_plan_token', // items.id=901 stage 8: the codes of the run plan commands; the screen that shows them is items.id=902 or 904
+  'plan.error.invalid_run_id', // items.id=901 stage 8: the codes of the run plan commands; the screen that shows them is items.id=902 or 904
+  'plan.error.no_plan', // items.id=901 stage 8: the codes of the run plan commands; the screen that shows them is items.id=902 or 904
+  'plan.error.plan_changed', // items.id=901 stage 8: the codes of the run plan commands; the screen that shows them is items.id=902 or 904
+  'plan.error.invalid_choice', // items.id=901 stage 8: the codes of the run plan commands; the screen that shows them is items.id=902 or 904
+  'plan.error.invalid_ceiling', // items.id=901 stage 8: the codes of the run plan commands; the screen that shows them is items.id=902 or 904
+  'plan.error.plan_too_many_paths', // items.id=901 stage 8: the codes of the run plan commands; the screen that shows them is items.id=902 or 904
+  'plan.error.plan_unavailable', // items.id=901 stage 8: the codes of the run plan commands; the screen that shows them is items.id=902 or 904
   'step_review.stop.required', // items.id=884: the backend parks an external step with this code. The run status event carries no park reason, so no surface shows these four yet (the run plan, items.id=901, or the chooser, items.id=900, would)
   'step_review.stop.privacy_filter_unavailable', // same
   'step_review.stop.blocked', // same

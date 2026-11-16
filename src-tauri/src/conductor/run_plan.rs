@@ -488,7 +488,7 @@ pub fn compute(input: &PlanInput<'_>) -> Result<RunPlan, PlanError> {
     Ok(plan)
 }
 
-fn bar_str(b: QualityBar) -> &'static str {
+pub(crate) fn bar_str(b: QualityBar) -> &'static str {
     match b {
         QualityBar::Basic => "basic",
         QualityBar::Standard => "standard",
@@ -496,7 +496,7 @@ fn bar_str(b: QualityBar) -> &'static str {
     }
 }
 
-fn destination_str(d: Destination) -> &'static str {
+pub(crate) fn destination_str(d: Destination) -> &'static str {
     match d {
         Destination::Local => "local",
         Destination::HostedApi => "hosted_api",

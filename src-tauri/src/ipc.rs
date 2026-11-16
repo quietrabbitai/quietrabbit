@@ -261,6 +261,15 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::launch::get_focus_launch_config,
         commands::launch::get_launch_state,
         commands::launch::submit_launch_answers,
+        // Group 36 in this list (Group 39 of HANDOFF_IPC_SURFACE.md) -- The run plan
+        // before a run starts: the plan a run would act under, its approval (a chat's
+        // two homes, or a run with no chat by token), the revocation and the park
+        // reason of a parked run (items.id=901, decisions.id=942 Q2 and Q3)
+        commands::run_plan::get_run_plan,
+        commands::run_plan::approve_run_plan,
+        commands::run_plan::get_run_plan_approval,
+        commands::run_plan::revoke_run_plan_approval,
+        commands::run_plan::get_run_park,
     ])
 }
 

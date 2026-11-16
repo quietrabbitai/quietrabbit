@@ -66,6 +66,15 @@ pub(crate) async fn focus_has_model_block(
     Ok(q.fetch_optional(pool).await?.is_some())
 }
 
+/// Why a plan could not be offered (items.id=901 stage 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlanOfferError {
+    /// More than the guard path cap of paths: no plan is offered, no hosted step runs.
+    TooManyPaths,
+    /// Any other reason; no detail travels.
+    Unavailable,
+}
+
 /// What the plan gate decided for a run start.
 #[derive(Debug)]
 pub(crate) enum PlanGate {
@@ -91,16 +100,10 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         }
 
         // 2. The plan, from this run's own definition, launch resolution and ceiling.
-        let plan = run_plan::build(&BuildInput {
-            pool: &self.pool,
-            user_id: &self.user_id,
-            key_hex: self.key_hex.as_deref().unwrap_or(""),
-            def,
-            launch: &self.launch,
-            focus_ceiling: self._focus_external_access,
-        })
-        .await
-        .map_err(|_| LifecycleError::PlanUnavailable)?;
+        let plan = self
+            .build_plan()
+            .await
+            .map_err(|_| LifecycleError::PlanUnavailable)?;
         let Some(plan) = plan else {
             return Ok(PlanGate::Proceed);
         };
@@ -120,6 +123,46 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             (None, true) => Ok(PlanGate::Required(Box::new(plan))),
             (None, false) => Ok(PlanGate::Proceed),
         }
+    }
+
+    /// The plan of this run, from its own definition, launch resolution and ceiling: the ONE
+    /// call to run_plan::build (a scan pins it), shared by the gate and by plan_offer so the
+    /// digest a screen is shown is the digest the run recomputes.
+    async fn build_plan(&self) -> Result<Option<RunPlan>, run_plan::PlanError> {
+        let def = self
+            .focus_def
+            .as_ref()
+            .expect("build_plan() requires load() to have succeeded first");
+        run_plan::build(&BuildInput {
+            pool: &self.pool,
+            user_id: &self.user_id,
+            key_hex: self.key_hex.as_deref().unwrap_or(""),
+            def,
+            launch: &self.launch,
+            focus_ceiling: self._focus_external_access,
+        })
+        .await
+    }
+
+    /// The plan a screen shows (items.id=901 stage 8, commands::run_plan::get_run_plan), and
+    /// whether the run would already proceed under a stored approval of this chat. Requires
+    /// load() and authorize_checks(), exactly as the gate does, on a run built the same way
+    /// (execution::plan_probe_run). Reads only: it writes nothing and consumes nothing (the
+    /// probe run holds no plan token, so an offer is never taken here). None: the Focus has
+    /// no planned step.
+    pub(crate) async fn plan_offer(&self) -> Result<Option<(RunPlan, bool)>, PlanOfferError> {
+        let plan = self.build_plan().await.map_err(|e| match e {
+            run_plan::PlanError::TooManyPaths => PlanOfferError::TooManyPaths,
+            _ => PlanOfferError::Unavailable,
+        })?;
+        let Some(plan) = plan else {
+            return Ok(None);
+        };
+        let approved = self
+            .read_plan_approval()
+            .await
+            .is_some_and(|a| plan_approval::verify(&plan, &a));
+        Ok(Some((plan, approved)))
     }
 
     /// The approval this run may act under, if one can be read. None for any failure.

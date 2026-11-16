@@ -629,7 +629,7 @@ fn the_plan_the_approval_and_the_memory_home_are_read_only_where_reviewed() {
             || name.ends_with("persistence/run_park_store.rs")
     };
     // (needle, allowed files). Production code only (before the first #[cfg(test)]).
-    let rules: [(&str, &[&str]); 8] = [
+    let rules: [(&str, &[&str]); 13] = [
         // The run's own approval: set by the gate, read for the StepContext and the Gate 3
         // look-ahead (lifecycle.rs) and nowhere else.
         (
@@ -646,6 +646,13 @@ fn the_plan_the_approval_and_the_memory_home_are_read_only_where_reviewed() {
         // Who reads the approval a run holds.
         (".plan.clone()", &["conductor/lifecycle.rs"]),
         ("ctx.plan", &["conductor/executor.rs"]),
+        // Stage 8: who reads which home an approval is in (get_run_plan_approval), and who
+        // writes, revokes or offers one. The five run plan commands, nowhere else.
+        ("read_chat_approval_with_home(", &["commands/run_plan.rs"]),
+        ("save_chat_approval(", &["commands/run_plan.rs"]),
+        ("revoke_chat_approval(", &["commands/run_plan.rs"]),
+        ("approve_offer(", &["commands/run_plan.rs"]),
+        ("register_offer(", &["commands/run_plan.rs"]),
         // The memory home is reached by the gate, the clearing sites and main.rs only.
         (
             "PlanMemory",
@@ -657,6 +664,7 @@ fn the_plan_the_approval_and_the_memory_home_are_read_only_where_reviewed() {
                 "commands/api_chat.rs",
                 "commands/chats.rs",
                 "commands/turn_marker.rs",
+                "commands/run_plan.rs",
                 "main.rs",
             ],
         ),

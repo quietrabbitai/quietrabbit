@@ -276,6 +276,29 @@ pub async fn read_chat_approval(
     .transpose()
 }
 
+/// read_chat_approval that also says WHICH home held the approval (items.id=901 stage 8:
+/// get_run_plan_approval is read-only and tells the screen). Same read order and the same
+/// rule: an Err is "no approval", never permission.
+pub async fn read_chat_approval_with_home(
+    memory: &PlanMemory,
+    conn: Option<&mut SqliteConnection>,
+    scope: &ChatScope,
+) -> Result<Option<(Approval, HomeKind)>, ApprovalError> {
+    if let Some(held) = memory.get_chat_approval(scope) {
+        return Ok(Some((held, HomeKind::Memory)));
+    }
+    Ok(read_chat_approval(memory, conn, scope)
+        .await?
+        .map(|a| (a, HomeKind::Persisted)))
+}
+
+/// Which home held an approval, without a version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeKind {
+    Persisted,
+    Memory,
+}
+
 /// Withdraw the approval of a chat from BOTH homes. Not latch-gated: it only removes a
 /// permission. With no connection only the memory home is reached and the persisted one is
 /// reported as an error, so the caller can retry.

@@ -592,6 +592,19 @@
   "plan": {
     "stop": {
       "exceeded": "This step would go beyond what you approved for this run, so nothing was sent."
+    },
+    "error": {
+      "persona_not_found": "That persona could not be found.",
+      "invalid_focus_id": "That Focus could not be found.",
+      "invalid_context_key": "That chat could not be identified.",
+      "invalid_plan_token": "This plan offer is no longer available. Open the plan again.",
+      "invalid_run_id": "That run could not be identified.",
+      "no_plan": "This Focus has no plan to approve.",
+      "plan_changed": "The plan changed since it was shown. Review it again.",
+      "invalid_choice": "One of the choices is not available for this plan.",
+      "invalid_ceiling": "That spending limit is not allowed for this plan.",
+      "plan_too_many_paths": "This Focus is too complex to plan, so nothing outside your device will run.",
+      "plan_unavailable": "The plan could not be prepared. Nothing was approved."
     }
   },
   "stepReview": {

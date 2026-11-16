@@ -1069,6 +1069,18 @@ export const commands = {
 	getFocusLaunchConfig: (focusId: string) => typedError<FocusLaunchConfig, string>(__TAURI_INVOKE("get_focus_launch_config", { focusId })),
 	getLaunchState: (personaId: string, contextKey: string, focusId: string) => typedError<LaunchState, string>(__TAURI_INVOKE("get_launch_state", { personaId, contextKey, focusId })),
 	submitLaunchAnswers: (personaId: string, contextKey: string, focusId: string, answers: LaunchAnswerInput[], runChange: string | null) => typedError<LaunchState, string>(__TAURI_INVOKE("submit_launch_answers", { personaId, contextKey, focusId, answers, runChange })),
+	getRunPlan: (personaId: string, contextKey: string | null, focusId: string) => typedError<RunPlanView, string>(__TAURI_INVOKE("get_run_plan", { personaId, contextKey, focusId })),
+	approveRunPlan: (request: ApproveRunPlanRequest) => typedError<RunPlanApprovalView, string>(__TAURI_INVOKE("approve_run_plan", { request })),
+	getRunPlanApproval: (personaId: string, contextKey: string, focusId: string) => typedError<RunPlanApprovalView, string>(__TAURI_INVOKE("get_run_plan_approval", { personaId, contextKey, focusId })),
+	revokeRunPlanApproval: (personaId: string, contextKey: string | null, planToken: string | null, focusId: string) => typedError<RunPlanRevocationView, string>(__TAURI_INVOKE("revoke_run_plan_approval", { personaId, contextKey, planToken, focusId })),
+	getRunPark: (personaId: string, runId: string) => typedError<{
+	run_id: string,
+	action_id: string,
+	/**  A registered code (spend::codes::Code). */
+	code: string,
+	/**  A JSON object of ids, counts and reason words, at most 4096 bytes. */
+	params_json: string,
+} | null, string>(__TAURI_INVOKE("get_run_park", { personaId, runId })),
 };
 
 /* Types */
@@ -1082,6 +1094,24 @@ export type ActiveBoardResponse = {
 	 *  high-priority container and the full list.
 	 */
 	high_priority: TopicInfo[],
+};
+
+/**
+ *  What approve_run_plan takes (a request struct: the generated bindings take at most ten
+ *  arguments, and with the Tauri state this command has more).
+ */
+export type ApproveRunPlanRequest = {
+	persona_id: string,
+	/**  The chat. Exactly one of context_key and plan_token. */
+	context_key: string | null,
+	/**  The token get_run_plan returned for a run with no chat. */
+	plan_token: string | null,
+	focus_id: string,
+	/**  The PIN-FREE digest get_run_plan showed. */
+	digest: string,
+	/**  micro-USD, a decimal string. */
+	ceiling_micros: string,
+	choices: PinInput[],
 };
 
 /**
@@ -1990,6 +2020,13 @@ export type MessageInfo = {
 	model_id: string | null,
 };
 
+export type ModeAlternativeView = {
+	mode_option_id: string,
+	/**  The strategy the Focus would take under that mode, or None with the reason. */
+	strategy: string | null,
+	reason: string,
+};
+
 export type ModelPriceDto = {
 	/**
 	 *  `price_state.known | unknown | stale`. `stale` is the "estimate may be
@@ -2084,6 +2121,29 @@ export type OauthStatus = {
 	key_length: number,
 	/**  A stable code when `Failed`. */
 	failure: string | null,
+};
+
+export type OfferView = {
+	/**  local, local_unmeasured or paid_api. */
+	strategy: string,
+	/**  local or hosted. */
+	subject: string,
+	/**  Empty for a local model. */
+	provider_id: string,
+	model_id: string,
+	/**  local, free, plan_included or metered. */
+	cost_tier: string,
+	/**  The gate's worst case in micro-USD (a decimal string), or None when there is none. */
+	est_cost_micros: string | null,
+	/**  qualifies, below_bar or not_measured. */
+	standing: string,
+	/**  below_basic, basic, standard or high, when measured. */
+	attained_bar: string | null,
+	above_worth_bar: boolean,
+	selectable: boolean,
+	/**  below_bar or no_estimate, when not selectable. */
+	not_selectable_reason: string | null,
+	needs_approval: boolean,
 };
 
 /**
@@ -2293,6 +2353,39 @@ export type PersonalFieldInfo = {
 	abstraction_tier2: string,
 	/**  Abstracted display value for cloud_frontier routing contexts. */
 	abstraction_tier3: string,
+};
+
+/**  One explicit choice of the user, as sent and as stored. */
+export type PinInput = {
+	action_id: string,
+	/**  local_unmeasured or paid_api. */
+	strategy: string,
+	/**  Empty for a local model. */
+	provider_id: string,
+	model_id: string,
+};
+
+export type PinView = {
+	action_id: string,
+	strategy: string,
+	provider_id: string,
+	model_id: string,
+};
+
+export type PlanStepView = {
+	action_id: string,
+	/**  model_block. */
+	kind: string,
+	task_type: string,
+	required_bar: string,
+	worth_paying_bar: string,
+	/**  local, hosted_api, manual_handoff. */
+	destinations: string[],
+	/**  local_only, anonymous_required, anonymous_preferred or unrestricted. */
+	highest_tier: string,
+	hosted_possible: boolean,
+	answer: ResolverAnswerView,
+	offers: OfferView[],
 };
 
 export type PriceInput = {
@@ -2653,6 +2746,19 @@ export type RequestChatCopyGate3ReviewRequest = {
 	content_text: string,
 };
 
+export type ResolverAnswerView = {
+	/**  selected, too_weak or no_candidate. */
+	kind: string,
+	subject: string | null,
+	provider_id: string | null,
+	model_id: string | null,
+	cost_tier: string | null,
+	/**  micro-USD, a decimal string. */
+	est_cost_micros: string | null,
+	required_bar: string | null,
+	reason: string | null,
+};
+
 export type ResumeRunRequest = {
 	run_id: string,
 	user_id: string,
@@ -2709,6 +2815,64 @@ export type RotationStatus = {
 	 *  does, never on a cold mount, where it describes an earlier rotation.
 	 */
 	last_outcome: LastRotationOutcome,
+};
+
+export type RunParkView = {
+	run_id: string,
+	action_id: string,
+	/**  A registered code (spend::codes::Code). */
+	code: string,
+	/**  A JSON object of ids, counts and reason words, at most 4096 bytes. */
+	params_json: string,
+};
+
+export type RunPlanApprovalView = {
+	focus_id: string,
+	/**  An approval is held. */
+	approved: boolean,
+	/**  persisted or memory, when approved. */
+	home: string | null,
+	digest: string | null,
+	/**  micro-USD, a decimal string. */
+	ceiling_micros: string | null,
+	choices: PinView[],
+	/**
+	 *  The chat cannot save (latched, or its latch could not be read): its approval lives in
+	 *  memory only and is asked again after a restart.
+	 */
+	one_time_chat: boolean,
+	/**  Echoed for a run with no chat. */
+	plan_token: string | null,
+};
+
+export type RunPlanRevocationView = {
+	/**  An approval or offer was removed from the memory-only home. */
+	memory: boolean,
+	/**  An approval row was removed from the persisted home. */
+	persisted: boolean,
+};
+
+export type RunPlanView = {
+	focus_id: string,
+	/**  The pin-free digest: what approve_run_plan must be given back. */
+	digest: string,
+	needs_approval: boolean,
+	/**
+	 *  The chat already holds an approval that matches this plan (a run would proceed).
+	 *  Always false for a run with no chat.
+	 */
+	approved: boolean,
+	handoff_listed: boolean,
+	document_profile: string | null,
+	/**  The dearest reachable path with no pins, in micro-USD (a decimal string). */
+	estimate_micros: string,
+	/**  The most a ceiling may be, in micro-USD (a decimal string). */
+	ceiling_max_micros: string,
+	/**  A run with no chat: the opaque single-use token of its offer. None for a chat. */
+	plan_token: string | null,
+	steps: PlanStepView[],
+	strategies: StrategyView[],
+	alternatives: ModeAlternativeView[],
 };
 
 export type SaveKeyRequest = {
@@ -2869,6 +3033,14 @@ export type StepReviewRunRequest = {
 
 export type StoreIngestedDocumentResponse = {
 	output_id: string,
+};
+
+export type StrategyView = {
+	/**  local, paid_api or manual_handoff. */
+	kind: string,
+	listed: boolean,
+	/**  A reason id (a closed word). */
+	reason: string,
 };
 
 export type SubmitConsentDecisionRequest = {
