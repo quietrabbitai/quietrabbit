@@ -64,13 +64,10 @@ const PRE_EXISTING_ORPHAN_KEYS: string[] = [
   'privacyGuardianModal.selectedCount', // defined, no t() call site anywhere
   'resolver.stop.too_weak', // items.id=896: the backend parks a model-block step with this code; the screen that shows it is items.id=902 or 904
   'resolver.stop.no_candidate', // same
-  'step_review.stop.required', // items.id=884 stage 1: the backend parks an external step with this code; StepReviewHost (stage 2) shows it
+  'step_review.stop.required', // items.id=884: the backend parks an external step with this code. The run status event carries no park reason, so no surface shows these four yet (the run plan, items.id=901, or the chooser, items.id=900, would)
   'step_review.stop.privacy_filter_unavailable', // same
   'step_review.stop.blocked', // same
   'step_review.stop.refused', // same
-  'step_review.error.persona_not_found', // items.id=884 stage 1: the codes of get_pending_step_review and decline_step_review; StepReviewHost (stage 2) shows them
-  'step_review.error.invalid_run_id', // same
-  'step_review.error.step_review_unavailable', // same
   'handoff.error.persona_not_found', // items.id=387: the codes of get_handoff_state; the panel that shows them is items.id=912
   'handoff.error.invalid_focus_id', // same
   'handoff.error.invalid_context_key', // same

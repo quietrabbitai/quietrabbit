@@ -30,6 +30,7 @@ import './NavShell.css'
 import { commands, type PersonaInfo, type PrivacyFilterStatus } from '../bindings'
 import { AccountSecurityScreen } from '../auth/AccountSecurityScreen'
 import type { SignOutNotice } from '../auth/rotationErrors'
+import { StepReviewHost } from '../stepReview/StepReviewHost'
 import { WorkspaceShell } from './WorkspaceShell'
 import { showPrivacyCheckBanner, showPrivacyRetry } from './privacyCheckBanner'
 import {
@@ -198,6 +199,16 @@ export function NavShell({ onSignOut }: NavShellProps) {
       >
         {t('auth.accountSecurity.openButton')}
       </button>
+      {/* items.id=884: the outbound review of an external step's prompt. One host
+          for every run of the active Persona (keyed by it, so nothing carries over a
+          Persona switch); it hides the native Cloud Chat pane itself while it shows. */}
+      {navState.activePersonaId && (
+        <StepReviewHost
+          key={navState.activePersonaId}
+          userId={requireCurrentUserId()}
+          personaId={navState.activePersonaId}
+        />
+      )}
       {accountSecurityOpen && (
         <AccountSecurityScreen
           onClose={() => setAccountSecurityOpen(false)}

@@ -1,0 +1,48 @@
+/* The notice StepReviewHost shows when the review itself cannot go on (items.id=884
+ * stage 2): an answer that was not recorded, or a review that could not be brought
+ * back up. Functional layout only -- Chat-BRAND sets the look (items.id=900). The
+ * review itself is PrivacyGuardianModal and keeps that modal's own treatment. Same
+ * authority tokens as the modal, same layer. */
+
+.step-review-notice-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.step-review-notice {
+  width: 420px;
+  max-width: calc(100vw - 32px);
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border-radius: 8px;
+  background: var(--pg-sage-mist);
+  color: var(--pg-ink);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
+  font-family: var(--font-sans);
+  text-align: left;
+}
+
+.step-review-notice__title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.step-review-notice__body {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.step-review-notice__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}

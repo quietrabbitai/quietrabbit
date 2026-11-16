@@ -575,6 +575,21 @@
       "no_candidate": "There is no AI model this task is allowed to use right now, so nothing was run."
     }
   },
+  "stepReview": {
+    "focusContext": "This came up while preparing a request to an outside AI service.",
+    "declineButton": "Don't send",
+    "confirmAllKeptPrivate": "Kept private. The request will be sent without it.",
+    "notice": {
+      "errorTitle": "Your choice was not recorded",
+      "errorNothingSent": "Nothing was sent.",
+      "stuckTitle": "This request is still waiting for your review",
+      "stuckBody": "Quiet Rabbit could not bring the review back up. Nothing was sent.",
+      "tryAgain": "Try again",
+      "checkAgain": "Check again",
+      "dontSend": "Don't send",
+      "close": "Close"
+    }
+  },
   "step_review": {
     "error": {
       "persona_not_found": "This persona is not available.",

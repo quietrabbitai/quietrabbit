@@ -124,6 +124,17 @@ export interface PrivacyGuardianModalProps {
    *  without recording any decision. Supplied ONLY by the copy review's
    *  modal (ChatPane), the only mount left since slice 3. */
   onDecline?: () => void
+  /** items.id=884: the wording the copy review's mount does not need to change but
+   *  the external-step review does ("Don't send" is not "Don't copy", and keeping
+   *  everything private does not stop that review: the request goes without it).
+   *  Each falls back to this modal's own copy-review text. */
+  labels?: PrivacyGuardianModalLabels
+}
+
+export interface PrivacyGuardianModalLabels {
+  focusContext?: string
+  declineButton?: string
+  confirmAllKeptPrivate?: string
 }
 
 interface RowState {
@@ -176,6 +187,7 @@ export function PrivacyGuardianModal({
   onResolve,
   onCancel,
   onDecline,
+  labels,
 }: PrivacyGuardianModalProps) {
   const { t } = useTranslation()
   const [rows, setRows] = useState<Record<string, RowState>>({})
@@ -329,7 +341,7 @@ export function PrivacyGuardianModal({
     const decisions = buildDecisions(rows)
     const { generalized, keptPrivate, released } = countsByDecision(decisions)
     const message = isAllKeptPrivate(decisions)
-      ? t('privacyGuardianModal.confirmAllKeptPrivate')
+      ? (labels?.confirmAllKeptPrivate ?? t('privacyGuardianModal.confirmAllKeptPrivate'))
       : t('privacyGuardianModal.confirmMixed', { generalized, keptPrivate, released })
     finishAndResolve(decisions, message)
   }
@@ -388,7 +400,8 @@ export function PrivacyGuardianModal({
       <div className="pg-modal" role="dialog" aria-modal="true">
         <PgHeader />
         <div className="pg-modal__subheader">
-          {t('privacyGuardianModal.focusContext', { focusName: payload.focus_name })}
+          {labels?.focusContext ??
+            t('privacyGuardianModal.focusContext', { focusName: payload.focus_name })}
         </div>
         <div className="pg-modal__body">
           {REVIEW_TIER_ORDER.map((tier) => {
@@ -425,7 +438,7 @@ export function PrivacyGuardianModal({
           )}
           {onDecline && (
             <button type="button" className="pg-modal__cancel-button" onClick={onDecline}>
-              {t('privacyGuardianModal.dontCopyButton')}
+              {labels?.declineButton ?? t('privacyGuardianModal.dontCopyButton')}
             </button>
           )}
           <button

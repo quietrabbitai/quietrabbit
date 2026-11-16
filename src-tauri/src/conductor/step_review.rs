@@ -764,6 +764,13 @@ pub async fn review_prompt<S: ReviewScanner>(
     let settled: Vec<SettledSpan> = result.auto_resolved.iter().map(auto_to_settled).collect();
 
     if result.pending_consent {
+        // Nothing to ask about: gate3 can only reach here with no spans through its
+        // forced-High branch (severity or an authoritative destination risk), which
+        // these parameters never set. If it ever did, a review the user cannot answer
+        // would park the step for good, so it is blocked instead.
+        if result.review_spans.is_empty() {
+            return block(conn, input, &sha, BlockReason::Indeterminate).await;
+        }
         if !spans_fit(input.prompt, &result.review_spans) {
             return block(conn, input, &sha, BlockReason::Unappliable).await;
         }
@@ -1579,6 +1586,21 @@ mod tests {
                 "nothing pending: the user was never asked"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_pending_review_with_nothing_to_ask_is_blocked_not_parked_for_good() {
+        let mut c = conn().await;
+        let scanner = FakeScanner::pending(vec![]);
+        let p = parked(review_prompt(&mut c, &scanner, &input(PROMPT)).await);
+        assert_eq!(p, Park::Blocked(BlockReason::Indeterminate));
+        assert!(
+            store::pending_review_for_run(&mut c, RUN)
+                .await
+                .unwrap()
+                .is_none(),
+            "no pending row the user could never answer"
+        );
     }
 
     #[tokio::test]
