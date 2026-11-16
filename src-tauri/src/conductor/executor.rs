@@ -1669,7 +1669,10 @@ fn resolver_stop(outcome: &crate::conductor::model_resolver::Resolution) -> Opti
                             .map(entry)
                             .unwrap_or(serde_json::Value::Null),
                     )
-                    .with("options", serde_json::Value::Array(shown)),
+                    .with("options", serde_json::Value::Array(shown))
+                    // The count before the cap above, so a stored park can say "and N more"
+                    // (conductor::run_park).
+                    .with("options_total", options.len()),
             ))
         }
         Resolution::NoCandidate(reason) => Some(spend_block_error(
@@ -7702,6 +7705,79 @@ mod tests {
             &[Destination::Local],
             ExternalAccess::AnonymousPreferred,
         )
+    }
+
+    // -- items.id=901 stage 7: the resolver's stop as the park a run keeps -------
+
+    /// The real producer: resolver_stop's parameters, turned into the failure the handler
+    /// makes (failure.rs copies the params to metadata unchanged), then into the stored park.
+    /// Options are carried in rank order with their standing words, the producer's own cap
+    /// (16) is reported as "omitted", and the JSON stays inside the store's cap.
+    #[test]
+    fn the_resolvers_too_weak_stop_becomes_a_park_with_its_ranked_options() {
+        use crate::conductor::model_capability::{AttainedBar, CapabilitySubject};
+        use crate::conductor::model_resolver::{
+            CostTier, ModelRef, OptionEntry, Resolution, Standing,
+        };
+        let entry = |i: usize, standing: Standing| OptionEntry {
+            model: ModelRef {
+                subject: CapabilitySubject::Local,
+                provider_id: String::new(),
+                model_id: format!("m-{i:02}"),
+            },
+            cost_tier: CostTier::Local,
+            est_cost_micros: 0,
+            standing,
+        };
+        let options: Vec<OptionEntry> = (0..20)
+            .map(|i| {
+                entry(
+                    i,
+                    if i < 2 {
+                        Standing::BelowBar(AttainedBar::Basic)
+                    } else {
+                        Standing::NotMeasured
+                    },
+                )
+            })
+            .collect();
+        let stop = resolver_stop(&Resolution::TooWeak {
+            required: crate::conductor::model_block::config::QualityBar::Standard,
+            best_below_bar: Some(entry(0, Standing::BelowBar(AttainedBar::Basic))),
+            options,
+        })
+        .expect("a stop");
+        let ConductorError::SpendBlock { params, .. } = stop else {
+            panic!("a spend block")
+        };
+        let meta = params.as_object().unwrap().clone().into_iter().collect();
+        let failure = FailureResult {
+            action: FailureAction::AwaitUser,
+            failure_mode: Some("F10".to_owned()),
+            plain_language: "resolver.too_weak".to_owned(),
+            is_recoverable: true,
+            severity: crate::conductor::failure::FailureSeverity::Require,
+            action_id: Some("draft".to_owned()),
+            focus_id: Some("f".to_owned()),
+            metadata: Some(meta),
+        };
+        let park = crate::conductor::run_park::from_failure(&failure).expect("a park");
+        assert_eq!(park.code, Code::ResolverTooWeak);
+        assert!(park.params_json.len() <= crate::persistence::run_park_store::PARAMS_MAX_BYTES);
+        let v: serde_json::Value = serde_json::from_str(&park.params_json).unwrap();
+        assert_eq!(v["required"], "standard");
+        let kept = v["options"].as_array().unwrap();
+        assert_eq!(kept.len(), 16, "the producer's own cap");
+        assert_eq!(v["options_total"], 20);
+        assert_eq!(v["options_omitted"], 4);
+        for (i, o) in kept.iter().enumerate() {
+            assert_eq!(o["model_id"], format!("m-{i:02}"), "rank order");
+            assert_eq!(o["subject"], "local");
+        }
+        assert_eq!(kept[0]["standing"], "below_bar");
+        assert_eq!(kept[0]["attained"], "basic");
+        assert_eq!(kept[5]["standing"], "not_measured");
+        assert_eq!(v["best_below_bar"]["model_id"], "m-00");
     }
 
     // -- condition 3: no document type, the step parks through TooWeak ---------

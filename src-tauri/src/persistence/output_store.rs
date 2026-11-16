@@ -1077,6 +1077,18 @@ pub async fn delete_output(
 // Consent decisions (D6-352)
 // ---------------------------------------------------------------------------
 
+/// items.id=901 stage 7: remove the run's park reason when the run moves on. BEST EFFORT: a
+/// failing clear never fails the cancel or the status write it rides on (the run's own state
+/// is the truth, the park a hint for a screen). One fixed log line, no parameter.
+async fn clear_park_best_effort(conn: &mut SqliteConnection, run_id: &str) {
+    if crate::persistence::run_park_store::clear_park(conn, run_id)
+        .await
+        .is_err()
+    {
+        log::warn!("output_store: the run's park reason was not cleared");
+    }
+}
+
 /// Mark a focus run as cancelled and delete its snapshots (decisions.id=865:
 /// cancelled purges at once).
 /// No-op if the run is already in a terminal state (complete/cancelled/failed).
@@ -1121,6 +1133,8 @@ pub async fn cancel_focus_run(
             .bind(run_id)
             .execute(&mut conn)
             .await?;
+        // items.id=901 stage 7: a cancelled run is not parked any more.
+        clear_park_best_effort(&mut conn, run_id).await;
         // items.id=884: a cancelled run is not waiting for an answer, so a step
         // review it was parked on is superseded (decisions.id=943 point 4).
         crate::persistence::step_review_store::supersede_pending_for_run(&mut conn, run_id)
@@ -1162,6 +1176,10 @@ pub async fn set_focus_run_status(
             .bind(focus_run_id)
             .execute(&mut conn)
             .await?;
+    }
+    // items.id=901 stage 7: any status but the parked one means the run moved on.
+    if status != "awaiting_user" {
+        clear_park_best_effort(&mut conn, focus_run_id).await;
     }
 
     Ok(())

@@ -37,6 +37,7 @@ pub mod propose_route;
 pub mod provider_selection;
 pub mod quality;
 pub mod reentry;
+pub mod run_park;
 pub mod run_plan;
 pub mod run_settings;
 pub mod scheduled_sweep;

@@ -38,6 +38,11 @@
 //
 // NOTHING HERE WIDENS A GATE. A value read from here is only ever COMPARED against the plan
 // the run recomputed (conductor::plan_approval::verify). A missing value means "ask again".
+//
+// items.id=901 stage 7 adds one more entry kind: the PARK REASON of a run (conductor::run_park)
+// whose own focus_runs row, or whose persisted park, could not be written. It holds a registered
+// code, a step id and filtered parameters (no text), at most MAX_PARKS for PARK_TTL, keyed by
+// (user, Persona, run), and goes at logout (clear_user) like everything here.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -47,6 +52,7 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 use crate::conductor::plan_approval::Approval;
+use crate::conductor::run_park::ParkRecord;
 
 pub const MAX_APPROVALS: usize = 64;
 pub const APPROVAL_TTL: Duration = Duration::from_secs(2 * 60 * 60);
@@ -54,6 +60,9 @@ pub const MAX_OFFERS: usize = 16;
 pub const OFFER_TTL: Duration = Duration::from_secs(10 * 60);
 pub const MAX_MARKERS: usize = 64;
 pub const MARKER_TTL: Duration = Duration::from_secs(120);
+/// items.id=901 stage 7: parks held here only when the run's own row could not be written.
+pub const MAX_PARKS: usize = 64;
+pub const PARK_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// Whose approval: the user, the Persona, the chat and the Focus.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -107,6 +116,11 @@ struct HeldOffer {
     created: Instant,
 }
 
+struct HeldPark {
+    park: ParkRecord,
+    held_at: Instant,
+}
+
 /// What the duplicate-turn marker holds: a message id and a hash of the content.
 pub struct Marker {
     pub message_id: String,
@@ -137,6 +151,8 @@ struct State {
     offers: HashMap<String, HeldOffer>,
     /// (user, Persona, chat) -> marker.
     markers: HashMap<(String, String, String), Marker>,
+    /// (user, Persona, run) -> the park of a run whose row could not be written.
+    parks: HashMap<(String, String, String), HeldPark>,
 }
 
 /// The memory-only home. Managed as Tauri state (main.rs).
@@ -343,6 +359,46 @@ impl PlanMemory {
         (marker.created.elapsed() < MARKER_TTL).then_some(marker)
     }
 
+    // -- the park of a run (items.id=901 stage 7) ------------------------------------------
+
+    /// Hold the park of a run whose own focus_runs row (and so its persisted park) could not
+    /// be written. Bounded and short-lived like every entry here, never persisted.
+    pub fn put_run_park(&self, user_id: &str, persona_id: &str, run_id: &str, park: ParkRecord) {
+        let mut s = self.lock();
+        let key = (user_id.to_owned(), persona_id.to_owned(), run_id.to_owned());
+        s.parks.remove(&key);
+        make_room(&mut s.parks, MAX_PARKS, PARK_TTL, |h| h.held_at);
+        s.parks.insert(
+            key,
+            HeldPark {
+                park,
+                held_at: Instant::now(),
+            },
+        );
+    }
+
+    /// The held park of a run (get_run_park reads memory first, then the table).
+    pub fn get_run_park(
+        &self,
+        user_id: &str,
+        persona_id: &str,
+        run_id: &str,
+    ) -> Option<ParkRecord> {
+        let mut s = self.lock();
+        s.parks.retain(|_, h| h.held_at.elapsed() < PARK_TTL);
+        s.parks
+            .get(&(user_id.to_owned(), persona_id.to_owned(), run_id.to_owned()))
+            .map(|h| h.park.clone())
+    }
+
+    /// Drop the held park of a run (the run moved on, or its persisted park was written).
+    pub fn remove_run_park(&self, user_id: &str, persona_id: &str, run_id: &str) -> bool {
+        self.lock()
+            .parks
+            .remove(&(user_id.to_owned(), persona_id.to_owned(), run_id.to_owned()))
+            .is_some()
+    }
+
     // -- clearing --------------------------------------------------------------------
 
     /// Everything of one user (the key left the registry).
@@ -351,6 +407,7 @@ impl PlanMemory {
         s.approvals.retain(|k, _| k.user_id != user_id);
         s.offers.retain(|_, o| o.owner.user_id != user_id);
         s.markers.retain(|k, _| k.0 != user_id);
+        s.parks.retain(|k, _| k.0 != user_id);
     }
 
     /// Everything of one chat: its approvals (every Focus) and its marker. A chat that is
@@ -372,6 +429,7 @@ impl PlanMemory {
         s.approvals.clear();
         s.offers.clear();
         s.markers.clear();
+        s.parks.clear();
     }
 
     // -- counts, for tests and diagnostics -------------------------------------------
@@ -385,6 +443,9 @@ impl PlanMemory {
     pub fn marker_count(&self) -> usize {
         self.lock().markers.len()
     }
+    pub fn park_count(&self) -> usize {
+        self.lock().parks.len()
+    }
 
     #[cfg(test)]
     pub(crate) fn age_approval(&self, scope: &ChatScope, by: Duration) {
@@ -396,6 +457,13 @@ impl PlanMemory {
     pub(crate) fn age_offer(&self, token: &str, by: Duration) {
         if let Some(o) = self.lock().offers.get_mut(token) {
             o.created = o.created.checked_sub(by).unwrap_or(o.created);
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn age_park(&self, user: &str, persona: &str, run: &str, by: Duration) {
+        let key = (user.to_owned(), persona.to_owned(), run.to_owned());
+        if let Some(h) = self.lock().parks.get_mut(&key) {
+            h.held_at = h.held_at.checked_sub(by).unwrap_or(h.held_at);
         }
     }
     #[cfg(test)]

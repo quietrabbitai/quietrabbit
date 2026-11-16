@@ -407,6 +407,60 @@ fn debug_output_shows_counts_and_nothing_else() {
     assert!(shown.contains("approvals: 1"));
 }
 
+// -- the park of a run whose row could not be written (items.id=901 stage 7) ---------------
+
+fn park(tag: &str) -> crate::conductor::run_park::ParkRecord {
+    crate::conductor::run_park::ParkRecord {
+        code: crate::spend::codes::Code::ResolverTooWeak,
+        action_id: "draft".to_owned(),
+        params_json: format!("{{\"tag\":\"{tag}\"}}"),
+    }
+}
+
+#[test]
+fn a_held_park_is_scoped_to_user_persona_and_run_and_replaced_by_a_newer_one() {
+    let m = PlanMemory::default();
+    m.put_run_park(USER, PERSONA, "run-1", park("a"));
+    assert_eq!(m.get_run_park(USER, PERSONA, "run-1"), Some(park("a")));
+    assert!(m.get_run_park("user-2", PERSONA, "run-1").is_none());
+    assert!(m.get_run_park(USER, "persona-2", "run-1").is_none());
+    assert!(m.get_run_park(USER, PERSONA, "run-2").is_none());
+    m.put_run_park(USER, PERSONA, "run-1", park("b"));
+    assert_eq!(m.park_count(), 1);
+    assert_eq!(m.get_run_park(USER, PERSONA, "run-1"), Some(park("b")));
+    assert!(m.remove_run_park(USER, PERSONA, "run-1"));
+    assert!(!m.remove_run_park(USER, PERSONA, "run-1"));
+    assert_eq!(m.park_count(), 0);
+}
+
+#[test]
+fn held_parks_are_bounded_expire_and_go_with_the_user() {
+    let m = PlanMemory::default();
+    for i in 0..(MAX_PARKS + 10) {
+        m.put_run_park(USER, PERSONA, &format!("run-{i}"), park("x"));
+    }
+    assert_eq!(m.park_count(), MAX_PARKS, "the oldest are evicted");
+    assert!(m.get_run_park(USER, PERSONA, "run-0").is_none());
+    assert!(m
+        .get_run_park(USER, PERSONA, &format!("run-{}", MAX_PARKS + 9))
+        .is_some());
+
+    m.put_run_park("user-2", PERSONA, "other", park("y"));
+    m.clear_user(USER);
+    assert!(m.get_run_park("user-2", PERSONA, "other").is_some());
+    assert_eq!(m.park_count(), 1);
+
+    m.age_park("user-2", PERSONA, "other", PARK_TTL);
+    assert!(
+        m.get_run_park("user-2", PERSONA, "other").is_none(),
+        "expired"
+    );
+
+    m.put_run_park(USER, PERSONA, "again", park("z"));
+    m.clear_all();
+    assert_eq!(m.park_count(), 0);
+}
+
 fn code_without_comments() -> String {
     include_str!("plan_memory.rs")
         .split("#[cfg(test)]")

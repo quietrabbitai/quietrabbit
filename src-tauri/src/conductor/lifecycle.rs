@@ -2421,6 +2421,20 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     /// INSERT on first call (status=initializing); UPDATE on subsequent calls.
     /// Python oracle: FocusRun._write_focus_run_record()
     async fn write_focus_run_record(&self, status: &str) -> Result<(), LifecycleError> {
+        self.write_run_row(status, None).await.map(|_| ())
+    }
+
+    /// The one writer of the run's focus_runs row, and, in the same function on the same
+    /// connection, of its park (items.id=901 stage 7): every status write either stores the
+    /// park it is given or removes any earlier one, so run_parks has a row for a run exactly
+    /// when the last status written for it carried one (the run moved on, resumed, ended or
+    /// was re-entered: the park is gone). Returns false when a park was given and could not be
+    /// stored (the caller then holds it in memory); a row that cannot be written is the Err.
+    async fn write_run_row(
+        &self,
+        status: &str,
+        park: Option<&crate::conductor::run_park::ParkRecord>,
+    ) -> Result<bool, LifecycleError> {
         let focus_run_id = self
             .focus_run_id
             .as_deref()
@@ -2488,7 +2502,53 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             .await?;
         }
 
-        Ok(())
+        Ok(self.settle_park(&mut conn, focus_run_id, park).await)
+    }
+
+    /// Store the park of the row just written, or remove an earlier one. Best effort by
+    /// design: it can never turn a written row into an error or change the failure it
+    /// describes, and it logs no parameter (items.id=901 stage 7).
+    async fn settle_park(
+        &self,
+        conn: &mut SqliteConnection,
+        run_id: &str,
+        park: Option<&crate::conductor::run_park::ParkRecord>,
+    ) -> bool {
+        use crate::persistence::run_park_store::{clear_park, put_park, ParkWrite};
+        let stored = match park {
+            Some(p) => put_park(
+                conn,
+                &ParkWrite {
+                    run_id,
+                    action_id: &p.action_id,
+                    code: p.code.as_str(),
+                    params_json: &p.params_json,
+                },
+            )
+            .await
+            .map_err(|_| log::warn!("lifecycle: the run's park reason was not stored"))
+            .is_ok(),
+            None => {
+                if clear_park(conn, run_id).await.is_err() {
+                    log::warn!("lifecycle: the run's earlier park reason was not cleared");
+                }
+                true
+            }
+        };
+        if stored {
+            if let Some(memory) = &self.plan_memory {
+                memory.remove_run_park(&self.user_id, &self.persona_id, run_id);
+            }
+        }
+        stored
+    }
+
+    /// Hold the park of a run in memory only: used when the run's row or its persisted
+    /// park could not be written. Never persisted; get_run_park reads it from here.
+    fn hold_park_in_memory(&self, park: &crate::conductor::run_park::ParkRecord) {
+        if let (Some(memory), Some(run_id)) = (&self.plan_memory, self.focus_run_id.as_deref()) {
+            memory.put_run_park(&self.user_id, &self.persona_id, run_id, park.clone());
+        }
     }
 
     /// items.id=894 B0: whether this run's chat carries the one-time write latch
@@ -2514,25 +2574,40 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     /// final status would otherwise stay `running`, so it is reported to the
     /// user (`data-write-failed`, kind `run`) as well as logged.
     async fn write_focus_run_record_logged(&self, status: &str) {
+        self.write_focus_run_record_parked(status, None).await;
+    }
+
+    /// write_focus_run_record_logged() that also carries a park (items.id=901 stage 7).
+    /// Returns true when the row was written and, if a park was given, the park was stored
+    /// with it. A false is never an error to the caller: the failure it describes stands.
+    async fn write_focus_run_record_parked(
+        &self,
+        status: &str,
+        park: Option<&crate::conductor::run_park::ParkRecord>,
+    ) -> bool {
         let saved = crate::write_failure::retry_transient(|| async {
             match tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                self.write_focus_run_record(status),
+                self.write_run_row(status, park),
             )
             .await
             {
-                Ok(Ok(())) => Ok(()),
+                Ok(Ok(stored)) => Ok(stored),
                 Ok(Err(e)) => Err(e.to_string()),
                 Err(_) => Err("timed out after 10s".to_owned()),
             }
         })
         .await;
-        if let Err(e) = saved {
-            crate::write_failure::report(
-                self.app_handle.as_ref(),
-                crate::write_failure::Lost::Run,
-                &format!("lifecycle: write_focus_run_record({status}) failed: {e}"),
-            );
+        match saved {
+            Ok(stored) => stored,
+            Err(e) => {
+                crate::write_failure::report(
+                    self.app_handle.as_ref(),
+                    crate::write_failure::Lost::Run,
+                    &format!("lifecycle: write_focus_run_record({status}) failed: {e}"),
+                );
+                false
+            }
         }
     }
 
@@ -3816,7 +3891,16 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                     }
                 }
             }
-            self.write_focus_run_record_logged("awaiting_user").await;
+            // items.id=901 stage 7: the park reason is written with the row, in the same
+            // function (write_run_row). If the row or the park cannot be stored it is held
+            // in the run-scoped memory-only home instead. Neither outcome touches `failure`.
+            let park = crate::conductor::run_park::from_failure(&failure);
+            let stored = self
+                .write_focus_run_record_parked("awaiting_user", park.as_ref())
+                .await;
+            if let (false, Some(p)) = (stored, park.as_ref()) {
+                self.hold_park_in_memory(p);
+            }
             self.emit_status_with_content(
                 "awaiting_user",
                 None,
@@ -4980,6 +5064,11 @@ fn deserialize_shared_state_track(json: &str) -> Result<SharedStateTrack, Lifecy
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// items.id=901 stage 7: tests of the run's park reason against a real outputs.db.
+#[cfg(test)]
+#[path = "run_park_lifecycle_tests.rs"]
+mod park_lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
