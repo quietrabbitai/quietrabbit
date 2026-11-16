@@ -574,5 +574,18 @@
       "too_weak": "None of the AI models available for this task is good enough for it yet, so nothing was run.",
       "no_candidate": "There is no AI model this task is allowed to use right now, so nothing was run."
     }
+  },
+  "step_review": {
+    "error": {
+      "persona_not_found": "This persona is not available.",
+      "invalid_run_id": "This request is not available.",
+      "step_review_unavailable": "Couldn't check the privacy review for this request. Try again in a moment."
+    },
+    "stop": {
+      "required": "Quiet Rabbit found something in this request that needs your decision before it can be sent. Nothing was sent.",
+      "privacy_filter_unavailable": "The privacy check is not available, so this request was not sent.",
+      "blocked": "The privacy check could not be completed, so this request was not sent.",
+      "refused": "You chose not to send this request, so it was stopped."
+    }
   }
 }

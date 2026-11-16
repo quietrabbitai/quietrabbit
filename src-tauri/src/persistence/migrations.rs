@@ -240,6 +240,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/outputs_015.sql"),
     },
     SchemaFile {
+        prefix: "outputs",
+        version: 16,
+        sql: include_str!("../../schema/outputs_016.sql"),
+    },
+    SchemaFile {
         prefix: "personal",
         version: 1,
         sql: include_str!("../../schema/personal_001.sql"),
@@ -3899,11 +3904,11 @@ mod tests {
 
         assert_eq!(
             result.expect("migration must apply cleanly"),
-            15,
+            16,
             "outputs_001 + outputs_002 + outputs_003 + outputs_004 + outputs_005 + \
              outputs_006 + outputs_007 + outputs_008 + outputs_009 + outputs_010 + \
-             outputs_011 + outputs_012 + outputs_013 + outputs_014 + outputs_015 \
-             must all apply in one pass"
+             outputs_011 + outputs_012 + outputs_013 + outputs_014 + outputs_015 + \
+             outputs_016 must all apply in one pass"
         );
 
         let mut conn =
@@ -5465,8 +5470,9 @@ mod tests {
             .await
             .expect("v11 must apply to a populated outputs.db");
         assert_eq!(
-            applied, 5,
-            "outputs_011, outputs_012, outputs_013, outputs_014 and outputs_015 were pending"
+            applied, 6,
+            "outputs_011, outputs_012, outputs_013, outputs_014, outputs_015 and outputs_016 \
+             were pending"
         );
 
         for (table, expected) in FOCUS_RUN_TABLES.iter().zip(before) {
@@ -5519,8 +5525,8 @@ mod tests {
             .await
             .expect("v12 must apply to a populated outputs.db");
         assert_eq!(
-            applied, 4,
-            "outputs_012, outputs_013, outputs_014 and outputs_015 were pending"
+            applied, 5,
+            "outputs_012, outputs_013, outputs_014, outputs_015 and outputs_016 were pending"
         );
 
         let row: (i64, i64, i64) = sqlx::query_as(
@@ -5578,8 +5584,8 @@ mod tests {
             .await
             .expect("v13 must apply to a populated outputs.db");
         assert_eq!(
-            applied, 3,
-            "outputs_013, outputs_014 and outputs_015 were pending"
+            applied, 4,
+            "outputs_013, outputs_014, outputs_015 and outputs_016 were pending"
         );
         assert_eq!(row_count(&mut conn, "outputs").await, 1);
         assert_eq!(row_count(&mut conn, "focus_runs").await, 1);
@@ -5656,7 +5662,10 @@ mod tests {
         let applied = run_migrations(&mut conn, "outputs", Some(TEST_KEY_HEX))
             .await
             .expect("v14 must apply to a populated outputs.db");
-        assert_eq!(applied, 2, "outputs_014 and outputs_015 were pending");
+        assert_eq!(
+            applied, 3,
+            "outputs_014, outputs_015 and outputs_016 were pending"
+        );
 
         for table in [
             "case_records",
@@ -5793,7 +5802,7 @@ mod tests {
         let applied = run_migrations(&mut conn, "outputs", Some(TEST_KEY_HEX))
             .await
             .expect("v15 must apply to a populated outputs.db");
-        assert_eq!(applied, 1, "only outputs_015 was pending");
+        assert_eq!(applied, 2, "outputs_015 and outputs_016 were pending");
 
         assert_eq!(row_count(&mut conn, "focus_runs").await, 1);
         assert_eq!(row_count(&mut conn, "session_variables").await, 1);
@@ -5830,6 +5839,79 @@ mod tests {
         );
         let version: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM schema_version WHERE version = 15")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(version, 1);
+        assert!(
+            fk_violations(&mut conn).await.is_empty(),
+            "foreign_key_check must be clean"
+        );
+    }
+
+    /// items.id=884: outputs_016 adds step_reviews. A populated v15 database keeps
+    /// its rows and gains one empty table that references focus_runs, with no
+    /// trigger and the hash and size checks.
+    #[tokio::test]
+    async fn outputs_v15_to_v16_adds_step_reviews_and_preserves_a_populated_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = open_keyed_scratch(&tmp.path().join("outputs.db")).await;
+        apply_versions_up_to(&mut conn, "outputs", 15).await;
+        exec_all(
+            &mut conn,
+            &[
+                "INSERT INTO focus_runs (id, focus_id, started_at) \
+                 VALUES ('run1', 'f', '2026-01-01T00:00:00Z')",
+                "INSERT INTO pass_artifacts \
+                 (context_key, focus_id, kind, content, written_by_run, created_at, updated_at) \
+                 VALUES ('c', 'f', 'content_brief', 'x', 'run1', \
+                         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            ],
+        )
+        .await;
+
+        let applied = run_migrations(&mut conn, "outputs", Some(TEST_KEY_HEX))
+            .await
+            .expect("v16 must apply to a populated outputs.db");
+        assert_eq!(applied, 1, "only outputs_016 was pending");
+
+        assert_eq!(row_count(&mut conn, "focus_runs").await, 1);
+        assert_eq!(row_count(&mut conn, "pass_artifacts").await, 1);
+        assert_eq!(row_count(&mut conn, "step_reviews").await, 0);
+
+        let fks: Vec<(String,)> =
+            sqlx::query_as("SELECT \"table\" FROM pragma_foreign_key_list('step_reviews')")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(fks, [("focus_runs".to_owned(),)]);
+        let triggers: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'step_reviews'",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert!(triggers.is_empty(), "no triggers: {triggers:?}");
+        // A review needs a real run and a 64 character hash.
+        let orphan = sqlx::query(
+            "INSERT INTO step_reviews (review_id, focus_run_id, action_id, prompt_sha, \
+             prompt_len, outcome, created_at, updated_at) \
+             VALUES ('r', 'no-run', 'a', ?, 1, 'pending', 't', 't')",
+        )
+        .bind("a".repeat(64))
+        .execute(&mut conn)
+        .await;
+        assert!(orphan.is_err(), "focus_run_id references focus_runs");
+        let short_hash = sqlx::query(
+            "INSERT INTO step_reviews (review_id, focus_run_id, action_id, prompt_sha, \
+             prompt_len, outcome, created_at, updated_at) \
+             VALUES ('r', 'run1', 'a', 'short', 1, 'pending', 't', 't')",
+        )
+        .execute(&mut conn)
+        .await;
+        assert!(short_hash.is_err(), "prompt_sha is a 64 character hash");
+        let version: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_version WHERE version = 16")
                 .fetch_one(&mut conn)
                 .await
                 .unwrap();

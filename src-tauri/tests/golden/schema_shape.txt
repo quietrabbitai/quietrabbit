@@ -519,6 +519,25 @@ TABLE session_variables
   written_by_run TEXT notnull=1 pk=0 default=None
   created_at TEXT notnull=1 pk=0 default=None
   updated_at TEXT notnull=1 pk=0 default=None
+TABLE step_reviews
+  review_id TEXT notnull=0 pk=1 default=None
+  focus_run_id TEXT notnull=1 pk=0 default=None
+  action_id TEXT notnull=1 pk=0 default=None
+  prompt_sha TEXT notnull=1 pk=0 default=None
+  prompt_len INTEGER notnull=1 pk=0 default=None
+  spans_json TEXT notnull=1 pk=0 default=Some("'[]'")
+  total_spans INTEGER notnull=1 pk=0 default=Some("0")
+  auto_resolved INTEGER notnull=1 pk=0 default=Some("0")
+  released INTEGER notnull=1 pk=0 default=Some("0")
+  generalized INTEGER notnull=1 pk=0 default=Some("0")
+  removed INTEGER notnull=1 pk=0 default=Some("0")
+  outcome TEXT notnull=1 pk=0 default=None
+  reason TEXT notnull=0 pk=0 default=None
+  outbound_sha TEXT notnull=0 pk=0 default=None
+  outbound_len INTEGER notnull=0 pk=0 default=None
+  provider_id TEXT notnull=0 pk=0 default=None
+  created_at TEXT notnull=1 pk=0 default=None
+  updated_at TEXT notnull=1 pk=0 default=None
 TABLE topic_storage_locations
   topic_id TEXT notnull=0 pk=1 default=None
   db_path TEXT notnull=1 pk=0 default=None

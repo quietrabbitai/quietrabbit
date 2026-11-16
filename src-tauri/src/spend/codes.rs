@@ -20,6 +20,9 @@
 //                  for a reason that is not spend (items.id=716)
 //   resolver.*     the model resolver stopped a model-block step before any
 //                  model was called (items.id=896)
+//   step_review.*  the outbound review of an external step's rendered prompt
+//                  parked or ended the step before any network traffic
+//                  (items.id=884, decisions.id=943)
 
 use serde::{Deserialize, Serialize};
 
@@ -150,6 +153,23 @@ pub enum Code {
     /// the reason.
     ResolverNoCandidate,
 
+    // -- the outbound review of an external step's prompt (items.id=884) -------
+    /// The review found text the user must decide on, and the step is parked
+    /// until they answer. Nothing was sent. The parameters carry the review id
+    /// and the action.
+    StepReviewRequired,
+    /// The Privacy Filter is not available, so the rendered prompt cannot be
+    /// reviewed. Nothing was sent (decisions.id=864, 937: no filter, no review,
+    /// no external step).
+    StepReviewPrivacyFilterUnavailable,
+    /// The review could not be completed: the filter failed or timed out, the
+    /// audit log could not be written, the review record could not be kept, or
+    /// the answers could not be applied to the text. Nothing was sent. The
+    /// parameters carry a short reason code.
+    StepReviewBlocked,
+    /// The user refused to send the reviewed prompt. The run ends cancelled.
+    StepReviewRefused,
+
     // -- cost basis, price state, limit state, consent state ------------------
     CostBasisListPriceEstimate,
     PriceStateKnown,
@@ -203,6 +223,10 @@ impl Code {
         Code::ApiChatPrivacyFilterUnavailable,
         Code::ResolverTooWeak,
         Code::ResolverNoCandidate,
+        Code::StepReviewRequired,
+        Code::StepReviewPrivacyFilterUnavailable,
+        Code::StepReviewBlocked,
+        Code::StepReviewRefused,
         Code::CostBasisListPriceEstimate,
         Code::PriceStateKnown,
         Code::PriceStateUnknown,
@@ -255,6 +279,10 @@ impl Code {
             Code::ApiChatPrivacyFilterUnavailable => "api_chat.privacy_filter_unavailable",
             Code::ResolverTooWeak => "resolver.too_weak",
             Code::ResolverNoCandidate => "resolver.no_candidate",
+            Code::StepReviewRequired => "step_review.required",
+            Code::StepReviewPrivacyFilterUnavailable => "step_review.privacy_filter_unavailable",
+            Code::StepReviewBlocked => "step_review.blocked",
+            Code::StepReviewRefused => "step_review.refused",
             Code::CostBasisListPriceEstimate => "cost_basis.list_price_estimate",
             Code::PriceStateKnown => "price_state.known",
             Code::PriceStateUnknown => "price_state.unknown",
@@ -341,6 +369,10 @@ mod tests {
             "api_chat.privacy_filter_unavailable",
             "resolver.too_weak",
             "resolver.no_candidate",
+            "step_review.required",
+            "step_review.privacy_filter_unavailable",
+            "step_review.blocked",
+            "step_review.refused",
             "cost_basis.list_price_estimate",
             "price_state.known",
             "price_state.unknown",
@@ -368,9 +400,10 @@ mod tests {
     /// this length check keeps the two in step.
     #[test]
     fn all_lists_every_variant() {
-        // 17 warnings + 11 blocks + 6 API Chat stops + 2 resolver stops + 1 cost
-        // basis + 3 price states + 3 limit states + 4 consent states.
-        assert_eq!(Code::ALL.len(), 47);
+        // 17 warnings + 11 blocks + 6 API Chat stops + 2 resolver stops + 4 step
+        // review codes + 1 cost basis + 3 price states + 3 limit states + 4
+        // consent states.
+        assert_eq!(Code::ALL.len(), 51);
     }
 
     #[test]
