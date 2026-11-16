@@ -995,4 +995,59 @@ mod tests {
             );
         }
     }
+
+    /// items.id=897 (decisions.id=948 point 2): the launch names are ordinary
+    /// store-backed bound names for an external step. As the flag ships (true) the
+    /// declaration rule decides: an external step must declare one it names, and a
+    /// row's output_var may never be one. None of them is a device name, and the
+    /// closed device list is unchanged.
+    #[test]
+    fn an_external_step_must_declare_a_launch_name_it_names_and_none_is_a_device_name() {
+        let bound = bound_names();
+        for name in crate::conductor::bound_spec::LAUNCH_NAMES {
+            assert!(bound.contains(&name), "{name} is a registered bound name");
+            assert!(
+                !DEVICE_NAMES_NEVER_EXTERNAL.contains(&name),
+                "{name} must not be on the closed device list"
+            );
+            let template = format!("{{{name}}}");
+            // Declared and named: allowed once the invariant is lifted, and as it ships.
+            assert!(
+                run_open(&[(step("e", EXT, &template, &[name], &[]), None)], bound).is_ok(),
+                "{name}"
+            );
+            assert!(
+                lint(&[(step("e", EXT, &template, &[name], &[]))], &[None]).is_ok(),
+                "{name} declared, as shipped"
+            );
+            // Named without being declared: refused, naming the declaration rule.
+            let e = run_open(&[(step("e", EXT, &template, &[], &[]), None)], bound).unwrap_err();
+            assert!(
+                e.contains(&format!("'{{{name}}}'")) && e.contains("declared_inputs"),
+                "{e}"
+            );
+            // A LOCAL step may name it freely.
+            assert!(run_open(&[(step("a", LOCAL, &template, &[], &[]), Some("v"))], bound).is_ok());
+            // And the name cannot be a row's output variable.
+            let e = run_open(&[(step("a", LOCAL, "x", &[], &[]), Some(name))], bound).unwrap_err();
+            assert!(e.contains(&format!("output_var '{name}'")), "{e}");
+        }
+        // The closed device list is exactly the two device names (items.id=884) and
+        // a launch name does not reach it by derivation: a variable a LOCAL step
+        // derives from a launch name is not a device taint.
+        assert_eq!(
+            DEVICE_NAMES_NEVER_EXTERNAL,
+            &["subject_context", "device_library_brief"]
+        );
+        let chain = [
+            (step("a", LOCAL, "{document_type}", &[], &[]), Some("v1")),
+            (step("e", EXT, "{v1}", &["v1"], &[]), None),
+        ];
+        if let Err(m) = run_open(&chain, bound) {
+            assert!(
+                !m.contains("device"),
+                "a launch-derived variable is never refused as a device name: {m}"
+            );
+        }
+    }
 }

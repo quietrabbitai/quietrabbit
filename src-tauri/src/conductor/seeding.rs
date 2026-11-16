@@ -95,6 +95,14 @@ pub enum SeedError {
     InvalidValue(&'static str),
     #[error("this persona's store could not be opened: {0}")]
     Open(String),
+    /// items.id=897: a launch name reached the store reader. A launch value is
+    /// resolved once at LOAD and seeded from that resolution, never read from the
+    /// store here (a later stage wires the resolution in), so a pass that asks for
+    /// one before then fails closed rather than running without a value.
+    #[error(
+        "'{0}' is a launch name, resolved when the run starts, and no resolution was supplied"
+    )]
+    LaunchNotResolved(&'static str),
 }
 
 /// The bound names a pass must read, in table order: names in a step's
@@ -206,6 +214,14 @@ pub async fn read_seeds(
 ) -> Result<HashMap<String, String>, SeedError> {
     let wants = |n: &str| names.contains(&n);
     let mut out: HashMap<String, String> = HashMap::new();
+
+    if let Some(n) = names
+        .iter()
+        .copied()
+        .find(|n| spec::spec(n).is_some_and(|s| s.source == Source::Launch))
+    {
+        return Err(SeedError::LaunchNotResolved(n));
+    }
 
     if wants(WRITE_MODE) {
         let key = context_key.ok_or(SeedError::NoContextKey(WRITE_MODE))?;
@@ -640,11 +656,14 @@ mod tests {
     async fn an_empty_store_gives_absent_session_names_and_present_derived_names() {
         let mut conn = mem_outputs_conn().await;
         // The two device names are read by conductor::device_seeding (they need
-        // the persona's personal.db), so read_seeds is given every other name.
+        // the persona's personal.db), and the launch names (items.id=897) are
+        // seeded from the run's launch resolution, so read_seeds is given every
+        // other name.
         let all: Vec<&'static str> = spec::NAMES
             .iter()
             .copied()
             .filter(|n| !crate::conductor::device_seeding::is_device_seed(n))
+            .filter(|n| spec::spec(n).is_some_and(|s| s.source != Source::Launch))
             .collect();
         let seeds = read_seeds(&mut conn, Some(CHAT), FOCUS, &all, Utc::now())
             .await
@@ -658,6 +677,26 @@ mod tests {
         assert_eq!(seeds[OPEN_TICKETS_BRIEF], "");
         assert_eq!(seeds[CASE_CONTEXT], "");
         assert_eq!(seeds[DELTA_CONTEXT], "");
+    }
+
+    /// items.id=897: a launch name is never read from the store here. A pass that
+    /// asks the store reader for one fails closed (until the run's launch resolution
+    /// is supplied), whatever else it asks for, and nothing is read first.
+    #[tokio::test]
+    async fn a_launch_name_asked_of_the_store_reader_fails_closed() {
+        let mut conn = mem_outputs_conn().await;
+        for name in spec::LAUNCH_NAMES {
+            let e = read_seeds(
+                &mut conn,
+                Some(CHAT),
+                FOCUS,
+                &[OPEN_TICKET_STATE, name],
+                Utc::now(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(e, SeedError::LaunchNotResolved(name), "{name}");
+        }
     }
 
     #[tokio::test]

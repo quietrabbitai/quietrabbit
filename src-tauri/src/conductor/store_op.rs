@@ -148,7 +148,7 @@ use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use crate::conductor::bound_spec::{
-    self, Presence, Source, HANDOFF_NAMES, HANDOFF_PENDING, WRITE_MODE,
+    self, Presence, Source, HANDOFF_NAMES, HANDOFF_PENDING, LAUNCH_NAMES, WRITE_MODE,
 };
 use crate::conductor::guard::Condition;
 use crate::conductor::tokens::{is_system_token, ActionDefinition};
@@ -684,6 +684,14 @@ pub enum StoreOpError {
         slot: &'static str,
         var: String,
     },
+    #[error("step '{action_id}': session_put target '{name}' is a launch name, answered by the user before the run and read once when the run starts, never written by a Focus row")]
+    LaunchNameNotSessionPutable { action_id: String, name: String },
+    #[error("step '{action_id}': slot '{slot}' names '{var}', a launch name that is read when the run starts and is never a writer's argument")]
+    ArgumentLaunchName {
+        action_id: String,
+        slot: &'static str,
+        var: String,
+    },
     #[error("step '{action_id}': store_op '{op}' saves facts about the user's equipment and is allowed only in a Focus whose collection_posture is focus_level: the consent gate never consults a per_field Focus, so the row would write without the one setup consent")]
     EntityOpNeedsFocusLevel { action_id: String, op: &'static str },
 }
@@ -943,6 +951,12 @@ pub fn check_composition(
                     name: name.to_owned(),
                 });
             }
+            if LAUNCH_NAMES.contains(&name) {
+                return Err(StoreOpError::LaunchNameNotSessionPutable {
+                    action_id,
+                    name: name.to_owned(),
+                });
+            }
             if name == WRITE_MODE {
                 return Err(StoreOpError::WriteModeNotPutable { action_id });
             }
@@ -1039,6 +1053,13 @@ pub fn check_composition(
             }
             if HANDOFF_NAMES.contains(&var) {
                 return Err(StoreOpError::ArgumentHandoffName {
+                    action_id,
+                    slot,
+                    var: var.to_owned(),
+                });
+            }
+            if LAUNCH_NAMES.contains(&var) {
+                return Err(StoreOpError::ArgumentLaunchName {
                     action_id,
                     slot,
                     var: var.to_owned(),
@@ -1848,6 +1869,55 @@ mod tests {
                     Err(StoreOpError::ArgumentHandoffName { .. })
                 ),
                 "argument {name}"
+            );
+        }
+    }
+
+    /// items.id=897: the launch names are answered before the run, so a Focus row
+    /// never writes one and never hands one to a writer.
+    #[test]
+    fn the_launch_names_are_never_a_session_put_target_or_a_writer_argument() {
+        for name in LAUNCH_NAMES {
+            assert!(
+                matches!(
+                    check(vec![model("a", "v"), put(name, "v")]),
+                    Err(StoreOpError::LaunchNameNotSessionPutable { .. })
+                ),
+                "target {name}"
+            );
+            let (mut row, v) = writer(
+                "copy",
+                "session_put",
+                Some("locked_intent"),
+                Some(&format!(r#"{{"value":"{name}"}}"#)),
+                None,
+            );
+            row.and_guards = Vec::new();
+            assert!(
+                matches!(
+                    check(vec![(row, v)]),
+                    Err(StoreOpError::ArgumentLaunchName { .. })
+                ),
+                "argument {name}"
+            );
+        }
+        // Nor an artifact_put target.
+        for name in LAUNCH_NAMES {
+            assert!(
+                matches!(
+                    check(vec![
+                        model("a", "v"),
+                        writer(
+                            "ap",
+                            "artifact_put",
+                            Some(name),
+                            Some(r#"{"value":"v"}"#),
+                            None
+                        )
+                    ]),
+                    Err(StoreOpError::UnknownArtifactName { .. })
+                ),
+                "artifact {name}"
             );
         }
     }

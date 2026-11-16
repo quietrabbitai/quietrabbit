@@ -789,6 +789,28 @@ mod tests {
         );
     }
 
+    /// items.id=897 (decisions.id=948 point 2, condition 4): the launch names are
+    /// registered bound names, so they are store-backed for the render record. A
+    /// starter that declares one counts as personal (severity at least 2 and
+    /// personal_flagged) with no producer at all. That is conservative for a launch
+    /// answer, which holds no user content, and is accepted.
+    #[test]
+    fn a_declared_launch_name_is_store_backed_and_counts_as_personal() {
+        for name in crate::conductor::bound_spec::LAUNCH_NAMES {
+            let step = step_of(json!({"display_name":"n","output_var":"o",
+                                      "template": format!("{{{name}}}"),
+                                      "declared_inputs":[name]}));
+            let mut steps = vec![step.clone()];
+            steps[0].action_id = "offer".to_owned();
+            let set = store_backed_inputs(&steps, &[Some("o".to_owned())]);
+            assert!(set.contains(name), "{name} is store-backed");
+            let got = inherit_from_inputs(&step, &TaskTrack::new(), &backed(&[name]));
+            assert!(got.sensitivity_severity >= 2, "{name}");
+            assert!(got.personal_flagged, "{name}");
+            assert!(!got.audit_unavailable, "{name}: only producers set it");
+        }
+    }
+
     #[test]
     fn the_last_producer_of_a_variable_is_the_one_inherited_from() {
         let step = step_of(json!({"display_name":"n","output_var":"o","template":"{a}",

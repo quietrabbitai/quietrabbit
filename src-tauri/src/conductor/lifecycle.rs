@@ -994,6 +994,7 @@ pub(crate) async fn load_focus_definition_from_db(
     )
     .map_err(|e| LifecycleError::ValidationFailed(format!("Focus '{focus_id}' {e}")))?;
     lint_declared_inputs(focus_id, &steps)?;
+    lint_launch_config(pool, focus_id, &steps).await?;
     analyze_guarded_composition(focus_id, &steps)?;
 
     Ok(Some(FocusDefinition {
@@ -1010,6 +1011,25 @@ pub(crate) async fn load_focus_definition_from_db(
         high_priority_trigger,
         collection_posture: focus_row.collection_posture,
     }))
+}
+
+/// items.id=897 (decisions.id=948 point 2): the Focus's launch config is read from
+/// shared.db and VALIDATED (launch_config::read_validated is the only way to read
+/// it), then every step's use of the launch names is linted against it
+/// (launch_config::lint). A Focus with no question has no config, and then no step
+/// may name a slot or carry a model-block requirement.
+async fn lint_launch_config(
+    pool: &sqlx::SqlitePool,
+    focus_id: &str,
+    steps: &[ActionDefinition],
+) -> Result<(), LifecycleError> {
+    let fail = |m: String| LifecycleError::ValidationFailed(m);
+    let registry = crate::conductor::model_block::document_type::registry()
+        .map_err(|e| fail(format!("Focus '{focus_id}': {e}")))?;
+    let config = crate::conductor::launch_config::read_validated(pool, focus_id, registry)
+        .await
+        .map_err(|e| fail(format!("Focus '{focus_id}': {e}")))?;
+    crate::conductor::launch_config::lint(focus_id, config.as_ref(), steps).map_err(fail)
 }
 
 /// items.id=878: LOAD analysis of a composition's guards. Returns the number of
@@ -1322,6 +1342,9 @@ pub async fn load_focus_definition(
     // items.id=879: declared-inputs lint on the YAML path (the DB path runs its
     // own inside load_focus_definition_from_db).
     lint_declared_inputs(&focus_def.focus_id, &focus_def.steps)?;
+    // items.id=897: the launch-name lint runs on both paths (a YAML template may
+    // name a launch slot too).
+    lint_launch_config(pool, &focus_def.focus_id, &focus_def.steps).await?;
     // items.id=887: store writers are database-only, so a YAML step is never one
     // and this passes trivially. It runs on both paths so that a YAML field that
     // ever populated store_op could not skip the checks.

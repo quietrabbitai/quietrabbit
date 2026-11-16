@@ -494,4 +494,32 @@ mod tests {
             assert!(!unnamed.contains_key(name), "{name}");
         }
     }
+
+    /// items.id=897: a step naming a launch name is tainted like one naming any store
+    /// name (its variable with it, and every step downstream), and a launch name is
+    /// restricted to the step whose own template names it.
+    #[test]
+    fn a_step_naming_a_launch_name_is_tainted_and_the_name_is_restricted() {
+        let names = crate::conductor::bound_spec::NAMES;
+        for name in crate::conductor::bound_spec::LAUNCH_NAMES {
+            let steps = [
+                step("clean", "hello {user_input}", Some("c")),
+                step("root", &format!("mode: {{{name}}}"), Some("v1")),
+                step("down", "from {v1}", Some("v2")),
+                step("after", "{previous_output}", Some("v3")),
+            ];
+            let t = closure(&steps, names);
+            assert_eq!(actions(&t), ["after", "down", "root"], "{name}");
+            assert!(t.vars.contains("v1") && t.vars.contains("v2"), "{name}");
+            assert!(!t.actions.contains("clean"), "{name}");
+
+            let st = store(&[(name, "quick")], &[name]);
+            let mut named = toks(&[]);
+            st.apply(&format!("uses {{{name}}}"), &mut named);
+            assert_eq!(named.get(name).map(String::as_str), Some("quick"), "{name}");
+            let mut unnamed = toks(&[(name, "quick")]);
+            st.apply("no names here", &mut unnamed);
+            assert!(!unnamed.contains_key(name), "{name}");
+        }
+    }
 }

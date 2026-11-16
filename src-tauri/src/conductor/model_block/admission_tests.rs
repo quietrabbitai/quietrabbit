@@ -560,6 +560,40 @@ async fn seed_focus(pool: &sqlx::SqlitePool, focus_id: &str, ceiling: &str, rows
     }
 }
 
+/// A document_type launch question on `focus_id` (items.id=897): `fixed` makes it a
+/// preset (asked = 0, one option), else an asked question with two options. The
+/// default is rma_letter.
+async fn seed_document_type_question(pool: &sqlx::SqlitePool, focus_id: &str, fixed: bool) {
+    sqlx::query(
+        "INSERT INTO focus_launch_questions
+            (focus_id, question_id, slot, kind, sort_order, asked, default_option, prompt)
+         VALUES (?, 'kind', 'document_type', 'choice', 1, ?, 'rma_letter', 'Which kind?')",
+    )
+    .bind(focus_id)
+    .bind(if fixed { 0_i64 } else { 1_i64 })
+    .execute(pool)
+    .await
+    .unwrap();
+    let options: &[&str] = if fixed {
+        &["rma_letter"]
+    } else {
+        &["rma_letter", "cover_letter"]
+    };
+    for (i, o) in options.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO focus_launch_options
+                (focus_id, question_id, option_id, sort_order, label)
+             VALUES (?, 'kind', ?, ?, 'Label')",
+        )
+        .bind(focus_id)
+        .bind(o)
+        .bind(i as i64)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
 /// A local ordinary step that produces `var`.
 fn supply(var: &str) -> Row {
     (
@@ -625,6 +659,11 @@ async fn every_example_loads_through_the_real_loader_as_the_right_kind_of_step()
         // starter, real content, so it may be last too (items.id=387).
         let focus_id = format!("admission-{id}");
         seed_focus(&env.pool, &focus_id, "local_only", &rows_for(id, &ex, pure)).await;
+        // items.id=897: a model block needs the run's document type, so its Focus
+        // declares the question (a fixed one: a preset).
+        if MODEL_STABLE_IDS.contains(id) {
+            seed_document_type_question(&env.pool, &focus_id, true).await;
+        }
 
         let def = crate::conductor::lifecycle::load_focus_definition_from_db(&env.pool, &focus_id)
             .await
@@ -1176,4 +1215,331 @@ fn every_shipped_local_cell_names_a_curated_tag() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 11: launch questions and mode profiles (items.id=897, decisions.id=948)
+// ---------------------------------------------------------------------------
+//
+//  * a Focus's launch config is read only through the validating reader, and LOAD
+//    refuses one that fails validate() (a default that is not an option, among
+//    others) and any step that uses a launch name wrongly;
+//  * a Focus with a model block must declare a document_type question, because the
+//    resolver reads its profile only from that seed (rider of items.id=896);
+//  * every shipped launch config validates, and every question ships a default that
+//    is one of its options;
+//  * a mode profile is an EnvelopeOverride, whose four keys are pinned: it can only
+//    narrow, and no key can switch a gate off.
+
+/// A mode question (launch_mode) with the options quick and careful, each with a
+/// profile, on `focus_id`. quick narrows to local only, careful raises the floor.
+async fn seed_mode_question(pool: &sqlx::SqlitePool, focus_id: &str) {
+    sqlx::query(
+        "INSERT INTO focus_launch_questions
+            (focus_id, question_id, slot, kind, sort_order, asked, default_option, prompt)
+         VALUES (?, 'how', 'launch_mode', 'mode', 0, 1, 'quick', 'How?')",
+    )
+    .bind(focus_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    for (i, (o, envelope)) in [
+        (
+            "quick",
+            r#"{"highest_tier":"local_only","destinations":["local"]}"#,
+        ),
+        (
+            "careful",
+            r#"{"quality_floor":{"min":"standard","max":"high"}}"#,
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        sqlx::query(
+            "INSERT INTO focus_launch_options
+                (focus_id, question_id, option_id, sort_order, label)
+             VALUES (?, 'how', ?, ?, 'Label')",
+        )
+        .bind(focus_id)
+        .bind(o)
+        .bind(i as i64)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO focus_mode_profiles (focus_id, option_id, envelope) VALUES (?, ?, ?)",
+        )
+        .bind(focus_id)
+        .bind(o)
+        .bind(envelope)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
+async fn guard_row(
+    pool: &sqlx::SqlitePool,
+    focus_id: &str,
+    action: &str,
+    op: &str,
+    var: &str,
+    value: &str,
+) {
+    sqlx::query(
+        "UPDATE focus_block_compositions SET guard_var = ?, guard_op = ?, guard_value = ?
+          WHERE id = ?",
+    )
+    .bind(var)
+    .bind(op)
+    .bind(value)
+    .bind(format!("{focus_id}:{action}"))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn load_text(pool: &sqlx::SqlitePool, focus_id: &str) -> Result<(), String> {
+    crate::conductor::lifecycle::load_focus_definition_from_db(pool, focus_id)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+fn local_step(id: &str, template: &str) -> Row {
+    (
+        id.to_owned(),
+        None,
+        json!({"routing_tier": 1, "task_type": "quick_response", "output_var": format!("{id}_out"),
+               "prompt_template": template}),
+    )
+}
+
+#[tokio::test]
+async fn a_focus_with_a_model_block_must_declare_a_document_type_question() {
+    let env = setup().await;
+    let ex = example_of("cb-12");
+    // No question: refused at LOAD, naming the reason.
+    seed_focus(
+        &env.pool,
+        "dt-none",
+        "local_only",
+        &rows_for("cb-12", &ex, false),
+    )
+    .await;
+    let e = load_text(&env.pool, "dt-none").await.unwrap_err();
+    assert!(e.contains("document_type") && e.contains("too weak"), "{e}");
+    // A fixed question (a preset) and an asked question both satisfy it.
+    seed_focus(
+        &env.pool,
+        "dt-fixed",
+        "local_only",
+        &rows_for("cb-12", &ex, false),
+    )
+    .await;
+    seed_document_type_question(&env.pool, "dt-fixed", true).await;
+    load_text(&env.pool, "dt-fixed").await.unwrap();
+    seed_focus(
+        &env.pool,
+        "dt-asked",
+        "local_only",
+        &rows_for("cb-12", &ex, false),
+    )
+    .await;
+    seed_document_type_question(&env.pool, "dt-asked", false).await;
+    load_text(&env.pool, "dt-asked").await.unwrap();
+    // A question on another slot does not.
+    seed_focus(
+        &env.pool,
+        "dt-other",
+        "local_only",
+        &rows_for("cb-12", &ex, false),
+    )
+    .await;
+    seed_mode_question(&env.pool, "dt-other").await;
+    let e = load_text(&env.pool, "dt-other").await.unwrap_err();
+    assert!(e.contains("document_type"), "{e}");
+}
+
+#[tokio::test]
+async fn a_step_naming_a_launch_slot_with_no_question_fails_to_load() {
+    let env = setup().await;
+    seed_focus(
+        &env.pool,
+        "slot-none",
+        "local_only",
+        &[local_step("a", "mode: {launch_mode}")],
+    )
+    .await;
+    let e = load_text(&env.pool, "slot-none").await.unwrap_err();
+    assert!(
+        e.contains("launch_mode") && e.contains("no launch question"),
+        "{e}"
+    );
+    // With the question it loads (a local step may name it freely).
+    seed_focus(
+        &env.pool,
+        "slot-ok",
+        "local_only",
+        &[local_step("a", "mode: {launch_mode}")],
+    )
+    .await;
+    seed_mode_question(&env.pool, "slot-ok").await;
+    load_text(&env.pool, "slot-ok").await.unwrap();
+    // run_change needs no question.
+    seed_focus(
+        &env.pool,
+        "chg",
+        "local_only",
+        &[local_step("a", "change: {run_change}")],
+    )
+    .await;
+    load_text(&env.pool, "chg").await.unwrap();
+}
+
+#[tokio::test]
+async fn a_guard_literal_outside_the_questions_options_fails_to_load() {
+    let env = setup().await;
+    // Rows a (eq quick) and b (ne quick) cover every value, so the guard analysis
+    // is satisfied and only the literal is in question.
+    for (id, literal, ok) in [("g-ok", "quick", true), ("g-typo", "quik", false)] {
+        seed_focus(
+            &env.pool,
+            id,
+            "local_only",
+            &[local_step("a", "x"), local_step("b", "y")],
+        )
+        .await;
+        seed_mode_question(&env.pool, id).await;
+        guard_row(&env.pool, id, "a", "eq", "launch_mode", literal).await;
+        guard_row(&env.pool, id, "b", "ne", "launch_mode", literal).await;
+        let r = load_text(&env.pool, id).await;
+        if ok {
+            r.unwrap_or_else(|e| panic!("{id}: {e}"));
+        } else {
+            let e = r.unwrap_err();
+            assert!(
+                e.contains("not one of the options") && e.contains("'quik'"),
+                "{e}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_launch_config_that_fails_validate_fails_the_load() {
+    let env = setup().await;
+    seed_focus(&env.pool, "bad-cfg", "local_only", &[local_step("a", "x")]).await;
+    seed_mode_question(&env.pool, "bad-cfg").await;
+    // A default that is not one of the options.
+    sqlx::query(
+        "UPDATE focus_launch_questions SET default_option = 'novel' WHERE focus_id = 'bad-cfg'",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    let e = load_text(&env.pool, "bad-cfg").await.unwrap_err();
+    assert!(e.contains("default 'novel'"), "{e}");
+    // A mode with no profile.
+    sqlx::query(
+        "UPDATE focus_launch_questions SET default_option = 'quick' WHERE focus_id = 'bad-cfg'",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "DELETE FROM focus_mode_profiles WHERE focus_id = 'bad-cfg' AND option_id = 'careful'",
+    )
+    .execute(&env.pool)
+    .await
+    .unwrap();
+    let e = load_text(&env.pool, "bad-cfg").await.unwrap_err();
+    assert!(e.contains("has no profile"), "{e}");
+}
+
+#[tokio::test]
+async fn every_shipped_launch_config_validates_and_every_default_is_an_option() {
+    let env = setup().await;
+    let reg = registry().unwrap();
+    let ids = crate::conductor::launch_config::declared_focus_ids(&env.pool)
+        .await
+        .unwrap();
+    // decisions.id=948 point 6: none ship in items.id=897 (items.id=903 ships Writing
+    // Assistant's). Whatever ships later is held to the rules here.
+    assert!(
+        ids.is_empty(),
+        "unexpected shipped launch questions: {ids:?}"
+    );
+    for id in ids {
+        let c = crate::conductor::launch_config::read_validated(&env.pool, &id, reg)
+            .await
+            .unwrap_or_else(|e| panic!("{id}: {e}"))
+            .unwrap();
+        for q in &c.questions {
+            assert!(q.option(&q.default_option).is_some(), "{id}/{}", q.id);
+        }
+    }
+}
+
+/// A mode profile is an EnvelopeOverride: exactly four keys, each a tighten-only
+/// thing. A new key must be reviewed here, and none may name a gate, a consent, a
+/// spend limit or an approval.
+#[test]
+fn a_mode_profile_has_exactly_the_four_envelope_keys_and_none_names_a_gate() {
+    use crate::conductor::model_block::config::{Destination, QualityBar, QualityFloor};
+    let all = EnvelopeOverride {
+        quality_floor: Some(QualityFloor {
+            min: QualityBar::Basic,
+            max: QualityBar::High,
+        }),
+        highest_tier: Some(ExternalAccess::LocalOnly),
+        destinations: Some(vec![Destination::Local]),
+        declared_inputs: Some(vec!["a".to_owned()]),
+    };
+    let v = serde_json::to_value(&all).unwrap();
+    let keys: BTreeSet<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        BTreeSet::from([
+            "declared_inputs",
+            "destinations",
+            "highest_tier",
+            "quality_floor"
+        ])
+    );
+    for k in &keys {
+        for banned in FORBIDDEN_SUBSTRINGS {
+            assert!(!k.contains(banned), "{k} names '{banned}'");
+        }
+    }
+    // And a profile naming anything else does not parse.
+    for bad in [
+        r#"{"gate1": false}"#,
+        r#"{"approve_hosted": true}"#,
+        r#"{"spend_limit": 100}"#,
+        r#"{"settings": {}}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<EnvelopeOverride>(bad).is_err(),
+            "{bad}"
+        );
+    }
+}
+
+/// The launch names are an exact, reviewed list: adding one is a design decision.
+#[test]
+fn the_launch_names_are_an_exact_reviewed_list() {
+    assert_eq!(
+        crate::conductor::bound_spec::LAUNCH_NAMES,
+        [
+            "document_type",
+            "launch_mode",
+            "launch_answer_1",
+            "launch_answer_2",
+            "launch_answer_3",
+            "run_change"
+        ]
+    );
+    assert_eq!(crate::conductor::launch_config::MAX_QUESTIONS, 5);
 }

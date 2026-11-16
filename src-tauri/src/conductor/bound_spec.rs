@@ -13,7 +13,9 @@
 //             (items.id=895): the current row of one kind in pass_artifacts
 //             (persistence::pass_artifact_store), written only by the
 //             artifact_put and artifact_clear store operations and absent
-//             until the first write.
+//             until the first write. Launch (items.id=897): the answer of a
+//             per-Focus launch question, or its default, resolved ONCE per run at
+//             LOAD (conductor::run_settings) and seeded from that resolution.
 //   presence  Optional: the name is ABSENT until something writes it (a guard
 //             on it is false, its token renders as nothing). Always: every pass
 //             that asks for it gets a value, and a read that fails fails the
@@ -49,6 +51,14 @@ pub enum Source {
     /// it. Never an argument of a store writer (a stored artifact is not data to
     /// copy back) and never a session_put target.
     Artifact,
+    /// items.id=897 (decisions.id=948 point 2): a LAUNCH name. Its answers are
+    /// stored as session variables of the chat (written only by the typed launch-
+    /// answer store, never by a Focus row), but a run reads them ONCE, at LOAD, and
+    /// every pass seeds the resolved value, so the re-expanded template and the
+    /// seeds cannot disagree if an answer changes mid-run. Read-only to a template,
+    /// a guard and a seed: never a session_put target, a writer's argument or a
+    /// row's output_var.
+    Launch,
 }
 
 /// Whether a pass can find the name absent.
@@ -92,6 +102,44 @@ pub const SUBJECT_CONTEXT: &str = "subject_context";
 /// items.id=891: one line per active device the Focus owns, newest first, each
 /// opening with the E-XXXXXXXX handle a model can name (conductor::device_seeding).
 pub const DEVICE_LIBRARY_BRIEF: &str = "device_library_brief";
+
+/// items.id=897 (decisions.id=948 point 2): the six LAUNCH names. document_type
+/// and launch_mode are role names, launch_answer_1 to 3 are the generic slots a
+/// Focus's other questions use, and run_change is the per-run settings patch (the
+/// third layer of decisions.id=942 addendum 3 g). All are Source::Launch. The slot
+/// names are exactly launch_config::SLOTS (a test pins it).
+pub const DOCUMENT_TYPE: &str = "document_type";
+pub const LAUNCH_MODE: &str = "launch_mode";
+pub const LAUNCH_ANSWER_1: &str = "launch_answer_1";
+pub const LAUNCH_ANSWER_2: &str = "launch_answer_2";
+pub const LAUNCH_ANSWER_3: &str = "launch_answer_3";
+pub const RUN_CHANGE: &str = "run_change";
+
+/// The names a launch QUESTION can own, in table order (a run_change is not a
+/// question).
+pub const LAUNCH_SLOT_NAMES: [&str; 5] = [
+    DOCUMENT_TYPE,
+    LAUNCH_MODE,
+    LAUNCH_ANSWER_1,
+    LAUNCH_ANSWER_2,
+    LAUNCH_ANSWER_3,
+];
+
+/// Every launch name, in table order.
+pub const LAUNCH_NAMES: [&str; 6] = [
+    DOCUMENT_TYPE,
+    LAUNCH_MODE,
+    LAUNCH_ANSWER_1,
+    LAUNCH_ANSWER_2,
+    LAUNCH_ANSWER_3,
+    RUN_CHANGE,
+];
+
+/// Longest launch answer (a question or option id): the shape every slot value
+/// has. The submit command checks membership in the question's options.
+pub const LAUNCH_ANSWER_MAX_CHARS: usize = 40;
+/// Longest run_change value: the session store's own limit.
+pub const RUN_CHANGE_MAX_BYTES: usize = 2048;
 
 /// items.id=895: the four per-pass artifact names. Each equals its
 /// pass_artifact_store::ArtifactKind::as_str() (a test pins it), so a name is
@@ -148,6 +196,12 @@ pub const NAMES: &[&str] = &[
     DELTA_ITEMS,
     HANDOFF_PENDING,
     HANDOFF_RECEIVED,
+    DOCUMENT_TYPE,
+    LAUNCH_MODE,
+    LAUNCH_ANSWER_1,
+    LAUNCH_ANSWER_2,
+    LAUNCH_ANSWER_3,
+    RUN_CHANGE,
 ];
 
 pub const SPECS: &[BoundSpec] = &[
@@ -260,6 +314,53 @@ pub const SPECS: &[BoundSpec] = &[
         literals: Literals::Authored,
         validate: valid_draft_handle,
     },
+    // items.id=897: the launch names. The five slots are Always (a Focus that has
+    // the question always has a value: the answer, or the question's default, which
+    // LOAD guarantees is one of its options) and Authored (the options are per-Focus
+    // data, so the validator is shape only and the submit command checks membership
+    // against the shipped data). run_change is Optional (absent means no change).
+    BoundSpec {
+        name: DOCUMENT_TYPE,
+        source: Source::Launch,
+        presence: Presence::Always,
+        literals: Literals::Authored,
+        validate: valid_launch_answer,
+    },
+    BoundSpec {
+        name: LAUNCH_MODE,
+        source: Source::Launch,
+        presence: Presence::Always,
+        literals: Literals::Authored,
+        validate: valid_launch_answer,
+    },
+    BoundSpec {
+        name: LAUNCH_ANSWER_1,
+        source: Source::Launch,
+        presence: Presence::Always,
+        literals: Literals::Authored,
+        validate: valid_launch_answer,
+    },
+    BoundSpec {
+        name: LAUNCH_ANSWER_2,
+        source: Source::Launch,
+        presence: Presence::Always,
+        literals: Literals::Authored,
+        validate: valid_launch_answer,
+    },
+    BoundSpec {
+        name: LAUNCH_ANSWER_3,
+        source: Source::Launch,
+        presence: Presence::Always,
+        literals: Literals::Authored,
+        validate: valid_launch_answer,
+    },
+    BoundSpec {
+        name: RUN_CHANGE,
+        source: Source::Launch,
+        presence: Presence::Optional,
+        literals: Literals::Authored,
+        validate: valid_run_change,
+    },
 ];
 
 /// The spec of a bound name, or None for any other name.
@@ -311,6 +412,26 @@ fn valid_handoff_id(s: &str) -> bool {
 /// A draft handle, exactly as handles::draft_handle writes it.
 fn valid_draft_handle(s: &str) -> bool {
     crate::persistence::handles::is_draft_handle(s)
+}
+
+/// A launch answer: a lower-case name of 1 to LAUNCH_ANSWER_MAX_CHARS characters
+/// (letters, digits, underscores, starting with a letter). Shape only: whether it
+/// is one of a question's options is the submit command's check against the shipped
+/// data, and fails closed there.
+fn valid_launch_answer(s: &str) -> bool {
+    valid_identifier(s) && s.len() <= LAUNCH_ANSWER_MAX_CHARS
+}
+
+/// A run_change value: a JSON object that parses as a SettingsPatch (so it can name
+/// only the six visible settings: an envelope key, a tier or a gate does not parse,
+/// deny_unknown_fields) and fits the session store. Whether each named step exists
+/// is checked against the scales when the settings are resolved.
+fn valid_run_change(s: &str) -> bool {
+    s.len() <= RUN_CHANGE_MAX_BYTES
+        && !s.contains('\0')
+        && s.trim_start().starts_with('{')
+        && serde_json::from_str::<crate::conductor::model_block::document_type::SettingsPatch>(s)
+            .is_ok()
 }
 
 /// An artifact value: at most pass_artifact_store::ARTIFACT_MAX_BYTES, no NUL,
@@ -391,6 +512,12 @@ mod tests {
         for n in HANDOFF_NAMES {
             assert_eq!(row(n), (Source::Session, Presence::Optional, None), "{n}");
         }
+        // items.id=897: five Always slots and one Optional run_change, all Launch,
+        // all Authored (the options are per-Focus data, never a compiled Closed list).
+        for n in LAUNCH_SLOT_NAMES {
+            assert_eq!(row(n), (Source::Launch, Presence::Always, None), "{n}");
+        }
+        assert_eq!(row(RUN_CHANGE), (Source::Launch, Presence::Optional, None));
         assert_eq!(WRITE_MODE_VALUES, &["open", "suppressed"]);
         assert_eq!(OPEN_TICKET_STATE_VALUES, &["none", "one", "many"]);
         // A derived name is never absent.
@@ -508,5 +635,87 @@ mod tests {
         assert!(!valid_artifact(""));
         assert!(!valid_artifact("  \n"));
         assert!(!valid_artifact("a\0b"));
+    }
+
+    /// items.id=897: the launch names are exactly the Launch-source rows, the five
+    /// slots are exactly the slots a launch question may own, the resolver's profile
+    /// name is registered here, and a Focus can never write one.
+    #[test]
+    fn the_launch_names_match_the_slots_the_resolver_and_the_data_use() {
+        let from_specs: Vec<&str> = SPECS
+            .iter()
+            .filter(|s| s.source == Source::Launch)
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(from_specs, LAUNCH_NAMES);
+        assert_eq!(LAUNCH_SLOT_NAMES, crate::conductor::launch_config::SLOTS);
+        assert_eq!(
+            &LAUNCH_NAMES[..5],
+            &LAUNCH_SLOT_NAMES[..],
+            "run_change is the one launch name that is not a question slot"
+        );
+        // The rider of items.id=896 stage 3: the resolver reads its profile from the
+        // seed of this name, and the name is registered.
+        assert_eq!(
+            crate::conductor::model_resolver_input::DOCUMENT_TYPE_NAME,
+            DOCUMENT_TYPE
+        );
+        assert!(spec(DOCUMENT_TYPE).is_some());
+        // The slots the SQL CHECK admits are the same five.
+        assert_eq!(
+            crate::conductor::launch_config::SLOT_DOCUMENT_TYPE,
+            DOCUMENT_TYPE
+        );
+        assert_eq!(
+            crate::conductor::launch_config::SLOT_LAUNCH_MODE,
+            LAUNCH_MODE
+        );
+    }
+
+    #[test]
+    fn the_launch_validators_check_shape_and_a_run_change_parses_as_a_settings_patch() {
+        let slot = spec(LAUNCH_MODE).unwrap();
+        for ok in ["quick", "document_polished", "a", "rma_letter2"] {
+            assert!((slot.validate)(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "Quick",
+            "2fast",
+            "has space",
+            "{brace}",
+            "a-b",
+            &"a".repeat(LAUNCH_ANSWER_MAX_CHARS + 1),
+        ] {
+            assert!(!(slot.validate)(bad), "{bad}");
+        }
+        assert!((slot.validate)(&"a".repeat(LAUNCH_ANSWER_MAX_CHARS)));
+
+        let change = spec(RUN_CHANGE).unwrap();
+        for ok in [
+            "{}",
+            r#"{"tone":"warm"}"#,
+            r#"{"tone":"firm","length":"short","latitude":"strict"}"#,
+        ] {
+            assert!((change.validate)(ok), "{ok}");
+        }
+        // An envelope key, a gate, an unknown key, a non-object or an oversized value
+        // is refused: a run_change moves the visible settings and nothing else.
+        for bad in [
+            "",
+            "null",
+            "[]",
+            "\"tone\"",
+            r#"{"highest_tier":"unrestricted"}"#,
+            r#"{"destinations":["hosted_api"]}"#,
+            r#"{"quality_floor":{"min":"basic","max":"high"}}"#,
+            r#"{"declared_inputs":["user_input"]}"#,
+            r#"{"gate1":false}"#,
+            r#"{"tone":5}"#,
+        ] {
+            assert!(!(change.validate)(bad), "{bad}");
+        }
+        let huge = format!(r#"{{"tone":"{}"}}"#, "a".repeat(RUN_CHANGE_MAX_BYTES));
+        assert!(!(change.validate)(&huge));
     }
 }

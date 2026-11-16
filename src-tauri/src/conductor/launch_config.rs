@@ -37,8 +37,10 @@ use std::collections::BTreeSet;
 
 use sqlx::{Row, SqlitePool};
 
+use crate::conductor::executor::find_tokens;
 use crate::conductor::model_block::config::{is_slug, EnvelopeOverride};
 use crate::conductor::model_block::document_type::{check_text, Registry};
+use crate::conductor::tokens::ActionDefinition;
 
 /// The five compiled slots a question may use. Each is also a bound name
 /// (conductor::bound_spec, stage 2 pins the two lists equal).
@@ -349,6 +351,9 @@ pub enum LaunchConfigError {
     Read(#[from] sqlx::Error),
     #[error("launch config of '{focus_id}': {message}")]
     Invalid { focus_id: String, message: String },
+    /// validate() refused the rows. The message already names the Focus.
+    #[error("{0}")]
+    Validation(String),
 }
 
 fn invalid(focus_id: &str, message: impl Into<String>) -> LaunchConfigError {
@@ -358,10 +363,15 @@ fn invalid(focus_id: &str, message: impl Into<String>) -> LaunchConfigError {
     }
 }
 
-/// Read a Focus's launch config from shared.db. `None` when the Focus declares no
-/// question. The result is NOT validated: callers run validate(), so LOAD, the
-/// admission test and the submit command share one rule set.
-pub async fn read(
+/// Read a Focus's launch config from shared.db WITHOUT validating it. `None` when
+/// the Focus declares no question.
+///
+/// PRIVATE ON PURPOSE (decisions.id=948, Chat-PM's stage 1 requirement): an
+/// unvalidated config must never reach a consumer. The only way out of this module
+/// is read_validated(), which runs validate() on the result, so LOAD, the admission
+/// test and the submit command share one rule set and none can forget it. A source
+/// scan below pins that nothing outside this file names this function.
+async fn read_unvalidated(
     pool: &SqlitePool,
     focus_id: &str,
 ) -> Result<Option<LaunchConfig>, LaunchConfigError> {
@@ -453,6 +463,105 @@ pub async fn read(
         questions,
         profiles,
     }))
+}
+
+/// The ids of every Focus that declares at least one launch question (shipped
+/// data), for the admission test. Ids only: a config is read through
+/// read_validated().
+pub async fn declared_focus_ids(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT DISTINCT focus_id FROM focus_launch_questions ORDER BY focus_id")
+        .fetch_all(pool)
+        .await
+}
+
+/// Read a Focus's launch config and VALIDATE it: the one reader every consumer
+/// uses (LOAD, the admission test, the stage 3 run-start hook and the submit
+/// command). An invalid config is an error, never a partial result.
+pub async fn read_validated(
+    pool: &SqlitePool,
+    focus_id: &str,
+    registry: &Registry,
+) -> Result<Option<LaunchConfig>, LaunchConfigError> {
+    let Some(config) = read_unvalidated(pool, focus_id).await? else {
+        return Ok(None);
+    };
+    config
+        .validate(registry)
+        .map_err(LaunchConfigError::Validation)?;
+    Ok(Some(config))
+}
+
+/// LOAD lint (decisions.id=948 point 2): how a Focus's steps use the launch names,
+/// against the Focus's own validated config (None when it declares no question).
+///
+///  * a step that names a slot (in its template, its declared inputs or a guard)
+///    needs a question on that slot;
+///  * a guard literal on a slot is one of that question's options (a typo in a
+///    guard would otherwise make a row unreachable without a word);
+///  * a step with a `requirement` (a model block) needs a document_type question,
+///    because the model resolver's profile is read only from that seed: the name
+///    must always have a value (rider of items.id=896 stage 3), and validate()
+///    guarantees the question's default is one of its options.
+///
+/// `run_change` needs no question: it is the per-run settings patch and is absent
+/// when there is no change. Question count, one question per slot and the defaults
+/// are validate()'s.
+pub fn lint(
+    focus_id: &str,
+    config: Option<&LaunchConfig>,
+    steps: &[ActionDefinition],
+) -> Result<(), String> {
+    use crate::conductor::guard::Condition;
+
+    let question_of = |slot: &str| config.and_then(|c| c.question_for_slot(slot));
+    for step in steps {
+        let mut named: BTreeSet<String> = step.declared_inputs.iter().cloned().collect();
+        if step.reads_template() {
+            named.extend(find_tokens(&step.prompt_template));
+        }
+        for g in step.guards() {
+            named.insert(g.var.clone());
+            let Some(slot) = SLOTS.iter().find(|s| **s == g.var) else {
+                continue;
+            };
+            let Some(q) = question_of(slot) else {
+                continue; // reported below as a missing question
+            };
+            let literals: Vec<&String> = match &g.condition {
+                Condition::Eq(l) | Condition::Ne(l) => vec![l],
+                Condition::In(v) => v.iter().collect(),
+                Condition::Present | Condition::Absent => Vec::new(),
+            };
+            for l in literals {
+                if q.option(l).is_none() {
+                    return Err(format!(
+                        "Focus '{focus_id}' step '{}': guard on '{slot}' compares with '{l}', \
+                         which is not one of the options of its question '{}'",
+                        step.action_id, q.id
+                    ));
+                }
+            }
+        }
+        for slot in SLOTS {
+            if named.contains(slot) && question_of(slot).is_none() {
+                return Err(format!(
+                    "Focus '{focus_id}' step '{}': names '{slot}', but the Focus declares no \
+                     launch question on that slot",
+                    step.action_id
+                ));
+            }
+        }
+        if step.requirement.is_some() && question_of(SLOT_DOCUMENT_TYPE).is_none() {
+            return Err(format!(
+                "Focus '{focus_id}' step '{}': a model block needs the run's document type, \
+                 and the Focus declares no '{SLOT_DOCUMENT_TYPE}' question (a question with a \
+                 default, asked or fixed): the resolver reads its profile only from that \
+                 value, and without it the step would stop as too weak",
+                step.action_id
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The optional one-line description of a Focus (the new display fact). An absent
@@ -750,7 +859,7 @@ mod tests {
             .unwrap();
         assert_eq!(n, 0);
         for f in ["writing-assistant", "quick-ask", "nothing"] {
-            assert!(read(&pool, f).await.unwrap().is_none(), "{f}");
+            assert!(read_unvalidated(&pool, f).await.unwrap().is_none(), "{f}");
         }
     }
 
@@ -786,7 +895,10 @@ mod tests {
             &[],
         )
         .await;
-        let c = read(&pool, "fx").await.unwrap().expect("a config");
+        let c = read_unvalidated(&pool, "fx")
+            .await
+            .unwrap()
+            .expect("a config");
         c.validate(reg()).unwrap();
         assert_eq!(c.questions.len(), 1);
         assert_eq!(c.questions[0].options.len(), 2);
@@ -795,7 +907,7 @@ mod tests {
             Some(ExternalAccess::LocalOnly)
         );
         // Another Focus sees nothing.
-        assert!(read(&pool, "fy").await.unwrap().is_none());
+        assert!(read_unvalidated(&pool, "fy").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -818,7 +930,7 @@ mod tests {
             &[],
         )
         .await;
-        let e = read(&pool, "fz").await.unwrap_err().to_string();
+        let e = read_unvalidated(&pool, "fz").await.unwrap_err().to_string();
         assert!(e.contains("profile of mode 'quick'"), "{e}");
         sqlx::query("DELETE FROM focus_mode_profiles WHERE focus_id = 'fz'")
             .execute(&pool)
@@ -832,7 +944,7 @@ mod tests {
             &[],
         )
         .await;
-        let e = read(&pool, "fz").await.unwrap_err().to_string();
+        let e = read_unvalidated(&pool, "fz").await.unwrap_err().to_string();
         assert!(e.contains("undeclared question 'ghost'"), "{e}");
     }
 
@@ -872,5 +984,289 @@ mod tests {
         for f in ["quick-ask", "api-chat", "qr-admin"] {
             assert!(read_one_liner(&pool, f).await.unwrap().is_none(), "{f}");
         }
+    }
+
+    // -- the LOAD lint ---------------------------------------------------------
+
+    use crate::conductor::guard::{Condition, Guard};
+    use crate::conductor::model_block::config::{
+        Difficulty, ModelRange, ModelRequirement, ModelTaskType, OutputSize, TaskNeed,
+    };
+    use crate::conductor::tokens::{ActionDefinition, StepType};
+    use std::collections::HashMap;
+
+    fn step(id: &str, template: &str) -> ActionDefinition {
+        ActionDefinition {
+            action_id: id.to_owned(),
+            display_name: id.to_owned(),
+            guide_id: "g".to_owned(),
+            task_type: "general".to_owned(),
+            routing_tier: ExternalAccess::LocalOnly,
+            step_type: StepType::Generate,
+            output_var: Some(format!("{id}_out")),
+            prompt_template: template.to_owned(),
+            field_requirements: HashMap::new(),
+            options_override: HashMap::new(),
+            external_access_override: None,
+            requires_user_handoff: false,
+            revisitable: false,
+            block_stable_id: None,
+            block_customization: None,
+            schedule_trigger: None,
+            guard: None,
+            declared_inputs: Vec::new(),
+            store_op: None,
+            and_guards: Vec::new(),
+            requirement: None,
+        }
+    }
+
+    fn model_step(id: &str) -> ActionDefinition {
+        let mut s = step(id, "write it");
+        s.requirement = Some(ModelRequirement {
+            block_stable_id: "cb-12".to_owned(),
+            need: TaskNeed {
+                task_type: ModelTaskType::CreativeWriting,
+                difficulty: Difficulty::Low,
+                output_size: OutputSize::Short,
+            },
+            range: ModelRange {
+                quality_floor: QualityFloor {
+                    min: QualityBar::Basic,
+                    max: QualityBar::High,
+                },
+                highest_tier: ExternalAccess::LocalOnly,
+                destinations: vec![Destination::Local],
+            },
+            class_preference: None,
+        });
+        s
+    }
+
+    fn guarded(mut s: ActionDefinition, var: &str, c: Condition) -> ActionDefinition {
+        s.guard = Some(Guard {
+            var: var.to_owned(),
+            condition: c,
+        });
+        s
+    }
+
+    fn lint_err(c: Option<&LaunchConfig>, steps: &[ActionDefinition]) -> String {
+        lint("fx", c, steps).unwrap_err()
+    }
+
+    #[test]
+    fn a_step_naming_a_slot_needs_a_question_on_it() {
+        let c = good();
+        // document_type, launch_mode and launch_answer_1 have questions.
+        lint(
+            "fx",
+            Some(&c),
+            &[step("a", "{document_type} {launch_mode} {launch_answer_1}")],
+        )
+        .unwrap();
+        // launch_answer_2 has none, in the template, a declaration or a guard.
+        let e = lint_err(Some(&c), &[step("a", "{launch_answer_2}")]);
+        assert!(
+            e.contains("launch_answer_2") && e.contains("no launch question"),
+            "{e}"
+        );
+        let mut declared = step("a", "x");
+        declared.declared_inputs = vec!["launch_answer_2".to_owned()];
+        assert!(lint_err(Some(&c), &[declared]).contains("launch_answer_2"));
+        let g = guarded(step("a", "x"), "launch_answer_2", Condition::Present);
+        assert!(lint_err(Some(&c), &[g]).contains("launch_answer_2"));
+        // A Focus with no config at all.
+        assert!(lint_err(None, &[step("a", "{launch_mode}")]).contains("launch_mode"));
+        // A Focus that uses none is fine either way.
+        lint("fx", None, &[step("a", "plain {user_input}")]).unwrap();
+    }
+
+    #[test]
+    fn run_change_needs_no_question() {
+        lint("fx", None, &[step("a", "{run_change}")]).unwrap();
+        lint(
+            "fx",
+            None,
+            &[guarded(step("a", "x"), "run_change", Condition::Present)],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_guard_literal_must_be_one_of_the_questions_options() {
+        let c = good();
+        for ok in [
+            Condition::Eq("quick".to_owned()),
+            Condition::Ne("careful".to_owned()),
+            Condition::In(vec!["quick".to_owned(), "careful".to_owned()]),
+            Condition::Present,
+            Condition::Absent,
+        ] {
+            lint(
+                "fx",
+                Some(&c),
+                &[guarded(step("a", "x"), "launch_mode", ok)],
+            )
+            .unwrap();
+        }
+        for bad in [
+            Condition::Eq("quik".to_owned()),
+            Condition::Ne("fast".to_owned()),
+            Condition::In(vec!["quick".to_owned(), "slow".to_owned()]),
+        ] {
+            let e = lint_err(Some(&c), &[guarded(step("a", "x"), "launch_mode", bad)]);
+            assert!(
+                e.contains("not one of the options") && e.contains("'how'"),
+                "{e}"
+            );
+        }
+        // A guard on a name that is not a launch slot is not this lint's.
+        lint(
+            "fx",
+            Some(&c),
+            &[guarded(
+                step("a", "x"),
+                "locked_intent",
+                Condition::Eq("anything".to_owned()),
+            )],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_model_block_needs_a_document_type_question_asked_or_fixed() {
+        let mut c = good();
+        lint("fx", Some(&c), &[model_step("m")]).unwrap();
+        // No config at all.
+        let e = lint_err(None, &[model_step("m")]);
+        assert!(e.contains("document_type") && e.contains("too weak"), "{e}");
+        // A config with other questions only.
+        c.questions.remove(1);
+        let e = lint_err(Some(&c), &[model_step("m")]);
+        assert!(e.contains("document_type"), "{e}");
+        // A fixed question (a preset, asked = false) satisfies it.
+        let mut fixed = good();
+        fixed.questions[1].asked = false;
+        fixed.questions[1].options.truncate(1);
+        fixed.validate(reg()).unwrap();
+        lint("fx", Some(&fixed), &[model_step("m")]).unwrap();
+    }
+
+    // -- the validated-only reader (Chat-PM's stage 1 requirement) -------------
+
+    #[tokio::test]
+    async fn read_validated_refuses_a_config_that_fails_validate() {
+        let (pool, _dir) = migrated().await;
+        // A default that is not one of the options: read_unvalidated returns it,
+        // read_validated refuses it.
+        insert(
+            &pool,
+            "INSERT INTO focus_launch_questions
+               (focus_id, question_id, slot, kind, sort_order, asked, default_option, prompt)
+             VALUES ('fbad', 'kind', 'document_type', 'choice', 1, 1, 'novel', 'Which?')",
+            &[],
+        )
+        .await;
+        for (o, n) in [("rma_letter", 1), ("cover_letter", 2)] {
+            sqlx::query(
+                "INSERT INTO focus_launch_options
+                   (focus_id, question_id, option_id, sort_order, label, hint)
+                 VALUES ('fbad', 'kind', ?, ?, 'L', '')",
+            )
+            .bind(o)
+            .bind(n)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        assert!(read_unvalidated(&pool, "fbad").await.unwrap().is_some());
+        let e = read_validated(&pool, "fbad", reg()).await.unwrap_err();
+        assert!(matches!(e, LaunchConfigError::Validation(_)), "{e}");
+        assert!(e.to_string().contains("default 'novel'"), "{e}");
+        // Fix the default and it is returned.
+        sqlx::query("UPDATE focus_launch_questions SET default_option = 'rma_letter'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let c = read_validated(&pool, "fbad", reg()).await.unwrap().unwrap();
+        assert_eq!(c.questions[0].default_option, "rma_letter");
+        // No rows: None.
+        assert!(read_validated(&pool, "none-here", reg())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    fn rust_sources() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push((
+                        p.to_string_lossy().into_owned(),
+                        std::fs::read_to_string(&p).unwrap(),
+                    ));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut out,
+        );
+        out
+    }
+
+    /// Chat-PM's stage 1 requirement: launch_config's reader does not validate, so
+    /// every consumer must. The unvalidated reader is private to this file (the
+    /// compiler enforces it), and this scan pins that nothing outside the file names
+    /// it or an old public `read`, that the validated reader is what LOAD calls, and
+    /// that every file that reads a config calls it (no file may build a LaunchConfig
+    /// from rows itself).
+    #[test]
+    fn no_caller_can_use_an_unvalidated_config() {
+        let this = "conductor/launch_config.rs";
+        for (path, text) in rust_sources() {
+            if path.ends_with(this) {
+                continue;
+            }
+            for banned in [
+                "read_unvalidated",
+                "launch_config::read(",
+                "launch_config::read_raw",
+                "FROM focus_launch_questions",
+                "FROM focus_launch_options",
+                "FROM focus_mode_profiles",
+            ] {
+                // The admission test edits the tables to build fixture Focuses (it
+                // writes rows, it builds no LaunchConfig from them).
+                assert!(
+                    !text.contains(banned) || path.ends_with("admission_tests.rs"),
+                    "{path} names '{banned}': a launch config is read only through \
+                     launch_config::read_validated"
+                );
+            }
+        }
+        let lifecycle = rust_sources()
+            .into_iter()
+            .find(|(p, _)| p.ends_with("conductor/lifecycle.rs"))
+            .unwrap()
+            .1;
+        assert!(lifecycle.contains("launch_config::read_validated("));
+        assert!(lifecycle.contains("launch_config::lint("));
+        // The reader is `async fn read_unvalidated` (private): no `pub` in front. Lines
+        // are matched from their start so this test's own text cannot satisfy it.
+        let own = include_str!("launch_config.rs");
+        assert!(own
+            .lines()
+            .any(|l| l.starts_with("async fn read_unvalidated(")));
+        assert!(!own
+            .lines()
+            .any(|l| l.starts_with("pub async fn read_unvalidated(")
+                || l.starts_with("pub(crate) async fn read_unvalidated(")
+                || l.starts_with("pub async fn read(")));
     }
 }

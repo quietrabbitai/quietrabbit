@@ -64,10 +64,12 @@ use crate::spend::disclosure::attributes_hash;
 use crate::spend::estimate::worst_case;
 use crate::spend::price::{resolve_price, PriceQuote};
 
-/// The bound session name that holds the run's selected document type id.
-/// items.id=897 registers it as a bound name and guarantees it a value (a Focus
-/// preset that fixes its type seeds the same name at seed time). Until then no
-/// name seeds it and every model-block step has no profile.
+/// The bound name that holds the run's selected document type id. items.id=897
+/// registered it in bound_spec (DOCUMENT_TYPE, Source::Launch, a test pins the two
+/// equal): a launch question on the document_type slot sets it, or a question that
+/// is not asked fixes it (a preset), and the question's default is always one of its
+/// options, so a Focus that uses model blocks always has a value (LOAD refuses one
+/// that has no such question). The resolver reads it ONLY from the pass's seeds.
 pub const DOCUMENT_TYPE_NAME: &str = "document_type";
 
 /// providers.provider_type of a curated local model row.
