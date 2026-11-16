@@ -189,6 +189,18 @@ pub enum LifecycleError {
     /// names the variable, never its value.
     #[error("Session store: {0}")]
     StoreSeed(#[from] crate::conductor::seeding::SeedError),
+    /// items.id=897: a launch answer is stale or unreadable, or the launch config
+    /// cannot be applied. The run does not start: nothing is guessed and no default
+    /// replaces a stored answer.
+    #[error("Launch answers: {0}")]
+    LaunchAnswers(String),
+    /// items.id=897 (decisions.id=948 point 5): a RESUMED run of a Focus that asks a
+    /// launch question. rehydrate_focus_run has no context_key, so it cannot read the
+    /// chat's answers, and the Focus defaults could be looser than what the user chose
+    /// (a mode only narrows). It fails closed until items.id=888 carries context_key
+    /// on rehydrate.
+    #[error("Launch answers are not available when resuming Focus '{0}': start the run again")]
+    LaunchAnswersUnavailableOnResume(String),
     /// items.id=887: a store writer row failed, so the pass stops and nothing
     /// after it runs (fail closed). A one-time chat's refusal is not this: it
     /// is an Ok outcome that writes nothing.
@@ -640,6 +652,7 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
         generic_title_template,
         high_priority_trigger,
         collection_posture,
+        model_origins: Vec::new(),
     })
 }
 
@@ -726,6 +739,7 @@ pub(crate) async fn load_focus_definition_from_db(
     let default_guide_id = "quick-ask-guide";
 
     let mut steps = Vec::with_capacity(composition_rows.len());
+    let mut model_origins: Vec<crate::conductor::model_block::ModelOrigin> = Vec::new();
     for row in composition_rows {
         let schedule_trigger = parse_optional_trigger(
             focus_id,
@@ -929,7 +943,7 @@ pub(crate) async fn load_focus_definition_from_db(
                             crate::conductor::model_block::EXTERNAL_MODEL_BLOCKS_ALLOWED,
                         )
                         .map_err(fail)?;
-                        (spec.expand)(
+                        let expanded = (spec.expand)(
                             &parsed,
                             &crate::conductor::model_block::ExpandInput {
                                 action_id: &row.action_id,
@@ -937,9 +951,18 @@ pub(crate) async fn load_focus_definition_from_db(
                                 settings: None,
                                 external_allowed:
                                     crate::conductor::model_block::EXTERNAL_MODEL_BLOCKS_ALLOWED,
+                                document_type: None,
+                                envelope_override: None,
                             },
                         )
-                        .map_err(fail)?
+                        .map_err(fail)?;
+                        // items.id=897: kept so a run start can re-expand the row.
+                        model_origins.push(crate::conductor::model_block::ModelOrigin {
+                            action_id: row.action_id.clone(),
+                            stable_id: stable_id.clone(),
+                            parsed,
+                        });
+                        expanded
                     }
                     RegisteredBlock::Render(spec) => {
                         // items.id=387: a RENDER block (cb-15) is parsed (typed, no
@@ -994,7 +1017,7 @@ pub(crate) async fn load_focus_definition_from_db(
     )
     .map_err(|e| LifecycleError::ValidationFailed(format!("Focus '{focus_id}' {e}")))?;
     lint_declared_inputs(focus_id, &steps)?;
-    lint_launch_config(pool, focus_id, &steps).await?;
+    lint_launch_config(pool, focus_id, &steps, &model_origins, max_routing_tier).await?;
     analyze_guarded_composition(focus_id, &steps)?;
 
     Ok(Some(FocusDefinition {
@@ -1010,6 +1033,7 @@ pub(crate) async fn load_focus_definition_from_db(
         generic_title_template: focus_row.generic_title_template,
         high_priority_trigger,
         collection_posture: focus_row.collection_posture,
+        model_origins,
     }))
 }
 
@@ -1022,6 +1046,8 @@ async fn lint_launch_config(
     pool: &sqlx::SqlitePool,
     focus_id: &str,
     steps: &[ActionDefinition],
+    origins: &[crate::conductor::model_block::ModelOrigin],
+    ceiling: ExternalAccess,
 ) -> Result<(), LifecycleError> {
     let fail = |m: String| LifecycleError::ValidationFailed(m);
     let registry = crate::conductor::model_block::document_type::registry()
@@ -1029,7 +1055,10 @@ async fn lint_launch_config(
     let config = crate::conductor::launch_config::read_validated(pool, focus_id, registry)
         .await
         .map_err(|e| fail(format!("Focus '{focus_id}': {e}")))?;
-    crate::conductor::launch_config::lint(focus_id, config.as_ref(), steps).map_err(fail)
+    crate::conductor::launch_config::lint(focus_id, config.as_ref(), steps).map_err(fail)?;
+    // items.id=897: every model row against every document type option and every mode
+    // profile, so a combination that cannot be applied refuses the Focus here.
+    crate::conductor::run_settings::trial_expand(config.as_ref(), origins, ceiling).map_err(fail)
 }
 
 /// items.id=878: LOAD analysis of a composition's guards. Returns the number of
@@ -1344,7 +1373,14 @@ pub async fn load_focus_definition(
     lint_declared_inputs(&focus_def.focus_id, &focus_def.steps)?;
     // items.id=897: the launch-name lint runs on both paths (a YAML template may
     // name a launch slot too).
-    lint_launch_config(pool, &focus_def.focus_id, &focus_def.steps).await?;
+    lint_launch_config(
+        pool,
+        &focus_def.focus_id,
+        &focus_def.steps,
+        &[],
+        focus_def.max_routing_tier,
+    )
+    .await?;
     // items.id=887: store writers are database-only, so a YAML step is never one
     // and this passes trivially. It runs on both paths so that a YAML field that
     // ever populated store_op could not skip the checks.
@@ -1487,6 +1523,10 @@ pub struct FocusDefinition {
     /// max_external_access shadow field this used to require).
     pub max_routing_tier: ExternalAccess,
     pub steps: Vec<ActionDefinition>,
+    /// items.id=897: the parsed rows of this Focus's model blocks, so a run start can
+    /// re-expand them with the run's launch answers (conductor::run_settings). Empty
+    /// for a Focus with no model block and for a YAML Focus.
+    pub model_origins: Vec<crate::conductor::model_block::ModelOrigin>,
     pub output_type: String,
     pub suggest_in_focuses: Vec<String>,
     pub multi_source_validation: bool,
@@ -1799,6 +1839,13 @@ pub struct FocusRun<L: DisclosureLoggerForRun = SqliteDisclosureLogger> {
     /// writers' arguments and guards. Pass-local: never a TaskTrack step, never
     /// checkpointed, never in a prompt or in extraction.
     pub(crate) store_vars: HashMap<String, String>,
+    /// items.id=897: what this run resolved from its launch answers (conductor::
+    /// run_settings), computed once by load() and seeded by every pass. In memory
+    /// only: never persisted, so a retry and a resumed run resolve again.
+    pub(crate) launch: crate::conductor::run_settings::LaunchResolution,
+    /// items.id=897: set by rehydrate_focus_run before load(), because a resumed run
+    /// has no context_key and so cannot read the chat's launch answers.
+    pub(crate) rehydrated: bool,
     /// items.id=778 (decisions.id=896): this run's writer lease. Taken by the
     /// caller that starts or resumes the run, BEFORE the run can touch a
     /// database, and held until the run is dropped, which for a spawned run is
@@ -1862,6 +1909,8 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             current_turn: None,
             store_tokens: crate::conductor::taint::StoreTokens::default(),
             store_vars: HashMap::new(),
+            launch: crate::conductor::run_settings::LaunchResolution::default(),
+            rehydrated: false,
             lease: None,
         }
     }
@@ -2017,6 +2066,98 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     /// Python oracle: FocusRun.load()
     pub async fn load(&mut self) -> Result<(), LifecycleError> {
         self.focus_def = Some(load_focus_definition(&self.pool, &self.focus_id).await?);
+        // items.id=897: resolve the launch answers and re-expand the model blocks
+        // BEFORE authorize(), so the tier check sees the expanded steps.
+        self.apply_launch_settings().await
+    }
+
+    /// items.id=897 (decisions.id=942 point 8, decisions.id=948): the RUN-START step.
+    /// Reads the Focus's launch config, resolves the chat's launch answers (or the
+    /// defaults), re-expands every model block with the selected document type, the
+    /// three settings layers and the mode profile (always through tighten(), inside
+    /// the block's finish()), and keeps the resolution for seeding.
+    ///
+    /// FAILS CLOSED: a stale or unreadable stored answer, a config that does not
+    /// validate or an expansion that cannot be applied ends the load; a RESUMED run
+    /// of a Focus with an asked question ends it too (rehydrate_focus_run has no
+    /// context_key, so it cannot read the answers, and the defaults could be looser
+    /// than what the user chose). A run with no chat (submit_focus_run) uses the
+    /// defaults, like any session name read with no chat. A one-time chat keeps its
+    /// pre-latch answers (reads are not latch-gated) and otherwise uses the defaults.
+    async fn apply_launch_settings(&mut self) -> Result<(), LifecycleError> {
+        use crate::conductor::run_settings::{
+            reexpand, resolve, saved_settings_patch, LaunchResolution, SavedSettingsContext,
+        };
+        let fail = |m: String| LifecycleError::LaunchAnswers(m);
+        let registry = crate::conductor::model_block::document_type::registry()
+            .map_err(LifecycleError::LaunchAnswers)?;
+        let config =
+            crate::conductor::launch_config::read_validated(&self.pool, &self.focus_id, registry)
+                .await
+                .map_err(|e| fail(e.to_string()))?;
+        let uses_run_change = {
+            let def = self.focus_def.as_ref().expect("load() just set focus_def");
+            crate::conductor::seeding::required_names(&def.steps)
+                .contains(&crate::conductor::bound_spec::RUN_CHANGE)
+        };
+        let has_origins = !self
+            .focus_def
+            .as_ref()
+            .expect("load() just set focus_def")
+            .model_origins
+            .is_empty();
+        if config.is_none() && !uses_run_change && !has_origins {
+            self.launch = LaunchResolution::default();
+            return Ok(());
+        }
+        if self.rehydrated
+            && config
+                .as_ref()
+                .is_some_and(|c| c.questions.iter().any(|q| q.asked))
+        {
+            return Err(LifecycleError::LaunchAnswersUnavailableOnResume(
+                self.focus_id.clone(),
+            ));
+        }
+        // The chat's stored answers. No chat means none: the defaults apply.
+        let stored = match self.context_key.as_deref() {
+            Some(key) => crate::persistence::launch_answer_store::read_answers_for_run(
+                &self.user_id,
+                &self.persona_id,
+                self.key_hex.as_deref().unwrap_or(""),
+                key,
+                &self.focus_id,
+            )
+            .await
+            .map_err(|e| fail(e.to_string()))?,
+            None => Default::default(),
+        };
+        // Layer 2, the read seam (nothing stores saved adjustments until items.id=905).
+        let selected_type = config
+            .as_ref()
+            .and_then(|c| c.question_for_slot(crate::conductor::launch_config::SLOT_DOCUMENT_TYPE))
+            .map(|q| match (stored.get(q.slot.as_str()), q.asked) {
+                (Some(v), true) if q.option(v).is_some() => v.clone(),
+                _ => q.default_option.clone(),
+            });
+        let saved = match &selected_type {
+            Some(t) => saved_settings_patch(
+                &SavedSettingsContext {
+                    user_id: &self.user_id,
+                    persona_id: &self.persona_id,
+                    key_hex: self.key_hex.as_deref().unwrap_or(""),
+                },
+                t,
+            )
+            .await
+            .map_err(LifecycleError::LaunchAnswers)?,
+            None => None,
+        };
+        let resolved = resolve(config.as_ref(), &stored, saved.as_ref(), registry)
+            .map_err(|e| fail(e.to_string()))?;
+        let def = self.focus_def.as_mut().expect("load() just set focus_def");
+        reexpand(def, &resolved).map_err(|e| fail(e.to_string()))?;
+        self.launch = resolved.resolution;
         Ok(())
     }
 
@@ -2746,6 +2887,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 &self.focus_id,
                 &def.steps,
                 &row_vars,
+                &self.launch,
             )
             .await?
         };
@@ -4602,6 +4744,8 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
         run.chat_binding = Some(bound);
     }
 
+    // items.id=897: a resumed run cannot read the chat's launch answers.
+    run.rehydrated = true;
     run.load().await?;
     run.resolve_tier_config().await?;
     run.failure_handler = Some(run.build_failure_handler().await);

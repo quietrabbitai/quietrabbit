@@ -6,6 +6,7 @@ FocusDefinition {
     version: "1.0",
     max_routing_tier: LocalOnly,
     steps: [],
+    model_origins: [],
     output_type: "shared-guide",
     suggest_in_focuses: [],
     multi_source_validation: false,

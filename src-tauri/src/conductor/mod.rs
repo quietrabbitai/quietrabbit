@@ -35,6 +35,7 @@ pub mod propose_route;
 pub mod provider_selection;
 pub mod quality;
 pub mod reentry;
+pub mod run_settings;
 pub mod scheduled_sweep;
 pub mod seeding;
 pub mod step_review;

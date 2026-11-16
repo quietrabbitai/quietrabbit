@@ -465,6 +465,110 @@ async fn read_unvalidated(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// Submitting answers (items.id=897 stage 3, decisions.id=948 point 4)
+// ---------------------------------------------------------------------------
+
+/// Answers that passed validate_submission(): the only value the answer store
+/// (persistence::launch_answer_store) accepts, so nothing stores an unvalidated
+/// answer. The field is private and only validate_submission() builds one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedAnswers {
+    writes: Vec<(&'static str, String)>,
+}
+
+impl ValidatedAnswers {
+    /// (bound name, value), in the order submitted.
+    pub fn writes(&self) -> &[(&'static str, String)] {
+        &self.writes
+    }
+}
+
+/// Why a submit was refused. Each has a stable code for the command layer.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SubmitError {
+    #[error("the Focus asks no question '{0}'")]
+    UnknownQuestion(String),
+    #[error("question '{0}' is not asked (its value is fixed)")]
+    QuestionNotAsked(String),
+    #[error("the answer to question '{0}' is not one of its options")]
+    InvalidAnswer(String),
+    #[error("the per-run change is not a valid settings change: {0}")]
+    InvalidRunChange(String),
+}
+
+impl SubmitError {
+    /// The stable error code (stage 4 maps these to its command codes).
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::UnknownQuestion(_) => "unknown_question",
+            Self::QuestionNotAsked(_) => "question_not_asked",
+            Self::InvalidAnswer(_) => "invalid_answer",
+            Self::InvalidRunChange(_) => "invalid_run_change",
+        }
+    }
+}
+
+/// Check a submit against the shipped data and the settings scales: every question
+/// must be one the Focus asks, every answer one of its options (so no free text
+/// reaches the store, and an unasked question cannot be set), and a per-run change
+/// must parse as a SettingsPatch whose named steps exist. Fails closed; a question
+/// named twice is refused. `config` is a validated config, so every option is a
+/// well-formed id.
+pub fn validate_submission(
+    config: &LaunchConfig,
+    answers: &[(&str, &str)],
+    run_change: Option<&str>,
+    registry: &Registry,
+) -> Result<ValidatedAnswers, SubmitError> {
+    use crate::conductor::bound_spec;
+    use crate::conductor::model_block::document_type::{resolve_settings, SettingsPatch};
+
+    let mut writes: Vec<(&'static str, String)> = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (question_id, value) in answers {
+        let q = config
+            .question(question_id)
+            .ok_or_else(|| SubmitError::UnknownQuestion((*question_id).to_owned()))?;
+        if !seen.insert(q.id.as_str()) {
+            return Err(SubmitError::InvalidAnswer(q.id.clone()));
+        }
+        if !q.asked {
+            return Err(SubmitError::QuestionNotAsked(q.id.clone()));
+        }
+        if q.option(value).is_none() {
+            return Err(SubmitError::InvalidAnswer(q.id.clone()));
+        }
+        let name = bound_spec::LAUNCH_SLOT_NAMES
+            .iter()
+            .copied()
+            .find(|n| *n == q.slot)
+            .expect("validate() admits only the compiled slots");
+        writes.push((name, (*value).to_owned()));
+    }
+    if let Some(raw) = run_change {
+        let shape_ok = bound_spec::spec(bound_spec::RUN_CHANGE).is_some_and(|s| (s.validate)(raw));
+        if !shape_ok {
+            return Err(SubmitError::InvalidRunChange(
+                "it must be a small JSON object of the visible settings".to_owned(),
+            ));
+        }
+        let patch: SettingsPatch =
+            serde_json::from_str(raw).map_err(|e| SubmitError::InvalidRunChange(e.to_string()))?;
+        // Scales are shared by every type, so any shipped type's defaults are a valid
+        // base to check that each named step exists.
+        let base = registry
+            .types
+            .first()
+            .map(|t| t.settings.clone())
+            .ok_or_else(|| SubmitError::InvalidRunChange("no document types".to_owned()))?;
+        resolve_settings(&base, None, Some(&patch), &registry.scales)
+            .map_err(SubmitError::InvalidRunChange)?;
+        writes.push((bound_spec::RUN_CHANGE, raw.to_owned()));
+    }
+    Ok(ValidatedAnswers { writes })
+}
+
 /// The ids of every Focus that declares at least one launch question (shipped
 /// data), for the admission test. Ids only: a config is read through
 /// read_validated().
@@ -1268,5 +1372,76 @@ mod tests {
             .any(|l| l.starts_with("pub async fn read_unvalidated(")
                 || l.starts_with("pub(crate) async fn read_unvalidated(")
                 || l.starts_with("pub async fn read(")));
+    }
+
+    // -- submitting answers (validate_submission) -------------------------------
+
+    fn submit(
+        answers: &[(&str, &str)],
+        run_change: Option<&str>,
+    ) -> Result<ValidatedAnswers, SubmitError> {
+        validate_submission(&good(), answers, run_change, reg())
+    }
+
+    #[test]
+    fn a_valid_submit_maps_each_question_to_its_slot_name_and_adds_the_run_change() {
+        let v = submit(
+            &[
+                ("how", "careful"),
+                ("kind", "cover_letter"),
+                ("thorough", "polished"),
+            ],
+            Some(r#"{"tone":"firm"}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            v.writes(),
+            &[
+                ("launch_mode", "careful".to_owned()),
+                ("document_type", "cover_letter".to_owned()),
+                ("launch_answer_1", "polished".to_owned()),
+                ("run_change", r#"{"tone":"firm"}"#.to_owned()),
+            ]
+        );
+        assert!(submit(&[], None).unwrap().writes().is_empty());
+    }
+
+    #[test]
+    fn a_submit_refuses_an_unknown_unasked_duplicate_or_non_option_answer_with_its_own_code() {
+        let e = submit(&[("nope", "quick")], None).unwrap_err();
+        assert_eq!(e.code(), "unknown_question");
+        let e = submit(&[("how", "slow")], None).unwrap_err();
+        assert_eq!(e.code(), "invalid_answer");
+        // Free text is never an option.
+        let e = submit(&[("how", "quick; DROP TABLE")], None).unwrap_err();
+        assert_eq!(e.code(), "invalid_answer");
+        let e = submit(&[("how", "quick"), ("how", "careful")], None).unwrap_err();
+        assert_eq!(e.code(), "invalid_answer");
+        let mut c = good();
+        c.questions[1].asked = false;
+        c.questions[1].options.truncate(1);
+        let e = validate_submission(&c, &[("kind", "rma_letter")], None, reg()).unwrap_err();
+        assert_eq!(e.code(), "question_not_asked");
+        // The error names the question, never the answer.
+        assert!(!submit(&[("how", "slow")], None)
+            .unwrap_err()
+            .to_string()
+            .contains("slow"));
+    }
+
+    #[test]
+    fn a_run_change_must_be_a_settings_patch_whose_steps_exist() {
+        for bad in [
+            r#"{"highest_tier":"unrestricted"}"#,
+            r#"{"destinations":["hosted_api"]}"#,
+            r#"{"gate1":false}"#,
+            "[]",
+            "",
+            r#"{"tone":"sparkly"}"#,
+        ] {
+            let e = submit(&[], Some(bad)).unwrap_err();
+            assert_eq!(e.code(), "invalid_run_change", "{bad}");
+        }
+        submit(&[], Some("{}")).unwrap();
     }
 }

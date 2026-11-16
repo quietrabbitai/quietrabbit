@@ -23,6 +23,7 @@ pub mod handoff_draft_store;
 pub mod ingest_blob;
 pub mod ingested_document_store;
 pub mod integration_keys_store;
+pub mod launch_answer_store;
 pub mod legacy_shape;
 pub mod message_store;
 pub mod migrations;

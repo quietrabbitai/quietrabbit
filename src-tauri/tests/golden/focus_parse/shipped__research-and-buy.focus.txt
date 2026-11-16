@@ -6,6 +6,7 @@ FocusDefinition {
     version: "1.0",
     max_routing_tier: AnonymousRequired,
     steps: [],
+    model_origins: [],
     output_type: "research_summary",
     suggest_in_focuses: [],
     multi_source_validation: false,

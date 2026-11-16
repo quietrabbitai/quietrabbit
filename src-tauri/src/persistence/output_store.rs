@@ -206,7 +206,9 @@ fn get_outputs_db_path(user_id: &str, persona_id: &str) -> PathBuf {
 /// back-off (about 1.5 s in all) and only for that error.
 ///
 /// SCOPE: only `open_outputs_db_retrying`, which the review paths use (the review
-/// commands and the step review itself). `open_outputs_db` keeps failing at once,
+/// commands and the step review itself) and the run-start read of a chat's launch
+/// answers (persistence::launch_answer_store, items.id=897: a failed read there fails
+/// the run start closed). `open_outputs_db` keeps failing at once,
 /// because other callers rely on it: the login-time sweeps hold a writer-gate lease
 /// for as long as their open takes, and a 1.5 s wait there is a behaviour change
 /// (login_returns_before_the_interrupted_run_demote_finishes pins the lease count).
@@ -4151,8 +4153,8 @@ mod tests {
     }
 
     /// Only the retrying open waits out the lock: the plain open migrates once, and
-    /// the review paths (commands::step_review and conductor::step_review) use the
-    /// retrying one.
+    /// the review paths (commands::step_review and conductor::step_review) and the
+    /// launch-answer store use the retrying one.
     #[test]
     fn only_the_review_paths_open_with_the_retry() {
         let src = include_str!("output_store.rs");
@@ -4176,6 +4178,11 @@ mod tests {
             (
                 "conductor/step_review.rs",
                 include_str!("../conductor/step_review.rs"),
+            ),
+            // items.id=897: the run-start read of the chat's launch answers.
+            (
+                "persistence/launch_answer_store.rs",
+                include_str!("launch_answer_store.rs"),
             ),
         ] {
             let code = text

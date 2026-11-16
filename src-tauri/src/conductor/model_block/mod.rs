@@ -41,10 +41,13 @@
 // SETTINGS ARE APPLIED WHEN A STEP IS EXPANDED. expand() is pure and takes the
 // resolved settings; LOAD calls it with the document type's shipped defaults. A
 // user's saved adjustments and a per-run change (document_type::resolve_settings)
-// need the step re-expanded at run start: that hook is B3/B4's, not built here.
+// re-expand the step when a run starts (items.id=897, conductor::run_settings), with
+// the run's selected document type (ExpandInput::document_type, which replaces the
+// type the row names) and the mode profile of its launch answer
+// (ExpandInput::envelope_override, applied through tighten() after the Focus-ceiling
+// clamp). The parsed row is kept for that (ModelOrigin, on the FocusDefinition).
 //
-// Nothing here reads `requirement`: the executor still picks the local model
-// through select_model() by task type. The resolver is B2.
+// The executor reads `requirement` through the model resolver (items.id=896).
 
 pub mod brief;
 pub mod config;
@@ -127,6 +130,26 @@ pub struct ExpandInput<'a> {
     pub settings: Option<&'a Settings>,
     /// EXTERNAL_MODEL_BLOCKS_ALLOWED, a parameter so a test can run both ways.
     pub external_allowed: bool,
+    /// items.id=897: the run's selected document type. When set it replaces the
+    /// document type the row's own configuration names, so the generated template
+    /// and the resolver's profile (read from the same selection) agree. None at
+    /// LOAD, which expands with the type the row names.
+    pub document_type: Option<&'a str>,
+    /// items.id=897: the mode profile of the run's launch answer. Applied through
+    /// tighten() after the Focus-ceiling clamp, so it can only narrow. None at LOAD.
+    pub envelope_override: Option<&'a EnvelopeOverride>,
+}
+
+/// items.id=897: what a run-start re-expansion needs from LOAD, kept on the
+/// FocusDefinition because an expanded step remembers nothing of its row
+/// (block_stable_id and block_customization are None on purpose).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelOrigin {
+    /// The composition row's action_id (the step it expanded into).
+    pub action_id: String,
+    /// The block's stable id (cb-12, cb-13 or cb-14).
+    pub stable_id: String,
+    pub parsed: ParsedModelBlock,
 }
 
 /// One model block in the registry.
@@ -259,8 +282,23 @@ pub(crate) fn finish(
         destinations: Some(reachable(input.focus_ceiling)),
         ..Default::default()
     };
-    let env = tighten(&common.envelope(), &clamp)
+    let mut env = tighten(&common.envelope(), &clamp)
         .map_err(|e| format!("the range cannot be clamped to the Focus ceiling: {e}"))?;
+    // (3b) items.id=897: the mode profile of the run's launch answer, again only
+    // through tighten(). A profile may not remove a declared input: the generated
+    // template already names it, so the step would name an input it no longer
+    // declares. Refused here, so the LOAD trial expansion reports it.
+    if let Some(over) = input.envelope_override {
+        env = tighten(&env, over)
+            .map_err(|e| format!("the mode profile cannot be applied to this block: {e}"))?;
+        if env.declared_inputs.len() != common.declared_inputs.len() {
+            return Err(
+                "a mode profile may not remove a declared input from a block whose generated \
+                 template names it"
+                    .to_owned(),
+            );
+        }
+    }
     let range = config::ModelRange {
         quality_floor: env.quality_floor,
         highest_tier: env.highest_tier,
@@ -324,6 +362,8 @@ pub(crate) fn resolve_type<'a>(
     input: &'a ExpandInput,
     reg: &'a document_type::Registry,
 ) -> Result<(&'a document_type::DocumentType, Settings), String> {
+    // items.id=897: the run's selected type replaces the one the row names.
+    let document_type = input.document_type.unwrap_or(document_type);
     let t = reg
         .document_type(document_type)
         .ok_or_else(|| format!("unknown document_type '{document_type}'"))?;

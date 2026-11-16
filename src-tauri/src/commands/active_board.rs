@@ -254,6 +254,7 @@ mod tests {
                 offset: Duration::hours(-4),
             }),
             collection_posture: Default::default(),
+            model_origins: Vec::new(),
         }
     }
 
@@ -277,6 +278,7 @@ mod tests {
                 offset: Duration::zero(),
             }),
             collection_posture: Default::default(),
+            model_origins: Vec::new(),
         }
     }
 
@@ -298,6 +300,7 @@ mod tests {
             generic_title_template: "Hidden item".to_owned(),
             high_priority_trigger: None,
             collection_posture: Default::default(),
+            model_origins: Vec::new(),
         }
     }
 

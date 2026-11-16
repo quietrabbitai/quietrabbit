@@ -6,6 +6,7 @@ FocusDefinition {
     version: "1.1",
     max_routing_tier: LocalOnly,
     steps: [],
+    model_origins: [],
     output_type: "general",
     suggest_in_focuses: [],
     multi_source_validation: false,

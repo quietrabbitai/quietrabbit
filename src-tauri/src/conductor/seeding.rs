@@ -69,6 +69,7 @@ use crate::conductor::bound_spec::{
     OPEN_TICKET_STATE, WRITE_MODE,
 };
 use crate::conductor::executor::find_tokens;
+use crate::conductor::run_settings::LaunchResolution;
 use crate::conductor::taint::{taint_closure, StoreTokens};
 use crate::conductor::tokens::ActionDefinition;
 use crate::persistence::case_store::{self, CaseRecord, EntityConfigDelta};
@@ -115,6 +116,11 @@ pub fn required_names(steps: &[ActionDefinition]) -> Vec<&'static str> {
             wanted.extend(find_tokens(&s.prompt_template));
         }
         wanted.extend(s.declared_inputs.iter().cloned());
+        // items.id=897 (rider of items.id=896 stage 3): the model resolver reads its
+        // profile from the seed of document_type, whether or not a template names it.
+        if s.requirement.is_some() {
+            wanted.insert(spec::DOCUMENT_TYPE.to_owned());
+        }
         // items.id=889: every clause variable of the row's AND-guard set.
         for g in s.guards() {
             wanted.insert(g.var.clone());
@@ -145,6 +151,9 @@ pub fn restricted_names(
 
 /// Seed one pass: the production entry point FocusRun::execute() calls. Opens
 /// the persona's outputs.db only when some bound name is required.
+// 8 arguments: the persona and chat keys, the Focus, its steps and variables, and the
+// run's launch resolution (items.id=897). Bundling them would hide which are keys.
+#[allow(clippy::too_many_arguments)]
 pub async fn seed_pass(
     user_id: &str,
     persona_id: &str,
@@ -153,6 +162,7 @@ pub async fn seed_pass(
     focus_id: &str,
     steps: &[ActionDefinition],
     row_vars: &[Option<String>],
+    launch: &LaunchResolution,
 ) -> Result<StoreTokens, SeedError> {
     let restricted = restricted_names(steps, row_vars);
     let names = required_names(steps);
@@ -162,21 +172,44 @@ pub async fn seed_pass(
             restricted,
         });
     }
-    let mut conn = crate::persistence::output_store::open_outputs_db(user_id, persona_id, key_hex)
-        .await
-        .map_err(|e| SeedError::Open(e.to_string()))?;
+    // items.id=897: the launch names are seeded from the run's launch resolution,
+    // resolved once at LOAD (conductor::run_settings), never read from the store here.
+    // A caller that supplies no resolution for a launch name a step needs FAILS THE
+    // PASS CLOSED (LaunchNotResolved), so no step runs without its value.
+    let (launch_names, other_names): (Vec<&'static str>, Vec<&'static str>) = names
+        .iter()
+        .copied()
+        .partition(|n| spec::spec(n).is_some_and(|s| s.source == Source::Launch));
+    let mut seeds: HashMap<String, String> = HashMap::new();
+    for name in launch_names {
+        let s = spec::spec(name).expect("required_names only yields registry names");
+        match launch.values.get(name) {
+            Some(v) if (s.validate)(v) => {
+                seeds.insert(name.to_owned(), clean(v));
+            }
+            Some(_) => return Err(SeedError::InvalidValue(name)),
+            None if s.presence == Presence::Always => {
+                return Err(SeedError::LaunchNotResolved(name));
+            }
+            None => {}
+        }
+    }
     // items.id=891: the two device names read the persona's personal.db as well,
     // and only a pass that names one opens it. read_seeds below handles every
     // other name.
-    let (device_names, store_names): (Vec<&'static str>, Vec<&'static str>) = names
+    let (device_names, store_names): (Vec<&'static str>, Vec<&'static str>) = other_names
         .iter()
         .copied()
         .partition(|n| crate::conductor::device_seeding::is_device_seed(n));
-    let mut seeds = if store_names.is_empty() {
-        HashMap::new()
-    } else {
-        read_seeds(&mut conn, context_key, focus_id, &store_names, Utc::now()).await?
-    };
+    if store_names.is_empty() && device_names.is_empty() {
+        return Ok(StoreTokens { seeds, restricted });
+    }
+    let mut conn = crate::persistence::output_store::open_outputs_db(user_id, persona_id, key_hex)
+        .await
+        .map_err(|e| SeedError::Open(e.to_string()))?;
+    if !store_names.is_empty() {
+        seeds.extend(read_seeds(&mut conn, context_key, focus_id, &store_names, Utc::now()).await?);
+    }
     if !device_names.is_empty() {
         let mut personal =
             crate::persistence::personal_store::open_personal_db(user_id, persona_id, key_hex)
@@ -1270,5 +1303,157 @@ mod tests {
         );
         // A pass that names none of them reads none of them.
         assert!(required_names(&[step("x", "{user_input}")]).is_empty());
+    }
+
+    // -- launch names (items.id=897) -----------------------------------------------
+
+    fn launch_step(id: &str, template: &str) -> ActionDefinition {
+        let mut s = ActionDefinition {
+            action_id: id.to_owned(),
+            display_name: id.to_owned(),
+            guide_id: "g".to_owned(),
+            task_type: "general".to_owned(),
+            routing_tier: crate::conductor::tokens::ExternalAccess::LocalOnly,
+            step_type: crate::conductor::tokens::StepType::Generate,
+            output_var: Some(format!("{id}_out")),
+            prompt_template: template.to_owned(),
+            field_requirements: HashMap::new(),
+            options_override: HashMap::new(),
+            external_access_override: None,
+            requires_user_handoff: false,
+            revisitable: false,
+            block_stable_id: None,
+            block_customization: None,
+            schedule_trigger: None,
+            guard: None,
+            declared_inputs: Vec::new(),
+            store_op: None,
+            and_guards: Vec::new(),
+            requirement: None,
+        };
+        s.requirement = None;
+        s
+    }
+
+    fn resolution(pairs: &[(&'static str, &str)]) -> LaunchResolution {
+        LaunchResolution {
+            values: pairs.iter().map(|(k, v)| (*k, (*v).to_owned())).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_step_with_a_requirement_wants_document_type_even_if_no_template_names_it() {
+        let plain = launch_step("a", "no tokens");
+        assert!(required_names(std::slice::from_ref(&plain)).is_empty());
+        let mut model = launch_step("m", "write it");
+        model.requirement = Some(crate::conductor::model_block::config::ModelRequirement {
+            block_stable_id: "cb-12".to_owned(),
+            need: crate::conductor::model_block::config::TaskNeed {
+                task_type: crate::conductor::model_block::config::ModelTaskType::CreativeWriting,
+                difficulty: crate::conductor::model_block::config::Difficulty::Low,
+                output_size: crate::conductor::model_block::config::OutputSize::Short,
+            },
+            range: crate::conductor::model_block::config::ModelRange {
+                quality_floor: crate::conductor::model_block::config::QualityFloor {
+                    min: crate::conductor::model_block::config::QualityBar::Basic,
+                    max: crate::conductor::model_block::config::QualityBar::High,
+                },
+                highest_tier: crate::conductor::tokens::ExternalAccess::LocalOnly,
+                destinations: vec![crate::conductor::model_block::config::Destination::Local],
+            },
+            class_preference: None,
+        });
+        assert_eq!(required_names(&[plain, model]), [spec::DOCUMENT_TYPE]);
+    }
+
+    #[tokio::test]
+    async fn launch_names_are_seeded_from_the_resolution_and_open_no_database() {
+        let steps = [launch_step("a", "mode {launch_mode} type {document_type}")];
+        let rows = vec![Some("a_out".to_owned())];
+        // No database exists for this user: the pass must not open one, so a
+        // successful seed proves it read nothing from a store.
+        let t = seed_pass(
+            "no-such-user",
+            "no-such-persona",
+            "00",
+            None,
+            "fx",
+            &steps,
+            &rows,
+            &resolution(&[("launch_mode", "quick"), ("document_type", "rma_letter")]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(t.seeds["launch_mode"], "quick");
+        assert_eq!(t.seeds["document_type"], "rma_letter");
+        assert!(t.restricted.contains("launch_mode"));
+    }
+
+    #[tokio::test]
+    async fn a_launch_name_the_resolution_lacks_fails_the_pass_closed() {
+        let steps = [launch_step("a", "{launch_answer_2}")];
+        let rows = vec![Some("a_out".to_owned())];
+        let e = seed_pass(
+            "u",
+            "p",
+            "00",
+            None,
+            "fx",
+            &steps,
+            &rows,
+            &LaunchResolution::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e, SeedError::LaunchNotResolved("launch_answer_2"));
+        // A value that fails its shape fails closed as well, never reaching a prompt.
+        let e = seed_pass(
+            "u",
+            "p",
+            "00",
+            None,
+            "fx",
+            &steps,
+            &rows,
+            &resolution(&[("launch_answer_2", "Not A Name")]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e, SeedError::InvalidValue("launch_answer_2"));
+    }
+
+    #[tokio::test]
+    async fn run_change_is_optional_and_its_braces_are_neutralised() {
+        let steps = [launch_step("a", "change {run_change}")];
+        let rows = vec![Some("a_out".to_owned())];
+        // Absent: no entry, so the token renders as nothing.
+        let t = seed_pass(
+            "u",
+            "p",
+            "00",
+            None,
+            "fx",
+            &steps,
+            &rows,
+            &LaunchResolution::default(),
+        )
+        .await
+        .unwrap();
+        assert!(!t.seeds.contains_key("run_change"));
+        // Present: braces become parentheses, as for every seeded text.
+        let t = seed_pass(
+            "u",
+            "p",
+            "00",
+            None,
+            "fx",
+            &steps,
+            &rows,
+            &resolution(&[("run_change", r#"{"tone":"warm"}"#)]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(t.seeds["run_change"], r#"("tone":"warm")"#);
     }
 }

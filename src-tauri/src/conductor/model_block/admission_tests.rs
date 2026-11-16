@@ -928,6 +928,8 @@ fn a_model_block_that_allows_hosted_api_names_neither_user_input_nor_persona_con
                     focus_ceiling: ExternalAccess::Unrestricted,
                     settings: None,
                     external_allowed: true,
+                    document_type: None,
+                    envelope_override: None,
                 },
             )
         };
@@ -982,6 +984,8 @@ fn a_model_block_that_allows_hosted_api_names_neither_user_input_nor_persona_con
                     focus_ceiling: ExternalAccess::LocalOnly,
                     settings: None,
                     external_allowed: false,
+                    document_type: None,
+                    envelope_override: None,
                 },
             )
             .is_ok());
@@ -1082,6 +1086,8 @@ fn an_empty_override_is_the_identity_and_the_focus_ceiling_only_narrows_every_ex
                     focus_ceiling: ceiling,
                     settings: None,
                     external_allowed: false,
+                    document_type: None,
+                    envelope_override: None,
                 },
             )
             .unwrap();
@@ -1542,4 +1548,429 @@ fn the_launch_names_are_an_exact_reviewed_list() {
         ]
     );
     assert_eq!(crate::conductor::launch_config::MAX_QUESTIONS, 5);
+}
+
+// ---------------------------------------------------------------------------
+// 12: the run-start step, end to end (items.id=897 stage 3, decisions.id=948)
+// ---------------------------------------------------------------------------
+//
+// A real FocusRun loads a Focus from shared.db whose model block has launch
+// questions, reads the chat's answers from a real persona outputs.db, re-expands the
+// block, and seeds the resolution. What is real: the migrations, the loader, the
+// answer store, FocusRun::load(), seed_pass(). Nothing calls a model.
+
+use crate::conductor::concurrency::ConductorScheduler;
+use crate::conductor::launch_config::{read_validated, validate_submission};
+use crate::conductor::lifecycle::{FocusRun, LifecycleError};
+use crate::conductor::run_settings::LaunchResolution;
+use crate::persistence::launch_answer_store::{put_answers, PutError};
+use crate::persistence::output_store::open_outputs_db;
+
+const USER: &str = "launch-user";
+const PERSONA: &str = "launch-persona";
+const KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+const CHAT: &str = "launch-chat";
+
+/// A Focus with a cb-12 draft block, an asked document_type question (rma_letter by
+/// default, cover_letter the other option) and a mode question (quick by default,
+/// careful the other).
+async fn launch_focus(env: &TestEnv, id: &str) {
+    seed_focus(
+        &env.pool,
+        id,
+        "local_only",
+        &rows_for("cb-12", &example_of("cb-12"), false),
+    )
+    .await;
+    seed_document_type_question(&env.pool, id, false).await;
+    seed_mode_question(&env.pool, id).await;
+}
+
+fn run_for(env: &TestEnv, focus: &str, context_key: Option<&str>) -> FocusRun {
+    let mut run = FocusRun::new(
+        USER.to_owned(),
+        PERSONA.to_owned(),
+        focus.to_owned(),
+        env.pool.clone(),
+        std::sync::Arc::new(ConductorScheduler::new()),
+        String::new(),
+        false,
+        Some(KEY.to_owned()),
+        None,
+        false,
+        std::collections::HashSet::new(),
+        None,
+    );
+    run.context_key = context_key.map(str::to_owned);
+    run
+}
+
+async fn submit(
+    env: &TestEnv,
+    focus: &str,
+    answers: &[(&str, &str)],
+    run_change: Option<&str>,
+) -> Result<(), PutError> {
+    let reg = registry().unwrap();
+    let cfg = read_validated(&env.pool, focus, reg)
+        .await
+        .unwrap()
+        .unwrap();
+    let v = validate_submission(&cfg, answers, run_change, reg).unwrap();
+    let mut conn = open_outputs_db(USER, PERSONA, KEY).await.unwrap();
+    put_answers(&mut conn, CHAT, focus, &v).await
+}
+
+fn block_of(run: &FocusRun) -> crate::conductor::tokens::ActionDefinition {
+    run.focus_def
+        .as_ref()
+        .unwrap()
+        .steps
+        .iter()
+        .find(|s| s.action_id == "the_block")
+        .unwrap()
+        .clone()
+}
+
+#[tokio::test]
+async fn a_run_with_no_answers_resolves_every_question_to_its_default() {
+    let env = setup().await;
+    launch_focus(&env, "rs-default").await;
+    let mut run = run_for(&env, "rs-default", Some(CHAT));
+    run.load().await.unwrap();
+    let l = &run.launch;
+    assert_eq!(l.values["document_type"], "rma_letter");
+    assert_eq!(l.values["launch_mode"], "quick");
+    assert_eq!(l.mode.as_deref(), Some("quick"));
+    // The default mode narrows to local only, through tighten().
+    let req = block_of(&run).requirement.unwrap();
+    assert_eq!(req.range.highest_tier, ExternalAccess::LocalOnly);
+    assert_eq!(
+        req.range.destinations,
+        vec![crate::conductor::model_block::config::Destination::Local]
+    );
+}
+
+#[tokio::test]
+async fn the_answers_change_the_expansion_the_mode_profile_and_the_seeds() {
+    use crate::conductor::model_block::config::QualityBar;
+    let env = setup().await;
+    launch_focus(&env, "rs-answers").await;
+    let mut before = run_for(&env, "rs-answers", Some(CHAT));
+    before.load().await.unwrap();
+    let default_template = block_of(&before).prompt_template;
+    let default_floor = block_of(&before).requirement.unwrap().range.quality_floor;
+
+    submit(
+        &env,
+        "rs-answers",
+        &[("how", "careful"), ("kind", "cover_letter")],
+        Some(r#"{"length":"long"}"#),
+    )
+    .await
+    .unwrap();
+    let mut run = run_for(&env, "rs-answers", Some(CHAT));
+    run.load().await.unwrap();
+    let step = block_of(&run);
+    // The selected type replaced the row's own (rma_letter): a different template,
+    // with the long range of the cover letter (the per-run change, layer 3).
+    assert_ne!(step.prompt_template, default_template);
+    let long = registry()
+        .unwrap()
+        .document_type("cover_letter")
+        .unwrap()
+        .length_words["long"];
+    assert!(
+        step.prompt_template.contains(&format!(
+            "between {} and {} words",
+            long.min_words, long.max_words
+        )),
+        "{}",
+        step.prompt_template
+    );
+    // The careful mode raised the floor (only ever up).
+    let floor = step.requirement.unwrap().range.quality_floor;
+    assert!(floor.min >= default_floor.min && floor.min == QualityBar::Standard);
+
+    // The seeds are the resolution, and the resolver's profile equals the answer.
+    let def = run.focus_def.as_ref().unwrap();
+    let row_vars: Vec<Option<String>> = def.steps.iter().map(|s| s.output_var.clone()).collect();
+    let tokens = crate::conductor::seeding::seed_pass(
+        USER,
+        PERSONA,
+        KEY,
+        Some(CHAT),
+        "rs-answers",
+        &def.steps,
+        &row_vars,
+        &run.launch,
+    )
+    .await
+    .unwrap();
+    assert_eq!(tokens.seeds["document_type"], "cover_letter");
+    let shipped = registry().unwrap();
+    assert_eq!(
+        crate::conductor::model_resolver::profile_for_document_type(
+            &tokens.seeds[crate::conductor::model_resolver_input::DOCUMENT_TYPE_NAME],
+            shipped,
+            &[]
+        )
+        .as_deref(),
+        Some("cover_letter")
+    );
+    // The launch names are restricted: no step receives one unless it names it.
+    assert!(tokens.restricted.contains("document_type"));
+}
+
+#[tokio::test]
+async fn a_stored_answer_outside_the_options_fails_the_run_and_no_default_replaces_it() {
+    let env = setup().await;
+    launch_focus(&env, "rs-stale").await;
+    let mut conn = open_outputs_db(USER, PERSONA, KEY).await.unwrap();
+    sqlx::query(
+        "INSERT INTO session_variables
+           (context_key, focus_id, name, value, version, written_by_run, created_at, updated_at)
+         VALUES (?, 'rs-stale', 'launch_mode', 'gone_mode', 1, 'r', 'now', 'now')",
+    )
+    .bind(CHAT)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    let mut run = run_for(&env, "rs-stale", Some(CHAT));
+    let e = run.load().await.unwrap_err();
+    assert!(matches!(e, LifecycleError::LaunchAnswers(_)), "{e}");
+    let text = e.to_string();
+    assert!(
+        text.contains("how") && !text.contains("gone_mode"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn a_stored_run_change_that_does_not_parse_fails_the_run() {
+    let env = setup().await;
+    launch_focus(&env, "rs-badchange").await;
+    let mut conn = open_outputs_db(USER, PERSONA, KEY).await.unwrap();
+    sqlx::query(
+        "INSERT INTO session_variables
+           (context_key, focus_id, name, value, version, written_by_run, created_at, updated_at)
+         VALUES (?, 'rs-badchange', 'run_change', '{\"highest_tier\":\"unrestricted\"}', 1, 'r', 'now', 'now')",
+    )
+    .bind(CHAT)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    let e = run_for(&env, "rs-badchange", Some(CHAT))
+        .load()
+        .await
+        .unwrap_err();
+    assert!(matches!(e, LifecycleError::LaunchAnswers(_)), "{e}");
+}
+
+#[tokio::test]
+async fn pre_latch_answers_still_apply_and_a_latched_submit_is_refused_with_its_own_code() {
+    let env = setup().await;
+    launch_focus(&env, "rs-latch").await;
+    submit(&env, "rs-latch", &[("kind", "cover_letter")], None)
+        .await
+        .unwrap();
+    let mut conn = open_outputs_db(USER, PERSONA, KEY).await.unwrap();
+    crate::persistence::session_store::latch_write_suppressed(&mut conn, CHAT, "rs-latch", "run-1")
+        .await
+        .unwrap();
+    // The latch deleted nothing and reads are not gated: the answer still applies.
+    let mut run = run_for(&env, "rs-latch", Some(CHAT));
+    run.load().await.unwrap();
+    assert_eq!(run.launch.values["document_type"], "cover_letter");
+    // A new submit is refused whole with the one-time code, and nothing changed.
+    let e = submit(&env, "rs-latch", &[("kind", "rma_letter")], None)
+        .await
+        .unwrap_err();
+    assert_eq!(e, PutError::OneTimeChat);
+    let mut again = run_for(&env, "rs-latch", Some(CHAT));
+    again.load().await.unwrap();
+    assert_eq!(again.launch.values["document_type"], "cover_letter");
+    // A latched chat that never answered uses the defaults.
+    let mut fresh = run_for(&env, "rs-latch", Some("another-latched-chat"));
+    crate::persistence::session_store::latch_write_suppressed(
+        &mut conn,
+        "another-latched-chat",
+        "rs-latch",
+        "run-2",
+    )
+    .await
+    .unwrap();
+    fresh.load().await.unwrap();
+    assert_eq!(fresh.launch.values["document_type"], "rma_letter");
+}
+
+#[tokio::test]
+async fn a_resumed_run_of_a_focus_with_an_asked_question_fails_closed_with_its_own_error() {
+    let env = setup().await;
+    launch_focus(&env, "rs-resume").await;
+    let mut run = run_for(&env, "rs-resume", None);
+    run.rehydrated = true;
+    let e = run.load().await.unwrap_err();
+    assert!(
+        matches!(&e, LifecycleError::LaunchAnswersUnavailableOnResume(f) if f == "rs-resume"),
+        "{e}"
+    );
+    // A Focus whose questions are all fixed (a preset) has nothing to ask, so its
+    // resumed run loads with the defaults.
+    seed_focus(
+        &env.pool,
+        "rs-resume-fixed",
+        "local_only",
+        &rows_for("cb-12", &example_of("cb-12"), false),
+    )
+    .await;
+    seed_document_type_question(&env.pool, "rs-resume-fixed", true).await;
+    let mut fixed = run_for(&env, "rs-resume-fixed", None);
+    fixed.rehydrated = true;
+    fixed.load().await.unwrap();
+    assert_eq!(fixed.launch.values["document_type"], "rma_letter");
+    // A run with no chat that was not resumed (submit_focus_run) uses the defaults.
+    let mut nochat = run_for(&env, "rs-resume", None);
+    nochat.load().await.unwrap();
+    assert_eq!(nochat.launch.values["launch_mode"], "quick");
+}
+
+#[tokio::test]
+async fn a_focus_with_no_launch_config_and_no_model_block_is_untouched() {
+    let env = setup().await;
+    seed_focus(
+        &env.pool,
+        "rs-plain",
+        "local_only",
+        &[local_step("a", "hello")],
+    )
+    .await;
+    let mut run = run_for(&env, "rs-plain", Some(CHAT));
+    run.load().await.unwrap();
+    assert_eq!(run.launch, LaunchResolution::default());
+    assert!(run.focus_def.as_ref().unwrap().model_origins.is_empty());
+    // Even resumed: nothing is asked.
+    let mut resumed = run_for(&env, "rs-plain", None);
+    resumed.rehydrated = true;
+    resumed.load().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_row_guard_survives_the_re_expansion() {
+    let env = setup().await;
+    launch_focus(&env, "rs-guard").await;
+    let mut run = run_for(&env, "rs-guard", Some(CHAT));
+    run.load().await.unwrap();
+    let def = run.focus_def.as_mut().unwrap();
+    let step = def
+        .steps
+        .iter_mut()
+        .find(|s| s.action_id == "the_block")
+        .unwrap();
+    step.guard = Some(crate::conductor::guard::Guard {
+        var: "launch_mode".to_owned(),
+        condition: crate::conductor::guard::Condition::Eq("quick".to_owned()),
+    });
+    let resolved = crate::conductor::run_settings::resolve(
+        read_validated(&env.pool, "rs-guard", registry().unwrap())
+            .await
+            .unwrap()
+            .as_ref(),
+        &Default::default(),
+        None,
+        registry().unwrap(),
+    )
+    .unwrap();
+    crate::conductor::run_settings::reexpand(def, &resolved).unwrap();
+    let step = def
+        .steps
+        .iter()
+        .find(|s| s.action_id == "the_block")
+        .unwrap();
+    assert!(step.guard.is_some(), "the guard is kept");
+}
+
+// -- the trial expansion refuses what cannot be applied ----------------------
+
+#[tokio::test]
+async fn a_mode_profile_that_cannot_be_applied_to_a_model_block_refuses_the_focus_at_load() {
+    let env = setup().await;
+    // (a) removes a declared input the block's template names.
+    // (b) leaves no destination (the block reaches local only).
+    for (id, envelope, expect) in [
+        (
+            "trial-input",
+            r#"{"declared_inputs":["content_brief"]}"#,
+            "remove a declared input",
+        ),
+        (
+            "trial-dest",
+            r#"{"destinations":["hosted_api"]}"#,
+            "no destination",
+        ),
+    ] {
+        seed_focus(
+            &env.pool,
+            id,
+            "local_only",
+            &rows_for("cb-12", &example_of("cb-12"), false),
+        )
+        .await;
+        seed_document_type_question(&env.pool, id, true).await;
+        seed_mode_question(&env.pool, id).await;
+        sqlx::query("UPDATE focus_mode_profiles SET envelope = ? WHERE focus_id = ? AND option_id = 'careful'")
+            .bind(envelope)
+            .bind(id)
+            .execute(&env.pool)
+            .await
+            .unwrap();
+        let e = load_text(&env.pool, id).await.unwrap_err();
+        assert!(e.contains("careful") && e.contains(expect), "{id}: {e}");
+    }
+    // And a good one loads.
+    launch_focus(&env, "trial-ok").await;
+    load_text(&env.pool, "trial-ok").await.unwrap();
+}
+
+// -- the seeds -----------------------------------------------------------------
+
+#[tokio::test]
+async fn a_caller_that_supplies_no_resolution_still_fails_closed() {
+    let env = setup().await;
+    launch_focus(&env, "rs-seed").await;
+    let mut run = run_for(&env, "rs-seed", Some(CHAT));
+    run.load().await.unwrap();
+    let def = run.focus_def.as_ref().unwrap();
+    let row_vars: Vec<Option<String>> = def.steps.iter().map(|s| s.output_var.clone()).collect();
+    // The model block needs document_type (the rider), and an empty resolution has
+    // none: the pass fails closed, naming the launch name.
+    let e = crate::conductor::seeding::seed_pass(
+        USER,
+        PERSONA,
+        KEY,
+        Some(CHAT),
+        "rs-seed",
+        &def.steps,
+        &row_vars,
+        &LaunchResolution::default(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        e,
+        crate::conductor::seeding::SeedError::LaunchNotResolved("document_type")
+    );
+    // With the run's own resolution it seeds.
+    crate::conductor::seeding::seed_pass(
+        USER,
+        PERSONA,
+        KEY,
+        Some(CHAT),
+        "rs-seed",
+        &def.steps,
+        &row_vars,
+        &run.launch,
+    )
+    .await
+    .unwrap();
 }

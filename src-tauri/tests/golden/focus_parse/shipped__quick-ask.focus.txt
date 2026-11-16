@@ -6,6 +6,7 @@ FocusDefinition {
     version: "1.0",
     max_routing_tier: LocalOnly,
     steps: [],
+    model_origins: [],
     output_type: "quick_ask",
     suggest_in_focuses: [
         "writing-assistant",

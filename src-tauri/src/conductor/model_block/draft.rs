@@ -209,6 +209,8 @@ mod tests {
                 focus_ceiling: ceiling,
                 settings: None,
                 external_allowed,
+                document_type: None,
+                envelope_override: None,
             },
         )
     }
@@ -453,6 +455,8 @@ mod tests {
                 focus_ceiling: ExternalAccess::LocalOnly,
                 settings: Some(&s),
                 external_allowed: false,
+                document_type: None,
+                envelope_override: None,
             },
         )
         .unwrap();
@@ -470,6 +474,8 @@ mod tests {
                 focus_ceiling: ExternalAccess::LocalOnly,
                 settings: Some(&s),
                 external_allowed: false,
+                document_type: None,
+                envelope_override: None,
             },
         )
         .is_err());

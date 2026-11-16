@@ -333,6 +333,7 @@ async fn subject_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conductor::run_settings::LaunchResolution;
     use crate::persistence::case_store::{open_case, NewCase};
     use crate::persistence::output_store::open_outputs_db;
     use crate::persistence::personal_store::open_personal_db;
@@ -978,9 +979,18 @@ mod tests {
         let rows = |s: &[crate::conductor::tokens::ActionDefinition]| {
             s.iter().map(|x| x.output_var.clone()).collect::<Vec<_>>()
         };
-        let t = seed_pass(USER, PERSONA, KEY, Some(CHAT), FOCUS, &both, &rows(&both))
-            .await
-            .unwrap();
+        let t = seed_pass(
+            USER,
+            PERSONA,
+            KEY,
+            Some(CHAT),
+            FOCUS,
+            &both,
+            &rows(&both),
+            &LaunchResolution::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             t.seeds[SUBJECT_CONTEXT], "Device: Router\nMake: Netgear",
             "the active case's device"
@@ -995,13 +1005,23 @@ mod tests {
             FOCUS,
             &only_brief,
             &rows(&only_brief),
+            &LaunchResolution::default(),
         )
         .await
         .unwrap();
         assert_eq!(t.seeds.len(), 1);
-        let t = seed_pass(USER, PERSONA, KEY, Some(CHAT), FOCUS, &other, &rows(&other))
-            .await
-            .unwrap();
+        let t = seed_pass(
+            USER,
+            PERSONA,
+            KEY,
+            Some(CHAT),
+            FOCUS,
+            &other,
+            &rows(&other),
+            &LaunchResolution::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(t.seeds.keys().collect::<Vec<_>>(), ["case_context"]);
         // Every bound name, device names included, is restricted: a step that does
         // not name one never receives it.
@@ -1009,9 +1029,18 @@ mod tests {
         assert!(t.restricted.contains(DEVICE_LIBRARY_BRIEF));
         // A Focus that names no bound name opens no store.
         let none = vec![step_naming("a", "{user_input}")];
-        let t = seed_pass(USER, PERSONA, KEY, None, FOCUS, &none, &rows(&none))
-            .await
-            .unwrap();
+        let t = seed_pass(
+            USER,
+            PERSONA,
+            KEY,
+            None,
+            FOCUS,
+            &none,
+            &rows(&none),
+            &LaunchResolution::default(),
+        )
+        .await
+        .unwrap();
         assert!(t.seeds.is_empty());
     }
 }

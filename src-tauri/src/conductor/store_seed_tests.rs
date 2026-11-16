@@ -23,6 +23,7 @@ use std::collections::HashMap;
 
 use crate::conductor::executor::{collect_output_vars, render_prompt, StepContext};
 use crate::conductor::lifecycle::{extraction_step_outputs, FocusDefinition};
+use crate::conductor::run_settings::LaunchResolution;
 use crate::conductor::seeding::seed_pass;
 use crate::conductor::tokens::{ActionDefinition, ExternalAccess, StepType};
 use crate::conductor::types::{TaskStep, TaskTrack};
@@ -91,6 +92,7 @@ fn focus_def(steps: Vec<ActionDefinition>) -> FocusDefinition {
         generic_title_template: String::new(),
         high_priority_trigger: None,
         collection_posture: Default::default(),
+        model_origins: Vec::new(),
     }
 }
 
@@ -304,9 +306,18 @@ async fn no_canary_reaches_the_extraction_request() {
             def.steps.iter().map(|s| s.output_var.clone()).collect();
 
         // Pass start: the production seeding.
-        let tokens = seed_pass(USER, PERSONA, KEY, Some(CHAT), FOCUS, &def.steps, &row_vars)
-            .await
-            .expect("seeding");
+        let tokens = seed_pass(
+            USER,
+            PERSONA,
+            KEY,
+            Some(CHAT),
+            FOCUS,
+            &def.steps,
+            &row_vars,
+            &LaunchResolution::default(),
+        )
+        .await
+        .expect("seeding");
         // The hostile turn is rendered many times (see the note in
         // a_user_turn_cannot_pull_a_store_value_into_an_unnamed_step): every
         // pass must leave the control step clean, and the last one is the track
@@ -393,9 +404,18 @@ async fn without_a_bound_name_every_step_is_offered_to_extraction() {
         ]);
         let row_vars: Vec<Option<String>> =
             def.steps.iter().map(|s| s.output_var.clone()).collect();
-        let tokens = seed_pass(USER, PERSONA, KEY, None, FOCUS, &def.steps, &row_vars)
-            .await
-            .expect("no bound name: no store, no chat needed");
+        let tokens = seed_pass(
+            USER,
+            PERSONA,
+            KEY,
+            None,
+            FOCUS,
+            &def.steps,
+            &row_vars,
+            &LaunchResolution::default(),
+        )
+        .await
+        .expect("no bound name: no store, no chat needed");
         assert!(tokens.seeds.is_empty());
         let track = run_echo_pass(&def, "hello", &tokens);
         assert_eq!(extraction_step_outputs(&track, &def).len(), 2);
@@ -415,9 +435,18 @@ async fn a_user_turn_cannot_pull_a_store_value_into_an_unnamed_step() {
         ]);
         let row_vars: Vec<Option<String>> =
             def.steps.iter().map(|s| s.output_var.clone()).collect();
-        let tokens = seed_pass(USER, PERSONA, KEY, Some(CHAT), FOCUS, &def.steps, &row_vars)
-            .await
-            .unwrap();
+        let tokens = seed_pass(
+            USER,
+            PERSONA,
+            KEY,
+            Some(CHAT),
+            FOCUS,
+            &def.steps,
+            &row_vars,
+            &LaunchResolution::default(),
+        )
+        .await
+        .unwrap();
         assert!(tokens.seeds.contains_key("case_context"));
         // render_template() substitutes in HashMap order, which is different on
         // every render, so a leak that needs one particular order shows up
@@ -502,9 +531,18 @@ async fn no_device_canary_reaches_the_extraction_request() {
         ]);
         let row_vars: Vec<Option<String>> =
             def.steps.iter().map(|s| s.output_var.clone()).collect();
-        let tokens = seed_pass(USER, PERSONA, KEY, Some(CHAT), FOCUS, &def.steps, &row_vars)
-            .await
-            .expect("seeding");
+        let tokens = seed_pass(
+            USER,
+            PERSONA,
+            KEY,
+            Some(CHAT),
+            FOCUS,
+            &def.steps,
+            &row_vars,
+            &LaunchResolution::default(),
+        )
+        .await
+        .expect("seeding");
         assert!(tokens.seeds["subject_context"].contains(C_DEVICE));
         assert!(tokens.seeds["device_library_brief"].contains(C_DEVICE));
 
@@ -622,7 +660,7 @@ async fn no_artifact_canary_reaches_the_extraction_request() {
         ]);
         let row_vars: Vec<Option<String>> =
             def.steps.iter().map(|s| s.output_var.clone()).collect();
-        let tokens = seed_pass(USER, PERSONA, KEY, Some(CHAT), FOCUS, &def.steps, &row_vars)
+        let tokens = seed_pass(USER, PERSONA, KEY, Some(CHAT), FOCUS, &def.steps, &row_vars, &LaunchResolution::default())
             .await
             .expect("seeding");
         for (name, canary) in [

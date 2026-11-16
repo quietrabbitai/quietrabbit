@@ -134,6 +134,8 @@ mod tests {
                 focus_ceiling: ExternalAccess::LocalOnly,
                 settings: Some(&s),
                 external_allowed: false,
+                document_type: None,
+                envelope_override: None,
             },
         )
     }
