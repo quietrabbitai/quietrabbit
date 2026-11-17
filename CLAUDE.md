@@ -1,5 +1,9 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: November 16, 2026 (items.id=901: new "Run plan and strategy approval" section;
+# Last updated: November 17, 2026 (items.id=899: new "Calibration harness" section; the
+# unsupported-additions line under "Model blocks" (the measures live in conductor/draft_check.rs)
+# and the PROVISIONAL BARS bullet under "Model resolver" (now the 21 read cells; both UNRATED
+# lists empty); nothing else.).
+# Before that, November 16, 2026 (items.id=901: new "Run plan and strategy approval" section;
 # four older lines that named the run plan as future work -- the quality_floor.max line and the
 # GATE 3 line under "Model resolver" and "Privacy treatment of a step attempt", and the
 # ManualHandoff range line under "Manual hand-off"; nothing else. Hosted enforcement is
@@ -388,8 +392,40 @@ with no requirement still goes through select_model.
   chat passes and parks nothing (see "Manual hand-off"). rehydrate_focus_run restores
   neither context_key nor the turn text, so a resumed run cannot run a store writer
   until items.id=888 persists context_key.
-- The unsupported-additions measures live only in examples/focus_calibration.rs for
-  now. They move into one shipped module at B6b; do not add a second copy.
+- The unsupported-additions measures live in ONE shipped module, conductor/draft_check.rs
+  (items.id=899, moved unchanged from examples/focus_calibration.rs; do not add a second
+  copy). It is pure (no I/O, no model or provider id, scans pin both): check(text, &CheckInput)
+  returns a CheckReport (placeholders, opening and closing chatter, unsupported specifics,
+  coverage) and decide(report, latitude, attempt) returns Accept, Regenerate, Mark or Skipped
+  through CheckPolicy::for_latitude (strict: regenerate once then mark, framed: mark only,
+  free: off). Coverage is keyed and used by the harness and tests only; production passes no
+  points. NOTHING in the executor calls it yet: items.id=903 consumes decide() (the guarded
+  second draft row of a composition is B7a and B7d), so no executor wiring lives in 899.
+  The check cannot catch soft embellishment, an invented cause, a reversed fact that keeps the
+  keywords, tone or readability.
+
+## Calibration harness (items.id=899, decisions.id=950)
+src-tauri/examples/calibration_harness.rs (with examples/support/, examples/harness/ and
+examples/calibration_data/: synthetic briefs, voice cases, rubrics and bars.json, never
+shipped) generates drafts through the SHIPPED cb-12 and cb-13 blocks on QR's own sidecar,
+scores them with draft_check, has the OTHER local models cross-judge (temperature 0, a closed
+JSON verdict, unparseable = no verdict), and writes read.html: a static page of at most 100
+drafts (at least 3 reads per cell) that Jason reads and exports as ratings.json.
+Flags: --approve-long-run (required for a real run, about 2 hours), --resume, --summarize,
+--judge, --read-page, --apply-ratings <run> <file>, --emit-cells <run>, --dry-run.
+- The judge only CHOOSES which drafts are read. A cell's bar comes only from Jason's reads
+  (provenance jason_read, best bar that at least 66% of the reads reach, fewer than 3 reads =
+  no cell); no harness_local cell is written, and the judge's agreement with Jason is reported
+  (agreement.md), not trusted. Network is local Ollama only (local_url() accepts only http to
+  127.0.0.1, localhost or ::1 with no credentials).
+- Run 20261116-213009 (300 drafts, 600 judge calls) produced the 21 baseline cells. They
+  REPLACE the first 12 seed rows in place in shared_045.sql and catalog/provider-catalog.json
+  (decisions.id=857: no new schema file; the row keys collide, so INSERT OR IGNORE alone would
+  have dropped them). A development database already at schema 45 does NOT get them (the seed
+  only runs at migration): reseed it or apply a catalog.
+- EXAMPLES ARE NOT BUILT, LINTED OR TESTED IN CI (plain `cargo test` and the CI clippy skip
+  them). Locally, from src-tauri/: `cargo clippy --tests --examples -- -D warnings` and
+  `cargo test --examples`.
 
 ## Model resolver (items.id=896, decisions.id=941 point 4, decisions.id=942 point 9)
 A pure resolver chooses the model of a MODEL-BLOCK step: the lowest-cost model that
@@ -425,18 +461,21 @@ is select_model_for_block in executor.rs.
   undoable in provider_catalog/apply.rs, needing min_shared_schema 45) and from
   shared_045.sql's seed, which is the baseline catalog's own section; nothing at run time
   writes the table (persistence/model_capability_store.rs is read-only).
-- PROVISIONAL BARS (Jason's read of the variant calibration run, decisions.id=942 addendum
-  3 b): llama3.2:3b and llama3.1:8b are basic for rma_letter, complaint_email and
-  personal_note; both are basic but MARGINAL for cover_letter; qwen2.5:7b is basic for
-  personal_note only, and basic but MARGINAL for essay_section with the other two.
-  qwen2.5:7b is unrated for the RMA letter, complaint and cover letter, creative_story
-  was not run, and no model reaches standard or high anywhere. Preferences live in `note`
-  only. A block whose floor is standard on a local-only ceiling therefore returns TooWeak
-  until items.id=899 and voice tuning change the bars. The admission test
-  (model_block/admission_tests.rs, check 10) lists the unrated shipped types
-  (UNRATED_SHIPPED_TYPES: creative_story) and block task types (UNRATED_BLOCK_TASK_TYPES:
-  quick_response, which cb-13's example uses, so a voice step cannot resolve until a
-  catalog rates that task type); a new type or block forces a decision there.
+- BARS (Jason's read of the items.id=899 calibration run, 100 reads over run 20261116-213009;
+  21 cells, every one jason_read, 12 drafts each, dated 2026-11-17; many rest on only 3 reads, so
+  a cell with 2 reads at one bar and 1 below takes the higher bar: the cell's note says the
+  split). Writing cells (creative_writing, per shipped type): rma_letter: llama3.2:3b
+  below_basic, llama3.1:8b standard, qwen2.5:7b standard; complaint_email: 3b standard, 8b high,
+  qwen standard; personal_note: 3b high, 8b high, qwen standard; cover_letter: 3b basic, 8b high,
+  qwen high; essay_section: 3b high, 8b standard, qwen basic; creative_story: 3b high, 8b high,
+  qwen basic. Voice (quick_response, task-type-wide, the lower of apply and refine): 3b standard,
+  8b basic, qwen basic. Only Jason's reads set a bar; the judge never does.
+  Consequences: llama3.2:3b is NEVER chosen for an rma_letter step (below_basic), so the next
+  qualifier is; a floor of high still parks for rma_letter and several others; no shipped type
+  or block task type is unrated any more (UNRATED_SHIPPED_TYPES and UNRATED_BLOCK_TASK_TYPES in
+  model_block/admission_tests.rs are EMPTY and a new type or block forces a decision there
+  again). Preferences live in `note` only. New measurements go through the harness
+  ("Calibration harness"), never by hand-editing a bar.
 - DOCUMENT PROFILE. The profile is the id of a SHIPPED document type and is read ONLY from
   the pass's seeds under the bound name `document_type` (DOCUMENT_TYPE_NAME in
   model_resolver_input.rs), never from the block's own configuration. A custom type
