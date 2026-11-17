@@ -63,7 +63,8 @@
 // purge_all_devices (a withdrawal that deletes) also CANCELS the Focus's parked
 // runs (awaiting_user, awaiting_schedule and the other non-terminal states): a
 // parked run keeps its step outputs in a snapshot and the chat window in
-// focus_runs.user_input, both of which can name the device, and cancel clears both
+// focus_runs.user_input (and its user-turns-only copy in focus_runs.external_input,
+// items.id=883), all of which can name the device, and cancel clears them all
 // (output_store::cancel_focus_run). A single-device purge does not cancel them: a
 // parked run of another device is not the user's to lose.
 //

@@ -146,19 +146,6 @@ fn to_message_info(r: message_store::MessageRecord) -> MessageInfo {
 /// get smarter later.
 const HISTORY_WINDOW: usize = 10;
 
-/// Build the `User: ...\nAssistant: ...\n` prefix send_message passes as
-/// SubmitFocusRunRequest.user_input, from the last HISTORY_WINDOW messages
-/// in `history` (already includes the just-saved new user turn as the last
-/// entry -- send_message calls this after save_message, not before).
-///
-/// user_input is opaque data substituted via a single str::replace() into
-/// the {user_input} template token (executor.rs's token substitution) --
-/// nothing further parses it, so plain-text prefixing here is safe.
-///
-/// Skips messages with empty content: an assistant placeholder row whose
-/// generation hasn't finished/backfilled yet (see send_message) has nothing
-/// useful to thread into context, and an empty "Assistant: \n" line would
-/// just be noise.
 /// Bounded wrapper around message_store::update_message_content -- same
 /// rationale as lifecycle.rs's write_focus_run_record_logged (f615f8b), applied
 /// to the one backfill write it doesn't cover: a stalled encrypted-DB write
@@ -220,6 +207,22 @@ fn derive_chat_title(content: &str) -> Option<String> {
     }
 }
 
+/// Build the `User: ...\nAssistant: ...\n` prefix send_message passes as
+/// SubmitFocusRunRequest.user_input, from the last HISTORY_WINDOW messages
+/// in `history` (already includes the just-saved new user turn as the last
+/// entry -- send_message calls this after save_message, not before).
+///
+/// user_input is opaque data substituted via a single str::replace() into
+/// the {user_input} template token (executor.rs's token substitution) --
+/// nothing further parses it, so plain-text prefixing here is safe.
+///
+/// Skips messages with empty content: an assistant placeholder row whose
+/// generation hasn't finished/backfilled yet (see send_message) has nothing
+/// useful to thread into context, and an empty "Assistant: \n" line would
+/// just be noise.
+///
+/// items.id=883: this is the LOCAL form (model turns included). An external step and the
+/// cb-15 starter receive build_user_turns_prompt instead.
 fn build_conversation_prompt(history: &[message_store::MessageRecord]) -> String {
     fold_window(history, true)
 }

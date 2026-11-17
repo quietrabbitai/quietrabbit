@@ -13,10 +13,15 @@
 //     is therefore never sent later, and never has to be asked about again.
 //     A user turn with no outbound text is left out and counted: it was never
 //     reviewed for sending.
-//   - A reply Gate 2 flagged is left out when the destination is a different
-//     provider from the one that produced it, or when the producer is not
-//     recorded (decisions.id=883, Chat-PM ruling on items.id=716). The count
-//     is returned so the omission is never silent.
+//   - A reply is kept ONLY when its producer is the bound destination: its
+//     provider_id equals the destination's. A reply from a different provider, or
+//     with no recorded producer, is left out, flagged or not (items.id=883,
+//     decisions.id=937 point 3: an external destination receives no model turn
+//     it did not produce itself). This AMENDS decisions.id=888 point 8, which left
+//     out only a FLAGGED reply of another producer. With an immutable single
+//     binding it never fires; it governs transfers and fan-out. A flagged
+//     reply of another producer still counts in omitted_flagged, any other in
+//     omitted_other_producer, so no omission is silent.
 //   - A reply that was cancelled, cut or truncated stays out of later history
 //     (it is kept for the user to read, not to feed back to a model).
 //   - Empty placeholders and failure messages are skipped, as in the QR prefix.
@@ -34,6 +39,9 @@ pub struct ApiHistory {
     /// Flagged replies left out because the destination differs from (or the
     /// message does not record) the provider that produced them.
     pub omitted_flagged: usize,
+    /// items.id=883: unflagged replies left out because their producer is not the
+    /// destination or is not recorded. Not an IPC field (the bindings are unchanged).
+    pub omitted_other_producer: usize,
     /// User turns left out because they carry no reviewed outbound text.
     pub omitted_unreviewed: usize,
 }
@@ -42,6 +50,7 @@ pub fn build_api_history(history: &[MessageRecord], destination: &BoundDestinati
     let start = history.len().saturating_sub(HISTORY_WINDOW);
     let mut prompt = String::new();
     let mut omitted_flagged = 0;
+    let mut omitted_other_producer = 0;
     let mut omitted_unreviewed = 0;
 
     for m in &history[start..] {
@@ -57,10 +66,13 @@ pub fn build_api_history(history: &[MessageRecord], destination: &BoundDestinati
                 }
             }
         } else {
-            if m.personal_flagged
-                && m.provider_id.as_deref() != Some(destination.provider_id.as_str())
-            {
-                omitted_flagged += 1;
+            // items.id=883 rule C: only the bound destination's own replies.
+            if m.provider_id.as_deref() != Some(destination.provider_id.as_str()) {
+                if m.personal_flagged {
+                    omitted_flagged += 1;
+                } else {
+                    omitted_other_producer += 1;
+                }
                 continue;
             }
             ("Assistant", m.content.as_str())
@@ -74,6 +86,7 @@ pub fn build_api_history(history: &[MessageRecord], destination: &BoundDestinati
     ApiHistory {
         prompt,
         omitted_flagged,
+        omitted_other_producer,
         omitted_unreviewed,
     }
 }
@@ -175,11 +188,36 @@ mod tests {
     }
 
     #[test]
-    fn an_unflagged_reply_from_another_provider_is_still_kept() {
-        let h = vec![reply("hello", Some("prov-y"))];
+    fn an_unflagged_reply_from_another_provider_is_left_out() {
+        // items.id=883 rule C FLIPS the earlier expectation (an unflagged reply from
+        // another provider was kept, decisions.id=888 point 8): a model turn the
+        // destination did not produce is no longer sent to it.
+        let h = vec![user("hi", "hi"), reply("hello", Some("prov-y"))];
         let out = build_api_history(&h, &dest());
-        assert_eq!(out.prompt, "Assistant: hello\n");
+        assert_eq!(out.prompt, "User: hi\n");
         assert_eq!(out.omitted_flagged, 0);
+        assert_eq!(out.omitted_other_producer, 1);
+    }
+
+    #[test]
+    fn an_unflagged_reply_with_no_recorded_producer_is_left_out() {
+        let h = vec![user("hi", "hi"), reply("who said this", None)];
+        let out = build_api_history(&h, &dest());
+        assert_eq!(out.prompt, "User: hi\n");
+        assert_eq!(out.omitted_other_producer, 1);
+    }
+
+    #[test]
+    fn a_reply_from_the_bound_destination_is_kept_flagged_or_not() {
+        let mut flagged = reply("kept, same producer", Some("prov-x"));
+        flagged.personal_flagged = true;
+        let h = vec![user("hi", "hi"), reply("plain", Some("prov-x")), flagged];
+        let out = build_api_history(&h, &dest());
+        assert_eq!(
+            out.prompt,
+            "User: hi\nAssistant: plain\nAssistant: kept, same producer\n"
+        );
+        assert_eq!((out.omitted_flagged, out.omitted_other_producer), (0, 0));
     }
 
     #[test]

@@ -1,5 +1,8 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: November 17, 2026 (items.id=898: new "Focus development tool" section; the dev-only
+# Last updated: November 17, 2026 (items.id=883: new "External steps and chat history" section; the
+# focus_runs.user_input bullet under "Model blocks", the starter's {user_input} line under "Manual
+# hand-off" and the RESUME paragraph under "Launch questions"; nothing else.).
+# Before that, November 17, 2026 (items.id=898: new "Focus development tool" section; the dev-only
 # paths paragraph under "Dev Environment" (one more compile-time path); nothing else. The
 # stale "document_types seed comes from focus_dev" comment in document_type.rs is corrected in code.).
 # Before that, November 17, 2026 (items.id=927: the cargo deny line under "Key commands" only -- fetch the
@@ -389,7 +392,9 @@ with no requirement still goes through select_model.
   `source`. Never edit qr_docs.db or the vault from here. conductor/model_block/
   admission_tests.rs checks the rest, and PINNED_KEYS there fails on any new
   configuration key until it is reviewed.
-- focus_runs.user_input holds the blended chat window so a parked run can resume. It
+- focus_runs.user_input holds the blended chat window so a parked run can resume (and
+  focus_runs.external_input, items.id=883, its user-turns-only copy: see "External steps and
+  chat history"; both are written together and cleared together). It
   is NULLed when the status becomes complete, cancelled or failed (output_store::
   USER_INPUT_CLEARED_STATUSES) and is not written for a latched one-time chat. A run
   parked and never finished keeps it until items.id=681 and 888 clear it.
@@ -748,6 +753,8 @@ in a run, so nothing depends on resume. The legacy requires_user_handoff pause i
   names execute_once, hosted_step_call, a provider, a gate or the spend gate, and the render
   dispatch sits before the tier computation in execute_step. Its only use of the executor is
   render_template (pub(crate) since this item) and find_tokens.
+  items.id=883: its {user_input} is the user's own turns only (FocusRun.external_input, never the
+  window that holds model turns), because a render row is an external step to the lint.
   - It is a block row to the registry and an EXTERNAL step to the declared-inputs lint
     (ActionDefinition::is_external_for_lint): declared inputs only, no persona_context,
     voice_profile, previous_output or focus_context (refused at parse, declared or not),
@@ -932,6 +939,8 @@ mechanism is exercised by fixture Focuses in tests.
   until items.id=888 carries context_key on rehydrate (items.id=913 depends on it: a review park
   resumes through rehydrate). A Focus whose questions are all fixed, and a run with no chat
   (submit_focus_run), use the defaults. A run_change is lost on a resumed run.
+  items.id=883 adds the same shape for the external text: focus_runs.external_input is stored beside
+  user_input and a NULL resumes empty (see "External steps and chat history").
 - ANSWER STORE AND THE ONE-TIME LATCH (persistence/launch_answer_store.rs; no new table: rows of
   session_variables under the six names). The only writer is put_answers(), which accepts only the
   ValidatedAnswers that launch_config::validate_submission() builds (every answer one of its
@@ -1120,6 +1129,39 @@ built: any screen (items.id=902 or 904).
     ceiling accounting and the same executor check keyed by (action id, kind). A bump of the
     digest tag re-asks and never allows.
   - items.id=633: must absorb outputs_017.sql with the other outputs files.
+
+## External steps and chat history (items.id=883, decisions.id=937 point 3 and decisions.id=952)
+An external destination never receives a model turn that a chat folded into {user_input}: a model
+turn can carry persona-derived text from an earlier local run. The local render is unchanged.
+- TWO FORMS, ONE FOLD. commands/messages.rs fold_window() builds both: build_conversation_prompt
+  (`User: ...` and `Assistant: ...` lines, the LOCAL form, FocusRun.user_input) and
+  build_user_turns_prompt (the same last HISTORY_WINDOW messages, the same `User: ` label and skips,
+  user rows only, FocusRun.external_input). The second is a strict subset of the first by construction
+  (a test pins it). A user turn is kept verbatim, including one the user pasted from a model: it cannot
+  be told apart from user text, and the outbound review (items.id=884) is its control.
+- WHAT READS WHICH. render_prompt (local) inserts ctx.user_input; render_prompt_with_disclosure (every
+  step with `treatment.hosted`) and the cb-15 starter (lifecycle.rs execute_handoff_render) insert
+  ctx.external_input and never name the full window (scan tests in executor.rs). new() defaults
+  external_input to user_input, which is right for a run with no history (submit_focus_run's typed
+  text). send_message passes Some(build_user_turns_prompt) and send_api_chat_message Some(its API
+  history) as the new load_and_authorize_run parameter `external_input` (server-side, never a DTO
+  field): it must be set BEFORE the focus_runs row is written, because that row stores it.
+- RESUME. focus_runs.external_input (schema/outputs_018.sql, items.id=633 must absorb it) is written beside
+  user_input and cleared at EVERY site that clears user_input (the lifecycle writer, output_store::
+  set_focus_run_status and cancel_focus_run; the same keep_input rule: a terminal status, the one-time
+  latch, focus_level consent). rehydrate_focus_run reads it and NEVER derives it from user_input (a model
+  reply can contain a line that starts with `User: `, so parsing the window would pass model text off as a
+  user turn; a scan pins it). A NULL (a row from before outputs_018, or one written without a copy)
+  resumes with an EMPTY external input: an external step renders {user_input} empty while a local step
+  still sees the stored window. Resume and the scheduled sweep both go through rehydrate_focus_run.
+- API CHAT, RULE C (amends decisions.id=888 point 8). build_api_history keeps an assistant turn ONLY
+  when its provider_id is the bound destination's; a turn from another provider or with no recorded
+  producer is left out, flagged or not (the earlier rule left out only a flagged one). With an immutable
+  binding this never fires: it governs transfers and fan-out. A flagged one still counts in
+  omitted_flagged, the rest in ApiHistory.omitted_other_producer (not an IPC field).
+- NOT CHANGED: output variables and {previous_output} that carry local-step output into an external
+  prompt (items.id=922's carry, not this item), and the declared-inputs lint (user_input is declared as
+  before).
 
 ## Collection consent (items.id=920 stage 1, decisions.id=944, decisions.id=509)
 A focus_level Focus (Tech Support) collects silently after ONE informed consent at
