@@ -7857,16 +7857,17 @@ mod tests {
                 .await
                 .map_err(|e| format!("{e:?}"))
                 .unwrap();
-            // The smallest model Jason rated acceptable for this type, a local one.
-            assert_eq!(sel.selected.model_id, "llama3.2:3b");
+            // llama3.2:3b is the smallest model but Jason read it below basic for this type
+            // (items.id=899), so the smallest one that reaches the bar is chosen.
+            assert_eq!(sel.selected.model_id, "llama3.1:8b");
             assert!(sel.selected.provider_id.is_none() && sel.selected.hosted_model.is_none());
-            // qwen2.5:7b is unrated for this type: not a fallback.
+            // The model below the bar is not a fallback; the other qualifier is.
             assert_eq!(
                 sel.fallbacks
                     .iter()
                     .map(|f| f.model_id.as_str())
                     .collect::<Vec<_>>(),
-                ["llama3.1:8b"]
+                ["qwen2.5:7b"]
             );
         })
         .await;
@@ -7879,10 +7880,19 @@ mod tests {
     async fn an_uncalibrated_local_cell_is_not_chosen_and_is_listed_as_not_measured() {
         with_temp_shared_db(|pool| async move {
             install_local_models(&pool).await;
-            // Turn off the two models rated for this type; qwen2.5:7b is unrated.
+            // Turn off the two other models, and remove qwen2.5:7b's cell for this type so
+            // it is unmeasured (the shipped data rates every model for every shipped type
+            // since items.id=899, so the unmeasured case is made here).
             sqlx::query(
                 "UPDATE providers SET qr_disabled_by_user = 1
                   WHERE local_model_tag IN ('llama3.2:3b', 'llama3.1:8b')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "DELETE FROM model_capabilities
+                  WHERE model_id = 'qwen2.5:7b' AND profile = 'rma_letter'",
             )
             .execute(&pool)
             .await
@@ -8079,7 +8089,7 @@ mod tests {
                     ExternalAccess::AnonymousPreferred,
                 )),
                 ExternalAccess::AnonymousPreferred,
-                Some("rma_letter"),
+                Some("complaint_email"),
                 "Write it.",
             );
             let (out, track, gateway) = run_once(&ctx, &pool).await;
@@ -8128,7 +8138,7 @@ mod tests {
             let short = resolved_ctx(
                 Some(local_req()),
                 ExternalAccess::AnonymousPreferred,
-                Some("rma_letter"),
+                Some("complaint_email"),
                 "Write it.",
             );
             let (out, _, gateway_short) = run_once(&short, &pool).await;
@@ -8143,7 +8153,7 @@ mod tests {
             let long = resolved_ctx(
                 Some(local_req()),
                 ExternalAccess::AnonymousPreferred,
-                Some("rma_letter"),
+                Some("complaint_email"),
                 &template,
             );
             let (out, track, gateway) = run_once(&long, &pool).await;

@@ -114,6 +114,18 @@ async fn env() -> Env {
         .await
         .unwrap();
 
+    // The shipped data (items.id=899) measures every curated model for every shipped
+    // document type, so the fixture removes one cell to have an unmeasured local model
+    // to offer: qwen2.5:7b for the fixture's rma_letter profile.
+    sqlx::query(
+        "DELETE FROM model_capabilities
+          WHERE model_id = 'qwen2.5:7b' AND task_type = 'creative_writing'
+            AND profile = 'rma_letter'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
     // A loadable Focus with one local model block (cb-12) and a preset document type.
     for (focus, name) in [
         (FOCUS, "Plan Fixture"),

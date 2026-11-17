@@ -4827,18 +4827,24 @@ mod tests {
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(rows, 12, "the seed is Jason's first read: 12 rated cells");
-        let unrated: i64 = sqlx::query_scalar(
+        assert_eq!(
+            rows, 21,
+            "the seed is the items.id=899 calibration read: 18 writing cells and 3 voice cells"
+        );
+        let rated: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM model_capabilities
               WHERE model_id = 'qwen2.5:7b'
-                AND profile IN ('rma_letter', 'complaint_email', 'cover_letter')",
+                AND ((task_type = 'creative_writing'
+                      AND profile IN ('rma_letter', 'complaint_email', 'cover_letter',
+                                      'creative_story'))
+                  OR (task_type = 'quick_response' AND profile = ''))",
         )
         .fetch_one(&mut conn)
         .await
         .unwrap();
         assert_eq!(
-            unrated, 0,
-            "qwen2.5:7b was not rated on these, so they stay unmeasured"
+            rated, 5,
+            "qwen2.5:7b is rated on the types it was unrated on"
         );
 
         sqlx::query("UPDATE model_capabilities SET attained_bar = 'excellent'")

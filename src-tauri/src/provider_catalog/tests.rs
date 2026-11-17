@@ -1725,9 +1725,12 @@ async fn dump_baseline_catalog() {
 // Capabilities (items.id=896)
 // ---------------------------------------------------------------------------
 
+/// A cell the baseline does not seed (items.id=899 rated every writing profile and
+/// the voice task type for all three curated models, so the tests use a task type
+/// the baseline leaves unmeasured).
 fn cell(extra: Value) -> Value {
     let mut base = json!({
-        "subject": "local", "model_id": "qwen2.5:7b", "task_type": "creative_writing",
+        "subject": "local", "model_id": "qwen2.5:7b", "task_type": "summarization",
         "profile": "rma_letter", "attained_bar": "basic", "model_class": "medium",
         "sample_count": 4, "measured_at": "2026-10-15", "provenance": "jason_read"});
     for (k, v) in extra.as_object().unwrap() {
@@ -1745,7 +1748,8 @@ async fn capability_rows(pool: &SqlitePool) -> i64 {
 
 async fn cell_bar(pool: &SqlitePool, model: &str, profile: &str) -> Option<String> {
     sqlx::query_scalar(
-        "SELECT attained_bar FROM model_capabilities WHERE model_id = ? AND profile = ?",
+        "SELECT attained_bar FROM model_capabilities
+          WHERE model_id = ? AND profile = ? AND task_type = 'summarization'",
     )
     .bind(model)
     .bind(profile)
@@ -1825,10 +1829,11 @@ async fn a_capability_cell_is_inserted_replaced_and_left_alone_when_identical() 
 #[tokio::test]
 async fn a_catalog_never_moves_a_cell_back_to_an_older_measurement() {
     with_db(|pool| async move {
-        // The seeded cell is dated 2026-11-13: a catalog dated earlier skips it.
+        // The seeded cell is dated 2026-11-17: a catalog dated earlier skips it.
         let before = dump(&pool).await;
         let d = doc(json!({"capabilities":[cell(json!({
             "model_id": "llama3.1:8b", "profile": "personal_note",
+            "task_type": "creative_writing",
             "attained_bar": "high", "measured_at": "2026-10-15"}))]}));
         let out = run(&pool, &d).await.unwrap();
         assert!(out.is_noop());
@@ -2042,17 +2047,47 @@ fn a_catalog_with_capabilities_must_say_the_app_needs_the_table() {
 #[test]
 fn the_baseline_carries_the_seeded_capability_cells() {
     let d = parse_catalog(BASELINE_CATALOG_JSON.as_bytes()).unwrap();
-    assert_eq!(d.capabilities.len(), 12);
+    assert_eq!(d.capabilities.len(), 21);
     assert!(d
         .capabilities
         .iter()
         .all(|c| c.subject == crate::conductor::model_capability::CapabilitySubject::Local));
-    // Not rated by Jason: stays unmeasured.
-    assert!(!d.capabilities.iter().any(|c| c.model_id == "qwen2.5:7b"
-        && matches!(
-            c.profile.as_deref(),
-            Some("rma_letter" | "complaint_email" | "cover_letter")
-        )));
+    // items.id=899: every cell is Jason's read, from the calibration run.
+    assert!(d
+        .capabilities
+        .iter()
+        .all(|c| c.provenance == crate::conductor::model_capability::Provenance::JasonRead));
+    let bar = |model: &str, task: &str, profile: Option<&str>| {
+        d.capabilities
+            .iter()
+            .find(|c| {
+                c.model_id == model
+                    && c.task_type.as_str() == task
+                    && c.profile.as_deref() == profile
+            })
+            .map(|c| c.attained_bar.as_str())
+    };
+    // qwen2.5:7b is now rated for the three types it was unrated for.
+    assert_eq!(
+        bar("qwen2.5:7b", "creative_writing", Some("rma_letter")),
+        Some("standard")
+    );
+    assert_eq!(
+        bar("qwen2.5:7b", "creative_writing", Some("complaint_email")),
+        Some("standard")
+    );
+    assert_eq!(
+        bar("qwen2.5:7b", "creative_writing", Some("cover_letter")),
+        Some("high")
+    );
+    // creative_story is rated, and the voice step has one task-type-wide cell per model.
+    assert_eq!(
+        bar("qwen2.5:7b", "creative_writing", Some("creative_story")),
+        Some("basic")
+    );
+    assert_eq!(bar("llama3.2:3b", "quick_response", None), Some("standard"));
+    assert_eq!(bar("llama3.1:8b", "quick_response", None), Some("basic"));
+    assert_eq!(bar("qwen2.5:7b", "quick_response", None), Some("basic"));
 }
 
 // ---------------------------------------------------------------------------

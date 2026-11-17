@@ -1128,9 +1128,10 @@ fn no_example_uses_a_bound_name_as_its_output_variable() {
 
 /// Shipped document types with NO rated local cell in the shipped capability data.
 /// A step of such a type resolves to TooWeak (every model not measured) until a
-/// catalog rates it. Naming it here is the decision that this is known. Jason's
-/// first calibration read did not cover creative_story.
-const UNRATED_SHIPPED_TYPES: &[&str] = &["creative_story"];
+/// catalog rates it. Naming it here is the decision that this is known. Empty since
+/// items.id=899: the calibration run rated creative_story, so every shipped type has
+/// a cell. A new shipped type forces a decision here again.
+const UNRATED_SHIPPED_TYPES: &[&str] = &[];
 
 fn shipped_capabilities() -> Vec<crate::provider_catalog::format::CapabilityDoc> {
     crate::provider_catalog::format::parse_catalog(
@@ -1172,11 +1173,10 @@ fn every_shipped_document_type_is_rated_or_named_as_unrated() {
 
 /// Task types of a registered model block with NO cell in the shipped capability
 /// data. A step of such a block resolves to TooWeak until a catalog rates the task
-/// type. The voice block's example uses quick_response, which the first calibration
-/// read did not cover (it measured drafts, not voice passes): the local half of the
-/// harness (items.id=899) is what rates it. Naming it here is the decision that
-/// this is known.
-const UNRATED_BLOCK_TASK_TYPES: &[&str] = &["quick_response"];
+/// type. Empty since items.id=899: the harness rated quick_response (the voice
+/// block's task type) through the shipped cb-13 block. A new block task type forces
+/// a decision here again.
+const UNRATED_BLOCK_TASK_TYPES: &[&str] = &[];
 
 #[test]
 fn every_model_block_task_type_has_a_cell_or_is_named_as_unrated() {

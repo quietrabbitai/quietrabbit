@@ -114,7 +114,13 @@ mod tests {
         for r in &t.rows {
             assert_eq!(r.subject, CapabilitySubject::Local, "{r:?}");
             assert!(r.provider_id.is_empty());
-            assert_eq!(r.task_type, ModelTaskType::CreativeWriting);
+            assert!(
+                matches!(
+                    r.task_type,
+                    ModelTaskType::CreativeWriting | ModelTaskType::QuickResponse
+                ),
+                "{r:?}"
+            );
             assert_eq!(r.provenance, Provenance::JasonRead);
             assert!(r.sample_count > 0);
         }
