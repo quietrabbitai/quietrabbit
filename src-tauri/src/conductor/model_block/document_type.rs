@@ -11,8 +11,9 @@
 // plain phrases, and the shipped types. Rust holds only the template SKELETON
 // (draft.rs, voice.rs, revise.rs): which phrase goes where and which declared
 // variable goes in which slot. Tuning wording is a data edit, never a code
-// change. The B7a document_types seed and focus_dev's emit-migration (B8) are
-// generated FROM that file, so there is one source.
+// change. The B7a document_types seed (items.id=903) is generated FROM that file, so
+// there is one source. focus_dev (items.id=898) does NOT read it: its emit-migration
+// renders Focus rows from Focus specs, and a document type is not a Focus row.
 //
 // A phrase may contain a slot written %name%: code fills it (a document type's
 // form, a word count). A phrase may never contain a {token}: that syntax is the

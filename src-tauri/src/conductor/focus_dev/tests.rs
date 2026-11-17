@@ -531,3 +531,99 @@ async fn delete_focus_removes_every_row_the_writer_wrote() {
         None => std::env::remove_var("QR_DATA_ROOT"),
     }
 }
+
+// -- items.id=898 stage 4 --------------------------------------------------------------------
+
+#[test]
+fn the_app_bundle_is_unchanged_and_names_no_dev_tool_file() {
+    let text = include_str!("../../../tauri.conf.json");
+    let v: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(
+        v["bundle"]["resources"],
+        json!({
+            "resources/ggml-backends/*": "ggml-backends/",
+            "../app/core_artifacts/focuses/*.focus": "core_artifacts/focuses/"
+        })
+    );
+    assert_eq!(v["bundle"]["externalBin"], json!(["binaries/qr-ollama"]));
+    for banned in ["focus_dev", "focus_specs", "focus_presets", "examples"] {
+        assert!(!text.contains(banned), "tauri.conf.json names {banned}");
+    }
+}
+
+/// Amendment 4 of decisions.id=951: the unknown-key check over every SHIPPED Focus. The
+/// loader ignores an unknown key in an ordinary step (RawStepFromDb and RawStep have no
+/// deny_unknown_fields), so a typo in shipped content would be silent. Counts rows
+/// checked and unknown keys found, in the shared_*.sql seeds (through a real migration)
+/// and the six .focus files.
+#[tokio::test]
+async fn no_shipped_ordinary_step_carries_a_key_the_loader_ignores() {
+    use crate::conductor::lifecycle::ORDINARY_STEP_KEYS;
+    let mut checked = 0usize;
+    let mut unknown: Vec<String> = Vec::new();
+
+    // The shared.db seeds.
+    let dir = std::env::temp_dir().join(format!("qr-898-keys-{}", std::process::id()));
+    let db = dir.join("instance").join("shared.db");
+    crate::persistence::migrations::migrate_shared_db_at(&db)
+        .await
+        .unwrap();
+    let pool =
+        sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(&db))
+            .await
+            .unwrap();
+    let ids: Vec<(String,)> = sqlx::query_as("SELECT focus_id FROM focuses ORDER BY focus_id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    let focuses_in_db = ids.len();
+    for (id,) in ids {
+        for row in store::list_compositions(&pool, &id).await.unwrap() {
+            if row.block_stable_id.is_some() {
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(&row.customization).unwrap();
+            checked += 1;
+            for k in v.as_object().unwrap().keys() {
+                if !ORDINARY_STEP_KEYS.contains(&k.as_str()) {
+                    unknown.push(format!("shared.db {id}/{}: {k}", row.action_id));
+                }
+            }
+        }
+    }
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The .focus files.
+    let focus_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("app")
+        .join("core_artifacts")
+        .join("focuses");
+    let mut files = 0usize;
+    for e in std::fs::read_dir(&focus_dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.extension().is_none_or(|x| x != "focus") {
+            continue;
+        }
+        files += 1;
+        let text = std::fs::read_to_string(&p).unwrap();
+        let v: serde_json::Value = serde_saphyr::from_str(&text).unwrap();
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        for (step, body) in v["steps"].as_object().expect("steps map") {
+            checked += 1;
+            for k in body.as_object().expect("a step map").keys() {
+                if !ORDINARY_STEP_KEYS.contains(&k.as_str()) {
+                    unknown.push(format!("{name} step {step}: {k}"));
+                }
+            }
+        }
+    }
+    println!(
+        "AMENDMENT 4 COUNT: {} unknown keys over {checked} shipped ordinary steps ({focuses_in_db} Focus rows in shared.db, {files} .focus files): {unknown:?}",
+        unknown.len()
+    );
+    assert_eq!(files, 6);
+    assert!(checked > 0);
+    assert!(unknown.is_empty(), "{unknown:#?}");
+}
