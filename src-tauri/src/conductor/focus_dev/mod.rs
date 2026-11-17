@@ -13,11 +13,26 @@
 // the typed columns, never as an expression.
 //
 // Nothing outside this module, its tests and the example names it (a scan test in
-// stage 3 pins that).
+// tool.rs's tests pins that).
+//
+// GATING (decisions.id=951 amendment 2). Always compiled: spec, preset, shape, render
+// (pure text) and drift (pure). Compiled only under cfg(any(test, debug_assertions)):
+// devroot (the guard that proves a directory is a development copy, and the function
+// that writes its marker), tool (validate, reseed, apply, the schema-directory reader)
+// and the store writers they call. A release build of the app therefore contains no code
+// that opens, writes or deletes a Focus row, and no marker writer. `test` is included
+// because `cargo test --release --lib -- release_` compiles the test modules in release.
 
+pub mod drift;
 pub mod preset;
+pub mod render;
 pub mod shape;
 pub mod spec;
+
+#[cfg(any(test, debug_assertions))]
+pub mod devroot;
+#[cfg(any(test, debug_assertions))]
+pub mod tool;
 
 #[cfg(test)]
 mod tests;
@@ -32,4 +47,10 @@ pub enum FocusDevError {
     Preset(String),
     #[error("shape: {}", .0.join("; "))]
     Shape(Vec<String>),
+    #[error("render: {0}")]
+    Render(String),
+    #[error("dev root: {0}")]
+    DevRoot(String),
+    #[error("database: {0}")]
+    Database(String),
 }

@@ -1725,6 +1725,24 @@ pub async fn migrate_shared_db() -> Result<u32, MigrationError> {
     migrate_db_file(&db_path, "shared", None).await
 }
 
+/// Migrate a shared.db at an explicit path (items.id=898: the focus_dev tool migrates a
+/// scratch copy and a marked development root without touching the process data root).
+#[cfg(any(test, debug_assertions))]
+pub(crate) async fn migrate_shared_db_at(db_path: &Path) -> Result<u32, MigrationError> {
+    migrate_db_file(db_path, "shared", None).await
+}
+
+/// The version of every registered shared schema file (items.id=898: emit-migration picks
+/// the next free number and cross-checks it against the schema directory).
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn shared_schema_versions() -> Vec<u32> {
+    SCHEMA_FILES
+        .iter()
+        .filter(|f| f.prefix == "shared")
+        .map(|f| f.version)
+        .collect()
+}
+
 /// Migrate a user's personal.db (encrypted). key_hex: bare hex bytes only.
 pub async fn migrate_personal_db(
     user_id: &str,
