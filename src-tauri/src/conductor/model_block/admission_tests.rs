@@ -518,45 +518,62 @@ async fn setup() -> TestEnv {
 type Row = (String, Option<String>, Value);
 
 async fn seed_focus(pool: &sqlx::SqlitePool, focus_id: &str, ceiling: &str, rows: &[Row]) {
-    sqlx::query(
-        "INSERT INTO focuses
-            (focus_id, display_name, description, version, max_routing_tier,
-             output_type, suggest_in_focuses, multi_source_validation,
-             generic_title_template, status, created_at, updated_at)
-         VALUES (?, 'Admission Focus', '', '1.0', ?, 'general', '[]', 0, 'Hidden item',
-                 'shipped', datetime('now'), datetime('now'))",
-    )
-    .bind(focus_id)
-    .bind(ceiling)
-    .execute(pool)
-    .await
-    .unwrap();
-    for (i, (action, block, custom)) in rows.iter().enumerate() {
-        let comp = format!("{focus_id}:{action}");
-        sqlx::query(
-            "INSERT INTO focus_block_compositions
-                (id, focus_id, action_id, block_stable_id, sequence_index, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
-        )
-        .bind(&comp)
-        .bind(focus_id)
-        .bind(action)
-        .bind(block)
-        .bind(i as i64)
-        .execute(pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO focus_block_customization
-                (id, composition_id, persona_id, customization, created_at, updated_at)
-             VALUES (?, ?, NULL, ?, datetime('now'), datetime('now'))",
-        )
-        .bind(format!("{comp}:default"))
-        .bind(&comp)
-        .bind(custom.to_string())
-        .execute(pool)
-        .await
-        .unwrap();
+    use crate::persistence::focus_composition_store as store;
+    let seed = store::FocusSeed {
+        focus: store::FocusSeedRow {
+            focus_id: focus_id.to_owned(),
+            display_name: "Admission Focus".to_owned(),
+            description: String::new(),
+            version: "1.0".to_owned(),
+            max_routing_tier: ceiling.to_owned(),
+            output_type: "general".to_owned(),
+            suggest_in_focuses: Vec::new(),
+            multi_source_validation: false,
+            generic_title_template: "Hidden item".to_owned(),
+            high_priority_trigger_anchor_field: None,
+            high_priority_trigger_offset: None,
+            status: "shipped".to_owned(),
+            collection_posture: "per_field".to_owned(),
+        },
+        compositions: rows
+            .iter()
+            .map(|(action, block, custom)| {
+                store::CompositionSeed::plain(action, block.as_deref(), &custom.to_string())
+            })
+            .collect(),
+        questions: Vec::new(),
+        ui_one_liner: None,
+    };
+    let mut conn = pool.acquire().await.unwrap();
+    store::write_focus(&mut conn, &seed).await.unwrap();
+}
+
+fn launch_question(
+    question_id: &str,
+    slot: &str,
+    kind: &str,
+    asked: bool,
+    default_option: &str,
+    prompt: &str,
+    options: &[(&str, Option<&str>)],
+) -> crate::persistence::focus_composition_store::LaunchQuestionSeed {
+    use crate::persistence::focus_composition_store as store;
+    store::LaunchQuestionSeed {
+        question_id: question_id.to_owned(),
+        slot: slot.to_owned(),
+        kind: kind.to_owned(),
+        asked,
+        default_option: default_option.to_owned(),
+        prompt: prompt.to_owned(),
+        options: options
+            .iter()
+            .map(|(o, envelope)| store::LaunchOptionSeed {
+                option_id: (*o).to_owned(),
+                label: "Label".to_owned(),
+                hint: String::new(),
+                envelope: envelope.map(str::to_owned),
+            })
+            .collect(),
     }
 }
 
@@ -564,34 +581,24 @@ async fn seed_focus(pool: &sqlx::SqlitePool, focus_id: &str, ceiling: &str, rows
 /// preset (asked = 0, one option), else an asked question with two options. The
 /// default is rma_letter.
 async fn seed_document_type_question(pool: &sqlx::SqlitePool, focus_id: &str, fixed: bool) {
-    sqlx::query(
-        "INSERT INTO focus_launch_questions
-            (focus_id, question_id, slot, kind, sort_order, asked, default_option, prompt)
-         VALUES (?, 'kind', 'document_type', 'choice', 1, ?, 'rma_letter', 'Which kind?')",
-    )
-    .bind(focus_id)
-    .bind(if fixed { 0_i64 } else { 1_i64 })
-    .execute(pool)
-    .await
-    .unwrap();
-    let options: &[&str] = if fixed {
-        &["rma_letter"]
+    let options: &[(&str, Option<&str>)] = if fixed {
+        &[("rma_letter", None)]
     } else {
-        &["rma_letter", "cover_letter"]
+        &[("rma_letter", None), ("cover_letter", None)]
     };
-    for (i, o) in options.iter().enumerate() {
-        sqlx::query(
-            "INSERT INTO focus_launch_options
-                (focus_id, question_id, option_id, sort_order, label)
-             VALUES (?, 'kind', ?, ?, 'Label')",
-        )
-        .bind(focus_id)
-        .bind(o)
-        .bind(i as i64)
-        .execute(pool)
+    let q = launch_question(
+        "kind",
+        "document_type",
+        "choice",
+        !fixed,
+        "rma_letter",
+        "Which kind?",
+        options,
+    );
+    let mut conn = pool.acquire().await.unwrap();
+    crate::persistence::focus_composition_store::write_launch(&mut conn, focus_id, &[q], None)
         .await
         .unwrap();
-    }
 }
 
 /// A local ordinary step that produces `var`.
@@ -1291,49 +1298,28 @@ fn every_shipped_local_cell_names_a_curated_tag() {
 /// A mode question (launch_mode) with the options quick and careful, each with a
 /// profile, on `focus_id`. quick narrows to local only, careful raises the floor.
 async fn seed_mode_question(pool: &sqlx::SqlitePool, focus_id: &str) {
-    sqlx::query(
-        "INSERT INTO focus_launch_questions
-            (focus_id, question_id, slot, kind, sort_order, asked, default_option, prompt)
-         VALUES (?, 'how', 'launch_mode', 'mode', 0, 1, 'quick', 'How?')",
-    )
-    .bind(focus_id)
-    .execute(pool)
-    .await
-    .unwrap();
-    for (i, (o, envelope)) in [
-        (
-            "quick",
-            r#"{"highest_tier":"local_only","destinations":["local"]}"#,
-        ),
-        (
-            "careful",
-            r#"{"quality_floor":{"min":"standard","max":"high"}}"#,
-        ),
-    ]
-    .iter()
-    .enumerate()
-    {
-        sqlx::query(
-            "INSERT INTO focus_launch_options
-                (focus_id, question_id, option_id, sort_order, label)
-             VALUES (?, 'how', ?, ?, 'Label')",
-        )
-        .bind(focus_id)
-        .bind(o)
-        .bind(i as i64)
-        .execute(pool)
+    let q = launch_question(
+        "how",
+        "launch_mode",
+        "mode",
+        true,
+        "quick",
+        "How?",
+        &[
+            (
+                "quick",
+                Some(r#"{"highest_tier":"local_only","destinations":["local"]}"#),
+            ),
+            (
+                "careful",
+                Some(r#"{"quality_floor":{"min":"standard","max":"high"}}"#),
+            ),
+        ],
+    );
+    let mut conn = pool.acquire().await.unwrap();
+    crate::persistence::focus_composition_store::write_launch(&mut conn, focus_id, &[q], None)
         .await
         .unwrap();
-        sqlx::query(
-            "INSERT INTO focus_mode_profiles (focus_id, option_id, envelope) VALUES (?, ?, ?)",
-        )
-        .bind(focus_id)
-        .bind(o)
-        .bind(envelope)
-        .execute(pool)
-        .await
-        .unwrap();
-    }
 }
 
 async fn guard_row(

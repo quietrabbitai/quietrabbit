@@ -1,0 +1,22 @@
+{
+  "format_version": 1,
+  "focus": {
+    "focus_id": "fixture-preset-focus",
+    "display_name": "Fixture Preset Focus",
+    "max_routing_tier": "local_only",
+    "status": "designed"
+  },
+  "rows": [
+    {
+      "action_id": "intake",
+      "config": {
+        "task_type": "quick_response",
+        "routing_tier": 1,
+        "output_var": "intake_note",
+        "prompt_template": "Summarize: {user_input}"
+      }
+    },
+    { "preset": "fixture_review", "as": "first", "params": { "source": "intake_note", "tone": "plain", "words": 120 } },
+    { "preset": "fixture_review", "as": "second", "params": { "source": "first_final_out", "tone": "warm", "words": 80 } }
+  ]
+}

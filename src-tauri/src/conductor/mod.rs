@@ -16,6 +16,7 @@ mod entity_writer_tests;
 pub mod executor;
 pub mod extract;
 pub mod failure;
+pub mod focus_dev;
 pub mod focus_display;
 pub mod guard;
 pub mod handoff_render;

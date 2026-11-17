@@ -679,6 +679,23 @@ fn parse_focus_definition(raw: RawFocusFile) -> Result<FocusDefinition, Lifecycl
     })
 }
 
+/// The keys of an ordinary step's customization JSON (RawStepFromDb's fields). The loader
+/// ignores any other key (RawStepFromDb has no deny_unknown_fields), so the focus_dev
+/// shape check reports one instead (items.id=898). A test pins this list to the struct.
+pub(crate) const ORDINARY_STEP_KEYS: &[&str] = &[
+    "display_name",
+    "guide_id",
+    "task_type",
+    "routing_tier",
+    "requires_user_handoff",
+    "step_type",
+    "output_var",
+    "prompt_template",
+    "field_requirements",
+    "options_override",
+    "declared_inputs",
+];
+
 /// items.id=496: DB-composition path's per-step JSON shape -- mirrors
 /// RawStep field-for-field except options_override, which is JSON-native
 /// here (no YAML value conversion needed -- the source is already

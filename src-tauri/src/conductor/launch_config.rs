@@ -1324,6 +1324,43 @@ mod tests {
         out
     }
 
+    const BANNED_READS: [&str; 6] = [
+        "read_unvalidated",
+        "launch_config::read(",
+        "launch_config::read_raw",
+        "FROM focus_launch_questions",
+        "FROM focus_launch_options",
+        "FROM focus_mode_profiles",
+    ];
+
+    /// Removes every "DELETE FROM focus_launch_questions|focus_launch_options|
+    /// focus_mode_profiles" occurrence (items.id=898: the one Focus writer's delete).
+    fn strip_launch_deletes(text: &str) -> String {
+        let mut out = text.to_owned();
+        for t in [
+            "focus_launch_questions",
+            "focus_launch_options",
+            "focus_mode_profiles",
+        ] {
+            out = out.replace(&format!("DELETE FROM {t}"), "");
+        }
+        out
+    }
+
+    #[test]
+    fn the_scan_allows_the_writers_deletes_and_still_fails_a_select() {
+        let writer = "sqlx::query(\"DELETE FROM focus_launch_options WHERE focus_id = ?\");\n\
+                      sqlx::query(\"DELETE FROM focus_mode_profiles WHERE focus_id = ?\");\n\
+                      sqlx::query(\"DELETE FROM focus_launch_questions WHERE focus_id = ?\");";
+        let s = strip_launch_deletes(writer);
+        assert!(BANNED_READS.iter().all(|b| !s.contains(b)));
+        let with_select = format!(
+            "{writer}\nsqlx::query(\"SELECT option_id FROM focus_launch_options WHERE focus_id = ?\");"
+        );
+        let s = strip_launch_deletes(&with_select);
+        assert!(BANNED_READS.iter().any(|b| s.contains(b)));
+    }
+
     /// Chat-PM's stage 1 requirement: launch_config's reader does not validate, so
     /// every consumer must. The unvalidated reader is private to this file (the
     /// compiler enforces it), and this scan pins that nothing outside the file names
@@ -1337,18 +1374,22 @@ mod tests {
             if path.ends_with(this) {
                 continue;
             }
-            for banned in [
-                "read_unvalidated",
-                "launch_config::read(",
-                "launch_config::read_raw",
-                "FROM focus_launch_questions",
-                "FROM focus_launch_options",
-                "FROM focus_mode_profiles",
-            ] {
+            for banned in BANNED_READS {
                 // The admission test edits the tables to build fixture Focuses (it
-                // writes rows, it builds no LaunchConfig from them).
+                // writes rows, it builds no LaunchConfig from them), so the whole file
+                // is allowed. The one Focus writer (items.id=898) is allowed ONLY its
+                // DELETE statements: they are stripped and every banned string must
+                // then be absent, so a SELECT in that file still fails.
+                if path.ends_with("admission_tests.rs") {
+                    continue;
+                }
+                let scanned = if path.ends_with("persistence/focus_composition_store.rs") {
+                    strip_launch_deletes(&text)
+                } else {
+                    text.clone()
+                };
                 assert!(
-                    !text.contains(banned) || path.ends_with("admission_tests.rs"),
+                    !scanned.contains(banned),
                     "{path} names '{banned}': a launch config is read only through \
                      launch_config::read_validated"
                 );

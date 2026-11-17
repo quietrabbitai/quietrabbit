@@ -1,0 +1,70 @@
+{
+  "format_version": 1,
+  "focus": {
+    "focus_id": "fixture-focus",
+    "display_name": "Fixture Focus",
+    "description": "A fixture for the focus_dev tests.",
+    "max_routing_tier": "local_only",
+    "status": "designed"
+  },
+  "rows": [
+    {
+      "action_id": "intake",
+      "config": {
+        "task_type": "quick_response",
+        "routing_tier": 1,
+        "output_var": "intake_note",
+        "prompt_template": "Summarize: {user_input}"
+      }
+    },
+    {
+      "action_id": "polish",
+      "guard": {
+        "var": "launch_answer_1",
+        "op": "eq",
+        "value": "warm"
+      },
+      "config": {
+        "task_type": "quick_response",
+        "routing_tier": 1,
+        "output_var": "polished",
+        "prompt_template": "Polish: {intake_note}"
+      }
+    },
+    {
+      "action_id": "plain_reply",
+      "guard": {
+        "var": "launch_answer_1",
+        "op": "ne",
+        "value": "warm"
+      },
+      "config": {
+        "task_type": "general",
+        "routing_tier": 1,
+        "output_var": "plain",
+        "prompt_template": "Reply to: {user_input}"
+      }
+    }
+  ],
+  "launch": [
+    {
+      "question_id": "tone",
+      "slot": "launch_answer_1",
+      "kind": "choice",
+      "default_option": "plain",
+      "prompt": "Which tone?",
+      "options": [
+        {
+          "option_id": "plain",
+          "label": "Plain"
+        },
+        {
+          "option_id": "warm",
+          "label": "Warm",
+          "hint": "Friendlier"
+        }
+      ]
+    }
+  ],
+  "ui_one_liner": "A fixture Focus."
+}

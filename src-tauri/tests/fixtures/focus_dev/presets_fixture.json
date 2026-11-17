@@ -1,0 +1,36 @@
+{
+  "format_version": 1,
+  "presets": [
+    {
+      "id": "fixture_review",
+      "description": "Two local steps: a review of a named input, then a finish step guarded on it.",
+      "params": [
+        { "name": "source", "type": "slug" },
+        { "name": "tone", "type": "enum", "values": ["plain", "warm"] },
+        { "name": "words", "type": "int", "min": 50, "max": 500 }
+      ],
+      "locals": ["review_out", "final_out"],
+      "rows": [
+        {
+          "action_id": "review",
+          "config": {
+            "task_type": "quick_response",
+            "routing_tier": 1,
+            "output_var": "review_out",
+            "prompt_template": "Review {%source%} in a %tone% tone, about %words% words."
+          }
+        },
+        {
+          "action_id": "finish",
+          "guard": { "var": "review_out", "op": "present" },
+          "config": {
+            "task_type": "quick_response",
+            "routing_tier": 1,
+            "output_var": "final_out",
+            "prompt_template": "Finish {review_out}"
+          }
+        }
+      ]
+    }
+  ]
+}

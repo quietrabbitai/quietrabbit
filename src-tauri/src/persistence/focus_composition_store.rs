@@ -210,6 +210,273 @@ pub async fn is_inline_composable_block(
     Ok(row.is_some())
 }
 
+// ---------------------------------------------------------------------------
+// The one writer (items.id=898, decisions.id=951 ruling 6)
+// ---------------------------------------------------------------------------
+//
+// A Focus is seeded by data-only migration files (shared_038.sql is the model),
+// and by the focus_dev tool and the tests through THESE functions: one row
+// shape, one set of INSERTs. The structs are plain data and always compiled (the
+// focus_dev expander and SQL renderer build them). The functions that WRITE are
+// compiled only in a debug build or a test build (decisions.id=951 amendment 2),
+// so a release build of the app contains no writer into shared.db's Focus tables.
+//
+// Ids follow the convention every existing seed uses: a composition id is
+// "{focus_id}:{action_id}" and its default customization id is "{composition_id}:default".
+// sort_order and sequence_index are the vector position, so order is the author's.
+
+/// The `focuses` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FocusSeedRow {
+    pub focus_id: String,
+    pub display_name: String,
+    pub description: String,
+    pub version: String,
+    pub max_routing_tier: String,
+    pub output_type: String,
+    pub suggest_in_focuses: Vec<String>,
+    pub multi_source_validation: bool,
+    pub generic_title_template: String,
+    pub high_priority_trigger_anchor_field: Option<String>,
+    pub high_priority_trigger_offset: Option<String>,
+    /// designed, in_build, shipped or deferred (the table's CHECK).
+    pub status: String,
+    /// per_field or focus_level (the table's CHECK).
+    pub collection_posture: String,
+}
+
+/// One composition row plus its default customization row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositionSeed {
+    pub action_id: String,
+    pub block_stable_id: Option<String>,
+    pub schedule_trigger_anchor_field: Option<String>,
+    pub schedule_trigger_offset: Option<String>,
+    pub guard_var: Option<String>,
+    pub guard_op: Option<String>,
+    pub guard_value: Option<String>,
+    pub guard_clauses: Option<String>,
+    pub store_op: Option<String>,
+    pub store_target: Option<String>,
+    pub store_args: Option<String>,
+    /// The default (persona_id NULL) customization JSON text.
+    pub customization: String,
+}
+
+impl CompositionSeed {
+    /// A row with no guard, schedule or store columns.
+    pub fn plain(action_id: &str, block: Option<&str>, customization: &str) -> Self {
+        Self {
+            action_id: action_id.to_owned(),
+            block_stable_id: block.map(str::to_owned),
+            schedule_trigger_anchor_field: None,
+            schedule_trigger_offset: None,
+            guard_var: None,
+            guard_op: None,
+            guard_value: None,
+            guard_clauses: None,
+            store_op: None,
+            store_target: None,
+            store_args: None,
+            customization: customization.to_owned(),
+        }
+    }
+}
+
+/// One option of a launch question. `envelope` is the focus_mode_profiles JSON of a
+/// mode question's option (None for a choice option).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchOptionSeed {
+    pub option_id: String,
+    pub label: String,
+    pub hint: String,
+    pub envelope: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchQuestionSeed {
+    pub question_id: String,
+    pub slot: String,
+    /// mode or choice.
+    pub kind: String,
+    pub asked: bool,
+    pub default_option: String,
+    pub prompt: String,
+    pub options: Vec<LaunchOptionSeed>,
+}
+
+/// Everything a Focus owns in shared.db.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FocusSeed {
+    pub focus: FocusSeedRow,
+    pub compositions: Vec<CompositionSeed>,
+    pub questions: Vec<LaunchQuestionSeed>,
+    /// focus_launch_display.ui_one_liner.
+    pub ui_one_liner: Option<String>,
+}
+
+#[cfg(any(test, debug_assertions))]
+pub async fn write_focus(
+    conn: &mut sqlx::SqliteConnection,
+    seed: &FocusSeed,
+) -> Result<(), sqlx::Error> {
+    let f = &seed.focus;
+    sqlx::query(
+        "INSERT INTO focuses
+            (focus_id, display_name, description, version, max_routing_tier,
+             output_type, suggest_in_focuses, multi_source_validation,
+             generic_title_template, high_priority_trigger_anchor_field,
+             high_priority_trigger_offset, status, collection_posture,
+             created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
+    )
+    .bind(&f.focus_id)
+    .bind(&f.display_name)
+    .bind(&f.description)
+    .bind(&f.version)
+    .bind(&f.max_routing_tier)
+    .bind(&f.output_type)
+    .bind(serde_json::to_string(&f.suggest_in_focuses).unwrap_or_else(|_| "[]".to_owned()))
+    .bind(i64::from(f.multi_source_validation))
+    .bind(&f.generic_title_template)
+    .bind(&f.high_priority_trigger_anchor_field)
+    .bind(&f.high_priority_trigger_offset)
+    .bind(&f.status)
+    .bind(&f.collection_posture)
+    .execute(&mut *conn)
+    .await?;
+    for (i, c) in seed.compositions.iter().enumerate() {
+        let comp = format!("{}:{}", f.focus_id, c.action_id);
+        sqlx::query(
+            "INSERT INTO focus_block_compositions
+                (id, focus_id, action_id, block_stable_id, sequence_index,
+                 schedule_trigger_anchor_field, schedule_trigger_offset,
+                 guard_var, guard_op, guard_value, guard_clauses,
+                 store_op, store_target, store_args, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
+        )
+        .bind(&comp)
+        .bind(&f.focus_id)
+        .bind(&c.action_id)
+        .bind(&c.block_stable_id)
+        .bind(i as i64)
+        .bind(&c.schedule_trigger_anchor_field)
+        .bind(&c.schedule_trigger_offset)
+        .bind(&c.guard_var)
+        .bind(&c.guard_op)
+        .bind(&c.guard_value)
+        .bind(&c.guard_clauses)
+        .bind(&c.store_op)
+        .bind(&c.store_target)
+        .bind(&c.store_args)
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(
+            "INSERT INTO focus_block_customization
+                (id, composition_id, persona_id, customization, created_at, updated_at)
+             VALUES (?, ?, NULL, ?, datetime('now'), datetime('now'))",
+        )
+        .bind(format!("{comp}:default"))
+        .bind(&comp)
+        .bind(&c.customization)
+        .execute(&mut *conn)
+        .await?;
+    }
+    write_launch(
+        conn,
+        &f.focus_id,
+        &seed.questions,
+        seed.ui_one_liner.as_deref(),
+    )
+    .await
+}
+
+/// The launch tables of one Focus (questions, options, mode profiles, one-liner).
+/// Separate so a caller that seeds the Focus rows first (the admission tests) can add a
+/// question afterwards.
+#[cfg(any(test, debug_assertions))]
+pub async fn write_launch(
+    conn: &mut sqlx::SqliteConnection,
+    focus_id: &str,
+    questions: &[LaunchQuestionSeed],
+    ui_one_liner: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    for (qi, q) in questions.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO focus_launch_questions
+                (focus_id, question_id, slot, kind, sort_order, asked, default_option, prompt)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(focus_id)
+        .bind(&q.question_id)
+        .bind(&q.slot)
+        .bind(&q.kind)
+        .bind(qi as i64)
+        .bind(i64::from(q.asked))
+        .bind(&q.default_option)
+        .bind(&q.prompt)
+        .execute(&mut *conn)
+        .await?;
+        for (oi, o) in q.options.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO focus_launch_options
+                    (focus_id, question_id, option_id, sort_order, label, hint)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(focus_id)
+            .bind(&q.question_id)
+            .bind(&o.option_id)
+            .bind(oi as i64)
+            .bind(&o.label)
+            .bind(&o.hint)
+            .execute(&mut *conn)
+            .await?;
+            if let Some(envelope) = &o.envelope {
+                sqlx::query(
+                    "INSERT INTO focus_mode_profiles (focus_id, option_id, envelope)
+                     VALUES (?, ?, ?)",
+                )
+                .bind(focus_id)
+                .bind(&o.option_id)
+                .bind(envelope)
+                .execute(&mut *conn)
+                .await?;
+            }
+        }
+    }
+    if let Some(text) = ui_one_liner {
+        sqlx::query("INSERT INTO focus_launch_display (focus_id, ui_one_liner) VALUES (?, ?)")
+            .bind(focus_id)
+            .bind(text)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Removes every row a Focus owns in shared.db. The launch tables have no foreign keys and
+/// the composition tables are deleted explicitly too, so this does not depend on the
+/// connection's foreign_keys pragma. Debug and test builds only.
+#[cfg(any(test, debug_assertions))]
+pub async fn delete_focus(
+    conn: &mut sqlx::SqliteConnection,
+    focus_id: &str,
+) -> Result<(), sqlx::Error> {
+    for sql in [
+        "DELETE FROM focus_block_customization WHERE composition_id IN
+            (SELECT id FROM focus_block_compositions WHERE focus_id = ?)",
+        "DELETE FROM focus_block_compositions WHERE focus_id = ?",
+        "DELETE FROM focus_launch_options WHERE focus_id = ?",
+        "DELETE FROM focus_mode_profiles WHERE focus_id = ?",
+        "DELETE FROM focus_launch_questions WHERE focus_id = ?",
+        "DELETE FROM focus_launch_display WHERE focus_id = ?",
+        "DELETE FROM focuses WHERE focus_id = ?",
+    ] {
+        sqlx::query(sql).bind(focus_id).execute(&mut *conn).await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
