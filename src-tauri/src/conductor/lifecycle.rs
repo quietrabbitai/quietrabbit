@@ -2519,18 +2519,22 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                     .execute(&mut conn)
                     .await?;
             } else {
-                sqlx::query("UPDATE focus_runs SET status = ?, user_input = NULL WHERE id = ?")
-                    .bind(status)
-                    .bind(focus_run_id)
-                    .execute(&mut conn)
-                    .await?;
+                // items.id=883: external_input follows user_input at every clear.
+                sqlx::query(
+                    "UPDATE focus_runs SET status = ?, user_input = NULL, external_input = NULL
+                     WHERE id = ?",
+                )
+                .bind(status)
+                .bind(focus_run_id)
+                .execute(&mut conn)
+                .await?;
             }
         } else {
             sqlx::query(
                 "INSERT INTO focus_runs
                  (id, focus_id, status, is_fast_lane, is_quick_ask,
-                  topic_id, user_input, started_at, notes)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  topic_id, user_input, external_input, started_at, notes)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(focus_run_id)
             .bind(&self.focus_id)
@@ -2539,6 +2543,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             .bind(if self.is_quick_ask { 1i32 } else { 0i32 })
             .bind(self.topic_id.as_deref())
             .bind(keep_input.then_some(self.user_input.as_str()))
+            .bind(keep_input.then_some(self.external_input.as_str()))
             .bind(now())
             .bind("{}")
             .execute(&mut conn)
@@ -4887,7 +4892,8 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
     let mut conn = open_outputs_db(&user_id, &persona_id, key).await?;
 
     let run_row = sqlx::query(
-        "SELECT focus_id, status, is_fast_lane, is_quick_ask, topic_id, user_input
+        "SELECT focus_id, status, is_fast_lane, is_quick_ask, topic_id, user_input,
+                external_input
          FROM focus_runs WHERE id = ?",
     )
     .bind(&focus_run_id)
@@ -4902,6 +4908,13 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
     let topic_id: Option<String> = run_row.try_get("topic_id")?;
     let user_input: String = run_row
         .try_get::<Option<String>, _>("user_input")?
+        .unwrap_or_default();
+    // items.id=883: the user-turns-only copy the run stored. NEVER derived from
+    // `user_input` (the full window holds model turns): a NULL (a row from before
+    // outputs_018, or one written without a copy) is empty, so an external step renders
+    // {user_input} empty on a resumed run while a local step still sees the window.
+    let external_input: String = run_row
+        .try_get::<Option<String>, _>("external_input")?
         .unwrap_or_default();
 
     let snapshot_row = sqlx::query(
@@ -4932,6 +4945,9 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
         app_handle,
     );
     run.focus_run_id = Some(focus_run_id);
+    // items.id=883: new() defaulted this to the full window. Replace it with the stored
+    // user-turns-only copy (empty when there is none), never the window.
+    run.external_input = external_input;
 
     // items.id=716: a resumed API Chat run goes back to the destination its
     // conversation was bound to, never to whatever the user's preference
@@ -15195,11 +15211,35 @@ steps:
 
     const WINDOW: &str = "User: hi\nAssistant: hello there\nUser: write me a letter\n";
 
+    /// The user-turns-only copy run_with_input() gives its run (items.id=883).
+    const EXTERNAL: &str = "User: hi\nUser: write me a letter\n";
+
+    /// focus_runs.user_input of the run. items.id=883: this ALSO asserts that
+    /// focus_runs.external_input is in exactly the same state (EXTERNAL where the window
+    /// is kept, NULL where it is cleared), so every clear site and every keep rule the
+    /// tests below drive is checked for both columns.
     async fn stored_user_input(run: &FocusRun) -> Option<String> {
+        let (user_input, external): (Option<String>, Option<String>) = stored_pair(run).await;
+        assert_eq!(
+            external.is_some(),
+            user_input.is_some(),
+            "external_input must be kept and cleared exactly as user_input is: \
+             user_input={user_input:?} external_input={external:?}"
+        );
+        if let Some(e) = &external {
+            assert_eq!(
+                e, EXTERNAL,
+                "the stored copy is the run's own, not the window"
+            );
+        }
+        user_input
+    }
+
+    async fn stored_pair(run: &FocusRun) -> (Option<String>, Option<String>) {
         let mut conn = open_outputs_db(&run.user_id, &run.persona_id, CRISIS_TEST_KEY_HEX)
             .await
             .expect("open_outputs_db");
-        sqlx::query_scalar("SELECT user_input FROM focus_runs WHERE id = ?")
+        sqlx::query_as("SELECT user_input, external_input FROM focus_runs WHERE id = ?")
             .bind(run.focus_run_id.as_deref().unwrap())
             .fetch_one(&mut conn)
             .await
@@ -15212,6 +15252,7 @@ steps:
         // gate reads the posture from it, and a missing one counts as gated).
         run.focus_def = Some(single_tier3_step_focus_def());
         run.user_input = WINDOW.to_owned();
+        run.external_input = EXTERNAL.to_owned();
         run
     }
 
@@ -15372,6 +15413,186 @@ steps:
             assert_eq!(stored_user_input(&run).await, None);
         })
         .await;
+    }
+
+    /// items.id=883: the two columns hold different text. The stored external copy is
+    /// the user's turns only and is never the window.
+    #[tokio::test]
+    async fn external_input_is_stored_beside_user_input_and_is_never_the_window() {
+        with_temp_data_root(async {
+            let run = run_with_input();
+            run.write_focus_run_record("awaiting_user").await.unwrap();
+            let (ui, ext) = stored_pair(&run).await;
+            assert_eq!(ui.as_deref(), Some(WINDOW));
+            assert_eq!(ext.as_deref(), Some(EXTERNAL));
+            assert!(!ext.unwrap().contains("Assistant:"));
+        })
+        .await;
+    }
+
+    /// items.id=883: a run that was started with no history (the default) stores its
+    /// own typed text in both columns.
+    #[tokio::test]
+    async fn a_run_with_no_history_stores_the_same_text_in_both_columns() {
+        with_temp_data_root(async {
+            let mut run = failure_ready_run(false);
+            run.focus_def = Some(single_tier3_step_focus_def());
+            run.user_input = "write me a letter".to_owned();
+            run.external_input = run.user_input.clone();
+            run.write_focus_run_record("awaiting_user").await.unwrap();
+            let (ui, ext) = stored_pair(&run).await;
+            assert_eq!(
+                (ui.as_deref(), ext.as_deref()),
+                (Some("write me a letter"), Some("write me a letter"))
+            );
+        })
+        .await;
+    }
+
+    /// items.id=883: resume. A run written by the real writer and read back by
+    /// rehydrate_focus_run (the one function resume_run and the scheduled sweep both
+    /// call) keeps the full window for local steps and gets its OWN stored
+    /// user-turns-only copy for external ones, never one derived from the window.
+    #[tokio::test]
+    async fn a_resumed_run_gets_its_stored_external_input_and_not_the_window() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+        let (user_id, persona_id) = ("resume-user-883", "resume-persona-883");
+        let pool = setup_shared_and_persona_for_resume_test(user_id, persona_id).await;
+
+        let mut run: FocusRun = FocusRun::new(
+            user_id.to_owned(),
+            persona_id.to_owned(),
+            "quick-ask".to_owned(),
+            pool.clone(),
+            Arc::new(ConductorScheduler::new()),
+            WINDOW.to_owned(),
+            false,
+            Some(RESUME_TEST_KEY_HEX.to_owned()),
+            None,
+            true,
+            std::collections::HashSet::new(),
+            None,
+        );
+        run.external_input = EXTERNAL.to_owned();
+        run.focus_def = Some(single_tier3_step_focus_def());
+        let run_id = uuid::Uuid::new_v4().to_string();
+        run.focus_run_id = Some(run_id.clone());
+        run.write_focus_run_record("awaiting_user").await.unwrap();
+
+        let resumed: FocusRun = rehydrate_focus_run(
+            user_id.to_owned(),
+            persona_id.to_owned(),
+            run_id,
+            pool.clone(),
+            Arc::new(ConductorScheduler::new()),
+            Some(RESUME_TEST_KEY_HEX.to_owned()),
+            std::collections::HashSet::new(),
+            None,
+        )
+        .await
+        .expect("rehydrate");
+        assert_eq!(
+            resumed.user_input, WINDOW,
+            "a local step still sees the window"
+        );
+        assert_eq!(resumed.external_input, EXTERNAL);
+        assert!(!resumed.external_input.contains("Assistant:"));
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    /// items.id=883, fail closed: a stored row with NO external copy (NULL: a row from
+    /// before outputs_018, or one written without it) resumes with an EMPTY external
+    /// input while user_input keeps the stored window for local steps. It is never
+    /// derived from the window.
+    #[tokio::test]
+    async fn a_resumed_run_with_a_null_external_input_gets_empty_never_the_window() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+        let (user_id, persona_id) = ("resume-user-883n", "resume-persona-883n");
+        let pool = setup_shared_and_persona_for_resume_test(user_id, persona_id).await;
+        let run_id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut conn = open_outputs_db(user_id, persona_id, RESUME_TEST_KEY_HEX)
+                .await
+                .expect("open");
+            sqlx::query(
+                "INSERT INTO focus_runs
+                 (id, focus_id, status, is_fast_lane, is_quick_ask, topic_id, user_input,
+                  external_input, started_at)
+                 VALUES (?, 'quick-ask', 'paused', 0, 1, NULL, ?, NULL, ?)",
+            )
+            .bind(&run_id)
+            .bind(WINDOW)
+            .bind(now())
+            .execute(&mut conn)
+            .await
+            .expect("seed");
+        }
+        let resumed: FocusRun = rehydrate_focus_run(
+            user_id.to_owned(),
+            persona_id.to_owned(),
+            run_id,
+            pool.clone(),
+            Arc::new(ConductorScheduler::new()),
+            Some(RESUME_TEST_KEY_HEX.to_owned()),
+            std::collections::HashSet::new(),
+            None,
+        )
+        .await
+        .expect("rehydrate");
+        assert_eq!(resumed.user_input, WINDOW);
+        assert_eq!(
+            resumed.external_input, "",
+            "NULL is empty, never the window"
+        );
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    /// Scan: rehydrate_focus_run never assigns external_input from user_input, the
+    /// resume paths all go through it, and the only assignments of the field in
+    /// lifecycle.rs production code are new() (the no-history default) and the stored copy.
+    #[test]
+    fn resume_never_derives_external_input_from_the_window() {
+        let src = include_str!("lifecycle.rs");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let live: String = code
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let start = live
+            .find("pub async fn rehydrate_focus_run")
+            .or_else(|| live.find("async fn rehydrate_focus_run"))
+            .expect("rehydrate_focus_run");
+        let body = &live[start..];
+        assert!(body.contains("run.external_input = external_input;"));
+        assert!(!body.contains("external_input = user_input"), "{body}");
+        assert!(!body.contains("external_input: user_input"), "{body}");
+        // Exactly two places set the field from something: new()'s default and the
+        // stored copy here.
+        assert_eq!(
+            live.matches("external_input: user_input.clone()").count(),
+            1
+        );
+        assert_eq!(
+            live.matches("run.external_input = external_input;").count(),
+            1
+        );
     }
 
     // -- items.id=894 B0 hand-check: does resuming a requires_user_handoff step

@@ -270,6 +270,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/outputs_017.sql"),
     },
     SchemaFile {
+        prefix: "outputs",
+        version: 18,
+        sql: include_str!("../../schema/outputs_018.sql"),
+    },
+    SchemaFile {
         prefix: "personal",
         version: 1,
         sql: include_str!("../../schema/personal_001.sql"),
@@ -3952,11 +3957,11 @@ mod tests {
 
         assert_eq!(
             result.expect("migration must apply cleanly"),
-            17,
+            18,
             "outputs_001 + outputs_002 + outputs_003 + outputs_004 + outputs_005 + \
              outputs_006 + outputs_007 + outputs_008 + outputs_009 + outputs_010 + \
              outputs_011 + outputs_012 + outputs_013 + outputs_014 + outputs_015 + \
-             outputs_016 + outputs_017 must all apply in one pass"
+             outputs_016 + outputs_017 + outputs_018 must all apply in one pass"
         );
 
         let mut conn =
@@ -5526,9 +5531,9 @@ mod tests {
             .await
             .expect("v11 must apply to a populated outputs.db");
         assert_eq!(
-            applied, 7,
-            "outputs_011, outputs_012, outputs_013, outputs_014, outputs_015, outputs_016 and \
-             outputs_017 were pending"
+            applied, 8,
+            "outputs_011, outputs_012, outputs_013, outputs_014, outputs_015, outputs_016, \
+             outputs_017 and outputs_018 were pending"
         );
 
         for (table, expected) in FOCUS_RUN_TABLES.iter().zip(before) {
@@ -5581,8 +5586,8 @@ mod tests {
             .await
             .expect("v12 must apply to a populated outputs.db");
         assert_eq!(
-            applied, 6,
-            "outputs_012, outputs_013, outputs_014, outputs_015, outputs_016 and outputs_017 \
+            applied, 7,
+            "outputs_012, outputs_013, outputs_014, outputs_015, outputs_016, outputs_017 and outputs_018 \
              were pending"
         );
 
@@ -5641,8 +5646,8 @@ mod tests {
             .await
             .expect("v13 must apply to a populated outputs.db");
         assert_eq!(
-            applied, 5,
-            "outputs_013, outputs_014, outputs_015, outputs_016 and outputs_017 were pending"
+            applied, 6,
+            "outputs_013, outputs_014, outputs_015, outputs_016, outputs_017 and outputs_018 were pending"
         );
         assert_eq!(row_count(&mut conn, "outputs").await, 1);
         assert_eq!(row_count(&mut conn, "focus_runs").await, 1);
@@ -5720,8 +5725,8 @@ mod tests {
             .await
             .expect("v14 must apply to a populated outputs.db");
         assert_eq!(
-            applied, 4,
-            "outputs_014, outputs_015, outputs_016 and outputs_017 were pending"
+            applied, 5,
+            "outputs_014, outputs_015, outputs_016, outputs_017 and outputs_018 were pending"
         );
 
         for table in [
@@ -5860,8 +5865,8 @@ mod tests {
             .await
             .expect("v15 must apply to a populated outputs.db");
         assert_eq!(
-            applied, 3,
-            "outputs_015, outputs_016 and outputs_017 were pending"
+            applied, 4,
+            "outputs_015, outputs_016, outputs_017 and outputs_018 were pending"
         );
 
         assert_eq!(row_count(&mut conn, "focus_runs").await, 1);
@@ -5933,7 +5938,10 @@ mod tests {
         let applied = run_migrations(&mut conn, "outputs", Some(TEST_KEY_HEX))
             .await
             .expect("v16 must apply to a populated outputs.db");
-        assert_eq!(applied, 2, "outputs_016 and outputs_017 were pending");
+        assert_eq!(
+            applied, 3,
+            "outputs_016, outputs_017 and outputs_018 were pending"
+        );
 
         assert_eq!(row_count(&mut conn, "focus_runs").await, 1);
         assert_eq!(row_count(&mut conn, "pass_artifacts").await, 1);
@@ -5982,6 +5990,36 @@ mod tests {
         );
     }
 
+    /// items.id=883: outputs_018 adds focus_runs.external_input. A populated v17 database
+    /// keeps its row, and the new column is NULL for it (which a resumed run reads as an
+    /// empty external input, never as a copy of user_input).
+    #[tokio::test]
+    async fn outputs_v17_to_v18_adds_external_input_null_for_existing_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut conn = open_keyed_scratch(&tmp.path().join("outputs.db")).await;
+        apply_versions_up_to(&mut conn, "outputs", 17).await;
+        exec_all(
+            &mut conn,
+            &[
+                "INSERT INTO focus_runs (id, focus_id, started_at, user_input) \
+                 VALUES ('run1', 'f', '2026-01-01T00:00:00Z', 'User: hi')",
+            ],
+        )
+        .await;
+
+        let applied = run_migrations(&mut conn, "outputs", Some(TEST_KEY_HEX))
+            .await
+            .expect("v18 must apply to a populated outputs.db");
+        assert_eq!(applied, 1, "only outputs_018 was pending");
+
+        let row: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT user_input, external_input FROM focus_runs WHERE id = 'run1'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(row, (Some("User: hi".to_owned()), None));
+    }
+
     /// items.id=901: outputs_017 adds plan_approvals and run_parks. A populated v16
     /// database keeps its rows and gains two empty tables with no foreign key and no
     /// trigger (items.id=633 rebuilds focus_runs and must not have to carry them), and the
@@ -6007,7 +6045,7 @@ mod tests {
         let applied = run_migrations(&mut conn, "outputs", Some(TEST_KEY_HEX))
             .await
             .expect("v17 must apply to a populated outputs.db");
-        assert_eq!(applied, 1, "only outputs_017 was pending");
+        assert_eq!(applied, 2, "outputs_017 and outputs_018 were pending");
 
         assert_eq!(row_count(&mut conn, "focus_runs").await, 1);
         assert_eq!(row_count(&mut conn, "pass_artifacts").await, 1);

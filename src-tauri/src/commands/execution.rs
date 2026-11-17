@@ -186,6 +186,12 @@ pub struct ReenterStepResponse {
 /// DTO is deserialized from the frontend, and a client must never choose which
 /// chat's session state a run reads. None for a run with no chat.
 ///
+/// `external_input` (items.id=883, decisions.id=937 point 3) is the user-turns-only text an
+/// external step receives for {user_input}. Server-side only, like `bound`, and a parameter
+/// (not a DTO field) because the focus_runs row is written inside this call and must store
+/// it. send_message passes build_user_turns_prompt, API Chat its same-producer history, and
+/// every caller with no history passes None (it then equals `user_input`).
+///
 /// items.id=778: the caller holds the run's writer lease (taken before anything
 /// was written) across this call and moves it into `run.lease` afterwards, so
 /// the run keeps it until it is dropped. If LOAD or AUTHORIZE fails the lease
@@ -209,6 +215,7 @@ pub(crate) async fn load_and_authorize_run(
     bound: Option<crate::api_chat::BoundDestination>,
     context_key: Option<String>,
     plan_memory: PlanMemory,
+    external_input: Option<String>,
     request: SubmitFocusRunRequest,
 ) -> Result<LoadOutcome, String> {
     let is_quick_ask = is_quick_ask_focus(&request.focus_id);
@@ -239,6 +246,12 @@ pub(crate) async fn load_and_authorize_run(
         confirmed_cross_persona_fact_ids,
         Some(app_handle),
     );
+    // items.id=883: the text an external render inserts for {user_input}, set BEFORE
+    // the focus_runs row is written so the stored copy is this one and never the full
+    // window. None = a run with no history (the default, its own typed text).
+    if let Some(external) = external_input {
+        run.external_input = external;
+    }
     run.crisis_floor_triggered = crisis_detected;
     run.chat_binding = bound;
     run.context_key = context_key;
@@ -388,6 +401,7 @@ pub async fn submit_focus_run(
         None,
         None, // submit_focus_run belongs to no chat
         plan_memory.inner().clone(),
+        None, // items.id=883: no history, so external_input defaults to the typed text
         request,
     )
     .await?

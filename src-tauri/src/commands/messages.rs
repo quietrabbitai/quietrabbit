@@ -728,6 +728,10 @@ pub async fn send_message(
         None,
         Some(context_key.clone()),
         plan_memory.inner().clone(),
+        // items.id=883: an external step and the hand-off starter get the user's own
+        // turns only; the local render keeps the full window (user_input). Passed in so
+        // the focus_runs row stores it.
+        Some(external_input),
         request,
     )
     .await?
@@ -750,9 +754,6 @@ pub async fn send_message(
         }
     };
     run.attach_lease(lease).map_err(|e| e.to_string())?;
-    // items.id=883: an external step and the hand-off starter get the user's own turns
-    // only; the local render keeps the full window (run.user_input).
-    run.external_input = external_input;
     // items.id=387: the raw turn, for the hand-off return writer alone (never
     // persisted or logged; see conductor::handoff_writer).
     run.set_current_turn(content);

@@ -1116,7 +1116,7 @@ pub async fn cancel_focus_run(
     // items.id=894 B0: a cancelled run can no longer resume, so it keeps no copy
     // of its input (USER_INPUT_CLEARED_STATUSES).
     let changed = sqlx::query(
-        "UPDATE focus_runs SET status = 'cancelled', user_input = NULL
+        "UPDATE focus_runs SET status = 'cancelled', user_input = NULL, external_input = NULL
          WHERE id = ? AND status NOT IN ('complete','cancelled','failed')",
     )
     .bind(run_id)
@@ -1165,11 +1165,14 @@ pub async fn set_focus_run_status(
     // items.id=894 B0: a terminal status clears the run's input in the same
     // statement (see USER_INPUT_CLEARED_STATUSES).
     if USER_INPUT_CLEARED_STATUSES.contains(&status) {
-        sqlx::query("UPDATE focus_runs SET status = ?, user_input = NULL WHERE id = ?")
-            .bind(status)
-            .bind(focus_run_id)
-            .execute(&mut conn)
-            .await?;
+        sqlx::query(
+            "UPDATE focus_runs SET status = ?, user_input = NULL, external_input = NULL
+             WHERE id = ?",
+        )
+        .bind(status)
+        .bind(focus_run_id)
+        .execute(&mut conn)
+        .await?;
     } else {
         sqlx::query("UPDATE focus_runs SET status = ? WHERE id = ?")
             .bind(status)

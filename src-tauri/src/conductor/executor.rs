@@ -9356,6 +9356,23 @@ mod tests {
         assert!(!external.contains(MODEL_FACT), "{external}");
     }
 
+    /// items.id=883, fail closed: with no external copy (a resumed run whose stored copy
+    /// was NULL) an external render has an EMPTY {user_input} while the local render
+    /// still sees the window.
+    #[test]
+    fn an_empty_external_input_renders_empty_while_the_local_render_keeps_the_window() {
+        let mut ctx = hosted_ctx(RunAttendance::Attended, "unused");
+        ctx.step.prompt_template = WINDOW_TEMPLATE.to_owned();
+        with_window(&mut ctx);
+        ctx.external_input = String::new();
+        let vars = HashMap::new();
+        let external = render_prompt_with_disclosure(&ctx, &vars, "", &HashMap::new(), "");
+        assert_eq!(external, "Help with:  End.");
+        assert!(!external.contains(USER_TURN) && !external.contains(MODEL_FACT));
+        let local = render_prompt(&ctx, &vars, "", "");
+        assert!(local.contains(USER_TURN) && local.contains(MODEL_FACT));
+    }
+
     /// Scan: the external render reads ctx.external_input and never ctx.user_input, and
     /// the local render is the one reader of the full window in this file.
     #[test]

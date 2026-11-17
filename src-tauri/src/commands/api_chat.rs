@@ -565,6 +565,9 @@ pub async fn send_api_chat_message(
         Some(destination.clone()),
         Some(context_key.clone()),
         plan_memory.inner().clone(),
+        // items.id=883: an API Chat run's external text is its reviewed, same-producer
+        // history (build_api_history), the same text as its window.
+        Some(api_history.prompt.clone()),
         run_request,
     )
     .await?
@@ -576,9 +579,6 @@ pub async fn send_api_chat_message(
         execution::LoadOutcome::PlanRequired(_) => return Err(execution::plan_required_error()),
     };
     run.attach_lease(lease).map_err(|e| e.to_string())?;
-    // items.id=883: an API Chat run's external text is its reviewed, same-producer
-    // history (build_api_history), the same text as its window.
-    run.external_input = api_history.prompt.clone();
     let run_id = run
         .focus_run_id
         .clone()
