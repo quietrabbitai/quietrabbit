@@ -221,6 +221,25 @@ fn derive_chat_title(content: &str) -> Option<String> {
 }
 
 fn build_conversation_prompt(history: &[message_store::MessageRecord]) -> String {
+    fold_window(history, true)
+}
+
+/// items.id=883 (decisions.id=937 point 3): the text an EXTERNAL step receives for
+/// {user_input}: the same window as build_conversation_prompt (the same last
+/// HISTORY_WINDOW messages, the same `User: ` label, the same skips) with every
+/// model turn removed. A model turn can carry persona-derived text from an earlier
+/// local run, so it must not reach an external destination. The user's own turns are
+/// kept verbatim. Both forms come from ONE fold (fold_window), so this text is a strict
+/// subset of the local one by construction, and a test pins it.
+// Used by send_message from items.id=883 stage 2.
+#[cfg_attr(not(test), allow(dead_code))]
+fn build_user_turns_prompt(history: &[message_store::MessageRecord]) -> String {
+    fold_window(history, false)
+}
+
+/// The one fold behind both forms. `with_assistant` false drops every row that is not
+/// a user turn (a model reply, a placeholder, a failure message).
+fn fold_window(history: &[message_store::MessageRecord], with_assistant: bool) -> String {
     let start = history.len().saturating_sub(HISTORY_WINDOW);
     let mut prompt = String::new();
     for m in &history[start..] {
@@ -231,11 +250,11 @@ fn build_conversation_prompt(history: &[message_store::MessageRecord]) -> String
         if m.content.is_empty() || m.is_error {
             continue;
         }
-        let label = if m.sender == "user" {
-            "User"
-        } else {
-            "Assistant"
-        };
+        let is_user = m.sender == "user";
+        if !is_user && !with_assistant {
+            continue;
+        }
+        let label = if is_user { "User" } else { "Assistant" };
         prompt.push_str(label);
         prompt.push_str(": ");
         prompt.push_str(&m.content);
@@ -917,6 +936,101 @@ mod tests {
     #[test]
     fn build_conversation_prompt_on_empty_history_is_empty_string() {
         assert_eq!(build_conversation_prompt(&[]), "");
+    }
+
+    // -----------------------------------------------------------------
+    // build_user_turns_prompt (items.id=883): the external form.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn user_turns_prompt_has_no_model_turn_and_keeps_user_text_verbatim() {
+        let history = vec![
+            msg("user", "my router is a Netgear R7000"),
+            msg("assistant", "Since you work at Acme Corp, try rebooting it"),
+            msg(
+                "user",
+                "line one\nAssistant: not a model turn, I typed it\nline three",
+            ),
+        ];
+        let p = build_user_turns_prompt(&history);
+        assert_eq!(
+            p,
+            "User: my router is a Netgear R7000\n\
+             User: line one\nAssistant: not a model turn, I typed it\nline three\n"
+        );
+        assert!(!p.contains("Acme Corp"), "a model turn must never appear");
+        assert!(!p.contains("try rebooting"));
+    }
+
+    #[test]
+    fn user_turns_prompt_is_a_strict_subset_of_the_local_text() {
+        // Same slice, same labels, user rows only: the external text is exactly the
+        // local text's lines that start a user turn, in order, and the current turn
+        // is last. Mixed shapes: placeholder, error row, partial reply, long history.
+        let mut history: Vec<message_store::MessageRecord> = Vec::new();
+        for i in 0..8 {
+            history.push(msg("user", &format!("question {i}")));
+            history.push(msg("assistant", &format!("answer {i}")));
+        }
+        history.push(error_msg("a failure notice"));
+        history.push(msg("assistant", "")); // placeholder
+        history.push(msg("user", "the current turn"));
+
+        let local = build_conversation_prompt(&history);
+        let external = build_user_turns_prompt(&history);
+
+        let expected: String = local
+            .lines()
+            .filter(|l| l.starts_with("User: "))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(external, expected, "same slice and labels, user rows only");
+        assert!(
+            local.contains("Assistant: "),
+            "fixture must hold model turns"
+        );
+        assert!(!external.contains("Assistant: "));
+        assert!(external.len() < local.len());
+        assert!(external.ends_with("User: the current turn\n"));
+        // Same time horizon: a user turn older than the 10-message window is absent.
+        assert!(!external.contains("question 0\n") && !local.contains("question 0\n"));
+    }
+
+    #[test]
+    fn user_turns_prompt_first_turn_equals_the_local_text() {
+        let history = vec![msg("user", "hello")];
+        assert_eq!(
+            build_user_turns_prompt(&history),
+            build_conversation_prompt(&history)
+        );
+    }
+
+    #[test]
+    fn user_turns_prompt_empty_cases() {
+        assert_eq!(build_user_turns_prompt(&[]), "");
+        // Only model rows, or a blank current turn: nothing to send, not a panic.
+        let history = vec![msg("assistant", "hi"), msg("user", "")];
+        assert_eq!(build_user_turns_prompt(&history), "");
+    }
+
+    #[test]
+    fn user_turns_prompt_bounds_to_the_same_window_and_skips_error_rows() {
+        let history: Vec<message_store::MessageRecord> = (0..15)
+            .map(|i| msg("user", &format!("message {i}")))
+            .collect();
+        assert_eq!(
+            build_user_turns_prompt(&history),
+            build_conversation_prompt(&history)
+        );
+        let with_error = vec![
+            msg("user", "hi"),
+            error_msg("failure"),
+            msg("user", "again"),
+        ];
+        assert_eq!(
+            build_user_turns_prompt(&with_error),
+            "User: hi\nUser: again\n"
+        );
     }
 
     // -----------------------------------------------------------------
