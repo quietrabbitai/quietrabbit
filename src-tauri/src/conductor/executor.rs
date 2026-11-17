@@ -9396,6 +9396,265 @@ mod tests {
         .await;
     }
 
+    // -- items.id=882 stage 4: the declared field_requirements path, from the REAL
+    // shipped templates. END-TO-END LIMIT: the personal track here is a FIXTURE
+    // (add_field in the test). In production PersonalTrack.fields is left empty at
+    // INITIALIZE (personal_store.rs, items.id=170) and nothing bridges entity facts to
+    // Gate 1 (items.id=929), so today these fields arrive empty in a real run. What
+    // these tests prove is the path from Gate 1 to the prompt, not the source.
+
+    async fn shipped_step(
+        pool: &sqlx::SqlitePool,
+        focus: &str,
+        step: &str,
+    ) -> crate::conductor::tokens::ActionDefinition {
+        let def = crate::conductor::lifecycle::load_focus_definition(pool, focus)
+            .await
+            .unwrap_or_else(|e| panic!("{focus} must load: {e}"));
+        def.steps
+            .into_iter()
+            .find(|s| s.action_id == step)
+            .unwrap_or_else(|| panic!("{focus} has no step {step}"))
+    }
+
+    fn fixture_field(
+        name: &str,
+        value: &str,
+        sensitivity: &str,
+        severity: i32,
+        tier2: &str,
+    ) -> crate::conductor::types::PersonalField {
+        crate::conductor::types::PersonalField {
+            field_name: name.to_owned(),
+            field_value: value.to_owned(),
+            sensitivity: sensitivity.to_owned(),
+            sensitivity_severity: severity,
+            source_id: "personal-specialist".to_owned(),
+            abstraction_tier2: tier2.to_owned(),
+            abstraction_tier3: "omit".to_owned(),
+        }
+    }
+
+    /// job_title, employer and industry at `tier2`, plus income_range (not declared
+    /// by either shipped step) at `pass`, so only the step's declaration keeps it out.
+    fn professional_track(tier2: &str) -> PersonalTrack {
+        let mut pt = PersonalTrack::new();
+        for f in [
+            fixture_field("job_title", "Staff Engineer", "personal", 2, tier2),
+            fixture_field("employer", "Acme Robotics", "personal", 2, tier2),
+            fixture_field("industry", "Logistics", "personal", 2, tier2),
+            fixture_field("income_range", "INCOME-185000", "financial", 3, "pass"),
+        ] {
+            pt.add_field(f).unwrap();
+        }
+        pt
+    }
+
+    /// The text the outbound review saw for the shipped step, run through execute_once
+    /// at tier 2 with `track`.
+    async fn shipped_prompt(
+        pool: &sqlx::SqlitePool,
+        focus: &str,
+        step: &str,
+        track: &PersonalTrack,
+    ) -> (String, PrivacyGateway<TestLogger>) {
+        let key_hex = hosted_pick_rig(pool).await;
+        let mut ctx = hosted_ctx(RunAttendance::Attended, &key_hex);
+        ctx.step = shipped_step(pool, focus, step).await;
+        ctx.effective_access = ctx.step.routing_tier;
+        ctx.focus_external_access = ctx.step.routing_tier;
+        ctx.execution_tier = 2;
+        ctx.abstraction_tier = 2;
+        ctx.raw_abstraction = 1;
+        // The saved "modified" preference, so a field that summarize changes does not
+        // park the step on floor consent: this test reads the prompt.
+        ctx.floor_consent_preference = Some(FLOOR_CONSENT_MODIFIED.to_owned());
+        ctx.persona_context = PERSONA_FACT.to_owned();
+        let (forced, seen) = capturing_scanner();
+        let _g = step_review::forced::arm(&ctx, forced).await;
+        let (_out, _track, gateway) = run_once_with(&ctx, pool, track).await;
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 1, "the review saw exactly one prompt");
+        (seen[0].clone(), gateway)
+    }
+
+    /// fit_analysis, real template, fields at `pass`: the values reach the tier-2 prompt;
+    /// the undeclared income_range and the persona slice never do.
+    #[tokio::test]
+    async fn fit_analysis_shows_declared_fields_at_pass() {
+        with_temp_shared_db(|pool| async move {
+            let (prompt, gateway) = shipped_prompt(
+                &pool,
+                "role-assessment",
+                "fit_analysis",
+                &professional_track("pass"),
+            )
+            .await;
+            assert!(
+                prompt.contains("Current role, if provided: Staff Engineer"),
+                "{prompt}"
+            );
+            assert!(
+                prompt.contains("Current employer, if provided: Acme Robotics"),
+                "{prompt}"
+            );
+            assert!(
+                prompt.contains("Current industry, if provided: Logistics"),
+                "{prompt}"
+            );
+            assert!(!prompt.contains("INCOME-185000"), "{prompt}");
+            assert!(!prompt.contains(PERSONA_FACT), "{prompt}");
+            assert!(!prompt.contains("{persona_context}"), "{prompt}");
+            // The disclosure log row Gate 1 wrote: all four are shared as they are
+            // (nothing abstracted). NOTE it lists every field Gate 1 approved, so it
+            // names income_range although projection kept it out of the prompt: the
+            // log OVER-reports against the prompt, never under-reports.
+            let rows = gate1_entries(&gateway);
+            assert_eq!(rows.len(), 1);
+            let mut shared = rows[0].fields_shared.clone();
+            shared.sort();
+            assert_eq!(
+                shared,
+                ["employer", "income_range", "industry", "job_title"]
+            );
+            assert!(rows[0].fields_abstracted.is_empty());
+            assert!(rows[0].fields_withheld.is_empty());
+            assert_eq!(rows[0].abstraction_tier, Some(2));
+        })
+        .await;
+    }
+
+    /// The same step at summarize: the exact labels summarize_label produces for a
+    /// personal-sensitivity field, and no value.
+    #[tokio::test]
+    async fn fit_analysis_shows_the_summarize_labels_at_summarize() {
+        with_temp_shared_db(|pool| async move {
+            let (prompt, gateway) = shipped_prompt(
+                &pool,
+                "role-assessment",
+                "fit_analysis",
+                &professional_track("summarize"),
+            )
+            .await;
+            assert!(
+                prompt.contains("Current role, if provided: personal job title information"),
+                "{prompt}"
+            );
+            assert!(
+                prompt.contains("Current employer, if provided: personal employer information"),
+                "{prompt}"
+            );
+            assert!(
+                prompt.contains("Current industry, if provided: personal industry information"),
+                "{prompt}"
+            );
+            for raw in [
+                "Staff Engineer",
+                "Acme Robotics",
+                "Logistics",
+                "INCOME-185000",
+            ] {
+                assert!(!prompt.contains(raw), "{raw} leaked: {prompt}");
+            }
+            let rows = gate1_entries(&gateway);
+            assert_eq!(rows.len(), 1);
+            let mut abstracted: Vec<_> = rows[0].fields_abstracted.keys().cloned().collect();
+            abstracted.sort();
+            assert_eq!(abstracted, ["employer", "industry", "job_title"]);
+            assert_eq!(
+                rows[0].fields_abstracted["job_title"],
+                "personal job title information"
+            );
+            // income_range (pass) is the one field shared as it is, and it is not in
+            // the prompt.
+            assert_eq!(rows[0].fields_shared, ["income_range"]);
+        })
+        .await;
+    }
+
+    /// The real case today (no field arrives): the prompt is the stage 1 withheld
+    /// render, with nothing left of the fields or the persona slice.
+    #[tokio::test]
+    async fn fit_analysis_with_no_fields_reads_empty_after_each_label() {
+        with_temp_shared_db(|pool| async move {
+            let (prompt, _) =
+                shipped_prompt(&pool, "role-assessment", "fit_analysis", &PersonalTrack::new())
+                    .await;
+            assert!(prompt.contains("Current role, if provided:  Current employer, if provided:  Current industry, if provided:"), "{prompt}");
+            assert!(prompt.trim_end().ends_with("Current industry, if provided:"), "{prompt}");
+            assert!(!prompt.contains(PERSONA_FACT), "{prompt}");
+        })
+        .await;
+    }
+
+    /// research, real template: location_city is the one declared field.
+    #[tokio::test]
+    async fn research_shows_only_the_declared_location_city() {
+        with_temp_shared_db(|pool| async move {
+            let mut track = professional_track("pass");
+            track
+                .add_field(fixture_field("location_city", "Portland", "general", 1, "pass"))
+                .unwrap();
+            let (prompt, _) = shipped_prompt(&pool, "research-and-buy", "research", &track).await;
+            assert!(
+                prompt.contains(
+                    "Region (use for availability and pricing if present, ignore if empty): Portland"
+                ),
+                "{prompt}"
+            );
+            for hidden in ["Staff Engineer", "Acme Robotics", "Logistics", "INCOME-185000", PERSONA_FACT] {
+                assert!(!prompt.contains(hidden), "{hidden} leaked: {prompt}");
+            }
+        })
+        .await;
+    }
+
+    /// The real shipped files load (the lint of stage 3 runs on them) and their real
+    /// templates carry no {persona_context}, in the template or the declaration; the
+    /// two edited steps declare exactly the fields the plan names.
+    #[tokio::test]
+    async fn the_shipped_focuses_load_and_no_template_names_persona_context() {
+        with_temp_shared_db(|pool| async move {
+            for focus in [
+                "quick-ask",
+                "writing-assistant",
+                "research-and-buy",
+                "role-assessment",
+                "api-chat",
+                "qr-admin",
+            ] {
+                let def = crate::conductor::lifecycle::load_focus_definition(&pool, focus)
+                    .await
+                    .unwrap_or_else(|e| panic!("{focus} must load: {e}"));
+                for s in &def.steps {
+                    assert!(
+                        !find_tokens(&s.prompt_template)
+                            .iter()
+                            .any(|t| t == "persona_context"),
+                        "{focus}/{}",
+                        s.action_id
+                    );
+                    assert!(
+                        !s.declared_inputs.iter().any(|d| d == "persona_context"),
+                        "{focus}/{}",
+                        s.action_id
+                    );
+                }
+            }
+            let names = |s: &crate::conductor::tokens::ActionDefinition| {
+                let mut n: Vec<String> = s.field_requirements.keys().cloned().collect();
+                n.sort();
+                n
+            };
+            let research = shipped_step(&pool, "research-and-buy", "research").await;
+            assert_eq!(names(&research), ["location_city"]);
+            let fit = shipped_step(&pool, "role-assessment", "fit_analysis").await;
+            assert_eq!(names(&fit), ["employer", "industry", "job_title"]);
+            assert!(!names(&fit).contains(&"income_range".to_owned()));
+        })
+        .await;
+    }
+
     /// No filter, no external step: an unbound hosted pick parks before the context
     /// check, the inference slot and the spend gate, and nothing is sent.
     #[tokio::test]
