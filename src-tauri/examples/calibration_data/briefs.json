@@ -1,0 +1,1633 @@
+{
+ "note": "Synthetic briefs for the local calibration harness (items.id=899). Every name, address, order number and organisation is invented. Each point carries keyword groups for the coverage measure: every group must match, a group matches when any alternative appears at the start of a word. The first brief of five types is the items.id=893 and 894 part 0 brief.",
+ "briefs": [
+  {
+   "id": "rma_letter-1",
+   "document_type": "rma_letter",
+   "origin": "items.id=893 and 894 part 0 brief",
+   "task": "Ask for a return authorization for a laptop.",
+   "recipient": "Returns department, Brightwater Electronics",
+   "sender": {
+    "address": "418 Larch Street, Duluth, MN 55802",
+    "date": "13 November 2026",
+    "name": "Tomas Brandvold"
+   },
+   "context": {
+    "employer": "Halvorsen Marine Supply",
+    "job_title": "Warehouse supervisor",
+    "location_city": "Duluth"
+   },
+   "points": [
+    {
+     "keys": [
+      [
+       "return authorization",
+       "return authorisation",
+       "return merchandise",
+       "rma"
+      ]
+     ],
+     "text": "Wants a return authorization"
+    },
+    {
+     "keys": [
+      [
+       "vantelle x14"
+      ]
+     ],
+     "text": "Product: Vantelle X14 laptop"
+    },
+    {
+     "keys": [
+      [
+       "vx14-0042718"
+      ]
+     ],
+     "text": "Serial number: VX14-0042718"
+    },
+    {
+     "keys": [
+      [
+       "3 august 2026",
+       "august 3, 2026",
+       "august 3 2026",
+       "august 3rd",
+       "3rd august"
+      ]
+     ],
+     "text": "Bought on 3 August 2026 from Brightwater Electronics"
+    },
+    {
+     "keys": [
+      [
+       "bw-558201"
+      ]
+     ],
+     "text": "Order number: BW-558201"
+    },
+    {
+     "keys": [
+      [
+       "hinge"
+      ],
+      [
+       "second week",
+       "2nd week",
+       "two weeks",
+       "week two"
+      ]
+     ],
+     "text": "The left hinge cracked in the second week"
+    },
+    {
+     "keys": [
+      [
+       "wobble"
+      ]
+     ],
+     "text": "The screen now wobbles"
+    },
+    {
+     "keys": [
+      [
+       "replacement"
+      ],
+      [
+       "refund"
+      ]
+     ],
+     "text": "Wants a replacement, not a refund"
+    },
+    {
+     "keys": [
+      [
+       "label"
+      ],
+      [
+       "own cost",
+       "own expense",
+       "my expense",
+       "my cost",
+       "at my own",
+       "pay for",
+       "pay the",
+       "cover the",
+       "cover shipping",
+       "shipping cost",
+       "shipping expense",
+       "shipping fee",
+       "postage"
+      ]
+     ],
+     "text": "Can ship it at own cost if they send a label"
+    }
+   ]
+  },
+  {
+   "id": "rma_letter-2",
+   "document_type": "rma_letter",
+   "origin": "items.id=899",
+   "task": "Ask for a refund for faulty headphones.",
+   "recipient": "Returns team, Tidewater Audio",
+   "sender": {
+    "name": "Mirelle Costa",
+    "address": "27 Heron Way, Tacoma, WA 98402",
+    "date": "16 November 2026"
+   },
+   "context": {
+    "job_title": "Dental hygienist",
+    "employer": "Bellmont Dental",
+    "location_city": ""
+   },
+   "points": [
+    {
+     "text": "Wants a refund to the original payment method",
+     "keys": [
+      [
+       "refund"
+      ],
+      [
+       "original payment",
+       "original method",
+       "card"
+      ]
+     ]
+    },
+    {
+     "text": "Product: Halden H3 headphones",
+     "keys": [
+      [
+       "halden h3"
+      ]
+     ]
+    },
+    {
+     "text": "Order number: HA-30417",
+     "keys": [
+      [
+       "ha-30417"
+      ]
+     ]
+    },
+    {
+     "text": "Bought on 22 September 2026 from Tidewater Audio",
+     "keys": [
+      [
+       "22 september 2026",
+       "september 22, 2026",
+       "september 22 2026",
+       "22nd september"
+      ]
+     ]
+    },
+    {
+     "text": "The left ear cup stopped working after two weeks",
+     "keys": [
+      [
+       "left"
+      ],
+      [
+       "two weeks",
+       "2 weeks",
+       "second week",
+       "fortnight"
+      ]
+     ]
+    },
+    {
+     "text": "Still has the original box",
+     "keys": [
+      [
+       "box",
+       "packaging"
+      ]
+     ]
+    },
+    {
+     "text": "Will post it back at own cost with a label",
+     "keys": [
+      [
+       "label"
+      ],
+      [
+       "own cost",
+       "own expense",
+       "my expense",
+       "my cost",
+       "at my own",
+       "pay for",
+       "pay the",
+       "cover the",
+       "postage",
+       "shipping"
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "id": "rma_letter-3",
+   "document_type": "rma_letter",
+   "origin": "items.id=899",
+   "task": "Ask for a repair or replacement of a coffee machine.",
+   "recipient": "Returns department, Fennimore Home Goods",
+   "sender": {
+    "name": "Gerald Oyelaran",
+    "address": "310 Pine Ridge Road, Billings, MT 59101",
+    "date": "16 November 2026"
+   },
+   "context": {
+    "job_title": "Bus driver",
+    "employer": "Yellowstone Valley Transit",
+    "location_city": ""
+   },
+   "points": [
+    {
+     "text": "Product: Corrin Barista 5 espresso machine",
+     "keys": [
+      [
+       "corrin barista 5"
+      ]
+     ]
+    },
+    {
+     "text": "Serial number: CB5-771204",
+     "keys": [
+      [
+       "cb5-771204"
+      ]
+     ]
+    },
+    {
+     "text": "Bought on 9 October 2026 from Fennimore Home Goods",
+     "keys": [
+      [
+       "9 october 2026",
+       "october 9, 2026",
+       "october 9 2026",
+       "9th october"
+      ]
+     ]
+    },
+    {
+     "text": "Order number: FH-90216",
+     "keys": [
+      [
+       "fh-90216"
+      ]
+     ]
+    },
+    {
+     "text": "The pump makes a grinding noise",
+     "keys": [
+      [
+       "grinding"
+      ],
+      [
+       "pump"
+      ]
+     ]
+    },
+    {
+     "text": "It also leaks water under the machine",
+     "keys": [
+      [
+       "leak"
+      ]
+     ]
+    },
+    {
+     "text": "Wants a repair or a replacement",
+     "keys": [
+      [
+       "repair"
+      ],
+      [
+       "replacement",
+       "replace"
+      ]
+     ]
+    },
+    {
+     "text": "Can send photos of the leak",
+     "keys": [
+      [
+       "photo"
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "id": "complaint_email-1",
+   "document_type": "complaint_email",
+   "origin": "items.id=893 and 894 part 0 brief",
+   "task": "Make a formal complaint.",
+   "recipient": "Customer service manager, Corvid Broadband",
+   "sender": {
+    "address": "92 Alder Court, Spokane, WA 99201",
+    "date": "13 November 2026",
+    "name": "Renata Voss"
+   },
+   "context": {
+    "employer": "Mirelle & Dunn Accounting",
+    "job_title": "Accounts payable clerk",
+    "location_city": "Spokane"
+   },
+   "points": [
+    {
+     "keys": [
+      [
+       "tr-220"
+      ]
+     ],
+     "text": "Router: TR-220"
+    },
+    {
+     "keys": [
+      [
+       "evening",
+       "night"
+      ],
+      [
+       "drop",
+       "disconnect",
+       "cut out",
+       "lost",
+       "interrupt",
+       "unstable",
+       "intermittent"
+      ]
+     ],
+     "text": "The connection has dropped every evening"
+    },
+    {
+     "keys": [
+      [
+       "five weeks",
+       "5 weeks",
+       "five-week"
+      ]
+     ],
+     "text": "For five weeks"
+    },
+    {
+     "keys": [
+      [
+       "four",
+       "4 ticket",
+       "4 support",
+       "4 separate"
+      ],
+      [
+       "ticket"
+      ]
+     ],
+     "text": "Four support tickets logged"
+    },
+    {
+     "keys": [
+      [
+       "cb-77120"
+      ],
+      [
+       "cb-77391"
+      ],
+      [
+       "cb-77804"
+      ],
+      [
+       "cb-78213"
+      ]
+     ],
+     "text": "Ticket numbers: CB-77120, CB-77391, CB-77804, CB-78213"
+    },
+    {
+     "keys": [
+      [
+       "restart"
+      ]
+     ],
+     "text": "Told each time to restart it"
+    },
+    {
+     "keys": [
+      [
+       "technician"
+      ],
+      [
+       "14 october",
+       "october 14"
+      ]
+     ],
+     "text": "A technician visit on 14 October never happened"
+    },
+    {
+     "keys": [
+      [
+       "nobody",
+       "no one",
+       "never called",
+       "did not call",
+       "didn't call",
+       "no call",
+       "not called",
+       "no phone call",
+       "without calling",
+       "failed to call",
+       "follow-up",
+       "follow up",
+       "not contacted",
+       "never contacted",
+       "no contact",
+       "no communication",
+       "not received any",
+       "was not contacted",
+       "wasn't contacted"
+      ]
+     ],
+     "text": "Nobody called"
+    },
+    {
+     "keys": [
+      [
+       "fix",
+       "repair",
+       "resolv",
+       "rectif"
+      ]
+     ],
+     "text": "Wants the fault fixed"
+    },
+    {
+     "keys": [
+      [
+       "credit"
+      ]
+     ],
+     "text": "Wants a credit for the weeks paid for service not received"
+    },
+    {
+     "keys": [
+      [
+       "named",
+       "dedicated",
+       "direct contact",
+       "contact person",
+       "point of contact"
+      ]
+     ],
+     "text": "Wants a named contact"
+    }
+   ]
+  },
+  {
+   "id": "complaint_email-2",
+   "document_type": "complaint_email",
+   "origin": "items.id=899",
+   "task": "Make a formal complaint about no heating.",
+   "recipient": "Property manager, Oakridge Property Management",
+   "sender": {
+    "name": "Marcus Whitlow",
+    "address": "Apartment 4B, 15 Willow Lane, Spokane, WA 99201",
+    "date": "16 November 2026"
+   },
+   "context": {
+    "job_title": "Electrician",
+    "employer": "Ridgeline Electric",
+    "location_city": ""
+   },
+   "points": [
+    {
+     "text": "The heating has been off since 3 November",
+     "keys": [
+      [
+       "heating"
+      ],
+      [
+       "3 november",
+       "november 3"
+      ]
+     ]
+    },
+    {
+     "text": "Three phone calls logged on 4, 7 and 10 November",
+     "keys": [
+      [
+       "4",
+       "7",
+       "10"
+      ],
+      [
+       "call",
+       "phone"
+      ]
+     ]
+    },
+    {
+     "text": "A repair visit promised for 8 November never happened",
+     "keys": [
+      [
+       "8 november",
+       "november 8"
+      ],
+      [
+       "visit",
+       "repair"
+      ]
+     ]
+    },
+    {
+     "text": "Wants the heating fixed within 48 hours",
+     "keys": [
+      [
+       "48 hours",
+       "forty-eight hours",
+       "two days"
+      ]
+     ]
+    },
+    {
+     "text": "Wants a rent reduction for the days without heat",
+     "keys": [
+      [
+       "rent"
+      ],
+      [
+       "reduc",
+       "credit",
+       "discount",
+       "refund",
+       "rebate"
+      ]
+     ]
+    },
+    {
+     "text": "Wants written confirmation of the repair date",
+     "keys": [
+      [
+       "written",
+       "in writing",
+       "confirm"
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "id": "complaint_email-3",
+   "document_type": "complaint_email",
+   "origin": "items.id=899",
+   "task": "Make a formal complaint about a late and incomplete food delivery.",
+   "recipient": "Customer care team, QuickPlate",
+   "sender": {
+    "name": "Priya Natarajan",
+    "address": "58 Orchard Close, Missoula, MT 59801",
+    "date": "16 November 2026"
+   },
+   "context": {
+    "job_title": "Nurse",
+    "employer": "Riverside Clinic",
+    "location_city": ""
+   },
+   "points": [
+    {
+     "text": "Order ST-4471 from Saltmarsh Kitchen through the QuickPlate app",
+     "keys": [
+      [
+       "st-4471"
+      ],
+      [
+       "saltmarsh"
+      ]
+     ]
+    },
+    {
+     "text": "Delivered on 8 November",
+     "keys": [
+      [
+       "8 november",
+       "november 8"
+      ]
+     ]
+    },
+    {
+     "text": "It arrived 70 minutes late",
+     "keys": [
+      [
+       "70 minutes",
+       "seventy minutes",
+       "70 min"
+      ]
+     ]
+    },
+    {
+     "text": "The food was cold",
+     "keys": [
+      [
+       "cold"
+      ]
+     ]
+    },
+    {
+     "text": "The lamb stew was missing",
+     "keys": [
+      [
+       "lamb stew",
+       "stew"
+      ],
+      [
+       "missing",
+       "not included",
+       "absent",
+       "did not arrive",
+       "never arrived",
+       "wasn't",
+       "was not",
+       "left out"
+      ]
+     ]
+    },
+    {
+     "text": "Charged 42.50 dollars",
+     "keys": [
+      [
+       "42.50"
+      ]
+     ]
+    },
+    {
+     "text": "Support chat offered only a voucher",
+     "keys": [
+      [
+       "voucher"
+      ]
+     ]
+    },
+    {
+     "text": "Wants a full refund",
+     "keys": [
+      [
+       "refund"
+      ],
+      [
+       "full"
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "id": "personal_note-1",
+   "document_type": "personal_note",
+   "origin": "items.id=893 and 894 part 0 brief",
+   "task": "Thank a neighbour.",
+   "recipient": "Dorrie, a neighbour",
+   "sender": {
+    "address": "92 Alder Court, Spokane, WA 99201",
+    "date": "13 November 2026",
+    "name": "Renata Voss"
+   },
+   "context": {
+    "employer": "Mirelle & Dunn Accounting",
+    "job_title": "Accounts payable clerk",
+    "location_city": "Spokane"
+   },
+   "points": [
+    {
+     "keys": [
+      [
+       "dorrie"
+      ],
+      [
+       "thank"
+      ]
+     ],
+     "text": "Thanks to Dorrie"
+    },
+    {
+     "keys": [
+      [
+       "house"
+      ],
+      [
+       "eye",
+       "watch",
+       "look",
+       "check"
+      ]
+     ],
+     "text": "She kept an eye on the house"
+    },
+    {
+     "keys": [
+      [
+       "tomato"
+      ],
+      [
+       "water"
+      ]
+     ],
+     "text": "She watered the tomatoes"
+    },
+    {
+     "keys": [
+      [
+       "ten days",
+       "10 days"
+      ]
+     ],
+     "text": "They were away for ten days"
+    },
+    {
+     "keys": [
+      [
+       "lemon curd"
+      ]
+     ],
+     "text": "They left her a jar of lemon curd"
+    },
+    {
+     "keys": [
+      [
+       "liked",
+       "enjoy",
+       "love",
+       "favourite",
+       "favorite"
+      ]
+     ],
+     "text": "She liked the lemon curd"
+    }
+   ]
+  },
+  {
+   "id": "personal_note-2",
+   "document_type": "personal_note",
+   "origin": "items.id=899",
+   "task": "Congratulate a friend on a new job.",
+   "recipient": "Joss, a friend",
+   "sender": {
+    "name": "Noor Haddad",
+    "address": "5 Linden Row, Duluth, MN 55805",
+    "date": "16 November 2026"
+   },
+   "context": {
+    "job_title": "Teacher",
+    "employer": "Kestrel Primary School",
+    "location_city": ""
+   },
+   "points": [
+    {
+     "text": "Congratulations on the new job",
+     "keys": [
+      [
+       "congrat"
+      ]
+     ]
+    },
+    {
+     "text": "Joss starts as a lab technician at Marrowfield Observatory next month",
+     "keys": [
+      [
+       "lab technician"
+      ],
+      [
+       "marrowfield"
+      ]
+     ]
+    },
+    {
+     "text": "Remembers Joss studying late into the night",
+     "keys": [
+      [
+       "late"
+      ],
+      [
+       "study",
+       "studying",
+       "studied"
+      ]
+     ]
+    },
+    {
+     "text": "Wants to take Joss out for dinner to celebrate",
+     "keys": [
+      [
+       "dinner"
+      ],
+      [
+       "celebrat"
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "id": "personal_note-3",
+   "document_type": "personal_note",
+   "origin": "items.id=899",
+   "task": "Apologise for missing a birthday.",
+   "recipient": "Aunt Berta",
+   "sender": {
+    "name": "Theo Lindqvist",
+    "address": "220 Maple Court, Spokane, WA 99203",
+    "date": "16 November 2026"
+   },
+   "context": {
+    "job_title": "Carpenter",
+    "employer": "Lindqvist Woodwork",
+    "location_city": ""
+   },
+   "points": [
+    {
+     "text": "Missed her 70th birthday on 2 November",
+     "keys": [
+      [
+       "70th",
+       "seventieth",
+       "70"
+      ],
+      [
+       "2 november",
+       "november 2"
+      ]
+     ]
+    },
+    {
+     "text": "Was ill with flu that week",
+     "keys": [
+      [
+       "flu"
+      ]
+     ]
+    },
+    {
+     "text": "Will visit on the first weekend of December",
+     "keys": [
+      [
+       "first weekend"
+      ],
+      [
+       "december"
+      ]
+     ]
+    },
+    {
+     "text": "Is sending a book of garden photographs",
+     "keys": [
+      [
+       "book"
+      ],
+      [
+       "garden"
+      ]
+     ]
+    },
+    {
+     "text": "Sends love",
+     "keys": [
+      [
+       "love"
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "id": "cover_letter-1",
+   "document_type": "cover_letter",
+   "origin": "items.id=893 and 894 part 0 brief",
+   "task": "Apply for a job as logistics coordinator.",
+   "recipient": "Northgate Freight Partners, Tacoma",
+   "sender": {
+    "address": "418 Larch Street, Duluth, MN 55802",
+    "date": "13 November 2026",
+    "name": "Tomas Brandvold"
+   },
+   "context": {
+    "employer": "Halvorsen Marine Supply",
+    "job_title": "Warehouse supervisor",
+    "location_city": "Duluth"
+   },
+   "points": [
+    {
+     "keys": [
+      [
+       "logistics coordinator"
+      ],
+      [
+       "northgate"
+      ]
+     ],
+     "text": "Applying for the logistics coordinator job at Northgate Freight Partners in Tacoma"
+    },
+    {
+     "keys": [
+      [
+       "six years",
+       "6 years"
+      ],
+      [
+       "warehouse"
+      ]
+     ],
+     "text": "Six years in warehouse operations"
+    },
+    {
+     "keys": [
+      [
+       "mis-pick",
+       "mispick",
+       "mis pick"
+      ],
+      [
+       "a third",
+       "one-third",
+       "one third"
+      ]
+     ],
+     "text": "Cut mis-picks by a third at the current job"
+    },
+    {
+     "keys": [
+      [
+       "bin label"
+      ]
+     ],
+     "text": "Did it by redoing the bin labelling"
+    },
+    {
+     "keys": [
+      [
+       "spreadsheet"
+      ],
+      [
+       "taught",
+       "self-taught",
+       "teach"
+      ]
+     ],
+     "text": "Taught themselves spreadsheet reporting"
+    },
+    {
+     "keys": [
+      [
+       "by hand",
+       "manual"
+      ]
+     ],
+     "text": "The team stopped doing the reporting by hand"
+    },
+    {
+     "keys": [
+      [
+       "planning"
+      ]
+     ],
+     "text": "Wants to move into planning work"
+    }
+   ]
+  },
+  {
+   "id": "cover_letter-2",
+   "document_type": "cover_letter",
+   "origin": "items.id=899",
+   "task": "Apply for a job as a junior bookkeeper.",
+   "recipient": "Hiring manager, Pinecrest Accounting, Spokane",
+   "sender": {
+    "name": "Hana Okonkwo-Reyes",
+    "address": "14 Birch Lane, Spokane, WA 99205",
+    "date": "16 November 2026"
+   },
+   "context": {
+    "job_title": "Office administrator",
+    "employer": "Halvorsen Hardware",
+    "location_city": ""
+   },
+   "points": [
+    {
+     "text": "Applying for the junior bookkeeper job at Pinecrest Accounting",
+     "keys": [
+      [
+       "junior bookkeeper"
+      ],
+      [
+       "pinecrest"
+      ]
+     ]
+    },
+    {
+     "text": "Four years as office administrator",
+     "keys": [
+      [
+       "four years",
+       "4 years"
+      ],
+      [
+       "administrator"
+      ]
+     ]
+    },
+    {
+     "text": "Handles the weekly invoices and supplier payments",
+     "keys": [
+      [
+       "invoice"
+      ],
+      [
+       "supplier"
+      ]
+     ]
+    },
+    {
+     "text": "Found and fixed a duplicate payment error",
+     "keys": [
+      [
+       "duplicate"
+      ]
+     ]
+    },
+    {
+     "text": "Studying for a bookkeeping certificate in the evenings",
+     "keys": [
+      [
+       "certificate"
+      ],
+      [
+       "evening"
+      ]
+     ]
+    },
+    {
+     "text": "Available to start in January",
+     "keys": [
+      [
+       "january"
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "id": "cover_letter-3",
+   "document_type": "cover_letter",
+   "origin": "items.id=899",
+   "task": "Apply for a job as a community garden coordinator.",
+   "recipient": "Selection panel, Lakeside Community Trust, Missoula",
+   "sender": {
+    "name": "Declan Faraday",
+    "address": "73 Aspen Terrace, Missoula, MT 59802",
+    "date": "16 November 2026"
+   },
+   "context": {
+    "job_title": "Landscaper",
+    "employer": "Greenfield Grounds",
+    "location_city": ""
+   },
+   "points": [
+    {
+     "text": "Applying for the community garden coordinator job at Lakeside Community Trust",
+     "keys": [
+      [
+       "community garden coordinator"
+      ],
+      [
+       "lakeside"
+      ]
+     ]
+    },
+    {
+     "text": "Seven years in landscaping",
+     "keys": [
+      [
+       "seven years",
+       "7 years"
+      ],
+      [
+       "landscap"
+      ]
+     ]
+    },
+    {
+     "text": "Ran a volunteer planting day with about 30 people",
+     "keys": [
+      [
+       "volunteer"
+      ],
+      [
+       "30",
+       "thirty"
+      ]
+     ]
+    },
+    {
+     "text": "Built raised beds for two schools",
+     "keys": [
+      [
+       "raised bed"
+      ],
+      [
+       "school"
+      ]
+     ]
+    },
+    {
+     "text": "Speaks to groups of children comfortably",
+     "keys": [
+      [
+       "children"
+      ],
+      [
+       "group",
+       "speak",
+       "talk"
+      ]
+     ]
+    },
+    {
+     "text": "Wants work that brings neighbours together",
+     "keys": [
+      [
+       "neighbour",
+       "neighbor"
+      ],
+      [
+       "together"
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "id": "essay_section-1",
+   "document_type": "essay_section",
+   "origin": "items.id=893 and 894 part 0 brief",
+   "task": "Write one section of an essay.",
+   "recipient": "General readers of the essay",
+   "sender": {
+    "address": "7 Quarry Lane, Bozeman, MT 59715",
+    "date": "13 November 2026",
+    "name": "Ilse Marchetti"
+   },
+   "context": {
+    "employer": "Cedar Hollow Public Library",
+    "job_title": "Library assistant",
+    "location_city": "Bozeman"
+   },
+   "points": [
+    {
+     "keys": [
+      [
+       "notice board",
+       "notice-board",
+       "bulletin board"
+      ],
+      [
+       "paper"
+      ]
+     ],
+     "text": "Argument: small towns should keep their paper-based public notice boards"
+    },
+    {
+     "keys": [
+      [
+       "council"
+      ],
+      [
+       "online"
+      ]
+     ],
+     "text": "This holds even when the council also posts notices online"
+    },
+    {
+     "keys": [
+      [
+       "left out",
+       "leave out",
+       "leaves out",
+       "excluded",
+       "exclude",
+       "miss out",
+       "shut out",
+       "locked out",
+       "cut off",
+       "no access",
+       "cannot access",
+       "can't access",
+       "unable to access",
+       "no internet",
+       "without internet",
+       "without access",
+       "lack access",
+       "lack internet",
+       "don't have access",
+       "do not have access"
+      ]
+     ],
+     "text": "Cover who gets left out by online-only notices"
+    },
+    {
+     "keys": [
+      [
+       "library"
+      ],
+      [
+       "post office"
+      ]
+     ],
+     "text": "A board in the library or post office is read by people who never visit the council website"
+    },
+    {
+     "keys": [
+      [
+       "website",
+       "web site"
+      ]
+     ],
+     "text": "Those readers never visit the council website"
+    }
+   ]
+  },
+  {
+   "id": "essay_section-2",
+   "document_type": "essay_section",
+   "origin": "items.id=899",
+   "task": "Write one section of an essay.",
+   "recipient": "General readers of the essay",
+   "sender": {
+    "name": "Ilse Marchetti",
+    "address": "7 Quarry Lane, Bozeman, MT 59715",
+    "date": "16 November 2026"
+   },
+   "context": {
+    "job_title": "Library assistant",
+    "employer": "Cedar Hollow Public Library",
+    "location_city": ""
+   },
+   "points": [
+    {
+     "text": "Argument: public libraries should lend tools as well as books",
+     "keys": [
+      [
+       "tool"
+      ],
+      [
+       "lend"
+      ]
+     ]
+    },
+    {
+     "text": "A household uses a drill for only a few minutes in a typical year",
+     "keys": [
+      [
+       "drill"
+      ],
+      [
+       "few minutes",
+       "minutes"
+      ]
+     ]
+    },
+    {
+     "text": "Lending spares households from buying equipment they use once or twice",
+     "keys": [
+      [
+       "buy",
+       "purchase",
+       "bought"
+      ]
+     ]
+    },
+    {
+     "text": "The cost to the library is small: shelving and repair",
+     "keys": [
+      [
+       "shelving"
+      ],
+      [
+       "repair"
+      ]
+     ]
+    },
+    {
+     "text": "Counterpoint: tools can be damaged or misused",
+     "keys": [
+      [
+       "damage"
+      ],
+      [
+       "misuse",
+       "misused"
+      ]
+     ]
+    },
+    {
+     "text": "Answer: a small deposit and a short instruction card",
+     "keys": [
+      [
+       "deposit"
+      ],
+      [
+       "instruction card",
+       "card"
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "id": "essay_section-3",
+   "document_type": "essay_section",
+   "origin": "items.id=899",
+   "task": "Write one section of an essay.",
+   "recipient": "General readers of the essay",
+   "sender": {
+    "name": "Ilse Marchetti",
+    "address": "7 Quarry Lane, Bozeman, MT 59715",
+    "date": "16 November 2026"
+   },
+   "context": {
+    "job_title": "Library assistant",
+    "employer": "Cedar Hollow Public Library",
+    "location_city": ""
+   },
+   "points": [
+    {
+     "text": "Argument: secondary schools should start later in the morning",
+     "keys": [
+      [
+       "later"
+      ],
+      [
+       "start",
+       "begin"
+      ]
+     ]
+    },
+    {
+     "text": "Teenagers' body clocks shift later, so early starts cut their sleep",
+     "keys": [
+      [
+       "body clock",
+       "body clocks",
+       "sleep"
+      ],
+      [
+       "teen",
+       "adolescen"
+      ]
+     ]
+    },
+    {
+     "text": "Alder Valley High moved its start from 7:45 to 8:45",
+     "keys": [
+      [
+       "alder valley"
+      ],
+      [
+       "7:45"
+      ],
+      [
+       "8:45"
+      ]
+     ]
+    },
+    {
+     "text": "Attendance improved after the change",
+     "keys": [
+      [
+       "attendance"
+      ]
+     ]
+    },
+    {
+     "text": "Objection: later starts make bus routes cost more",
+     "keys": [
+      [
+       "bus"
+      ],
+      [
+       "cost",
+       "expens"
+      ]
+     ]
+    },
+    {
+     "text": "Answer: the cost can be met by staggering the routes",
+     "keys": [
+      [
+       "stagger"
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "id": "creative_story-1",
+   "document_type": "creative_story",
+   "origin": "items.id=899",
+   "task": "Write a short story.",
+   "recipient": "General readers",
+   "sender": {
+    "name": "Ilse Marchetti",
+    "address": "7 Quarry Lane, Bozeman, MT 59715",
+    "date": "16 November 2026"
+   },
+   "context": {
+    "job_title": "Library assistant",
+    "employer": "Cedar Hollow Public Library",
+    "location_city": ""
+   },
+   "points": [
+    {
+     "text": "Setting: a lighthouse on a rocky island in winter",
+     "keys": [
+      [
+       "lighthouse"
+      ],
+      [
+       "island",
+       "rock"
+      ]
+     ]
+    },
+    {
+     "text": "Main character: Odile, an old keeper who talks to the foghorn",
+     "keys": [
+      [
+       "odile"
+      ],
+      [
+       "foghorn"
+      ]
+     ]
+    },
+    {
+     "text": "A storm knocks out the lamp",
+     "keys": [
+      [
+       "storm"
+      ],
+      [
+       "lamp"
+      ]
+     ]
+    },
+    {
+     "text": "A child's red kite is found on the rocks",
+     "keys": [
+      [
+       "kite"
+      ]
+     ]
+    },
+    {
+     "text": "Ends with the lamp lit again",
+     "keys": [
+      [
+       "lit",
+       "light",
+       "glow",
+       "burn"
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "id": "creative_story-2",
+   "document_type": "creative_story",
+   "origin": "items.id=899",
+   "task": "Write a short story.",
+   "recipient": "General readers",
+   "sender": {
+    "name": "Ilse Marchetti",
+    "address": "7 Quarry Lane, Bozeman, MT 59715",
+    "date": "16 November 2026"
+   },
+   "context": {
+    "job_title": "Library assistant",
+    "employer": "Cedar Hollow Public Library",
+    "location_city": ""
+   },
+   "points": [
+    {
+     "text": "Setting: a bakery that opens only at night",
+     "keys": [
+      [
+       "bakery"
+      ],
+      [
+       "night"
+      ]
+     ]
+    },
+    {
+     "text": "Baker: Matteo",
+     "keys": [
+      [
+       "matteo"
+      ]
+     ]
+    },
+    {
+     "text": "Customers are night-shift workers",
+     "keys": [
+      [
+       "night-shift",
+       "night shift",
+       "shift"
+      ]
+     ]
+    },
+    {
+     "text": "One customer pays with a coin from another country",
+     "keys": [
+      [
+       "coin"
+      ]
+     ]
+    },
+    {
+     "text": "Ends with warm bread",
+     "keys": [
+      [
+       "warm"
+      ],
+      [
+       "bread"
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "id": "creative_story-3",
+   "document_type": "creative_story",
+   "origin": "items.id=899",
+   "task": "Write a short story.",
+   "recipient": "General readers",
+   "sender": {
+    "name": "Ilse Marchetti",
+    "address": "7 Quarry Lane, Bozeman, MT 59715",
+    "date": "16 November 2026"
+   },
+   "context": {
+    "job_title": "Library assistant",
+    "employer": "Cedar Hollow Public Library",
+    "location_city": ""
+   },
+   "points": [
+    {
+     "text": "Setting: a recycling plant",
+     "keys": [
+      [
+       "recycling"
+      ]
+     ]
+    },
+    {
+     "text": "Two sorting robots, Tin and Bolt",
+     "keys": [
+      [
+       "tin"
+      ],
+      [
+       "bolt"
+      ]
+     ]
+    },
+    {
+     "text": "Tin finds a music box in the belt",
+     "keys": [
+      [
+       "music box"
+      ]
+     ]
+    },
+    {
+     "text": "They disagree about whether to recycle it",
+     "keys": [
+      [
+       "recycl"
+      ],
+      [
+       "disagree",
+       "argue",
+       "debate"
+      ]
+     ]
+    },
+    {
+     "text": "Ends with the music box kept on a shelf",
+     "keys": [
+      [
+       "shelf"
+      ]
+     ]
+    }
+   ]
+  }
+ ]
+}
