@@ -108,6 +108,10 @@ pub const DEVICE_NAMES_NEVER_EXTERNAL: &[&str] = &[
     crate::conductor::bound_spec::DEVICE_LIBRARY_BRIEF,
 ];
 
+/// The system token that renders empty at an external destination (items.id=882).
+/// An external step may not name or declare it. A local step still may.
+const PERSONA_CONTEXT: &str = "persona_context";
+
 /// Why a Focus failed the declared-inputs lint. Each variant is its own
 /// failure with its own message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +133,11 @@ pub enum DeclaredInputsError {
     /// An external step names or declares a DEVICE name, or a variable derived from
     /// one (DEVICE_NAMES_NEVER_EXTERNAL). Whatever STORE_NAMES_EXTERNAL_ALLOWED says.
     DeviceNameInExternalStep { action_id: String, name: String },
+    /// An external step names or declares {persona_context} (items.id=882,
+    /// decisions.id=937 point 2). It renders EMPTY at an external destination, so a
+    /// template that names it, or a declaration of it, is refused rather than left as
+    /// a silent no-op. Declared or not.
+    PersonaContextInExternalStep { action_id: String },
 }
 
 impl std::fmt::Display for DeclaredInputsError {
@@ -169,6 +178,13 @@ impl std::fmt::Display for DeclaredInputsError {
                  warranty contact included). A device name stays on the device, whatever the \
                  outbound review would show the user: the catalogue's tier policies are not \
                  the review's to waive (items.id=884, items.id=891, decisions.id=507)"
+            ),
+            Self::PersonaContextInExternalStep { action_id } => write!(
+                f,
+                "step '{action_id}': an external step cannot name or declare \
+                 '{{{PERSONA_CONTEXT}}}': it always renders empty at an external destination. \
+                 Personalise an external step through its field_requirements, which Gate 1 \
+                 sees (decisions.id=937 point 2, items.id=882)"
             ),
         }
     }
@@ -228,6 +244,10 @@ pub(crate) fn lint_with(
             // The device names never reach an external step, whatever the flag says,
             // and this is checked FIRST so the refusal is always the explicit one.
             lint_device_names(step, &device_taint).map_err(|e| e.to_string())?;
+            // {persona_context} is refused in an external step, declared or not, and
+            // before the undeclared-name rule so the refusal is the explicit one
+            // (items.id=882).
+            lint_persona_context(step).map_err(|e| e.to_string())?;
             lint_step(step, &earlier, bound, &bound_like).map_err(|e| e.to_string())?;
             if !store_names_external_allowed {
                 lint_store_names(step, &taint, bound, &bound_like).map_err(|e| e.to_string())?;
@@ -236,6 +256,28 @@ pub(crate) fn lint_with(
         if let Some(v) = var {
             earlier.insert(v);
         }
+    }
+    Ok(())
+}
+
+/// items.id=882: an external step (is_external_for_lint: routing_tier above LocalOnly,
+/// which is also what a model block expands to, or a render block) may not name
+/// {persona_context} in its template or list it in declared_inputs. The runtime
+/// renders it empty on that path whatever this lint says (executor.rs,
+/// render_prompt_with_disclosure); the lint is the authoring guard. A LOCAL step is
+/// not checked: its render inserts the slice.
+fn lint_persona_context(step: &ActionDefinition) -> Result<(), DeclaredInputsError> {
+    if !step.is_external_for_lint() {
+        return Ok(());
+    }
+    let declared = step.declared_inputs.iter().any(|d| d == PERSONA_CONTEXT);
+    let named = find_tokens(&step.prompt_template)
+        .iter()
+        .any(|n| n == PERSONA_CONTEXT);
+    if declared || named {
+        return Err(DeclaredInputsError::PersonaContextInExternalStep {
+            action_id: step.action_id.clone(),
+        });
     }
     Ok(())
 }
@@ -513,12 +555,8 @@ mod tests {
         // An external template with no tokens needs no declaration.
         assert!(run(&[(step("e", EXT, "no tokens at all", &[], &[]), None)], &[]).is_ok());
         // An undeclared SYSTEM token is rejected like any other name.
-        let e = run(
-            &[(step("e", EXT, "{persona_context}", &[], &[]), None)],
-            &[],
-        )
-        .unwrap_err();
-        assert!(e.contains("{persona_context}") && e.contains("does not declare"));
+        let e = run(&[(step("e", EXT, "{focus_context}", &[], &[]), None)], &[]).unwrap_err();
+        assert!(e.contains("{focus_context}") && e.contains("does not declare"));
         // A declared system token loads.
         assert!(run(
             &[(step("e", EXT, "{user_input}", &["user_input"], &[]), None)],
@@ -543,6 +581,127 @@ mod tests {
             &[]
         )
         .is_ok());
+    }
+
+    /// items.id=882: {persona_context} in an external step is refused, declared or not,
+    /// with its own error, and that error wins over the undeclared-name rule.
+    #[test]
+    fn persona_context_in_an_external_step_is_refused_declared_or_not() {
+        // Named and undeclared: the explicit refusal, not "does not declare".
+        let e = run(
+            &[(step("e", EXT, "ctx {persona_context}", &[], &[]), None)],
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(
+            e,
+            "step 'e': an external step cannot name or declare '{persona_context}': it always \
+             renders empty at an external destination. Personalise an external step through its \
+             field_requirements, which Gate 1 sees (decisions.id=937 point 2, items.id=882)"
+        );
+        assert!(!e.contains("does not declare"));
+        // Named and declared: still refused.
+        let e = run(
+            &[(
+                step("e", EXT, "ctx {persona_context}", &["persona_context"], &[]),
+                None,
+            )],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("cannot name or declare '{persona_context}'"),
+            "{e}"
+        );
+        // Declared only, template does not name it: refused too.
+        let e = run(
+            &[(step("e", EXT, "no tokens", &["persona_context"], &[]), None)],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("cannot name or declare '{persona_context}'"),
+            "{e}"
+        );
+        // Every external ceiling, and the flag in either position.
+        for tier in [
+            ExternalAccess::AnonymousRequired,
+            ExternalAccess::AnonymousPreferred,
+            ExternalAccess::Unrestricted,
+        ] {
+            let steps = [(step("e", tier, "{persona_context}", &[], &[]), None)];
+            assert!(run(&steps, &[]).is_err(), "{tier:?}");
+            assert!(run_closed(&steps, &[]).is_err(), "{tier:?} closed");
+            assert!(run_open(&steps, &[]).is_err(), "{tier:?} open");
+        }
+        // A field_requirements entry of that name does not make it allowed.
+        assert!(run(
+            &[(
+                step("e", EXT, "{persona_context}", &[], &["persona_context"],),
+                None
+            )],
+            &[]
+        )
+        .is_err());
+        // The first of several steps is the one named.
+        let e = run(
+            &[
+                (step("ok", EXT, "no tokens", &[], &[]), None),
+                (step("bad", EXT, "{persona_context}", &[], &[]), None),
+            ],
+            &[],
+        )
+        .unwrap_err();
+        assert!(e.starts_with("step 'bad'"), "{e}");
+    }
+
+    /// A model-block expansion is an ordinary step with an external routing_tier and
+    /// a requirement: the same rule covers it (it is is_external_for_lint).
+    #[test]
+    fn a_model_block_expansion_is_covered_through_is_external_for_lint() {
+        let mut expanded = step("m", EXT, "Write. {persona_context}", &[], &[]);
+        expanded.block_stable_id = None;
+        {
+            use crate::conductor::model_block::config::{
+                Destination, Difficulty, ModelRange, ModelRequirement, ModelTaskType, OutputSize,
+                QualityBar, QualityFloor, TaskNeed,
+            };
+            expanded.requirement = Some(ModelRequirement {
+                block_stable_id: "fx".to_owned(),
+                need: TaskNeed {
+                    task_type: ModelTaskType::CreativeWriting,
+                    difficulty: Difficulty::Low,
+                    output_size: OutputSize::Short,
+                },
+                range: ModelRange {
+                    quality_floor: QualityFloor {
+                        min: QualityBar::Basic,
+                        max: QualityBar::High,
+                    },
+                    highest_tier: EXT,
+                    destinations: vec![Destination::HostedApi],
+                },
+                class_preference: None,
+            });
+        }
+        assert!(expanded.is_external_for_lint());
+        let e = run(&[(expanded, None)], &[]).unwrap_err();
+        assert!(
+            e.contains("cannot name or declare '{persona_context}'"),
+            "{e}"
+        );
+    }
+
+    /// The refusal is placed before the undeclared-name rule in lint_with.
+    #[test]
+    fn the_persona_context_refusal_runs_before_the_declaration_rules() {
+        let src = include_str!("declared_inputs.rs");
+        let prod = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let lint = prod.split("pub(crate) fn lint_with(").nth(1).unwrap();
+        let persona_at = lint.find("lint_persona_context(step)").unwrap();
+        let step_at = lint.find("lint_step(step, &earlier").unwrap();
+        let device_at = lint.find("lint_device_names(step, &device_taint)").unwrap();
+        assert!(device_at < persona_at && persona_at < step_at);
     }
 
     #[test]

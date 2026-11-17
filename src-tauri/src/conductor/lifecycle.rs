@@ -10834,6 +10834,53 @@ steps:
         .await;
     }
 
+    /// items.id=882: {persona_context} in an external step fails LOAD on the database
+    /// path, declared or not, with the explicit error (not "does not declare"). A local
+    /// step naming it still loads.
+    #[tokio::test]
+    async fn persona_context_db_an_external_step_naming_it_fails_load() {
+        with_temp_data_root(async {
+            for (id, declared) in [
+                ("pc-undeclared", &[][..]),
+                ("pc-declared", &["persona_context"][..]),
+            ] {
+                let m = declared_load(
+                    id,
+                    vec![dstep("e", 2, "ctx {persona_context}", declared, &[], None)],
+                )
+                .await
+                .unwrap_err();
+                assert!(m.contains(&format!("Focus '{id}'")), "{m}");
+                assert!(
+                    m.contains(
+                        "step 'e': an external step cannot name or declare '{persona_context}'"
+                    ),
+                    "{m}"
+                );
+                assert!(!m.contains("does not declare"), "{m}");
+            }
+            // A declaration alone (template does not name it) is refused too.
+            let m = declared_load(
+                "pc-declared-only",
+                vec![dstep("e", 2, "none", &["persona_context"], &[], None)],
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                m.contains("cannot name or declare '{persona_context}'"),
+                "{m}"
+            );
+            // A local step may still name it.
+            declared_load(
+                "pc-local",
+                vec![dstep("l", 1, "ctx {persona_context}", &[], &[], None)],
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn declared_inputs_db_a_declared_name_nothing_produces_fails_load() {
         with_temp_data_root(async {
@@ -11049,6 +11096,41 @@ steps:
             panic!("expected ValidationFailed");
         };
         assert!(m.contains("step 'second'") && m.contains("{v}") && m.contains("does not declare"));
+    }
+
+    /// items.id=882 on the YAML path: the same refusal, and a local step is untouched.
+    #[test]
+    fn persona_context_yaml_an_external_step_naming_it_fails_load() {
+        let text = |tier: u8, declared: &str| {
+            format!(
+                r#"
+id: pc-yaml
+max_routing_tier: 2
+steps:
+  only:
+    routing_tier: {tier}
+    prompt_template: "ctx {{persona_context}}"
+{declared}"#
+            )
+        };
+        for declared in ["", "    declared_inputs:\n      - persona_context\n"] {
+            let def = parse_focus_text(&text(2, declared)).unwrap();
+            let LifecycleError::ValidationFailed(m) =
+                lint_declared_inputs("pc-yaml", &def.steps).unwrap_err()
+            else {
+                panic!("expected ValidationFailed");
+            };
+            assert!(
+                m.contains(
+                    "step 'only': an external step cannot name or declare '{persona_context}'"
+                ),
+                "{m}"
+            );
+            assert!(!m.contains("does not declare"), "{m}");
+        }
+        // A local step naming it loads.
+        let def = parse_focus_text(&text(1, "")).unwrap();
+        lint_declared_inputs("pc-yaml", &def.steps).unwrap();
     }
 
     /// shared_038 seeded draft_writing WITHOUT a declaration. An existing
