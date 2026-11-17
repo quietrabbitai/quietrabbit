@@ -95,7 +95,8 @@
 //     itself adds characterisation; the original draft prompt fed it in);
 //   - temperature 0.2 for the draft (shipped 0.5); other options as shipped;
 //   - four samples per brief and model (60 generations) instead of two.
-// Deterministic measures per draft (no quality scoring): coverage of the brief's
+// Deterministic measures per draft (no quality scoring; the measures themselves live in
+// the shipped module conductor/draft_check.rs since items.id=899, this file only calls it): coverage of the brief's
 // listed points (keyword matching), unsupported specifics (numbers, dates, spelled
 // numbers, capitalised names and places not in the brief or persona context, listed
 // for a reader to check), bracketed placeholders, opening and closing chatter, word
@@ -114,6 +115,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use quietrabbit_lib::conductor::draft_check::{check, CheckInput, CheckReport, Point};
 use quietrabbit_lib::ollama_sidecar::{self, OllamaSidecar, OllamaSource};
 use quietrabbit_lib::providers::utils::set_data_root;
 use serde::{Deserialize, Serialize};
@@ -818,14 +820,6 @@ Sender details (use only where the format or a point calls for them):\n\
 \n\
 Voice preferences: {voice_profile}\n";
 
-struct Point {
-    /// Shown in the prompt and on the pages.
-    text: &'static str,
-    /// Coverage test: every group must match, a group matches when any of its
-    /// alternatives is found (lower case, at the start of a word) in the draft.
-    keys: &'static [&'static [&'static str]],
-}
-
 struct Sender {
     name: &'static str,
     address: &'static str,
@@ -841,7 +835,7 @@ struct VBrief {
     recipient: &'static str,
     format: &'static str,
     sender: Sender,
-    points: Vec<Point>,
+    points: Vec<Point<'static>>,
 }
 
 const DATE: &str = "13 November 2026";
@@ -1013,348 +1007,6 @@ fn allowed_text(b: &Brief, vb: &VBrief, variant: bool) -> String {
 
 // -- Deterministic measures -------------------------------------------------
 
-#[derive(Serialize, Deserialize, Clone, Default)]
-struct Measures {
-    points_total: usize,
-    points_covered: usize,
-    missing_points: Vec<String>,
-    /// Numbers, dates, spelled numbers and capitalised names or places that are
-    /// not in the brief or persona context. A list for a reader to check.
-    unsupported: Vec<String>,
-    placeholders: Vec<String>,
-    opening_chatter: Option<String>,
-    closing_chatter: Option<String>,
-}
-
-/// Lower-cases and folds typographic quotes, dashes and no-break spaces, so the
-/// keyword tests are not defeated by them.
-fn norm(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            '\u{2018}' | '\u{2019}' => '\'',
-            '\u{2010}'..='\u{2015}' => '-',
-            '\u{00a0}' => ' ',
-            c => c,
-        })
-        .collect::<String>()
-        .to_lowercase()
-}
-
-/// `term` (already lower case) occurs in `hay` at the start of a word.
-fn has_term(hay: &str, term: &str) -> bool {
-    hay.match_indices(term).any(|(i, _)| {
-        hay[..i]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !c.is_alphanumeric())
-    })
-}
-
-fn point_covered(hay: &str, keys: &[&[&str]]) -> bool {
-    keys.iter()
-        .all(|alts| alts.iter().any(|a| has_term(hay, a)))
-}
-
-/// Bracketed placeholders such as [Your Name], {date} or <Name>. Returns the spans
-/// and the text with each span replaced by a space. A bracket pair with no letters
-/// inside (a citation like [1]) or that starts with white space is not a span.
-fn split_placeholders(text: &str) -> (Vec<String>, String) {
-    let mut spans: Vec<String> = Vec::new();
-    let mut rest = String::with_capacity(text.len());
-    for (li, line) in text.lines().enumerate() {
-        if li > 0 {
-            rest.push('\n');
-        }
-        let chars: Vec<char> = line.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            let close = match chars[i] {
-                '[' => ']',
-                '{' => '}',
-                '<' => '>',
-                c => {
-                    rest.push(c);
-                    i += 1;
-                    continue;
-                }
-            };
-            let end = chars[i + 1..].iter().take(80).position(|&c| c == close);
-            if let Some(e) = end {
-                let inner: String = chars[i + 1..i + 1 + e].iter().collect();
-                if inner.chars().any(char::is_alphabetic)
-                    && !inner.starts_with(char::is_whitespace)
-                    && !inner.starts_with('/')
-                {
-                    spans.push(chars[i..i + e + 2].iter().collect());
-                    rest.push(' ');
-                    i += e + 2;
-                    continue;
-                }
-            }
-            rest.push(chars[i]);
-            i += 1;
-        }
-    }
-    (spans, rest)
-}
-
-fn starts_with_word(s: &str, w: &str) -> bool {
-    s.starts_with(w)
-        && s[w.len()..]
-            .chars()
-            .next()
-            .is_none_or(|c| !c.is_alphanumeric())
-}
-
-/// First non-empty line is remarks about the draft rather than the draft.
-fn opening_chatter(text: &str) -> Option<String> {
-    const STARTS: &[&str] = &[
-        "here is",
-        "here's",
-        "here are",
-        "here you",
-        "sure",
-        "certainly",
-        "of course",
-        "absolutely",
-        "okay",
-        "ok",
-        "below is",
-        "i've written",
-        "i have written",
-        "i've drafted",
-        "i have drafted",
-        "i've put together",
-        "happy to",
-        "great",
-    ];
-    const WORDS: &[&str] = &[
-        "draft", "letter", "email", "note", "essay", "section", "version",
-    ];
-    let first = text.lines().map(str::trim).find(|l| !l.is_empty())?;
-    let low = norm(first);
-    let low = low.trim_start_matches(|c: char| "*#>-_ ".contains(c));
-    let starts = STARTS.iter().any(|s| starts_with_word(low, s));
-    let colon = low.ends_with(':')
-        && !low.starts_with("dear")
-        && WORDS.iter().any(|w| low.contains(w))
-        && low.split_whitespace().count() <= 14;
-    (starts || colon).then(|| first.to_owned())
-}
-
-/// The last paragraph talks about the draft itself (an offer to revise, a note).
-fn closing_chatter(text: &str) -> Option<String> {
-    const PHRASES: &[&str] = &[
-        "this draft",
-        "this letter is",
-        "this email is",
-        "this note is",
-        "i hope this helps",
-        "hope this helps",
-        "let me know if you'd like me",
-        "let me know if you want me",
-        "let me know if you would like me",
-        "feel free to adjust",
-        "feel free to modify",
-        "feel free to customize",
-        "feel free to customise",
-        "you can adjust",
-        "you may want to",
-        "note:",
-        "(note",
-        "adjust as needed",
-        "if you'd like me to",
-        "if you would like me to",
-        "would you like me to",
-        "i can adjust",
-        "i can revise",
-    ];
-    let last = text
-        .split("\n\n")
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .last()?;
-    let low = norm(last);
-    PHRASES
-        .iter()
-        .any(|p| low.contains(p))
-        .then(|| last.lines().next().unwrap_or(last).to_owned())
-}
-
-/// Capitalised words that are fine anywhere (greetings, closings, headings).
-const COMMON_CAPS: &[&str] = &[
-    "dear",
-    "hello",
-    "hi",
-    "hey",
-    "sincerely",
-    "regards",
-    "best",
-    "thanks",
-    "thank",
-    "you",
-    "yours",
-    "kind",
-    "kindly",
-    "warm",
-    "warmly",
-    "cheers",
-    "respectfully",
-    "faithfully",
-    "truly",
-    "subject",
-    "re",
-    "sir",
-    "madam",
-    "to",
-    "from",
-    "date",
-    "cc",
-    "please",
-    "mr",
-    "mrs",
-    "ms",
-    "miss",
-    "dr",
-    "mx",
-    "regarding",
-    "cordially",
-    "gratefully",
-    "with",
-    "and",
-    "the",
-    "of",
-    "for",
-    "in",
-    "on",
-    "at",
-    "a",
-    "an",
-    "hiring",
-    "manager",
-    "team",
-    "committee",
-];
-const HONORIFICS: &[&str] = &["mr", "mrs", "ms", "dr", "miss", "mx", "st"];
-const NUMBER_WORDS: &[&str] = &[
-    "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve",
-    "twenty", "thirty", "forty", "fifty", "hundred", "thousand", "dozen", "half", "third",
-    "quarter",
-];
-
-fn word_set(text: &str) -> HashSet<String> {
-    norm(text)
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
-/// Every alphanumeric part of `core` (split at hyphens, slashes and so on) is a
-/// word of the allowed text. So VX14-0042718 passes when both parts are supplied
-/// and VX14-0042719 does not.
-fn parts_allowed(core: &str, allowed: &HashSet<String>) -> bool {
-    norm(core)
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .all(|w| allowed.contains(w))
-}
-
-fn core_token(t: &str) -> &str {
-    t.trim_matches(|c: char| !c.is_alphanumeric())
-}
-
-fn starts_upper(s: &str) -> bool {
-    s.chars().next().is_some_and(char::is_uppercase)
-}
-
-fn ends_sentence(t: &str) -> bool {
-    t.trim_end_matches(['"', '\'', ')', '*', '_', '\u{201d}', '\u{2019}'])
-        .ends_with(['.', '!', '?', ':'])
-}
-
-/// Numbers, dates, spelled numbers and capitalised names or places in the draft
-/// that are not in the allowed text. Heuristic, built to be listed for a person to
-/// check, not to be exact: it has false positives (a title-case word in a heading,
-/// a product word) and false negatives (see the page text). Placeholders are cut out
-/// first (counted separately). A single capitalised word that opens a sentence is
-/// skipped unless it has a digit, an inner capital, or sits on a short all-capitalised
-/// line (a name or greeting line); a Subject line is checked for numbers only.
-fn unsupported_specifics(text: &str, allowed: &HashSet<String>) -> Vec<String> {
-    let (_, text) = split_placeholders(text);
-    let mut out: Vec<String> = Vec::new();
-    for line in text.lines() {
-        let toks: Vec<&str> = line.split_whitespace().collect();
-        let Some(first) = toks.first() else { continue };
-        let first_low = norm(core_token(first));
-        let heading = first_low == "subject" || first_low == "re";
-        let name_line = toks.len() <= 3 && toks.iter().all(|t| starts_upper(core_token(t)));
-        let mut sentence_start = true;
-        for (i, t) in toks.iter().enumerate() {
-            let core = core_token(t);
-            let initial = sentence_start;
-            let low = norm(core);
-            sentence_start = !HONORIFICS.contains(&low.as_str()) && ends_sentence(t);
-            if core.is_empty() {
-                continue;
-            }
-            let digits_only = core.chars().all(|c| c.is_ascii_digit());
-            if i == 0 && digits_only && (t.ends_with('.') || t.ends_with(')')) {
-                sentence_start = true; // a list marker such as "1."
-                continue;
-            }
-            let mut flag = None;
-            if core.chars().any(|c| c.is_ascii_digit()) {
-                if !parts_allowed(core, allowed) {
-                    flag = Some(core);
-                }
-            } else if heading {
-                continue;
-            } else if starts_upper(core) {
-                let p = core.split(['\'', '\u{2019}']).next().unwrap_or(core);
-                let common = norm(p)
-                    .split(|c: char| !c.is_alphanumeric())
-                    .filter(|w| !w.is_empty())
-                    .all(|w| COMMON_CAPS.contains(&w));
-                let inner_caps = p.chars().skip(1).any(char::is_uppercase);
-                if p.chars().count() > 1
-                    && !common
-                    && !(initial && !name_line && !inner_caps)
-                    && !parts_allowed(p, allowed)
-                {
-                    flag = Some(p);
-                }
-            } else if NUMBER_WORDS.contains(&low.as_str()) && !allowed.contains(&low) {
-                flag = Some(core);
-            }
-            if let Some(f) = flag {
-                if !out.iter().any(|x| x == f) {
-                    out.push(f.to_owned());
-                }
-            }
-        }
-    }
-    out
-}
-
-fn measure(text: &str, points: &[Point], allowed: &HashSet<String>) -> Measures {
-    let hay = norm(text);
-    let missing: Vec<String> = points
-        .iter()
-        .filter(|p| !point_covered(&hay, p.keys))
-        .map(|p| p.text.to_owned())
-        .collect();
-    Measures {
-        points_total: points.len(),
-        points_covered: points.len() - missing.len(),
-        missing_points: missing,
-        unsupported: unsupported_specifics(text, allowed),
-        placeholders: split_placeholders(text).0,
-        opening_chatter: opening_chatter(text),
-        closing_chatter: closing_chatter(text),
-    }
-}
-
 /// One saved draft with its generation record and measures.
 struct Draft {
     brief: String,
@@ -1362,7 +1014,7 @@ struct Draft {
     sample: u32,
     rec: Record,
     text: String,
-    m: Measures,
+    m: CheckReport,
 }
 
 /// Reads every saved draft under `dir` and measures it. `variant` picks which
@@ -1377,7 +1029,7 @@ fn load_drafts(
     let mut out = Vec::new();
     for (b, vb) in bs.iter().zip(vbs) {
         assert_eq!(b.id, vb.id, "briefs and variant briefs are out of step");
-        let allowed = word_set(&allowed_text(b, vb, variant));
+        let allowed = allowed_text(b, vb, variant);
         for m in MODELS {
             for n in 1..=samples {
                 let stem = format!("{}-{n}", slug(m));
@@ -1391,7 +1043,13 @@ fn load_drafts(
                 let Ok(rec) = serde_json::from_str::<Record>(&js) else {
                     continue;
                 };
-                let measures = measure(&text, &vb.points, &allowed);
+                let measures = check(
+                    &text,
+                    &CheckInput {
+                        allowed_text: &allowed,
+                        points: &vb.points,
+                    },
+                );
                 out.push(Draft {
                     brief: b.id.to_owned(),
                     model: (*m).to_owned(),
@@ -2229,110 +1887,6 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn allowed(s: &str) -> HashSet<String> {
-        word_set(s)
-    }
-
-    #[test]
-    fn placeholders_are_found_and_cut_out() {
-        let (spans, rest) = split_placeholders("Dear [Name],\nSee [1] and {date} <Your Name>.\n");
-        assert_eq!(spans, vec!["[Name]", "{date}", "<Your Name>"]);
-        assert!(rest.contains("[1]"));
-        assert!(!rest.contains("Name"));
-    }
-
-    #[test]
-    fn opening_and_closing_chatter() {
-        assert!(opening_chatter("Here is a polished draft:\n\nDear X,").is_some());
-        assert!(opening_chatter("Sure, here you go.\nDear X,").is_some());
-        assert!(opening_chatter("Dear Returns Department,\nSurely this is fine.").is_none());
-        assert!(closing_chatter(
-            "Dear X,\n\nBody.\n\nTomas\n\nLet me know if you'd like me to adjust the tone."
-        )
-        .is_some());
-        assert!(
-            closing_chatter("Dear X,\n\nPlease let me know if you need anything.\n\nTomas")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn coverage_uses_word_starts_and_groups() {
-        let hay = norm("The left hinge cracked in the 2nd week. Ticket CB-77804 only.");
-        assert!(point_covered(
-            &hay,
-            &[&["hinge"], &["second week", "2nd week"]]
-        ));
-        assert!(!point_covered(&hay, &[&["hinge"], &["refund"]]));
-        // "4" must start a word: it does not match inside cb-77804.
-        assert!(!has_term(&hay, "4 ticket"));
-        assert!(has_term(&hay, "cb-77804"));
-    }
-
-    #[test]
-    fn unsupported_specifics_flags_invented_and_passes_supplied() {
-        let a = allowed(
-            "laptop serial VX14-0042718 bought on 3 August 2026 order BW-558201. \
-             Tomas Brandvold, 418 Larch Street, Duluth, MN 55802. Returns department. five weeks",
-        );
-        let draft = "Tomas Brandvold\n418 Larch Street, Duluth, MN 55802\n\n13 November 2026\n\n\
-                     Dear Returns Department,\n\n\
-                     I bought the laptop (serial VX14-0042718) on 3 August 2026, order BW-558201, \
-                     and called Mr. Harlow in Seattle on 12 September. It failed after 33 percent of \
-                     the warranty, within three weeks.\n\nSincerely,\nTomas Brandvold";
-        let u = unsupported_specifics(draft, &a);
-        for expected in [
-            "13",
-            "November",
-            "Harlow",
-            "Seattle",
-            "12",
-            "September",
-            "33",
-            "three",
-        ] {
-            assert!(
-                u.iter().any(|x| x == expected),
-                "{expected} missing from {u:?}"
-            );
-        }
-        for fine in [
-            "VX14-0042718",
-            "BW-558201",
-            "3",
-            "August",
-            "Tomas",
-            "Brandvold",
-            "Duluth",
-            "Returns",
-            "Department",
-            "Sincerely",
-            "I",
-        ] {
-            assert!(
-                !u.iter().any(|x| x == fine),
-                "{fine} wrongly flagged in {u:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn changed_identifier_digit_is_flagged() {
-        let a = allowed("serial VX14-0042718");
-        let u = unsupported_specifics("Serial VX14-0042719 here.", &a);
-        assert_eq!(u, vec!["VX14-0042719"]);
-    }
-
-    #[test]
-    fn subject_line_and_list_markers_are_not_names() {
-        let a = allowed("complaint about the router");
-        let u = unsupported_specifics(
-            "Subject: Formal Complaint Regarding Disruptions\n1. First point\n",
-            &a,
-        );
-        assert!(u.is_empty(), "{u:?}");
-    }
 
     #[test]
     fn variant_prompt_renders_without_leftover_tokens() {

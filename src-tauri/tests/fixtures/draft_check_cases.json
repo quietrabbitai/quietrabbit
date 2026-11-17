@@ -1,0 +1,363 @@
+{
+ "cases": [
+  {
+   "id": "clean_rma",
+   "allowed": "Tomas Brandvold 418 Larch Street Duluth MN 55802 13 November 2026 Returns department. Vantelle X14 laptop serial VX14-0042718 bought on 3 August 2026 order BW-558201. Left hinge cracked in the second week. Wants a replacement, not a refund.",
+   "points": [
+    {
+     "text": "Product: Vantelle X14 laptop",
+     "keys": [
+      [
+       "vantelle x14"
+      ]
+     ]
+    },
+    {
+     "text": "Serial: VX14-0042718",
+     "keys": [
+      [
+       "vx14-0042718"
+      ]
+     ]
+    },
+    {
+     "text": "Hinge cracked in the second week",
+     "keys": [
+      [
+       "hinge"
+      ],
+      [
+       "second week",
+       "2nd week"
+      ]
+     ]
+    },
+    {
+     "text": "Wants a replacement, not a refund",
+     "keys": [
+      [
+       "replacement"
+      ],
+      [
+       "refund"
+      ]
+     ]
+    }
+   ],
+   "text": "Tomas Brandvold\n418 Larch Street, Duluth, MN 55802\n\n13 November 2026\n\nDear Returns Department,\n\nI am writing about my Vantelle X14 laptop, serial VX14-0042718, bought on 3 August 2026 under order BW-558201. The left hinge cracked in the second week. I would like a replacement, not a refund.\n\nSincerely,\nTomas Brandvold\n",
+   "expected": {
+    "closing_chatter": null,
+    "missing_points": [],
+    "opening_chatter": null,
+    "placeholders": [],
+    "points_covered": 4,
+    "points_total": 4,
+    "unsupported": []
+   }
+  },
+  {
+   "id": "placeholders_and_chatter",
+   "allowed": "Dorrie watered the tomatoes. Away ten days. Lemon curd.",
+   "points": [
+    {
+     "text": "Thanks to Dorrie",
+     "keys": [
+      [
+       "dorrie"
+      ],
+      [
+       "thank"
+      ]
+     ]
+    },
+    {
+     "text": "She watered the tomatoes",
+     "keys": [
+      [
+       "tomato"
+      ],
+      [
+       "water"
+      ]
+     ]
+    },
+    {
+     "text": "Away for ten days",
+     "keys": [
+      [
+       "ten days",
+       "10 days"
+      ]
+     ]
+    },
+    {
+     "text": "A jar of lemon curd",
+     "keys": [
+      [
+       "lemon curd"
+      ]
+     ]
+    }
+   ],
+   "text": "Here is a polished draft:\n\nDear [Neighbor Name],\n\nThank you, Dorrie, for watering the tomatoes while we were away. See you on {date}.\n\nWarmly,\n<Your Name>\n\nLet me know if you'd like me to adjust the tone.",
+   "expected": {
+    "closing_chatter": "Let me know if you'd like me to adjust the tone.",
+    "missing_points": [
+     "Away for ten days",
+     "A jar of lemon curd"
+    ],
+    "opening_chatter": "Here is a polished draft:",
+    "placeholders": [
+     "[Neighbor Name]",
+     "{date}",
+     "<Your Name>"
+    ],
+    "points_covered": 2,
+    "points_total": 4,
+    "unsupported": []
+   }
+  },
+  {
+   "id": "invented_specifics",
+   "allowed": "Router TR-220 dropped every evening for five weeks. Four tickets CB-77120 CB-77391. Technician visit on 14 October never happened.",
+   "points": [
+    {
+     "text": "Router TR-220",
+     "keys": [
+      [
+       "tr-220"
+      ]
+     ]
+    },
+    {
+     "text": "Five weeks",
+     "keys": [
+      [
+       "five weeks",
+       "5 weeks"
+      ]
+     ]
+    },
+    {
+     "text": "Technician on 14 October",
+     "keys": [
+      [
+       "technician"
+      ],
+      [
+       "14 october",
+       "october 14"
+      ]
+     ]
+    },
+    {
+     "text": "Wants a named contact",
+     "keys": [
+      [
+       "named",
+       "dedicated"
+      ]
+     ]
+    }
+   ],
+   "text": "Dear Northwind Support,\n\nMy TR-220 router has dropped every evening for five weeks. I spoke to Ms. Okafor in Leeds on 9 September, ticket CB-77120, and again under CB-77392. The technician booked for 14 October never came, and I lost 40 percent of my service. I have waited three months in total.\n\nRegards,\nA customer",
+   "expected": {
+    "closing_chatter": null,
+    "missing_points": [
+     "Wants a named contact"
+    ],
+    "opening_chatter": null,
+    "placeholders": [],
+    "points_covered": 3,
+    "points_total": 4,
+    "unsupported": [
+     "Northwind",
+     "Support",
+     "Okafor",
+     "Leeds",
+     "9",
+     "September",
+     "CB-77392",
+     "40",
+     "three"
+    ]
+   }
+  },
+  {
+   "id": "framed_embellishment",
+   "allowed": "Logistics coordinator at Northgate Freight Partners in Tacoma. Six years in warehouse operations.",
+   "points": [
+    {
+     "text": "Six years in warehouse operations",
+     "keys": [
+      [
+       "six years",
+       "6 years"
+      ],
+      [
+       "warehouse"
+      ]
+     ]
+    },
+    {
+     "text": "Northgate",
+     "keys": [
+      [
+       "northgate"
+      ]
+     ]
+    }
+   ],
+   "text": "Dear Hiring Manager,\n\nI am a seasoned professional with six years in warehouse operations, and I would be thrilled to join Northgate Freight Partners in Tacoma. My time at Brightwater taught me to lead.\n\nSincerely,\nAn applicant",
+   "expected": {
+    "closing_chatter": null,
+    "missing_points": [],
+    "opening_chatter": null,
+    "placeholders": [],
+    "points_covered": 2,
+    "points_total": 2,
+    "unsupported": [
+     "Brightwater"
+    ]
+   }
+  },
+  {
+   "id": "changed_identifier_and_subject",
+   "allowed": "serial VX14-0042718 complaint about the router",
+   "points": [
+    {
+     "text": "Serial VX14-0042718",
+     "keys": [
+      [
+       "vx14-0042718"
+      ]
+     ]
+    }
+   ],
+   "text": "Subject: Formal Complaint Regarding Disruptions\n1. First point\n2) Second point with citation [1] and [2a]\nSerial VX14-0042719 here.\n",
+   "expected": {
+    "closing_chatter": null,
+    "missing_points": [
+     "Serial VX14-0042718"
+    ],
+    "opening_chatter": null,
+    "placeholders": [
+     "[2a]"
+    ],
+    "points_covered": 0,
+    "points_total": 1,
+    "unsupported": [
+     "1",
+     "VX14-0042719"
+    ]
+   }
+  },
+  {
+   "id": "typography_and_names",
+   "allowed": "Dr. Priya Raman and the team. It’s about the lab.",
+   "points": [
+    {
+     "text": "It’s about the lab",
+     "keys": [
+      [
+       "it's about the lab"
+      ]
+     ]
+    }
+   ],
+   "text": "Hi Dr. Raman,\n\n“It’s about the lab” — and Priya’s team agrees.\n\nBest,\nMx Quill\n\nNote: this draft is short.",
+   "expected": {
+    "closing_chatter": "Note: this draft is short.",
+    "missing_points": [],
+    "opening_chatter": null,
+    "placeholders": [],
+    "points_covered": 1,
+    "points_total": 1,
+    "unsupported": [
+     "Quill"
+    ]
+   }
+  },
+  {
+   "id": "empty",
+   "allowed": "anything",
+   "points": [
+    {
+     "text": "A point",
+     "keys": [
+      [
+       "point"
+      ]
+     ]
+    }
+   ],
+   "text": "",
+   "expected": {
+    "closing_chatter": null,
+    "missing_points": [
+     "A point"
+    ],
+    "opening_chatter": null,
+    "placeholders": [],
+    "points_covered": 0,
+    "points_total": 1,
+    "unsupported": []
+   }
+  },
+  {
+   "id": "whitespace_only",
+   "allowed": "",
+   "points": [],
+   "text": "  \n\n \n",
+   "expected": {
+    "closing_chatter": null,
+    "missing_points": [],
+    "opening_chatter": null,
+    "placeholders": [],
+    "points_covered": 0,
+    "points_total": 0,
+    "unsupported": []
+   }
+  },
+  {
+   "id": "colon_opening",
+   "allowed": "Letter about a hinge.",
+   "points": [],
+   "text": "Here's the letter:\nDear Sir or Madam,\nAbout the hinge.\n\nThis letter is a draft.",
+   "expected": {
+    "closing_chatter": "This letter is a draft.",
+    "missing_points": [],
+    "opening_chatter": "Here's the letter:",
+    "placeholders": [],
+    "points_covered": 0,
+    "points_total": 0,
+    "unsupported": []
+   }
+  },
+  {
+   "id": "all_caps_name_line_and_numbers",
+   "allowed": "Order 100 shipped.",
+   "points": [],
+   "text": "ANNA LEE\n\nThe order 100 shipped in twelve boxes, 7 pallets, and a half share. Brightwater Electronics, St. Paul.",
+   "expected": {
+    "closing_chatter": null,
+    "missing_points": [],
+    "opening_chatter": null,
+    "placeholders": [],
+    "points_covered": 0,
+    "points_total": 0,
+    "unsupported": [
+     "ANNA",
+     "LEE",
+     "twelve",
+     "7",
+     "half",
+     "Electronics",
+     "St",
+     "Paul"
+    ]
+   }
+  }
+ ],
+ "note": "Characterization of the measures moved from examples/focus_calibration.rs (items.id=899 stage 1). Every input is invented. Expected values were produced by the pre-move code and are pinned unchanged, including its known quirks: a bracketed citation number such as [1] is flagged as an unsupported number, [2a] is read as a placeholder, and a spelled number or a capitalised word on a short all-capitals line is flagged."
+}
