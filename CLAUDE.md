@@ -1,5 +1,7 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: November 17, 2026 (items.id=899: new "Calibration harness" section; the
+# Last updated: November 17, 2026 (items.id=927: the cargo deny line under "Key commands" only -- fetch the
+# advisory database first; nothing else.).
+# Before that, November 17, 2026 (items.id=899: new "Calibration harness" section; the
 # unsupported-additions line under "Model blocks" (the measures live in conductor/draft_check.rs)
 # and the PROVISIONAL BARS bullet under "Model resolver" (now the 21 read cells; both UNRATED
 # lists empty); nothing else.).
@@ -148,7 +150,7 @@ Key commands:
   cargo build                                          — compile check
   cargo fmt --check                                    — formatting (CI gate; `cargo fmt` reformats the whole crate and cannot be scoped to a file; to fix one file run `rustfmt` on that path; after any `cargo fmt` run `git status` and stage by explicit path (project guide entry cargo_fmt_does_not_scope_to_files))
   cargo clippy --tests -- -D warnings                  — lint (CI gate)
-  cargo deny check                                     — advisories/licenses/bans/sources (CI gate)
+  cargo deny fetch && cargo deny check                 — advisories/licenses/bans/sources (CI gate; run `fetch` first: CI uses the advisory database of the day and a local copy that is days old passes advisories CI then fails, items.id=927)
   cargo test 2>&1 | grep -E "^error|test result"      — test summary (PLAIN, never --lib: --lib skips the src-tauri/tests/ targets)
   git branch --show-current                            — verify branch (must show main)
   git log --oneline main | head -10                    — commit verification
