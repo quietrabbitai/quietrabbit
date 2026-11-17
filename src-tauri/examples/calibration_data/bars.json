@@ -1,0 +1,30 @@
+{
+ "note": "Rules for choosing what Jason reads and for turning his reads into a cell bar (items.id=899, decisions.id=950). No cell is written from a judge's bar: the judge only picks drafts and is reported against Jason's reads. Jason's bar vocabulary is the model_capabilities one.",
+ "vocabulary": [
+  "below_basic",
+  "basic",
+  "standard",
+  "high"
+ ],
+ "reads": {
+  "min_per_cell": 3,
+  "max_per_cell": 6,
+  "max_total": 100
+ },
+ "borderline": {
+  "finding_rate_band": [
+   0.1,
+   0.5
+  ],
+  "judge_disagreement_share": 0.34
+ },
+ "rollup": {
+  "share_at_or_above": 0.66,
+  "quick_response": "min_over_modes"
+ },
+ "model_class": {
+  "llama3.2:3b": "small",
+  "llama3.1:8b": "medium",
+  "qwen2.5:7b": "medium"
+ }
+}

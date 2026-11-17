@@ -1,0 +1,37 @@
+{
+ "note": "Rubric wording for the developer-run judge (items.id=899). Edit freely: it is data. The judge sees the instructions the assistant was given and its output, never the model's name.",
+ "bars": "- below_basic: not usable. It fails a required point, adds a fact that was not supplied, leaves a placeholder or remarks about itself, or is the wrong kind of text.\n- basic: usable after the reader fixes a few things.\n- standard: usable with light edits.\n- high: could be used as it is.",
+ "template": "You are checking a piece of writing produced by an assistant. Read the instructions the assistant was given and the output it produced, then judge the output.\n\nBars:\n{bars}\n\nWhat to check:\n{focus}\n\nInstructions the assistant was given:\n<<<\n{instructions}\n>>>\n\nThe assistant's output:\n<<<\n{output}\n>>>\n\nAnswer with one JSON object and nothing else, in exactly this shape: {shape}",
+ "kinds": {
+  "writing": {
+   "focus": "Does the output cover every point of the brief? Does it add any fact, number, name, place or date that was not supplied (this matters most for a strict or framed document and is allowed for a free one)? Is it only the document, with no placeholder and no remarks about itself? Is it the right kind of document and about the requested length? Does it read naturally?",
+   "criteria": [
+    "covers_every_point",
+    "adds_nothing_unsupported",
+    "only_the_document",
+    "right_form_and_length",
+    "reads_naturally"
+   ]
+  },
+  "voice_apply": {
+   "focus": "Does the rewrite keep every fact and all of the meaning of the draft? Does it add anything that was not in the draft? Is it only the rewritten text, with no remarks about itself? Does it sound the way the settings ask? Does it read naturally?",
+   "criteria": [
+    "keeps_every_fact",
+    "adds_nothing_new",
+    "only_the_rewrite",
+    "matches_the_settings",
+    "reads_naturally"
+   ]
+  },
+  "voice_refine": {
+   "focus": "Is the output short, plain guidance about how the writer's voice should sound, and not a draft of the document itself? Does it follow the settings and the voice profile it was given? Does it invent details about the writer? Is it only the guidance, with no remarks about itself?",
+   "criteria": [
+    "short_plain_guidance",
+    "not_a_draft",
+    "follows_the_settings",
+    "invents_nothing",
+    "only_the_guidance"
+   ]
+  }
+ }
+}

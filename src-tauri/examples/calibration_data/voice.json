@@ -1,0 +1,273 @@
+{
+ "note": "Synthetic voice cases for the quick_response measures (items.id=899 stage 3). Every name, number and organisation is invented. A voice profile is the text the voice_profile token carries (the executor's key=value format). An apply case is a finished draft to rewrite in a voice: its points are the facts the rewrite must keep. A refine case has no draft: the step writes guidance from the profile and the document type's settings.",
+ "profiles": [
+  {
+   "id": "formal_brisk",
+   "text": "directness=direct, formality=formal, length_preference=concise, pacing=brisk, tone=neutral"
+  },
+  {
+   "id": "warm_casual",
+   "text": "directness=diplomatic, formality=casual, length_preference=short, pacing=measured, tone=warm"
+  },
+  {
+   "id": "formal_unhurried",
+   "text": "directness=diplomatic, formality=formal, length_preference=detailed, pacing=deliberate, tone=balanced"
+  }
+ ],
+ "apply": [
+  {
+   "id": "apply-rma",
+   "document_type": "rma_letter",
+   "profile": "formal_brisk",
+   "draft": "Tomas Brandvold\n418 Larch Street, Duluth, MN 55802\n\n13 November 2026\n\nDear Returns Department,\n\nI bought a Vantelle X14 laptop, serial number VX14-0042718, on 3 August 2026 from Brightwater Electronics, order BW-558201. In the second week the left hinge cracked, and the screen now wobbles. I would like a return authorization and a replacement, not a refund. If you send me a label, I can ship it at my own cost.\n\nSincerely,\nTomas Brandvold",
+   "points": [
+    {
+     "text": "Serial number VX14-0042718",
+     "keys": [
+      [
+       "vx14-0042718"
+      ]
+     ]
+    },
+    {
+     "text": "Order BW-558201",
+     "keys": [
+      [
+       "bw-558201"
+      ]
+     ]
+    },
+    {
+     "text": "The left hinge cracked",
+     "keys": [
+      [
+       "hinge"
+      ]
+     ]
+    },
+    {
+     "text": "The screen wobbles",
+     "keys": [
+      [
+       "wobble"
+      ]
+     ]
+    },
+    {
+     "text": "A replacement, not a refund",
+     "keys": [
+      [
+       "replacement"
+      ],
+      [
+       "refund"
+      ]
+     ]
+    },
+    {
+     "text": "Can ship it at own cost with a label",
+     "keys": [
+      [
+       "label"
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "id": "apply-complaint",
+   "document_type": "complaint_email",
+   "profile": "formal_brisk",
+   "draft": "Subject: Formal complaint about repeated outages\n\nDear Customer Service Manager,\n\nMy connection on router TR-220 has dropped every evening for five weeks. I have logged four support tickets (CB-77120, CB-77391, CB-77804 and CB-78213) and each time I was told to restart the router. A technician visit on 14 October never happened and nobody called me. I want the fault fixed, a credit for the weeks of service I did not receive, and a named contact.\n\nRegards,\nRenata Voss",
+   "points": [
+    {
+     "text": "Router TR-220",
+     "keys": [
+      [
+       "tr-220"
+      ]
+     ]
+    },
+    {
+     "text": "Five weeks",
+     "keys": [
+      [
+       "five weeks",
+       "5 weeks"
+      ]
+     ]
+    },
+    {
+     "text": "Ticket CB-77804",
+     "keys": [
+      [
+       "cb-77804"
+      ]
+     ]
+    },
+    {
+     "text": "Told to restart the router",
+     "keys": [
+      [
+       "restart"
+      ]
+     ]
+    },
+    {
+     "text": "Technician visit on 14 October never happened",
+     "keys": [
+      [
+       "14 october",
+       "october 14"
+      ]
+     ]
+    },
+    {
+     "text": "Wants a credit",
+     "keys": [
+      [
+       "credit"
+      ]
+     ]
+    },
+    {
+     "text": "Wants a named contact",
+     "keys": [
+      [
+       "named",
+       "contact"
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "id": "apply-note",
+   "document_type": "personal_note",
+   "profile": "warm_casual",
+   "draft": "Dear Dorrie,\n\nThank you for keeping an eye on the house and watering the tomatoes while we were away for ten days. We left you a jar of lemon curd, and I hope you like it.\n\nRenata",
+   "points": [
+    {
+     "text": "Thanks to Dorrie",
+     "keys": [
+      [
+       "dorrie"
+      ],
+      [
+       "thank"
+      ]
+     ]
+    },
+    {
+     "text": "She watered the tomatoes",
+     "keys": [
+      [
+       "tomato"
+      ]
+     ]
+    },
+    {
+     "text": "Away for ten days",
+     "keys": [
+      [
+       "ten days",
+       "10 days"
+      ]
+     ]
+    },
+    {
+     "text": "A jar of lemon curd",
+     "keys": [
+      [
+       "lemon curd"
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "id": "apply-essay",
+   "document_type": "essay_section",
+   "profile": "formal_unhurried",
+   "draft": "Small towns should keep their paper public notice boards. Even when the council also posts notices online, a board in the library or the post office is read by people who never visit the council website. Online-only notices leave out residents without a home internet connection, and they are the ones most likely to miss a change to the bus timetable or a planning notice. A paper board costs little and reaches them.",
+   "points": [
+    {
+     "text": "Keep the paper notice boards",
+     "keys": [
+      [
+       "notice board"
+      ],
+      [
+       "paper"
+      ]
+     ]
+    },
+    {
+     "text": "The council also posts online",
+     "keys": [
+      [
+       "council"
+      ],
+      [
+       "online"
+      ]
+     ]
+    },
+    {
+     "text": "The library or post office",
+     "keys": [
+      [
+       "library"
+      ],
+      [
+       "post office"
+      ]
+     ]
+    },
+    {
+     "text": "Residents without home internet are left out",
+     "keys": [
+      [
+       "internet"
+      ],
+      [
+       "leave out",
+       "left out",
+       "excluded",
+       "miss"
+      ]
+     ]
+    },
+    {
+     "text": "A paper board costs little",
+     "keys": [
+      [
+       "costs little",
+       "cheap",
+       "inexpensive",
+       "low cost",
+       "little cost"
+      ]
+     ]
+    }
+   ]
+  }
+ ],
+ "refine": [
+  {
+   "id": "refine-rma",
+   "document_type": "rma_letter",
+   "profile": "formal_brisk"
+  },
+  {
+   "id": "refine-note",
+   "document_type": "personal_note",
+   "profile": "warm_casual"
+  },
+  {
+   "id": "refine-essay",
+   "document_type": "essay_section",
+   "profile": "formal_unhurried"
+  }
+ ]
+}
