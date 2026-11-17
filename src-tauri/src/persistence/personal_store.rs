@@ -476,6 +476,15 @@ pub async fn save_personal_field(
     source: &str,
     extra_metadata: Option<serde_json::Value>,
 ) -> Result<String, PersonalStoreError> {
+    for policy in [abstraction_tier2, abstraction_tier3] {
+        if !ABSTRACTION_POLICIES.contains(&policy) {
+            return Err(PersonalStoreError::Validation(format!(
+                "Unknown abstraction policy '{policy}'. Must be pass, omit, summarize, \
+                 range_only, or not_permitted."
+            )));
+        }
+    }
+
     let sensitivity_severity: i32 = match sensitivity {
         "general" => 1,
         "personal" => 2,
@@ -793,8 +802,21 @@ pub(crate) async fn create_entity_fact_with_provenance_conn(
 /// another (the entity_facts column default, personal_001.sql).
 pub(crate) const ABSTRACTION_PASS: &str = "pass";
 
+/// The abstraction policy a user-entered or confirmed singleton fact is written
+/// with (items.id=930 stage 1). Always one of ABSTRACTION_POLICIES, so the
+/// entity_facts CHECK accepts it: medical and financial values are
+/// not_permitted at both external tiers, everything else takes the column
+/// default. Nothing reads these columns for disclosure (decisions.id=953 ruling 2):
+/// the disclosure policy lives in fact_disclosure_policy.
+pub(crate) fn default_abstraction_for(sensitivity: &str) -> &'static str {
+    match sensitivity {
+        "medical" | "financial" => "not_permitted",
+        _ => ABSTRACTION_PASS,
+    }
+}
+
 /// Policies permitted by the entity_facts abstraction_tier2/3 CHECK constraints.
-const ABSTRACTION_POLICIES: [&str; 5] =
+pub(crate) const ABSTRACTION_POLICIES: [&str; 5] =
     ["pass", "omit", "summarize", "range_only", "not_permitted"];
 
 /// create_entity_fact_with_provenance_conn with the two abstraction policies
@@ -1632,6 +1654,61 @@ pub(crate) async fn read_floor_consent_preference_conn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // items.id=930 stage 1: save_personal_field names a bad policy itself, and the
+    // two values the old writers bound ("general", "") are exactly what it refuses.
+    #[tokio::test]
+    async fn save_personal_field_refuses_a_policy_the_check_would_reject() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved = std::env::var("QR_DATA_ROOT").ok();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("QR_DATA_ROOT", dir.path());
+        let key = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
+        for bad in ["", "general", "redacted"] {
+            let r = save_personal_field(
+                "sp-user",
+                "sp-persona",
+                key,
+                "f",
+                "v",
+                "personal",
+                "user",
+                "self",
+                bad,
+                "pass",
+                "ipc",
+                None,
+            )
+            .await;
+            assert!(matches!(r, Err(PersonalStoreError::Validation(_))), "{bad}");
+        }
+        for ok in ABSTRACTION_POLICIES {
+            save_personal_field(
+                "sp-user",
+                "sp-persona",
+                key,
+                "f",
+                "v",
+                "personal",
+                "user",
+                "self",
+                ok,
+                ok,
+                "ipc",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(default_abstraction_for("medical"), "not_permitted");
+        assert_eq!(default_abstraction_for("financial"), "not_permitted");
+        assert_eq!(default_abstraction_for("general"), "pass");
+        assert_eq!(default_abstraction_for("personal"), "pass");
+        match saved {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
+    }
 
     /// The subkey open_personal_db applies for `key_hex` (test fixtures that
     /// create the file themselves must use it, items.id=630).

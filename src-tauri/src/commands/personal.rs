@@ -94,6 +94,35 @@ pub async fn get_personal_fields(
         .collect())
 }
 
+/// The write half of update_personal_field, split out so it is testable
+/// against a real personal.db without a Tauri State (items.id=930).
+async fn store_user_field(
+    request: &UpdatePersonalFieldRequest,
+    key_hex_str: &str,
+) -> Result<(), String> {
+    let sensitivity = request.sensitivity.as_deref().unwrap_or("personal");
+
+    personal_store::save_personal_field(
+        &request.user_id,
+        &request.persona_id,
+        key_hex_str,
+        &request.field_name,
+        &request.value,
+        sensitivity,
+        "user", // source_id: user-entered fields always have source "user"
+        "self", // ownership_scope: default per-user ownership
+        // items.id=930: "" violated the entity_facts CHECK. A valid default; the
+        // disclosure policy is fact_disclosure_policy, not these columns.
+        personal_store::default_abstraction_for(sensitivity),
+        personal_store::default_abstraction_for(sensitivity),
+        "ipc", // source: provenance tag for this write path
+        None,  // extra_metadata
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn update_personal_field(
@@ -106,24 +135,7 @@ pub async fn update_personal_field(
         .await
         .ok_or_else(|| "not logged in".to_owned())?;
 
-    let sensitivity = request.sensitivity.as_deref().unwrap_or("personal");
-
-    personal_store::save_personal_field(
-        &request.user_id,
-        &request.persona_id,
-        &key_hex_str,
-        &request.field_name,
-        &request.value,
-        sensitivity,
-        "user", // source_id: user-entered fields always have source "user"
-        "self", // ownership_scope: default per-user ownership
-        "",     // abstraction_tier2: empty -- set by Gate logic, not user
-        "",     // abstraction_tier3: empty -- set by Gate logic, not user
-        "ipc",  // source: provenance tag for this write path
-        None,   // extra_metadata
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    store_user_field(&request, &key_hex_str).await?;
 
     // Re-fetch to return current state (includes any gate-computed abstractions).
     let field = personal_store::get_personal_field(
@@ -169,4 +181,72 @@ pub async fn get_voice_profile(
             .cloned()
             .unwrap_or_default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::Row;
+
+    const KEY: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
+
+    async fn read_row(user: &str, persona: &str, field: &str) -> (String, String, String) {
+        let mut conn = personal_store::open_personal_db(user, persona, KEY)
+            .await
+            .unwrap();
+        let r = sqlx::query(
+            "SELECT field_value, abstraction_tier2, abstraction_tier3 FROM entity_facts
+             WHERE entity_id IS NULL AND field_name = ? AND valid_until IS NULL",
+        )
+        .bind(field)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        (r.get(0), r.get(1), r.get(2))
+    }
+
+    // items.id=930 stage 1: the first tests this writer has had, against the real schema.
+    #[tokio::test]
+    async fn update_personal_field_writes_succeed_against_the_real_schema() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved = std::env::var("QR_DATA_ROOT").ok();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("QR_DATA_ROOT", dir.path());
+        let (u, p) = ("pf-user", "pf-persona");
+
+        for (field, sens, want) in [
+            ("home_city", None, "pass"),
+            ("employer", Some("general"), "pass"),
+            ("diagnosis", Some("medical"), "not_permitted"),
+            ("income", Some("financial"), "not_permitted"),
+        ] {
+            let req = UpdatePersonalFieldRequest {
+                persona_id: p.to_owned(),
+                user_id: u.to_owned(),
+                field_name: field.to_owned(),
+                value: "v1".to_owned(),
+                sensitivity: sens.map(str::to_owned),
+            };
+            store_user_field(&req, KEY)
+                .await
+                .unwrap_or_else(|e| panic!("{field}: {e}"));
+            let (v, t2, t3) = read_row(u, p, field).await;
+            assert_eq!((v.as_str(), t2.as_str(), t3.as_str()), ("v1", want, want));
+        }
+
+        // An unknown sensitivity is still refused by the store.
+        let bad = UpdatePersonalFieldRequest {
+            persona_id: p.to_owned(),
+            user_id: u.to_owned(),
+            field_name: "x".to_owned(),
+            value: "v".to_owned(),
+            sensitivity: Some("secret".to_owned()),
+        };
+        assert!(store_user_field(&bad, KEY).await.is_err());
+
+        match saved {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
+    }
 }

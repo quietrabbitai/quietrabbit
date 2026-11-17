@@ -689,11 +689,10 @@ pub async fn persist_confirmed_field(
     confirmed_value: &str,
     sensitivity: &str,
 ) -> Result<(), PersonalStoreError> {
-    // abstraction_tier2/tier3 are display hints for the frontend -- not enforcement.
-    let (abstraction_tier2, abstraction_tier3) = match sensitivity {
-        "medical" | "financial" => ("redacted", "redacted"),
-        _ => ("general", "general"),
-    };
+    // items.id=930: the old values ("general", "redacted") violated the
+    // entity_facts CHECK, so every write was rejected. Bind a valid policy.
+    let abstraction = crate::persistence::personal_store::default_abstraction_for(sensitivity);
+    let (abstraction_tier2, abstraction_tier3) = (abstraction, abstraction);
 
     save_personal_field(
         user_id,
@@ -792,6 +791,54 @@ pub async fn get_candidate_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PF_KEY: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
+
+    // items.id=930 stage 1: persist_confirmed_field against the real personal_001 CHECK.
+    #[tokio::test]
+    async fn persist_confirmed_field_succeeds_and_is_idempotent_against_the_real_schema() {
+        use sqlx::Row;
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved = std::env::var("QR_DATA_ROOT").ok();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("QR_DATA_ROOT", dir.path());
+        let (u, p) = ("pcf-user", "pcf-persona");
+
+        for (field, sens, want) in [
+            ("home_city", "personal", "pass"),
+            ("job_title", "general", "pass"),
+            ("health_condition", "medical", "not_permitted"),
+            ("annual_income", "financial", "not_permitted"),
+        ] {
+            persist_confirmed_field(u, p, PF_KEY, field, "first", sens)
+                .await
+                .unwrap_or_else(|e| panic!("{field}: {e}"));
+            // Replay (crash recovery) supersedes, never duplicates.
+            persist_confirmed_field(u, p, PF_KEY, field, "second", sens)
+                .await
+                .unwrap();
+            let mut conn = crate::persistence::personal_store::open_personal_db(u, p, PF_KEY)
+                .await
+                .unwrap();
+            let rows = sqlx::query(
+                "SELECT field_value, abstraction_tier2, abstraction_tier3 FROM entity_facts
+                 WHERE entity_id IS NULL AND field_name = ? AND valid_until IS NULL",
+            )
+            .bind(field)
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+            assert_eq!(rows.len(), 1, "{field}");
+            assert_eq!(rows[0].get::<String, _>(0), "second");
+            assert_eq!(rows[0].get::<String, _>(1), want);
+            assert_eq!(rows[0].get::<String, _>(2), want);
+        }
+
+        match saved {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
+    }
 
     #[test]
     fn test_classify_sensitivity_medical() {
