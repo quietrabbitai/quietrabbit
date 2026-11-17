@@ -65,12 +65,13 @@ steps:
       who it is best suited for. Do not recommend a specific retailer.
 
       Requirements: {requirements}
-      {persona_context}
-    field_requirements: []
+      Region (use for availability and pricing if present, ignore if empty): {location_city}
+    field_requirements:
+      - name: location_city
+        scope: optional
     declared_inputs:
       - voice_profile
       - requirements
-      - persona_context
     options_override:
       temperature: 0.4
       num_predict: 1024

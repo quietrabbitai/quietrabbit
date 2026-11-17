@@ -55,7 +55,7 @@ ActionDefinition {
     output_var: Some(
         "fit_analysis",
     ),
-    prompt_template: "{voice_profile} Based on the job summary and the user's professional context below, analyse fit. The user's resume is not available in this session — base the analysis on their current role, industry, and any context provided. Structure the output as: 1. Strengths — where the user's professional context aligns well\n   with the role requirements\n2. Gaps — requirements the user may not meet, with a realistic\n   assessment of whether each gap is a dealbreaker, bridgeable,\n   or minor\n3. Signals — anything notable about the role, company, or posting\n   that the user should factor into their decision (positive or\n   cautionary)\n\nJob summary: {jd_summary} {persona_context}\n",
+    prompt_template: "{voice_profile} Based on the job summary and any professional context below, analyse fit. The user's resume is not available in this session — base the analysis on the context provided, which may be limited or empty. Structure the output as: 1. Strengths — where the user's professional context aligns well\n   with the role requirements\n2. Gaps — requirements the user may not meet, with a realistic\n   assessment of whether each gap is a dealbreaker, bridgeable,\n   or minor\n3. Signals — anything notable about the role, company, or posting\n   that the user should factor into their decision (positive or\n   cautionary)\n\nJob summary: {jd_summary} Current role, if provided: {job_title} Current employer, if provided: {employer} Current industry, if provided: {industry}\n",
     field_requirements: {},
     options_override: {},
     external_access_override: Some(
@@ -71,12 +71,11 @@ ActionDefinition {
     declared_inputs: [
         "voice_profile",
         "jd_summary",
-        "persona_context",
     ],
     store_op: None,
     requirement: None,
 }
-field_requirements: {}
+field_requirements: {"employer": Optional, "industry": Optional, "job_title": Optional}
 options_override: {"num_predict":768,"temperature":0.4}
 --- step
 ActionDefinition {

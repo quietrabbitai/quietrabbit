@@ -55,7 +55,7 @@ ActionDefinition {
     output_var: Some(
         "research_results",
     ),
-    prompt_template: "{voice_profile} Based on the following requirements, research the available options. For each viable option surface: key strengths, weaknesses, and who it is best suited for. Do not recommend a specific retailer.\nRequirements: {requirements} {persona_context}\n",
+    prompt_template: "{voice_profile} Based on the following requirements, research the available options. For each viable option surface: key strengths, weaknesses, and who it is best suited for. Do not recommend a specific retailer.\nRequirements: {requirements} Region (use for availability and pricing if present, ignore if empty): {location_city}\n",
     field_requirements: {},
     options_override: {},
     external_access_override: Some(
@@ -71,12 +71,11 @@ ActionDefinition {
     declared_inputs: [
         "voice_profile",
         "requirements",
-        "persona_context",
     ],
     store_op: None,
     requirement: None,
 }
-field_requirements: {}
+field_requirements: {"location_city": Optional}
 options_override: {"num_predict":1024,"temperature":0.4}
 --- step
 ActionDefinition {

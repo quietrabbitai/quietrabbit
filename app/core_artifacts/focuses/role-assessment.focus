@@ -96,10 +96,10 @@ steps:
     output_var: fit_analysis
     prompt_template: >
       {voice_profile}
-      Based on the job summary and the user's professional context below,
+      Based on the job summary and any professional context below,
       analyse fit. The user's resume is not available in this session —
-      base the analysis on their current role, industry, and any context
-      provided. Structure the output as:
+      base the analysis on the context provided, which may be limited or
+      empty. Structure the output as:
       1. Strengths — where the user's professional context aligns well
          with the role requirements
       2. Gaps — requirements the user may not meet, with a realistic
@@ -110,12 +110,19 @@ steps:
          cautionary)
 
       Job summary: {jd_summary}
-      {persona_context}
-    field_requirements: []
+      Current role, if provided: {job_title}
+      Current employer, if provided: {employer}
+      Current industry, if provided: {industry}
+    field_requirements:
+      - name: job_title
+        scope: optional
+      - name: employer
+        scope: optional
+      - name: industry
+        scope: optional
     declared_inputs:
       - voice_profile
       - jd_summary
-      - persona_context
     options_override:
       temperature: 0.4
       num_predict: 768
