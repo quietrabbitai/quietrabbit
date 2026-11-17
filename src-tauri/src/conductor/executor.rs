@@ -216,6 +216,10 @@ pub struct StepContext {
     pub focus_id: String,
     pub focus_run_id: String,
     pub user_input: String,
+    /// items.id=883 (decisions.id=937 point 3): the text an EXTERNAL render inserts for
+    /// {user_input}: the user's own turns only, never a model turn. `user_input` (the
+    /// full blended window) is read by the local render alone. See FocusRun.external_input.
+    pub external_input: String,
     pub persona_context: String, // rendered MemoryBroker output (Phase 3)
     /// items.id=406: identity fields PG_GATE_3 needs to open outputs.db/
     /// personal.db for the fact-identity persistence cascade (prior-decision
@@ -1217,7 +1221,10 @@ fn render_prompt_with_disclosure(
         tokens.insert(k.clone(), v.clone());
     }
     // SYSTEM_TOKENS override everything
-    tokens.insert("user_input".to_owned(), ctx.user_input.clone());
+    // items.id=883 (decisions.id=937 point 3): the user's own turns only. The full
+    // window (ctx.user_input, which holds model turns) is never read on this path, and a
+    // scan test pins that.
+    tokens.insert("user_input".to_owned(), ctx.external_input.clone());
     tokens.insert("previous_output".to_owned(), previous_output.to_owned());
     tokens.insert("focus_context".to_owned(), ctx.focus_id.clone());
     // items.id=882 (decisions.id=937 point 2): {persona_context} renders EMPTY on this
@@ -4331,6 +4338,7 @@ mod tests {
             focus_id: "f".to_owned(),
             focus_run_id: "fr".to_owned(),
             user_input: "".to_owned(),
+            external_input: "".to_owned(),
             persona_context: "".to_owned(),
             focus_external_access: ExternalAccess::AnonymousRequired,
             effective_access: ExternalAccess::AnonymousRequired,
@@ -4404,6 +4412,7 @@ mod tests {
             focus_id: "f".to_owned(),
             focus_run_id: "fr".to_owned(),
             user_input: "".to_owned(),
+            external_input: "".to_owned(),
             persona_context: "".to_owned(),
             focus_external_access: ExternalAccess::LocalOnly,
             effective_access: ExternalAccess::LocalOnly,
@@ -4463,6 +4472,7 @@ mod tests {
             focus_id: "f".to_owned(),
             focus_run_id: "fr".to_owned(),
             user_input: "".to_owned(),
+            external_input: "".to_owned(),
             persona_context: "".to_owned(),
             focus_external_access: ExternalAccess::LocalOnly,
             effective_access: ExternalAccess::LocalOnly,
@@ -4534,6 +4544,7 @@ mod tests {
             focus_id: "focus-1".to_owned(),
             focus_run_id: "run-1".to_owned(),
             user_input: String::new(),
+            external_input: String::new(),
             persona_context: String::new(),
             focus_external_access: ExternalAccess::AnonymousRequired,
             effective_access: ExternalAccess::AnonymousRequired,
@@ -9261,6 +9272,123 @@ mod tests {
         disclosure.insert("persona_context".to_owned(), PERSONA_FACT.to_owned());
         let external = render_prompt_with_disclosure(&ctx, &vars, "", &disclosure, "");
         assert!(!external.contains(PERSONA_FACT), "{external}");
+    }
+
+    // -- items.id=883: an external render gets the user's own turns, never a model turn --
+
+    const MODEL_FACT: &str = "MODEL-TURN-FACT-QUOKKA-77";
+    const USER_TURN: &str = "my printer is an HP LaserJet";
+    const WINDOW_TEMPLATE: &str = "Help with: {user_input} End.";
+
+    /// The full blended window (what the local render sees) and the user-only form
+    /// (what an external render sees), as send_message builds them.
+    fn with_window(ctx: &mut StepContext) {
+        ctx.user_input =
+            format!("User: {USER_TURN}\nAssistant: Since you work at {MODEL_FACT}, try this\n");
+        ctx.external_input = format!("User: {USER_TURN}\n");
+    }
+
+    /// An ORDINARY external step: the text that goes to review and out carries the
+    /// user's turn verbatim and no model turn.
+    #[tokio::test]
+    async fn an_ordinary_external_step_never_renders_a_model_turn() {
+        with_temp_shared_db(|pool| async move {
+            let key_hex = hosted_pick_rig(&pool).await;
+            let mut ctx = resolved_ctx(
+                None,
+                ExternalAccess::AnonymousPreferred,
+                None,
+                WINDOW_TEMPLATE,
+            );
+            ctx.key_hex = key_hex;
+            ctx.qr_hosted_provider_preference = Some("fixture-host-a".to_owned());
+            with_window(&mut ctx);
+            let (forced, seen) = capturing_scanner();
+            let _g = step_review::forced::arm(&ctx, forced).await;
+
+            let _ = run_once(&ctx, &pool).await;
+            let seen = seen.borrow();
+            assert_eq!(seen.len(), 1, "the review saw exactly one prompt");
+            assert!(!seen[0].contains(MODEL_FACT), "{}", seen[0]);
+            assert!(!seen[0].contains("Assistant:"), "{}", seen[0]);
+            assert_eq!(seen[0], format!("Help with: User: {USER_TURN}\n End."));
+        })
+        .await;
+    }
+
+    /// The same on a RESOLVED hosted pick.
+    #[tokio::test]
+    async fn a_resolved_hosted_pick_never_renders_a_model_turn() {
+        with_temp_shared_db(|pool| async move {
+            let key_hex = hosted_pick_rig(&pool).await;
+            let mut ctx = hosted_pick_ctx(&key_hex, WINDOW_TEMPLATE);
+            with_window(&mut ctx);
+            let (forced, seen) = capturing_scanner();
+            let _g = step_review::forced::arm(&ctx, forced).await;
+
+            let _ = run_once(&ctx, &pool).await;
+            let seen = seen.borrow();
+            assert_eq!(seen.len(), 1, "the review saw exactly one prompt");
+            assert!(!seen[0].contains(MODEL_FACT), "{}", seen[0]);
+            assert!(seen[0].contains(USER_TURN), "{}", seen[0]);
+        })
+        .await;
+    }
+
+    /// Local steps are unchanged: the local render inserts the full window, the
+    /// external render of the SAME context inserts the user's turns only.
+    #[test]
+    fn the_local_render_keeps_the_full_window_and_the_external_one_has_user_turns_only() {
+        let mut ctx = hosted_ctx(RunAttendance::Attended, "unused");
+        ctx.step.prompt_template = WINDOW_TEMPLATE.to_owned();
+        with_window(&mut ctx);
+        let vars = HashMap::new();
+        let local = render_prompt(&ctx, &vars, "", "");
+        assert_eq!(local, format!("Help with: {} End.", ctx.user_input));
+        assert!(local.contains(MODEL_FACT));
+        let external = render_prompt_with_disclosure(&ctx, &vars, "", &HashMap::new(), "");
+        assert_eq!(external, format!("Help with: User: {USER_TURN}\n End."));
+        // A disclosure entry cannot smuggle the window back in: the system token is
+        // inserted after the disclosure fields.
+        let mut disclosure = HashMap::new();
+        disclosure.insert("user_input".to_owned(), ctx.user_input.clone());
+        let external = render_prompt_with_disclosure(&ctx, &vars, "", &disclosure, "");
+        assert!(!external.contains(MODEL_FACT), "{external}");
+    }
+
+    /// Scan: the external render reads ctx.external_input and never ctx.user_input, and
+    /// the local render is the one reader of the full window in this file.
+    #[test]
+    fn the_external_render_never_reads_the_full_window() {
+        let src = include_str!("executor.rs");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let live: String = code
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let after = live
+            .split("fn render_prompt_with_disclosure(")
+            .nth(1)
+            .expect("render_prompt_with_disclosure");
+        let end = [
+            "\nfn ",
+            "\nasync fn ",
+            "\npub fn ",
+            "\npub(crate) fn ",
+            "\npub async fn ",
+        ]
+        .iter()
+        .filter_map(|m| after.find(m))
+        .min()
+        .expect("a following top-level fn");
+        let body = &after[..end];
+        assert!(body.contains("render_template("), "whole function: {body}");
+        assert!(!body.contains("ctx.user_input"), "{body}");
+        assert!(body.contains("ctx.external_input.clone()"), "{body}");
+        // The local render does read the window, so the scan is not vacuous.
+        assert_eq!(live.matches("ctx.user_input").count(), 1);
+        assert_eq!(live.matches("ctx.external_input").count(), 1);
     }
 
     /// Scan: render_prompt_with_disclosure never reads ctx.persona_context.

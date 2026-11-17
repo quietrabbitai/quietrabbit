@@ -107,6 +107,7 @@ fn ctx(
         focus_id: FOCUS.to_owned(),
         focus_run_id: "canary-run".to_owned(),
         user_input: user_input.to_owned(),
+        external_input: user_input.to_owned(),
         persona_context: String::new(),
         focus_external_access: ExternalAccess::LocalOnly,
         effective_access: ExternalAccess::LocalOnly,

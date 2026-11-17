@@ -231,8 +231,6 @@ fn build_conversation_prompt(history: &[message_store::MessageRecord]) -> String
 /// local run, so it must not reach an external destination. The user's own turns are
 /// kept verbatim. Both forms come from ONE fold (fold_window), so this text is a strict
 /// subset of the local one by construction, and a test pins it.
-// Used by send_message from items.id=883 stage 2.
-#[cfg_attr(not(test), allow(dead_code))]
 fn build_user_turns_prompt(history: &[message_store::MessageRecord]) -> String {
     fold_window(history, false)
 }
@@ -707,6 +705,7 @@ pub async fn send_message(
         .await
         .map_err(|e| e.to_string())?;
     let user_input = build_conversation_prompt(&history);
+    let external_input = build_user_turns_prompt(&history);
 
     // 3. Start the real Focus run (LOAD + AUTHORIZE synchronously, same as
     // submit_focus_run), keeping ownership of `run` so step 5 can await its
@@ -751,6 +750,9 @@ pub async fn send_message(
         }
     };
     run.attach_lease(lease).map_err(|e| e.to_string())?;
+    // items.id=883: an external step and the hand-off starter get the user's own turns
+    // only; the local render keeps the full window (run.user_input).
+    run.external_input = external_input;
     // items.id=387: the raw turn, for the hand-off return writer alone (never
     // persisted or logged; see conductor::handoff_writer).
     run.set_current_turn(content);

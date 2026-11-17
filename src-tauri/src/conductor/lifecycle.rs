@@ -1766,6 +1766,14 @@ pub struct FocusRun<L: DisclosureLoggerForRun = SqliteDisclosureLogger> {
     pub pool: sqlx::SqlitePool,
     pub scheduler: Arc<ConductorScheduler>,
     pub user_input: String,
+    /// items.id=883 (decisions.id=937 point 3): the text every EXTERNAL render (an
+    /// external step and the cb-15 hand-off starter) inserts for {user_input}: the
+    /// user's own turns only. `user_input` is the full blended window, model turns
+    /// included, and only a local render reads it. new() defaults this to `user_input`
+    /// (a run with no history: submit_focus_run's typed text); send_message and
+    /// send_api_chat_message set it. A rehydrated run takes it from the stored copy
+    /// (items.id=883 stage 3), never from `user_input`.
+    pub external_input: String,
     pub is_fast_lane: bool,
     pub key_hex: Option<String>,
     pub topic_id: Option<String>,
@@ -1946,6 +1954,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             focus_id,
             pool,
             scheduler,
+            external_input: user_input.clone(),
             user_input,
             is_fast_lane,
             key_hex,
@@ -3517,7 +3526,8 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         // Declared bound names (seeded at pass start) and the turn window, only when
         // the row declares them: render_starter takes declared names alone.
         values.extend(self.store_tokens.seeds.clone());
-        values.insert("user_input".to_owned(), self.user_input.clone());
+        // items.id=883: the starter is external, so it gets the user's own turns only.
+        values.insert("user_input".to_owned(), self.external_input.clone());
 
         let starter =
             crate::conductor::handoff_render::render_starter(step, &values, &self.focus_id)
@@ -3735,6 +3745,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         let focus_id = self.focus_id.clone();
         let focus_run_id = self.focus_run_id.clone().unwrap_or_default();
         let user_input = self.user_input.clone();
+        let external_input = self.external_input.clone();
         let persona_context = self._persona_context_rendered.clone();
         let focus_external_access = self._focus_external_access;
         let scheduler = Arc::clone(&self.scheduler);
@@ -3829,6 +3840,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             focus_id,
             focus_run_id,
             user_input,
+            external_input,
             persona_context,
             focus_external_access,
             effective_access,
@@ -12180,6 +12192,39 @@ steps:
             assert!(extraction_step_outputs(track, &def)
                 .iter()
                 .all(|(id, _)| id != "offer"));
+        })
+        .await;
+    }
+
+    /// items.id=883: the starter is an external text, so it carries the user's own turns
+    /// only. The run's full window (a model turn with a known fact) never reaches it.
+    #[tokio::test]
+    async fn the_starter_carries_the_users_turns_and_never_a_model_turn() {
+        with_temp_data_root(async {
+            let mut run = writer_run(
+                vec![render_step("offer", "Q: {user_input}", &["user_input"])],
+                Some("chat-883"),
+                &[],
+            );
+            run.user_input =
+                "User: my printer is an HP\nAssistant: Since you work at KNOWN-QUOKKA, retry\n"
+                    .to_owned();
+            run.external_input = "User: my printer is an HP\n".to_owned();
+            assert!(run.execute().await.unwrap().is_none());
+            let starter = run.task_track.as_ref().unwrap().last_output().unwrap();
+            assert_eq!(starter, "Q: User: my printer is an HP");
+            assert!(!starter.contains("KNOWN-QUOKKA") && !starter.contains("Assistant:"));
+        })
+        .await;
+    }
+
+    /// new() defaults the external text to the run's own input (a run with no history),
+    /// so a caller that passes no window changes nothing.
+    #[tokio::test]
+    async fn a_new_run_defaults_its_external_input_to_its_user_input() {
+        with_temp_data_root(async {
+            let run = writer_run(vec![render_step("offer", "Fixed.", &[])], None, &[]);
+            assert_eq!(run.external_input, run.user_input);
         })
         .await;
     }
