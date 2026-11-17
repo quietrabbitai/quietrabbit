@@ -1220,7 +1220,15 @@ fn render_prompt_with_disclosure(
     tokens.insert("user_input".to_owned(), ctx.user_input.clone());
     tokens.insert("previous_output".to_owned(), previous_output.to_owned());
     tokens.insert("focus_context".to_owned(), ctx.focus_id.clone());
-    tokens.insert("persona_context".to_owned(), ctx.persona_context.clone());
+    // items.id=882 (decisions.id=937 point 2): {persona_context} renders EMPTY on this
+    // path, the one every step that goes to an external destination takes
+    // (`treatment.hosted`). The assembled slice is never read here: a standing summary
+    // is labelled tier2_permitted at every ceiling and the eligibility check is not
+    // complete (items.id=536), so the slice is not safe to send. Personalisation of an
+    // external step goes through its declared field_requirements, which Gate 1 sees and
+    // which arrive through `disclosure` above. render_prompt (local) still inserts the
+    // slice. A test pins that this function never names ctx.persona_context.
+    tokens.insert("persona_context".to_owned(), String::new());
     tokens.insert("voice_profile".to_owned(), voice_profile_str.to_owned());
     // items.id=886: as in render_prompt. (Since items.id=884 flipped
     // STORE_NAMES_EXTERNAL_ALLOWED an external step may name a bound name it declares:
@@ -9157,6 +9165,235 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned()
+    }
+
+    // -- items.id=882: {persona_context} renders empty at an external destination ----
+
+    const PERSONA_FACT: &str = "KNOWN-FACT-ZEBRA-42";
+
+    /// A scanner that finds nothing and records every text it was asked to scan: the
+    /// text execute_once rendered for the hosted call, before the call.
+    fn capturing_scanner() -> (
+        step_review::forced::Forced,
+        std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    ) {
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = std::rc::Rc::clone(&seen);
+        let mut forced = step_review::forced::clean();
+        forced.result = std::rc::Rc::new(move |content: &str| {
+            sink.borrow_mut().push(content.to_owned());
+            Ok(crate::conductor::privacy::types::Gate3Result {
+                approved: true,
+                ..Default::default()
+            })
+        });
+        (forced, seen)
+    }
+
+    const PERSONA_TEMPLATE: &str = "Plan the work. Context: {persona_context} End of context.";
+
+    /// Test 1a: an ORDINARY external step (no requirement) whose template names the
+    /// token, with a filled slice on the context: the text that goes to review and out
+    /// carries neither the fact nor the token.
+    #[tokio::test]
+    async fn an_ordinary_external_step_renders_persona_context_empty() {
+        with_temp_shared_db(|pool| async move {
+            let key_hex = hosted_pick_rig(&pool).await;
+            let mut ctx = resolved_ctx(
+                None,
+                ExternalAccess::AnonymousPreferred,
+                None,
+                PERSONA_TEMPLATE,
+            );
+            ctx.key_hex = key_hex;
+            ctx.qr_hosted_provider_preference = Some("fixture-host-a".to_owned());
+            ctx.persona_context = PERSONA_FACT.to_owned();
+            let (forced, seen) = capturing_scanner();
+            let _g = step_review::forced::arm(&ctx, forced).await;
+
+            let _ = run_once(&ctx, &pool).await;
+            let seen = seen.borrow();
+            assert_eq!(seen.len(), 1, "the review saw exactly one prompt");
+            assert!(!seen[0].contains(PERSONA_FACT), "{}", seen[0]);
+            assert!(!seen[0].contains("{persona_context}"), "{}", seen[0]);
+            assert_eq!(seen[0], "Plan the work. Context:  End of context.");
+        })
+        .await;
+    }
+
+    /// Test 1b: the same on a RESOLVED hosted pick.
+    #[tokio::test]
+    async fn a_resolved_hosted_pick_renders_persona_context_empty() {
+        with_temp_shared_db(|pool| async move {
+            let key_hex = hosted_pick_rig(&pool).await;
+            let mut ctx = hosted_pick_ctx(&key_hex, PERSONA_TEMPLATE);
+            ctx.persona_context = PERSONA_FACT.to_owned();
+            let (forced, seen) = capturing_scanner();
+            let _g = step_review::forced::arm(&ctx, forced).await;
+
+            let _ = run_once(&ctx, &pool).await;
+            let seen = seen.borrow();
+            assert_eq!(seen.len(), 1, "the review saw exactly one prompt");
+            assert!(!seen[0].contains(PERSONA_FACT), "{}", seen[0]);
+            assert!(!seen[0].contains("{persona_context}"), "{}", seen[0]);
+        })
+        .await;
+    }
+
+    /// Test 2: local still gets it. The local render inserts the slice, the external
+    /// render of the SAME context does not.
+    #[test]
+    fn the_local_render_still_inserts_persona_context_and_the_external_one_does_not() {
+        let mut ctx = hosted_ctx(RunAttendance::Attended, "unused");
+        ctx.step.prompt_template = PERSONA_TEMPLATE.to_owned();
+        ctx.persona_context = PERSONA_FACT.to_owned();
+        let vars = HashMap::new();
+        let local = render_prompt(&ctx, &vars, "", "");
+        assert_eq!(
+            local,
+            format!("Plan the work. Context: {PERSONA_FACT} End of context.")
+        );
+        let external = render_prompt_with_disclosure(&ctx, &vars, "", &HashMap::new(), "");
+        assert_eq!(external, "Plan the work. Context:  End of context.");
+        // A disclosure entry cannot smuggle the name back in: the empty value is
+        // inserted after the disclosure fields.
+        let mut disclosure = HashMap::new();
+        disclosure.insert("persona_context".to_owned(), PERSONA_FACT.to_owned());
+        let external = render_prompt_with_disclosure(&ctx, &vars, "", &disclosure, "");
+        assert!(!external.contains(PERSONA_FACT), "{external}");
+    }
+
+    /// Scan: render_prompt_with_disclosure never reads ctx.persona_context.
+    #[test]
+    fn the_external_render_never_reads_the_persona_context_slice() {
+        let src = include_str!("executor.rs");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let live: String = code
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The body ends at the next top-level fn (comment lines are filtered out of
+        // `live`, so a comment banner cannot be the end marker).
+        let after = live
+            .split("fn render_prompt_with_disclosure(")
+            .nth(1)
+            .expect("render_prompt_with_disclosure");
+        let end = [
+            "\nfn ",
+            "\nasync fn ",
+            "\npub fn ",
+            "\npub(crate) fn ",
+            "\npub async fn ",
+        ]
+        .iter()
+        .filter_map(|m| after.find(m))
+        .min()
+        .expect("a following top-level fn");
+        let body = &after[..end];
+        assert!(
+            body.contains("render_template("),
+            "the body is the whole function, not a prefix: {body}"
+        );
+        assert!(
+            !body.contains("scan_voice_profile"),
+            "the body stops before the next function"
+        );
+        assert!(!body.contains("persona_context()"), "{body}");
+        assert!(!body.contains("ctx.persona_context"), "{body}");
+        assert!(body.contains("tokens.insert(\"persona_context\".to_owned(), String::new());"));
+        // The local render does read it, so the scan above is not vacuous.
+        let local = live
+            .split("pub(crate) fn render_prompt(")
+            .nth(1)
+            .and_then(|r| r.split("fn render_prompt_with_disclosure(").next())
+            .expect("render_prompt");
+        assert!(local.contains("ctx.persona_context.clone()"));
+        // The slice has one production reader: the local render.
+        assert_eq!(live.matches("ctx.persona_context").count(), 1);
+    }
+
+    /// Test 7, a CHARACTERISATION (no tier-filtering is asserted, none is claimed):
+    /// what the Memory Broker returns for a focus whose domain_context.db holds a
+    /// standing summary, asked as a tier-1 and as a tier-2 run. The observed values
+    /// are recorded in the asserts so a change to the broker shows up here. Then the
+    /// rendered slice is put on an external step's context: the prompt still has none
+    /// of it.
+    #[tokio::test]
+    async fn broker_characterisation_and_the_external_prompt_still_empty() {
+        use crate::conductor::memory_broker::MemoryBroker;
+        use sqlx::{ConnectOptions, Connection};
+        with_temp_shared_db(|pool| async move {
+            let key_hex = hosted_pick_rig(&pool).await;
+            let (user, persona, focus) = (SPEND_USER, "persona-1", "focus-1");
+
+            // A standing summary written the way the store reads it: the table row
+            // that migration seeds, updated. (No production writer is called: the
+            // block writers have no callers, items.id=535's guard.)
+            crate::persistence::domain_context_store::ensure_domain_context_db(
+                user, persona, focus, &key_hex,
+            )
+            .await
+            .expect("domain_context.db");
+            let path = crate::persistence::domain_context_store::get_domain_context_path(
+                user, persona, focus,
+            );
+            let db_key = crate::auth::subkeys::db_key_hex(
+                user,
+                &key_hex,
+                crate::auth::subkeys::DbPurpose::DomainContext,
+                &crate::auth::subkeys::scope(&[persona, focus]).unwrap(),
+            )
+            .unwrap();
+            let mut conn = crate::providers::utils::quiet_connect_options()
+                .filename(&path)
+                .create_if_missing(false)
+                .pragma("key", format!("\"x'{}'\"", db_key.as_str()))
+                .pragma("cipher_compatibility", "4")
+                .pragma("journal_mode", "DELETE")
+                .connect()
+                .await
+                .expect("open domain_context.db");
+            sqlx::query("UPDATE standing_summary SET content = ?, token_count = 9 WHERE id = 1")
+                .bind(PERSONA_FACT)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            conn.close().await.unwrap();
+
+            let mut rendered_by_tier = Vec::new();
+            for tier in [1, 2] {
+                let mut slice = MemoryBroker::new()
+                    .assemble_context(
+                        user, persona, focus, None, &key_hex, tier, 8192, false, None, None,
+                    )
+                    .await;
+                let scopes: Vec<String> = slice
+                    .retrieved_blocks
+                    .iter()
+                    .map(|b| b.visibility_scope.clone())
+                    .collect();
+                rendered_by_tier.push((slice.render(), scopes));
+                slice.clear();
+            }
+            // Observed today: the slice is the same text at tier 1 and at tier 2, as
+            // one block labelled tier2_permitted. Recorded, not endorsed.
+            assert_eq!(rendered_by_tier[0].0, PERSONA_FACT);
+            assert_eq!(rendered_by_tier[1].0, PERSONA_FACT);
+            assert_eq!(rendered_by_tier[0].1, vec!["tier2_permitted".to_owned()]);
+            assert_eq!(rendered_by_tier[1].1, vec!["tier2_permitted".to_owned()]);
+
+            // That text, on an external step's context, is not in the prompt.
+            let mut ctx = hosted_pick_ctx(&key_hex, PERSONA_TEMPLATE);
+            ctx.persona_context = rendered_by_tier[1].0.clone();
+            let (forced, seen) = capturing_scanner();
+            let _g = step_review::forced::arm(&ctx, forced).await;
+            let _ = run_once(&ctx, &pool).await;
+            let seen = seen.borrow();
+            assert_eq!(seen.len(), 1);
+            assert!(!seen[0].contains(PERSONA_FACT), "{}", seen[0]);
+        })
+        .await;
     }
 
     /// No filter, no external step: an unbound hosted pick parks before the context
