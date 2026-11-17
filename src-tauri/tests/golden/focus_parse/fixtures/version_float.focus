@@ -6,7 +6,7 @@ max_routing_tier: 1
 steps:
   one:
     display_name: One
-    task_type: generic
+    task_type: general
     routing_tier: 1
     step_type: generate
     prompt_template: Say {user_input}

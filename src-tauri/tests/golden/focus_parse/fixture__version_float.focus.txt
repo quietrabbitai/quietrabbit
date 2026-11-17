@@ -19,7 +19,7 @@ ActionDefinition {
     action_id: "one",
     display_name: "One",
     guide_id: "quick-ask-guide",
-    task_type: "generic",
+    task_type: "general",
     routing_tier: LocalOnly,
     step_type: Generate,
     output_var: None,

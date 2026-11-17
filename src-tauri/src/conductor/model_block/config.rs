@@ -92,7 +92,39 @@ pub enum ModelTaskType {
     QuickResponse,
 }
 
+/// The task type an ordinary step gets when it names none, and the one value
+/// that is valid for an ordinary step but is not a model-block task type
+/// (items.id=898). select_model routes it to its default arm; no capability
+/// cell is keyed on it.
+pub const GENERAL_TASK_TYPE: &str = "general";
+
+/// Whether `t` is an accepted ActionDefinition.task_type at LOAD: one of the
+/// eight measured task types or GENERAL_TASK_TYPE. Exact match: an empty,
+/// padded or differently cased value is not valid (items.id=898).
+pub fn is_valid_task_type(t: &str) -> bool {
+    t == GENERAL_TASK_TYPE || ModelTaskType::ALL.iter().any(|m| m.as_str() == t)
+}
+
+/// The accepted values, for an error message.
+pub fn valid_task_types() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = ModelTaskType::ALL.iter().map(|m| m.as_str()).collect();
+    v.push(GENERAL_TASK_TYPE);
+    v
+}
+
 impl ModelTaskType {
+    /// Every task type, in the order providers/evaluation.rs registers them.
+    pub const ALL: [ModelTaskType; 8] = [
+        Self::Summarization,
+        Self::StructuredOutput,
+        Self::Code,
+        Self::Reasoning,
+        Self::Research,
+        Self::LongContext,
+        Self::CreativeWriting,
+        Self::QuickResponse,
+    ];
+
     /// The string ActionDefinition.task_type carries (what select_model matches).
     pub fn as_str(self) -> &'static str {
         match self {

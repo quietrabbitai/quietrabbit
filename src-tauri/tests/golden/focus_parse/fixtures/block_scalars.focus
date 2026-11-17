@@ -6,7 +6,7 @@ description: |
   last line
 steps:
   literal:
-    task_type: generic
+    task_type: general
     routing_tier: 1
     step_type: generate
     prompt_template: |
@@ -15,7 +15,7 @@ steps:
 
       Line four after blank
   folded:
-    task_type: generic
+    task_type: general
     routing_tier: 1
     step_type: generate
     prompt_template: >
@@ -24,13 +24,13 @@ steps:
 
       New paragraph.
   stripped:
-    task_type: generic
+    task_type: general
     routing_tier: 1
     step_type: generate
     prompt_template: >-
       No trailing newline
   kept:
-    task_type: generic
+    task_type: general
     routing_tier: 1
     step_type: generate
     prompt_template: |+

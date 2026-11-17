@@ -4,12 +4,12 @@ guides: &g
 output_types: *g
 steps:
   one:
-    task_type: generic
+    task_type: general
     routing_tier: 1
     step_type: generate
     prompt_template: &t "Say {user_input}"
   two:
-    task_type: generic
+    task_type: general
     routing_tier: 1
     step_type: generate
     prompt_template: *t

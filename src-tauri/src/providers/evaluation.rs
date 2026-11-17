@@ -5,7 +5,8 @@
 //! (unencrypted, per-instance — no personal data).
 //!
 //! Runs at startup (Layer 1) and on-demand for recalibration.
-//! Task types must match `task_types.yaml`.
+//! Task types must match `ModelTaskType::ALL` (conductor/model_block/config.rs),
+//! the list the loader accepts; a test pins the two equal (items.id=898).
 //!
 //! Python oracle: `providers/evaluation.py`
 
@@ -422,6 +423,16 @@ impl EvaluationHarness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // items.id=898: the evaluation registry, ModelTaskType::ALL and the loader's
+    // accepted list are one list.
+    #[test]
+    fn the_evaluation_task_types_equal_the_loaders_model_task_types() {
+        use crate::conductor::model_block::config::ModelTaskType;
+        let eval: Vec<&str> = default_evaluation_tasks().keys().copied().collect();
+        let model: Vec<&str> = ModelTaskType::ALL.iter().map(|t| t.as_str()).collect();
+        assert_eq!(eval, model);
+    }
 
     // -- looks_like_code -----------------------------------------------------
 

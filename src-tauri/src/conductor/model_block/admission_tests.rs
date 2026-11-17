@@ -832,6 +832,57 @@ async fn an_out_of_range_routing_tier_in_a_database_row_is_a_load_error() {
     }
 }
 
+/// items.id=898: the database path rejects a present-but-unparsable step_type and
+/// an unknown task_type, with the step's name, through the same builder as the
+/// YAML path. An absent step_type still loads.
+#[tokio::test]
+async fn an_unknown_step_type_or_task_type_in_a_database_row_is_a_load_error() {
+    let env = setup().await;
+    let cases = [
+        (
+            json!({"routing_tier": 1, "task_type": "quick_response", "step_type": "generat",
+                "output_var": "x", "prompt_template": "hi"}),
+            Some("unknown step_type"),
+        ),
+        (
+            json!({"routing_tier": 1, "task_type": "generic",
+                "output_var": "x", "prompt_template": "hi"}),
+            Some("unknown task_type"),
+        ),
+        (
+            json!({"routing_tier": 1, "task_type": "", "output_var": "x",
+                "prompt_template": "hi"}),
+            Some("unknown task_type"),
+        ),
+        (
+            json!({"routing_tier": 1, "task_type": "quick_response",
+                "output_var": "x", "prompt_template": "hi"}),
+            None,
+        ),
+    ];
+    for (n, (custom, expect)) in cases.into_iter().enumerate() {
+        let focus_id = format!("bad-type-{n}");
+        seed_focus(
+            &env.pool,
+            &focus_id,
+            "local_only",
+            &[("step_a".to_owned(), None, custom)],
+        )
+        .await;
+        let r =
+            crate::conductor::lifecycle::load_focus_definition_from_db(&env.pool, &focus_id).await;
+        match expect {
+            Some(text) => {
+                let e = r.unwrap_err().to_string();
+                assert!(e.contains("step_a") && e.contains(text), "{e}");
+            }
+            None => {
+                r.unwrap().unwrap();
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_model_block_with_a_wrong_input_name_fails_the_declared_inputs_lint() {
     // The producers are missing, so the declared names are not real: the existing

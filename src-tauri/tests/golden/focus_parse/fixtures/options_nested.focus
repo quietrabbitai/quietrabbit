@@ -1,7 +1,7 @@
 id: fixture-options
 steps:
   one:
-    task_type: generic
+    task_type: general
     routing_tier: 1
     step_type: generate
     prompt_template: x

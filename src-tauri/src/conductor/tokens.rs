@@ -236,7 +236,7 @@ pub struct ActionDefinition {
     pub action_id: String,
     pub display_name: String,
     pub guide_id: String,
-    pub task_type: String, // validated against task_types.yaml at LOAD
+    pub task_type: String, // validated at LOAD: model_block::config::is_valid_task_type (items.id=898)
     pub routing_tier: ExternalAccess,
     pub step_type: StepType,
     pub output_var: Option<String>,

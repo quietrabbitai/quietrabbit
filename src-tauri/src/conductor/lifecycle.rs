@@ -434,11 +434,28 @@ fn build_action_definition(
     default_guide_id: &str,
     raw: NormalizedRawStep,
 ) -> Result<ActionDefinition, String> {
-    let step_type = raw
-        .step_type
-        .as_deref()
-        .and_then(|s| s.parse::<StepType>().ok())
-        .unwrap_or_default();
+    // items.id=898: an absent step_type keeps the default, a PRESENT one must
+    // parse. It used to become Generate silently when it did not.
+    let step_type = match raw.step_type.as_deref() {
+        None => StepType::default(),
+        Some(s) => s
+            .parse::<StepType>()
+            .map_err(|e| format!("step '{action_id}': {e}"))?,
+    };
+    // items.id=898: same rule for task_type. Absent is "general"; a present value
+    // must be one of the measured task types or "general".
+    let task_type = match raw.task_type {
+        None => crate::conductor::model_block::config::GENERAL_TASK_TYPE.to_owned(),
+        Some(t) => {
+            if !crate::conductor::model_block::config::is_valid_task_type(&t) {
+                return Err(format!(
+                    "step '{action_id}': unknown task_type '{t}'. Must be one of: {}",
+                    crate::conductor::model_block::config::valid_task_types().join(" | ")
+                ));
+            }
+            t
+        }
+    };
 
     // items.id=439 (Part 6c/6d), corrected by items.id=528 Phase 2:
     // requires_user_handoff and external_access_override are independently
@@ -459,7 +476,7 @@ fn build_action_definition(
     Ok(ActionDefinition {
         display_name: raw.display_name.unwrap_or_else(|| action_id.clone()),
         guide_id: raw.guide_id.unwrap_or_else(|| default_guide_id.to_owned()),
-        task_type: raw.task_type.unwrap_or_else(|| "general".to_owned()),
+        task_type,
         routing_tier,
         step_type,
         output_var: raw.output_var,
@@ -5471,6 +5488,77 @@ mod tests {
             step.external_access_override,
             Some(ExternalAccess::LocalOnly)
         );
+    }
+
+    // items.id=898: a present step_type must parse and a present task_type must be
+    // a known one, on the YAML path. Absent keeps the defaults.
+    fn parse_with(
+        step_type: Option<&str>,
+        task_type: Option<&str>,
+    ) -> Result<ActionDefinition, String> {
+        let mut r = single_step_raw(Some(1), None);
+        r.step_type = step_type.map(str::to_owned);
+        r.task_type = task_type.map(str::to_owned);
+        let mut steps_map = IndexMap::new();
+        steps_map.insert("step_a".to_owned(), r);
+        let mut raw = minimal_raw();
+        raw.steps = Some(steps_map);
+        match parse_focus_definition(raw) {
+            Ok(mut d) => Ok(d.steps.remove(0)),
+            Err(LifecycleError::ValidationFailed(m)) => Err(m),
+            Err(e) => panic!("unexpected error {e:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unparsable_step_type_is_a_load_error_and_an_absent_one_keeps_the_default() {
+        for bad in ["generat", "Generate", "", " generate", "summarize"] {
+            let m = parse_with(Some(bad), Some("general")).unwrap_err();
+            assert!(
+                m.contains("step_a") && m.contains("unknown step_type"),
+                "{bad:?}: {m}"
+            );
+        }
+        assert_eq!(
+            parse_with(None, Some("general")).unwrap().step_type,
+            StepType::Generate
+        );
+        assert_eq!(
+            parse_with(Some("post_process"), None).unwrap().step_type,
+            StepType::PostProcess
+        );
+    }
+
+    #[test]
+    fn an_unknown_task_type_is_a_load_error_and_every_known_one_loads() {
+        for bad in [
+            "generic",
+            "",
+            "General",
+            " general",
+            "ocr",
+            "extraction",
+            "code ",
+        ] {
+            let m = parse_with(None, Some(bad)).unwrap_err();
+            assert!(
+                m.contains("step_a") && m.contains("unknown task_type"),
+                "{bad:?}: {m}"
+            );
+            assert!(
+                m.contains("general"),
+                "the message lists the valid values: {m}"
+            );
+        }
+        let mut valid: Vec<&str> = crate::conductor::model_block::config::ModelTaskType::ALL
+            .iter()
+            .map(|t| t.as_str())
+            .collect();
+        valid.push("general");
+        for t in valid {
+            assert_eq!(parse_with(None, Some(t)).unwrap().task_type, t);
+        }
+        assert_eq!(parse_with(None, None).unwrap().task_type, "general");
     }
 
     // items.id=894 B0: an out-of-range tier is a LOAD error, never a panic.
