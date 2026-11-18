@@ -79,6 +79,7 @@ use crate::conductor::step_treatment::{
 use crate::conductor::tokens::{ActionDefinition, ExternalAccess};
 use crate::conductor::types::{PersonalTrack, SharedStateTrack, TaskStep, TaskTrack};
 use crate::final_failure;
+use crate::persistence::fact_policy_store::UserPolicies;
 use crate::persistence::integration_keys_store::{self, QR_HOSTED_KEY_TYPE};
 use crate::persistence::provider_store::{self, Provider, ProviderModel};
 use crate::providers::errors::ProviderError;
@@ -572,7 +573,28 @@ impl StepExecutor {
         // privacy::types::PersonalTrack (typed enum fields) differs from
         // conductor::types::PersonalTrack (sqlx-friendly String fields).
         // to_gate_track() converts between them. See module comment.
-        let gate_track = to_gate_track(personal_track);
+        //
+        // items.id=931: a bridged personal fact (personal_fact_bridge) carries the
+        // policy resolved at INITIALIZE. A step that goes external re-reads the
+        // user's policy table here and Gate 1 uses the STRICTER of the snapshot and
+        // the fresh read, so a policy tightened after the run started still holds. A
+        // table or database that cannot be read counts as omit for every bridged field.
+        let fresh_policies = if treatment.hosted
+            && personal_track
+                .fields()
+                .values()
+                .any(crate::conductor::personal_fact_bridge::is_bridged)
+        {
+            Some(reload_fact_policies(ctx).await)
+        } else {
+            None
+        };
+        let gate_track = to_gate_track_with(personal_track, fresh_policies.as_ref());
+        // items.id=931 report_scope: Gate 1 reports (log row, shared, withheld, floor
+        // clamp) over the step's DECLARED field names only. approved_fields stays
+        // unfiltered: the declared-field filter below is still the live control.
+        let report_scope: std::collections::HashSet<String> =
+            ctx.step.field_requirements.keys().cloned().collect();
 
         // -- Steps 6-7 — PG_GATE_1: field approval + abstraction --
         let g1 = privacy_gateway
@@ -585,6 +607,7 @@ impl StepExecutor {
                 treatment.execution_tier,
                 treatment.access,
                 selected_model.provider_id.clone(),
+                Some(&report_scope),
             )
             .await
             .map_err(|e| ConductorError::DisclosureLogWrite {
@@ -3036,14 +3059,90 @@ fn compute_step_sensitivity(
 /// Fail-closed on unrecognised values (Unknown(s) and General/Pass respectively).
 ///
 /// Python oracle: N/A — single PersonalTrack class in Python.
+#[cfg(test)]
 fn to_gate_track(ct: &PersonalTrack) -> GateTrack {
+    to_gate_track_with(ct, None)
+}
+
+/// The user's fact policies, read again for one step (items.id=931). Any failure to
+/// open or read personal.db is UserPolicies::Unreadable, which answers "omit" for
+/// every field and tier (decisions.id=953 ruling 10). Logs no value.
+async fn reload_fact_policies(ctx: &StepContext) -> UserPolicies {
+    match crate::persistence::personal_store::open_personal_db(
+        &ctx.user_id,
+        &ctx.persona_id,
+        &ctx.key_hex,
+    )
+    .await
+    {
+        Ok(mut conn) => UserPolicies::load(&mut conn).await,
+        Err(e) => {
+            log::warn!(
+                "executor: fact policies unreadable for a step, bridged fields are omit: {e}"
+            );
+            UserPolicies::Unreadable
+        }
+    }
+}
+
+/// to_gate_track with the executor's policy re-read. `fresh` is None for a step that
+/// reads no bridged field or goes nowhere external.
+///
+/// A BRIDGED field (personal_fact_bridge::is_bridged) is mapped fail-closed
+/// (decisions.id=953 ruling 4): an unknown sensitivity is financial, not general; a
+/// field that is not catalogued, or whose sensitivity is not general or personal, is
+/// not_permitted at both tiers whatever the snapshot says; otherwise each tier takes
+/// the stricter of the INITIALIZE snapshot and the fresh policy. An unknown policy word
+/// maps to AbstractionPolicy::Unknown, which Gate 1 omits. Any other field maps as it
+/// always did (an unknown sensitivity is general: items.id=930 and earlier).
+fn to_gate_track_with(ct: &PersonalTrack, fresh: Option<&UserPolicies>) -> GateTrack {
+    use crate::conductor::personal_fact_bridge::{is_bridged, resolve_word, stricter};
+    use crate::conductor::personal_fact_fields::{registry, Origin, Tier};
     let mut gt = GateTrack::new();
     for (_, field) in ct.fields() {
+        let bridged = is_bridged(field);
         let sensitivity = match field.sensitivity.as_str() {
             "personal" => Sensitivity::Personal,
             "medical" => Sensitivity::Medical,
             "financial" => Sensitivity::Financial,
-            _ => Sensitivity::General, // "general" + unknown -> General (fail-safe)
+            "general" => Sensitivity::General,
+            // unknown: general for an ordinary field, financial for a bridged one
+            _ if bridged => Sensitivity::Financial,
+            _ => Sensitivity::General,
+        };
+        let (tier2, tier3) = if bridged {
+            let cat = registry().map_err(|_| ());
+            let catalogued = cat.is_ok_and(|c| c.field(&field.field_name).is_some());
+            let open_to_policy = matches!(field.sensitivity.as_str(), "general" | "personal");
+            if !catalogued || !open_to_policy {
+                ("not_permitted".to_owned(), "not_permitted".to_owned())
+            } else {
+                let tier = |snapshot: &str, t: Tier| -> String {
+                    match fresh {
+                        None => stricter(snapshot, snapshot).to_owned(),
+                        Some(f) => {
+                            let now = resolve_word(
+                                cat,
+                                &field.field_name,
+                                &field.sensitivity,
+                                Origin::ThisPersona,
+                                t,
+                                f,
+                            );
+                            stricter(snapshot, now).to_owned()
+                        }
+                    }
+                };
+                (
+                    tier(&field.abstraction_tier2, Tier::Two),
+                    tier(&field.abstraction_tier3, Tier::Three),
+                )
+            }
+        } else {
+            (
+                field.abstraction_tier2.clone(),
+                field.abstraction_tier3.clone(),
+            )
         };
         let _ = gt.add_field(GateField {
             field_name: field.field_name.clone(),
@@ -3051,8 +3150,8 @@ fn to_gate_track(ct: &PersonalTrack) -> GateTrack {
             sensitivity,
             sensitivity_severity: field.sensitivity_severity as u8,
             source_id: field.source_id.clone(),
-            abstraction_tier2: AbstractionPolicy::from_str(&field.abstraction_tier2),
-            abstraction_tier3: AbstractionPolicy::from_str(&field.abstraction_tier3),
+            abstraction_tier2: AbstractionPolicy::from_str(&tier2),
+            abstraction_tier3: AbstractionPolicy::from_str(&tier3),
         });
     }
     gt.seal();
@@ -7371,6 +7470,7 @@ mod tests {
                     1,
                     ExternalAccess::LocalOnly,
                     None,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -7405,6 +7505,7 @@ mod tests {
                     1,
                     2,
                     ExternalAccess::AnonymousRequired,
+                    None,
                     None,
                 )
                 .await
@@ -8374,6 +8475,18 @@ mod tests {
         pt
     }
 
+    /// items.id=931: Gate 1 reports (and the floor-consent prompt names) only the
+    /// step's DECLARED fields, so a fixture that wants its clamped field reported
+    /// declares it, as a real external step does through field_requirements.
+    fn declare_field(ctx: &mut StepContext, name: &str) {
+        ctx.step.field_requirements.insert(
+            name.to_owned(),
+            "recommended"
+                .parse::<crate::conductor::tokens::FieldRequirement>()
+                .unwrap(),
+        );
+    }
+
     fn gate1_entries(gateway: &PrivacyGateway<TestLogger>) -> Vec<DisclosureLogEntry> {
         gateway
             .logger
@@ -8437,7 +8550,7 @@ mod tests {
         with_temp_shared_db(|pool| async move {
             install_local_models(&pool).await;
             let stub = LocalModelStub::start(1);
-            let ctx = resolved_ctx(
+            let mut ctx = resolved_ctx(
                 Some(requirement(
                     QualityBar::Basic,
                     &[Destination::Local, Destination::HostedApi],
@@ -8447,6 +8560,7 @@ mod tests {
                 Some("rma_letter"),
                 "Write it. {diagnosis}",
             );
+            declare_field(&mut ctx, "diagnosis");
             // The ceiling values are the external ones lifecycle computes (the
             // fixture sets 2/2/1): without the fix this track is clamped and the
             // step parks on floor consent.
@@ -8508,6 +8622,7 @@ mod tests {
             );
             ctx.key_hex = key_hex;
             ctx.plan = hosted_pin_approval();
+            declare_field(&mut ctx, "diagnosis");
             let (out, track, gateway) = run_once_with(&ctx, &pool, &clamping_track()).await;
             let failure = out.unwrap().expect("the step parks");
             assert_eq!(failure.action, FailureAction::AwaitFloorConsent);
@@ -8551,8 +8666,10 @@ mod tests {
             );
             resolved.key_hex = key_hex.clone();
             resolved.plan = hosted_pin_approval();
+            declare_field(&mut resolved, "diagnosis");
             let mut ordinary_ctx =
                 resolved_ctx(None, ExternalAccess::AnonymousPreferred, None, "Write it.");
+            declare_field(&mut ordinary_ctx, "diagnosis");
             ordinary_ctx.key_hex = key_hex;
             ordinary_ctx.qr_hosted_provider_preference = Some("fixture-host-a".to_owned());
             let (a, _, ga) = run_once_with(&resolved, &pool, &clamping_track()).await;
@@ -8781,7 +8898,7 @@ mod tests {
         // The gates take the treatment.
         let flat: String = live.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(flat.contains(
-            "treatment.abstraction_tier, treatment.raw_abstraction, treatment.execution_tier, treatment.access, selected_model.provider_id.clone(), )"
+            "treatment.abstraction_tier, treatment.raw_abstraction, treatment.execution_tier, treatment.access, selected_model.provider_id.clone(), Some(&report_scope), )"
         ));
         assert!(flat.contains("let hosted_step = treatment.hosted;"));
         assert!(flat.contains("let prompt = if treatment.hosted {"));
@@ -8858,6 +8975,8 @@ mod tests {
         ordinary_ctx.key_hex = key_hex.to_owned();
         ordinary_ctx.qr_hosted_provider_preference = Some("fixture-host-a".to_owned());
         ordinary_ctx.execution_tier = 3;
+        declare_field(&mut resolved, "diagnosis");
+        declare_field(&mut ordinary_ctx, "diagnosis");
         (resolved, ordinary_ctx)
     }
 
@@ -8952,6 +9071,7 @@ mod tests {
             );
             ctx.key_hex = key_hex;
             ctx.execution_tier = 3;
+            declare_field(&mut ctx, "diagnosis");
             // items.id=901: attempt 1 runs under an approved pin of the host (a hosted pick
             // needs one); attempt 2 under a zero-pin approval, which permits resolver LOCAL
             // picks only, so it shows the retry selecting again.
@@ -9650,18 +9770,14 @@ mod tests {
             assert!(!prompt.contains("INCOME-185000"), "{prompt}");
             assert!(!prompt.contains(PERSONA_FACT), "{prompt}");
             assert!(!prompt.contains("{persona_context}"), "{prompt}");
-            // The disclosure log row Gate 1 wrote: all four are shared as they are
-            // (nothing abstracted). NOTE it lists every field Gate 1 approved, so it
-            // names income_range although projection kept it out of the prompt: the
-            // log OVER-reports against the prompt, never under-reports.
+            // The disclosure log row Gate 1 wrote: the three DECLARED fields are shared
+            // as they are (nothing abstracted). items.id=931 report_scope: income_range
+            // is approved by Gate 1 but undeclared, so the row no longer names it.
             let rows = gate1_entries(&gateway);
             assert_eq!(rows.len(), 1);
             let mut shared = rows[0].fields_shared.clone();
             shared.sort();
-            assert_eq!(
-                shared,
-                ["employer", "income_range", "industry", "job_title"]
-            );
+            assert_eq!(shared, ["employer", "industry", "job_title"]);
             assert!(rows[0].fields_abstracted.is_empty());
             assert!(rows[0].fields_withheld.is_empty());
             assert_eq!(rows[0].abstraction_tier, Some(2));
@@ -9710,9 +9826,9 @@ mod tests {
                 rows[0].fields_abstracted["job_title"],
                 "personal job title information"
             );
-            // income_range (pass) is the one field shared as it is, and it is not in
-            // the prompt.
-            assert_eq!(rows[0].fields_shared, ["income_range"]);
+            // income_range (pass) is undeclared: not in the prompt and, with
+            // report_scope, not in the row either.
+            assert!(rows[0].fields_shared.is_empty());
         })
         .await;
     }
@@ -9740,10 +9856,8 @@ mod tests {
     /// declared-field filter keeps it out of the prompt and the disclosure buffer.
     /// Remove the filter and this test fails. No behaviour change in this stage.
     ///
-    /// The gate1 row is deliberately NOT asserted absent here: today it lists every
-    /// field Gate 1 approved (see fit_analysis_shows_declared_fields_at_pass), so it
-    /// OVER-reports. The assertion below pins that, and items.id=931 stage 2 (report_scope)
-    /// flips it to "absent".
+    /// Stage 1 pinned the gate1 row's over-report (it listed every approved field); stage 2's
+    /// report_scope flipped it: the row now names the declared field only.
     #[tokio::test]
     async fn an_undeclared_financial_field_the_template_names_never_reaches_the_prompt_or_the_buffer(
     ) {
@@ -9805,15 +9919,195 @@ mod tests {
             let buf = shared.read_disclosure_buffer(&ctx.step.action_id);
             assert_eq!(buf.keys().cloned().collect::<Vec<_>>(), ["job_title"]);
             assert!(!buf.values().any(|v| v.contains("INCOME")), "{buf:?}");
-            // The gate1 row today (over-reports undeclared approved fields; stage 2's
-            // report_scope makes this ["job_title"] only).
+            // The gate1 row (items.id=931 stage 2, report_scope): declared fields only.
             let rows = gate1_entries(&gateway);
             assert_eq!(rows.len(), 1);
-            let mut shared_names = rows[0].fields_shared.clone();
-            shared_names.sort();
-            assert_eq!(shared_names, ["income_range", "job_title"]);
+            assert_eq!(rows[0].fields_shared, ["job_title"]);
+            assert!(rows[0].fields_withheld.is_empty());
+            assert!(rows[0].fields_abstracted.is_empty());
         })
         .await;
+    }
+
+    // -- items.id=931 stage 2: the bridge through execute_once -------------------------
+
+    fn bridge_fact(name: &str, value: &str) -> crate::conductor::types::EntityFact {
+        crate::conductor::types::EntityFact {
+            id: format!("id-{name}"),
+            entity_id: None,
+            field_name: name.to_owned(),
+            field_value: value.to_owned(),
+            sensitivity: "personal".to_owned(),
+            sensitivity_severity: 2,
+            source_persona_id: "persona-1".to_owned(),
+            cross_persona_export: false,
+            origin_persona_id: None,
+        }
+    }
+
+    /// A track holding bridged fields, built the production way (bridge_fields) from
+    /// `policies` (the INITIALIZE snapshot).
+    fn bridged_track(facts: &[(&str, &str)], snapshot_pass: bool) -> PersonalTrack {
+        use crate::conductor::personal_fact_fields::{registry, Tier};
+        use crate::persistence::fact_policy_store::{FactPolicyRow, UserPolicies};
+        let rows: Vec<FactPolicyRow> = if snapshot_pass {
+            facts
+                .iter()
+                .map(|(n, _)| FactPolicyRow {
+                    field_name: (*n).to_owned(),
+                    tier2: Some("pass".to_owned()),
+                    tier3: None,
+                    set_at: String::new(),
+                    set_by: "user".to_owned(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let _ = Tier::Two;
+        let policies = UserPolicies::Rows(rows);
+        let efs: Vec<_> = facts.iter().map(|(n, v)| bridge_fact(n, v)).collect();
+        let mut pt = PersonalTrack::new();
+        for f in crate::conductor::personal_fact_bridge::bridge_fields(
+            efs.iter(),
+            "persona-1",
+            registry().map_err(|_| ()),
+            &policies,
+        ) {
+            pt.add_field(f).unwrap();
+        }
+        pt
+    }
+
+    /// An external step declaring job_title, run against `track`, with the user's
+    /// policy table in personal.db set to `db_pass` (a pass row for job_title at tier 2)
+    /// or left empty. Returns the prompt the review saw (None when nothing was sent)
+    /// and the gateway.
+    async fn bridged_run(
+        pool: &sqlx::SqlitePool,
+        track: &PersonalTrack,
+        db_pass: bool,
+    ) -> (Option<String>, PrivacyGateway<TestLogger>) {
+        use crate::conductor::personal_fact_fields::Tier;
+        let key_hex = hosted_pick_rig(pool).await;
+        let mut ctx = hosted_ctx(RunAttendance::Attended, &key_hex);
+        ctx.step.prompt_template = "Role: {job_title}".to_owned();
+        declare_field(&mut ctx, "job_title");
+        ctx.floor_consent_preference = Some(FLOOR_CONSENT_MODIFIED.to_owned());
+        ctx.external_input = "USERTEXT-XYZ".to_owned();
+        if db_pass {
+            let mut conn = crate::persistence::personal_store::open_personal_db(
+                &ctx.user_id,
+                &ctx.persona_id,
+                &ctx.key_hex,
+            )
+            .await
+            .expect("personal.db opens in the fixture");
+            crate::persistence::fact_policy_store::set_fact_policy(
+                &mut conn,
+                "job_title",
+                Tier::Two,
+                "pass",
+                "user",
+            )
+            .await
+            .unwrap();
+        }
+        let (forced, seen) = capturing_scanner();
+        let _g = step_review::forced::arm(&ctx, forced).await;
+        let (_out, _t, gateway) = run_once_with(&ctx, pool, track).await;
+        let seen = seen.borrow();
+        (seen.first().cloned(), gateway)
+    }
+
+    /// A bridged value with brace tokens reaches the prompt as parentheses and is not
+    /// re-expanded: the user's own text and the previous output never appear in its place.
+    /// (items.id=931, Chat-PM extra test (a); the renderer is not single-pass.)
+    #[tokio::test]
+    async fn a_bridged_value_with_brace_tokens_reaches_the_prompt_as_parentheses() {
+        with_temp_shared_db(|pool| async move {
+            let track = bridged_track(
+                &[(
+                    "job_title",
+                    "Lead {user_input} / {previous_output} / {persona_context}",
+                )],
+                true,
+            );
+            let (prompt, gateway) = bridged_run(&pool, &track, true).await;
+            let prompt = prompt.expect("the step was sent");
+            assert_eq!(
+                prompt,
+                "Role: Lead (user_input) / (previous_output) / (persona_context)"
+            );
+            assert!(!prompt.contains("USERTEXT-XYZ"), "{prompt}");
+            let rows = gate1_entries(&gateway);
+            assert_eq!(rows[0].fields_shared, ["job_title"]);
+        })
+        .await;
+    }
+
+    /// The snapshot says pass, the table now has no row (a policy tightened after the run
+    /// started): the executor's re-read takes the stricter, so the value is withheld.
+    #[tokio::test]
+    async fn a_policy_tightened_after_the_snapshot_withholds_the_value() {
+        with_temp_shared_db(|pool| async move {
+            let track = bridged_track(&[("job_title", "Staff Engineer")], true);
+            let (prompt, gateway) = bridged_run(&pool, &track, false).await;
+            if let Some(p) = &prompt {
+                assert!(!p.contains("Staff Engineer"), "{p}");
+            }
+            let rows = gate1_entries(&gateway);
+            assert_eq!(rows[0].fields_withheld, ["job_title"]);
+            assert!(rows[0].fields_shared.is_empty());
+        })
+        .await;
+    }
+
+    /// to_gate_track for a BRIDGED field: an unknown sensitivity is financial, a field
+    /// outside general/personal or outside the catalogue is not_permitted at both tiers,
+    /// and an ordinary field keeps today's mapping (unknown is general).
+    #[test]
+    fn a_bridged_field_maps_fail_closed_and_an_ordinary_one_is_unchanged() {
+        use crate::conductor::personal_fact_bridge::BRIDGE_SOURCE_ID;
+        let mk = |name: &str, sens: &str, source: &str| crate::conductor::types::PersonalField {
+            field_name: name.to_owned(),
+            field_value: "v".to_owned(),
+            sensitivity: sens.to_owned(),
+            sensitivity_severity: 2,
+            source_id: source.to_owned(),
+            abstraction_tier2: "pass".to_owned(),
+            abstraction_tier3: "pass".to_owned(),
+        };
+        let mut pt = PersonalTrack::new();
+        pt.add_field(mk("job_title", "mystery", BRIDGE_SOURCE_ID))
+            .unwrap();
+        pt.add_field(mk("income_range", "personal", BRIDGE_SOURCE_ID))
+            .unwrap();
+        pt.add_field(mk("employer", "personal", BRIDGE_SOURCE_ID))
+            .unwrap();
+        pt.add_field(mk("ordinary", "mystery", "personal-specialist"))
+            .unwrap();
+        let gt = to_gate_track(&pt);
+        let f = |n: &str| gt.fields().get(n).unwrap();
+        assert_eq!(f("job_title").sensitivity, Sensitivity::Financial);
+        assert_eq!(
+            f("job_title").abstraction_tier2,
+            AbstractionPolicy::NotPermitted
+        );
+        assert_eq!(
+            f("job_title").abstraction_tier3,
+            AbstractionPolicy::NotPermitted
+        );
+        // not catalogued
+        assert_eq!(
+            f("income_range").abstraction_tier2,
+            AbstractionPolicy::NotPermitted
+        );
+        // catalogued, personal: the snapshot pass is kept (no fresh read here)
+        assert_eq!(f("employer").abstraction_tier2, AbstractionPolicy::Pass);
+        // ordinary field: unchanged mapping
+        assert_eq!(f("ordinary").sensitivity, Sensitivity::General);
+        assert_eq!(f("ordinary").abstraction_tier2, AbstractionPolicy::Pass);
     }
 
     /// research, real template: location_city is the one declared field.

@@ -138,6 +138,39 @@ pub enum DeclaredInputsError {
     /// template that names it, or a declaration of it, is refused rather than left as
     /// a silent no-op. Declared or not.
     PersonaContextInExternalStep { action_id: String },
+    /// An external step's field_requirements names a field that cannot work
+    /// (items.id=931, decisions.id=953 ruling 5): not a name in the personal fact
+    /// catalogue, not named as a {token} in the template, or equal to an output
+    /// variable, a bound name or a system token (a render would be ambiguous).
+    FieldRequirementInvalid {
+        action_id: String,
+        name: String,
+        reason: FieldRequirementProblem,
+    },
+}
+
+/// Why a field_requirements name was refused (no value is ever involved).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldRequirementProblem {
+    NotInCatalogue,
+    CatalogueUnreadable,
+    NotNamedInTemplate,
+    CollidesWithOutputVar,
+    CollidesWithBoundName,
+    CollidesWithSystemToken,
+}
+
+impl FieldRequirementProblem {
+    fn text(self) -> &'static str {
+        match self {
+            Self::NotInCatalogue => "it is not a name in the personal fact catalogue",
+            Self::CatalogueUnreadable => "the personal fact catalogue cannot be read",
+            Self::NotNamedInTemplate => "the template does not name it as a {token}",
+            Self::CollidesWithOutputVar => "it is also a row's output variable",
+            Self::CollidesWithBoundName => "it is also a registered bound name",
+            Self::CollidesWithSystemToken => "it is also a system token",
+        }
+    }
 }
 
 impl std::fmt::Display for DeclaredInputsError {
@@ -178,6 +211,16 @@ impl std::fmt::Display for DeclaredInputsError {
                  warranty contact included). A device name stays on the device, whatever the \
                  outbound review would show the user: the catalogue's tier policies are not \
                  the review's to waive (items.id=884, items.id=891, decisions.id=507)"
+            ),
+            Self::FieldRequirementInvalid {
+                action_id,
+                name,
+                reason,
+            } => write!(
+                f,
+                "step '{action_id}': field_requirements names '{name}' in an external step, \
+                 but {} (items.id=931)",
+                reason.text()
             ),
             Self::PersonaContextInExternalStep { action_id } => write!(
                 f,
@@ -249,6 +292,7 @@ pub(crate) fn lint_with(
             // (items.id=882).
             lint_persona_context(step).map_err(|e| e.to_string())?;
             lint_step(step, &earlier, bound, &bound_like).map_err(|e| e.to_string())?;
+            lint_field_requirements(step, row_vars, bound).map_err(|e| e.to_string())?;
             if !store_names_external_allowed {
                 lint_store_names(step, &taint, bound, &bound_like).map_err(|e| e.to_string())?;
             }
@@ -359,6 +403,52 @@ fn lint_store_names(
         }),
         None => Ok(()),
     }
+}
+
+/// items.id=931 (decisions.id=953 ruling 5): every field_requirements name of an
+/// external step must be a personal fact catalogue name, must be named as a {token} in
+/// the template, and must equal no row's output variable, no bound name and no system
+/// token. A name outside the catalogue never has a value at run time (not_permitted), so
+/// refusing it here turns a silent empty render into an authoring error. A LOCAL step is
+/// not checked: its fields come from the ordinary render.
+fn lint_field_requirements(
+    step: &ActionDefinition,
+    row_vars: &[Option<String>],
+    bound: &[&str],
+) -> Result<(), DeclaredInputsError> {
+    if !step.is_external_for_lint() || step.field_requirements.is_empty() {
+        return Ok(());
+    }
+    let catalogue = crate::conductor::personal_fact_fields::registry();
+    let tokens = find_tokens(&step.prompt_template);
+    let mut names: Vec<&String> = step.field_requirements.keys().collect();
+    names.sort();
+    for name in names {
+        let problem = if is_system_token(name) {
+            Some(FieldRequirementProblem::CollidesWithSystemToken)
+        } else if bound.contains(&name.as_str()) {
+            Some(FieldRequirementProblem::CollidesWithBoundName)
+        } else if row_vars.iter().flatten().any(|v| v == name) {
+            Some(FieldRequirementProblem::CollidesWithOutputVar)
+        } else {
+            match &catalogue {
+                Err(_) => Some(FieldRequirementProblem::CatalogueUnreadable),
+                Ok(c) if c.field(name).is_none() => Some(FieldRequirementProblem::NotInCatalogue),
+                Ok(_) if !tokens.iter().any(|t| t == name) => {
+                    Some(FieldRequirementProblem::NotNamedInTemplate)
+                }
+                Ok(_) => None,
+            }
+        };
+        if let Some(reason) = problem {
+            return Err(DeclaredInputsError::FieldRequirementInvalid {
+                action_id: step.action_id.clone(),
+                name: name.clone(),
+                reason,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn lint_step(
@@ -1208,5 +1298,63 @@ mod tests {
                 "a launch-derived variable is never refused as a device name: {m}"
             );
         }
+    }
+
+    // -- items.id=931: field_requirements of an external step ----------------------
+
+    fn field_lint(
+        template: &str,
+        fields: &[&str],
+        tier: ExternalAccess,
+        prior_var: Option<&str>,
+    ) -> Result<(), String> {
+        let mut steps = Vec::new();
+        if let Some(v) = prior_var {
+            steps.push((step("p", LOCAL, "make", &[], &[]), Some(v)));
+        }
+        steps.push((step("s", tier, template, &[], fields), None));
+        run_open(&steps, &[])
+    }
+
+    #[test]
+    fn a_catalogue_field_named_in_the_template_passes() {
+        assert!(field_lint("Role {job_title}", &["job_title"], EXT, None).is_ok());
+    }
+
+    #[test]
+    fn a_name_outside_the_catalogue_is_refused() {
+        let e = field_lint("Pay {income_range}", &["income_range"], EXT, None).unwrap_err();
+        assert!(e.contains("income_range") && e.contains("catalogue"), "{e}");
+    }
+
+    #[test]
+    fn a_declared_field_the_template_never_names_is_refused() {
+        let e = field_lint("Hello", &["job_title"], EXT, None).unwrap_err();
+        assert!(e.contains("does not name it"), "{e}");
+    }
+
+    #[test]
+    fn a_field_equal_to_an_output_var_a_bound_name_or_a_system_token_is_refused() {
+        // an output variable of ANY row
+        let e = field_lint("Role {job_title}", &["job_title"], EXT, Some("job_title")).unwrap_err();
+        assert!(e.contains("output variable"), "{e}");
+        // a system token
+        let e = field_lint("{user_input}", &["user_input"], EXT, None).unwrap_err();
+        assert!(e.contains("system token"), "{e}");
+        // a bound name
+        let steps = vec![(
+            step("s", EXT, "Role {job_title}", &[], &["job_title"]),
+            None,
+        )];
+        let e = run_open(&steps, &["job_title"]).unwrap_err();
+        assert!(
+            e.contains("bound name") || e.contains("session or case"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_local_step_is_not_checked() {
+        assert!(field_lint("Pay {income_range}", &["income_range"], LOCAL, None).is_ok());
     }
 }

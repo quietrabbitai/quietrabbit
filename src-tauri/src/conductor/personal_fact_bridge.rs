@@ -1,0 +1,284 @@
+// src-tauri/src/conductor/personal_fact_bridge.rs
+//
+// items.id=931, decisions.id=953 ruling 4: the ONE constructor of bridged Gate 1 fields.
+//
+// A catalogued, singleton, same-Persona entity fact becomes a PersonalField on
+// PersonalTrack.fields (the single source for Gate 1, Gate 2, the voice scan and step
+// sensitivity). Its abstraction_tier2 and abstraction_tier3 carry the EFFECTIVE policy
+// word (personal_fact_fields::effective_policy) at INITIALIZE, so Gate 1's existing
+// apply_abstraction decides what is sent. The bridge NEVER reads the entity_facts
+// abstraction columns (they default to 'pass' and cannot tell a default from a choice):
+// EntityFact does not carry them and the loader does not select them (a scan pins it).
+//
+// PURE: no I/O. The caller (lifecycle::build_personal_track) supplies the facts that
+// already passed apply_entity_fact_provenance_check, the catalogue and the user's
+// policies. A bridged field is recognised later by BRIDGE_SOURCE_ID, which nothing else
+// writes, so the mapping to the gate track and the re-read can tell it apart.
+
+use std::collections::HashMap;
+
+use crate::conductor::personal_fact_fields::{
+    effective_policy, effective_sensitivity, validate_value, Catalogue, Origin, Policy,
+    PolicyInput, Tier,
+};
+use crate::conductor::types::{EntityFact, PersonalField};
+use crate::persistence::fact_policy_store::UserPolicies;
+
+/// The source_id of every bridged field and of nothing else.
+pub const BRIDGE_SOURCE_ID: &str = "entity_fact_bridge";
+
+/// True for a field this module built.
+pub fn is_bridged(field: &PersonalField) -> bool {
+    field.source_id == BRIDGE_SOURCE_ID
+}
+
+/// How strict a policy word is. Higher is stricter. An unknown word is as strict as
+/// omit (fail closed), `ask` behaves as omit until items.id=924.
+fn strictness(word: &str) -> u8 {
+    match word {
+        "pass" => 0,
+        "summarize" => 1,
+        "not_permitted" => 3,
+        // omit, ask and anything unknown
+        _ => 2,
+    }
+}
+
+/// The STRICTER of two policy words (decisions.id=953 ruling 7): not_permitted over
+/// omit (ask and unknown count as omit) over summarize over pass. Equal strictness
+/// keeps `a`, so pass against pass stays pass (an explicit pass survives a re-read
+/// that still says pass, and keeps no floor clamp). Returns a word Gate 1 understands.
+pub fn stricter(a: &str, b: &str) -> &'static str {
+    let s = strictness(a).max(strictness(b));
+    match s {
+        0 => "pass",
+        1 => "summarize",
+        3 => "not_permitted",
+        _ => "omit",
+    }
+}
+
+/// The word stored on the field for a resolved policy (ask is written as omit).
+fn policy_word(p: Policy) -> &'static str {
+    match p {
+        Policy::Pass => "pass",
+        Policy::Summarize => "summarize",
+        Policy::Omit | Policy::Ask => "omit",
+        Policy::NotPermitted => "not_permitted",
+    }
+}
+
+fn severity_of(sensitivity: &str) -> i32 {
+    match sensitivity {
+        "general" => 1,
+        "personal" => 2,
+        // medical, financial and anything unknown
+        _ => 3,
+    }
+}
+
+/// `{` and `}` become `(` and `)` in a bridged value, the seeding::clean convention
+/// (decisions.id=953 amendment, items.id=931). render_template substitutes tokens one
+/// after another over a HashMap, not in a single pass, so a value that carried
+/// `{user_input}` could be expanded by a later substitution and one that carried an
+/// unknown `{x}` would be stripped. A value with no braces cannot name a token. The
+/// renderer's own single-pass fix is a separate item (items.id=932).
+fn clean_braces(v: &str) -> String {
+    v.replace('{', "(").replace('}', ")")
+}
+
+/// The effective policy word for a bridged field at `tier`, against `policies`.
+/// Used at INITIALIZE (bridge) and again by the executor's re-read.
+pub fn resolve_word(
+    catalogue: Result<&Catalogue, ()>,
+    field_name: &str,
+    stored_sensitivity: &str,
+    origin: Origin,
+    tier: Tier,
+    policies: &UserPolicies,
+) -> &'static str {
+    policy_word(effective_policy(
+        catalogue,
+        &PolicyInput {
+            field_name,
+            stored_sensitivity,
+            origin,
+            tier,
+            user_policy: policies.lookup(field_name, tier),
+        },
+    ))
+}
+
+/// Build the bridged fields from facts that already passed the provenance check.
+///
+/// Qualifies: entity_id None (a singleton), catalogued name. Everything else is left
+/// alone (entity-scoped facts, uncatalogued names). Origin is ThisPersona only when
+/// source_persona_id equals `persona_id`; any other is CrossPersona and resolves to
+/// not_permitted (v1). A value that fails the field validator is kept at not_permitted
+/// so Gate 1 lists it as withheld and never releases it. A name that appears twice
+/// (it cannot in a healthy store: the partial unique index) is dropped entirely.
+/// `catalogue` Err (unreadable) bridges nothing.
+pub fn bridge_fields<'a>(
+    facts: impl Iterator<Item = &'a EntityFact>,
+    persona_id: &str,
+    catalogue: Result<&Catalogue, ()>,
+    policies: &UserPolicies,
+) -> Vec<PersonalField> {
+    let Ok(cat) = catalogue else {
+        log::warn!("personal fact catalogue unreadable: no fact is bridged");
+        return Vec::new();
+    };
+    let mut built: Vec<PersonalField> = Vec::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut dropped: Vec<String> = Vec::new();
+    for fact in facts {
+        if fact.entity_id.is_some() {
+            continue;
+        }
+        let Some(def) = cat.field(&fact.field_name) else {
+            continue;
+        };
+        if seen.contains_key(&fact.field_name) {
+            dropped.push(fact.field_name.clone());
+            continue;
+        }
+        let origin = if fact.source_persona_id == persona_id {
+            Origin::ThisPersona
+        } else {
+            Origin::CrossPersona
+        };
+        let sensitivity = effective_sensitivity(def, &fact.sensitivity).to_owned();
+        let (value, valid) = match validate_value(def, &fact.field_value) {
+            Ok(v) => (clean_braces(&v), true),
+            Err(_) => (clean_braces(&fact.field_value), false),
+        };
+        let word = |tier: Tier| -> &'static str {
+            if !valid {
+                return "not_permitted";
+            }
+            resolve_word(
+                Ok(cat),
+                &fact.field_name,
+                &sensitivity,
+                origin,
+                tier,
+                policies,
+            )
+        };
+        let tier2 = word(Tier::Two).to_owned();
+        let tier3 = word(Tier::Three).to_owned();
+        seen.insert(fact.field_name.clone(), built.len());
+        built.push(PersonalField {
+            field_name: fact.field_name.clone(),
+            field_value: value,
+            sensitivity_severity: severity_of(&sensitivity).max(fact.sensitivity_severity.min(3)),
+            sensitivity,
+            source_id: BRIDGE_SOURCE_ID.to_owned(),
+            abstraction_tier2: tier2,
+            abstraction_tier3: tier3,
+        });
+    }
+    for name in dropped {
+        // A duplicate is dropped whole, the first copy included (fail closed).
+        if let Some(&i) = seen.get(&name) {
+            built[i].field_name.clear();
+        }
+        log::warn!("personal fact '{name}' appears twice: not bridged");
+    }
+    built.retain(|f| !f.field_name.is_empty());
+    built
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conductor::personal_fact_fields::registry;
+
+    fn fact(name: &str, value: &str, entity: Option<&str>, source: &str) -> EntityFact {
+        EntityFact {
+            id: format!("id-{name}"),
+            entity_id: entity.map(str::to_owned),
+            field_name: name.to_owned(),
+            field_value: value.to_owned(),
+            sensitivity: "personal".to_owned(),
+            sensitivity_severity: 2,
+            source_persona_id: source.to_owned(),
+            cross_persona_export: false,
+            origin_persona_id: None,
+        }
+    }
+
+    fn none() -> UserPolicies {
+        UserPolicies::Rows(Vec::new())
+    }
+
+    #[test]
+    fn stricter_orders_pass_summarize_omit_not_permitted() {
+        assert_eq!(stricter("pass", "summarize"), "summarize");
+        assert_eq!(stricter("summarize", "omit"), "omit");
+        assert_eq!(stricter("omit", "pass"), "omit");
+        assert_eq!(stricter("not_permitted", "pass"), "not_permitted");
+        assert_eq!(stricter("pass", "pass"), "pass");
+        // ask and garbage count as omit
+        assert_eq!(stricter("pass", "ask"), "omit");
+        assert_eq!(stricter("pass", "???"), "omit");
+        assert_eq!(stricter("summarize", "???"), "omit");
+    }
+
+    #[test]
+    fn a_singleton_catalogued_fact_bridges_at_omit_by_default() {
+        let facts = [fact("job_title", "Engineer", None, "p1")];
+        let out = bridge_fields(facts.iter(), "p1", registry().map_err(|_| ()), &none());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].source_id, BRIDGE_SOURCE_ID);
+        assert_eq!(out[0].abstraction_tier2, "omit");
+        assert_eq!(out[0].abstraction_tier3, "omit");
+    }
+
+    #[test]
+    fn entity_scoped_uncatalogued_and_unreadable_catalogue_bridge_nothing() {
+        let facts = [
+            fact("job_title", "x", Some("e1"), "p1"),
+            fact("favourite_colour", "x", None, "p1"),
+        ];
+        assert!(bridge_fields(facts.iter(), "p1", registry().map_err(|_| ()), &none()).is_empty());
+        let one = [fact("job_title", "x", None, "p1")];
+        assert!(bridge_fields(one.iter(), "p1", Err(()), &none()).is_empty());
+    }
+
+    #[test]
+    fn a_cross_persona_fact_is_not_permitted_and_a_bad_value_is_withheld() {
+        let facts = [
+            fact("employer", "Acme", None, "other"),
+            fact("job_title", &"x".repeat(500), None, "p1"),
+        ];
+        let out = bridge_fields(facts.iter(), "p1", registry().map_err(|_| ()), &none());
+        assert_eq!(out.len(), 2);
+        for f in &out {
+            assert_eq!(f.abstraction_tier2, "not_permitted", "{}", f.field_name);
+            assert_eq!(f.abstraction_tier3, "not_permitted");
+        }
+    }
+
+    #[test]
+    fn braces_in_a_value_become_parentheses() {
+        let facts = [fact(
+            "job_title",
+            "A {user_input} and {previous_output}",
+            None,
+            "p1",
+        )];
+        let out = bridge_fields(facts.iter(), "p1", registry().map_err(|_| ()), &none());
+        assert_eq!(out[0].field_value, "A (user_input) and (previous_output)");
+        assert!(!out[0].field_value.contains(['{', '}']));
+    }
+
+    #[test]
+    fn a_duplicate_name_is_dropped_whole() {
+        let facts = [
+            fact("industry", "A", None, "p1"),
+            fact("industry", "B", None, "p1"),
+        ];
+        assert!(bridge_fields(facts.iter(), "p1", registry().map_err(|_| ()), &none()).is_empty());
+    }
+}

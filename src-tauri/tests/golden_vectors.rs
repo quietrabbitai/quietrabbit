@@ -666,6 +666,7 @@ async fn test_gate1_normal_paths() {
             execution_tier,
             access_for_tier(execution_tier),
             provider,
+            None,
         )
         .await
         .unwrap_or_else(|e| panic!("{label}: gate1 returned Err: {e}"));
@@ -768,6 +769,7 @@ async fn test_gate1_disclosure_failure_tier1_nonfatal() {
         1,
         ExternalAccess::LocalOnly,
         None,
+        None,
     )
     .await;
 
@@ -799,6 +801,7 @@ async fn test_gate1_disclosure_failure_tier2_fatal() {
         2,
         ExternalAccess::AnonymousRequired,
         Some("ollama".into()),
+        None,
     )
     .await;
 

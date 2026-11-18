@@ -2717,6 +2717,45 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         rendered
     }
 
+    /// items.id=931: fill `track.fields` from the qualifying entity facts. See the call
+    /// site in build_personal_track. Reads nothing when no fact qualifies, so a persona
+    /// with no personal facts opens no extra connection.
+    async fn bridge_personal_facts(
+        &self,
+        track: &mut PersonalTrack,
+        key_hex: &str,
+    ) -> Result<(), LifecycleError> {
+        use crate::conductor::personal_fact_bridge::bridge_fields;
+        use crate::conductor::personal_fact_fields::registry;
+        use crate::persistence::fact_policy_store::UserPolicies;
+
+        let catalogue = registry().map_err(|_| ());
+        let policies = if track.entity_facts().values().any(|f| f.entity_id.is_none()) {
+            let mut conn = crate::persistence::personal_store::open_personal_db(
+                &self.user_id,
+                &self.persona_id,
+                key_hex,
+            )
+            .await
+            .map_err(|e| LifecycleError::PersonalStore(e.to_string()))?;
+            UserPolicies::load(&mut conn).await
+        } else {
+            return Ok(());
+        };
+        let built = bridge_fields(
+            track.entity_facts().values(),
+            &self.persona_id,
+            catalogue,
+            &policies,
+        );
+        for field in built {
+            track
+                .add_field(field)
+                .map_err(|e| LifecycleError::PersonalStore(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// Load PersonalTrack from personal.db and attach guide/operator versions.
     /// Returns an UNSEALED track — initialize() seals it immediately after.
     /// Python oracle: FocusRun._build_personal_track()
@@ -2744,6 +2783,15 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             self.apply_entity_fact_provenance_check(&mut track, fact)
                 .await?;
         }
+
+        // items.id=931 (decisions.id=953 ruling 4): the Gate 1 bridge. Facts that
+        // PASSED the provenance check above (they are in track.entity_facts) and are
+        // catalogued singletons become PersonalTrack.fields, each carrying the
+        // policy resolved NOW against the user's fact_disclosure_policy table. This
+        // is the only production writer of PersonalTrack.fields (a scan test pins it).
+        // The policy table is read once here (the snapshot) and again by the executor
+        // before each external step. A table that cannot be read is omit for all.
+        self.bridge_personal_facts(&mut track, key_hex).await?;
 
         self.load_group_facts_into_track(&mut track, key_hex)
             .await?;

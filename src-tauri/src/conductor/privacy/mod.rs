@@ -49,6 +49,7 @@ impl<L: DisclosureLogger> PrivacyGateway<L> {
         execution_tier: u8,
         effective_access: ExternalAccess,
         provider: Option<String>,
+        report_scope: Option<&std::collections::HashSet<String>>,
     ) -> Result<Gate1Result, DisclosureLogWriteError> {
         gate1::gate1(
             &self.logger,
@@ -60,6 +61,7 @@ impl<L: DisclosureLogger> PrivacyGateway<L> {
             execution_tier,
             effective_access,
             provider,
+            report_scope,
         )
         .await
     }

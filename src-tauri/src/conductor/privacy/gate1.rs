@@ -19,6 +19,8 @@
 // purely for the disclosure log's own numeric audit field below, not for
 // this decision.
 
+use std::collections::HashSet;
+
 use indexmap::IndexMap;
 
 use crate::conductor::tokens::ExternalAccess;
@@ -41,6 +43,7 @@ pub async fn gate1<L: DisclosureLogger>(
     execution_tier: u8,
     effective_access: ExternalAccess,
     provider: Option<String>,
+    report_scope: Option<&HashSet<String>>,
 ) -> Result<Gate1Result, DisclosureLogWriteError> {
     let mut approved: IndexMap<String, String> = IndexMap::new();
     let mut withheld: Vec<String> = Vec::new();
@@ -94,6 +97,34 @@ pub async fn gate1<L: DisclosureLogger>(
         .filter(|(name, _)| !fields_shared.contains(name))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+
+    // items.id=931 report_scope (decisions.id=953 ruling 4): when Some, the REPORT
+    // (the log row and the shared, withheld and floor-clamped lists the caller acts on)
+    // covers only the step's declared field names. `approved` stays unfiltered: the
+    // declared-field filter in execute_once is the control that decides what the step
+    // receives, and this only stops the report and the consent prompt from naming a
+    // field the step never asked for. None reports everything (the golden vectors).
+    let (fields_shared, fields_abstracted, withheld, floor_clamped) = match report_scope {
+        None => (fields_shared, fields_abstracted, withheld, floor_clamped),
+        Some(scope) => (
+            fields_shared
+                .into_iter()
+                .filter(|n| scope.contains(n))
+                .collect::<Vec<_>>(),
+            fields_abstracted
+                .into_iter()
+                .filter(|(n, _)| scope.contains(n))
+                .collect::<IndexMap<_, _>>(),
+            withheld
+                .into_iter()
+                .filter(|n| scope.contains(n))
+                .collect::<Vec<_>>(),
+            floor_clamped
+                .into_iter()
+                .filter(|n| scope.contains(n))
+                .collect::<Vec<_>>(),
+        ),
+    };
 
     // Write disclosure log BEFORE returning result (write-before-send invariant).
     // Fatality split applied here: qr_local swallows, external access propagates.
