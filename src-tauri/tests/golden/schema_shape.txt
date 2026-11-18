@@ -664,6 +664,12 @@ TABLE entity_relationships
   relationship_type TEXT notnull=1 pk=0 default=None
   created_at TEXT notnull=1 pk=0 default=Some("strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
   extra_metadata TEXT notnull=1 pk=0 default=Some("'{}'")
+TABLE fact_disclosure_policy
+  field_name TEXT notnull=0 pk=1 default=None
+  tier2 TEXT notnull=0 pk=0 default=None
+  tier3 TEXT notnull=0 pk=0 default=None
+  set_at TEXT notnull=1 pk=0 default=None
+  set_by TEXT notnull=1 pk=0 default=None
 TABLE group_fact_sources
   group_id TEXT notnull=1 pk=1 default=None
   opted_in_at TEXT notnull=1 pk=0 default=None

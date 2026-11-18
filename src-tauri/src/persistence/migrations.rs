@@ -330,6 +330,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/personal_011.sql"),
     },
     SchemaFile {
+        prefix: "personal",
+        version: 12,
+        sql: include_str!("../../schema/personal_012.sql"),
+    },
+    SchemaFile {
         prefix: "plan_state",
         version: 1,
         sql: include_str!("../../schema/plan_state_001.sql"),
@@ -3679,8 +3684,8 @@ mod tests {
 
         assert_eq!(
             result.expect("migration must apply cleanly to a real encrypted file"),
-            11,
-            "personal_001 through personal_011 must all apply in one pass"
+            12,
+            "personal_001 through personal_012 must all apply in one pass"
         );
 
         let mut conn = open_verify_conn(
@@ -3753,7 +3758,7 @@ mod tests {
             std::env::remove_var("QR_DATA_ROOT");
         }
 
-        assert_eq!(first.expect("first migration must succeed"), 11);
+        assert_eq!(first.expect("first migration must succeed"), 12);
         assert_eq!(
             second.expect("second migration on an already-migrated real file must not error"),
             0,
@@ -4589,7 +4594,7 @@ mod tests {
         let mut conn = make_test_conn().await;
         assert_eq!(
             run_migrations(&mut conn, "personal", None).await.unwrap(),
-            11
+            12
         );
 
         sqlx::query("DROP TABLE persona_floor_consent")
@@ -4606,8 +4611,9 @@ mod tests {
             .execute(&mut conn)
             .await
             .unwrap();
+        drop_personal_012(&mut conn).await;
         drop_personal_011(&mut conn).await;
-        sqlx::query("DELETE FROM schema_version WHERE version IN (9, 10, 11)")
+        sqlx::query("DELETE FROM schema_version WHERE version IN (9, 10, 11, 12)")
             .execute(&mut conn)
             .await
             .unwrap();
@@ -4621,7 +4627,7 @@ mod tests {
 
         assert_eq!(
             run_migrations(&mut conn, "personal", None).await.unwrap(),
-            3
+            4
         );
         let name: (String,) =
             sqlx::query_as("SELECT group_display_name FROM group_keys WHERE group_id = 'g-1'")
@@ -4656,20 +4662,21 @@ mod tests {
         let mut conn = make_test_conn().await;
         assert_eq!(
             run_migrations(&mut conn, "personal", None).await.unwrap(),
-            11
+            12
         );
         sqlx::query("DROP TABLE consent_audit_records")
             .execute(&mut conn)
             .await
             .unwrap();
+        drop_personal_012(&mut conn).await;
         drop_personal_011(&mut conn).await;
-        sqlx::query("DELETE FROM schema_version WHERE version IN (10, 11)")
+        sqlx::query("DELETE FROM schema_version WHERE version IN (10, 11, 12)")
             .execute(&mut conn)
             .await
             .unwrap();
         assert_eq!(
             run_migrations(&mut conn, "personal", None).await.unwrap(),
-            2
+            3
         );
         // The table is there, takes a row, and has the index.
         sqlx::query(
@@ -4695,6 +4702,60 @@ mod tests {
         );
     }
 
+    /// items.id=930 stage 3: personal_012.sql is additive and data-free, so it
+    /// reaches a database at 011 with an empty policy table (every field then
+    /// resolves to the catalogue default). A second run is a no-op.
+    #[tokio::test]
+    async fn personal_012_applies_on_top_of_a_personal_011_database_with_no_policies() {
+        let mut conn = make_test_conn().await;
+        assert_eq!(
+            run_migrations(&mut conn, "personal", None).await.unwrap(),
+            12
+        );
+        drop_personal_012(&mut conn).await;
+        sqlx::query("DELETE FROM schema_version WHERE version = 12")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            run_migrations(&mut conn, "personal", None).await.unwrap(),
+            1
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fact_disclosure_policy")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+        sqlx::query(
+            "INSERT INTO fact_disclosure_policy (field_name, tier2, set_at, set_by)
+             VALUES ('job_title', 'omit', 't', 'user')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO fact_disclosure_policy (field_name, set_at, set_by)
+             VALUES ('job_title', 't', 'user')",
+        )
+        .execute(&mut conn)
+        .await
+        .expect_err("field_name is the primary key");
+        assert_eq!(
+            run_migrations(&mut conn, "personal", None).await.unwrap(),
+            0,
+            "a second run is a no-op"
+        );
+    }
+
+    /// Undo personal_012.sql's table, so a test can rebuild a database as it
+    /// stood at 011.
+    async fn drop_personal_012(conn: &mut SqliteConnection) {
+        sqlx::query("DROP TABLE fact_disclosure_policy")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+    }
+
     /// Undo personal_011.sql's two objects, so a test can rebuild a database as
     /// it stood at 010.
     async fn drop_personal_011(conn: &mut SqliteConnection) {
@@ -4716,10 +4777,11 @@ mod tests {
         let mut conn = make_test_conn().await;
         assert_eq!(
             run_migrations(&mut conn, "personal", None).await.unwrap(),
-            11
+            12
         );
+        drop_personal_012(&mut conn).await;
         drop_personal_011(&mut conn).await;
-        sqlx::query("DELETE FROM schema_version WHERE version = 11")
+        sqlx::query("DELETE FROM schema_version WHERE version IN (11, 12)")
             .execute(&mut conn)
             .await
             .unwrap();
@@ -4733,7 +4795,7 @@ mod tests {
 
         assert_eq!(
             run_migrations(&mut conn, "personal", None).await.unwrap(),
-            1
+            2
         );
         let owner: Option<String> =
             sqlx::query_scalar("SELECT owner_focus FROM entities WHERE id = 'e-old'")
@@ -5180,8 +5242,8 @@ mod tests {
         }
 
         assert_eq!(
-            first.expect("first migration, which applies all 11 real versions, must succeed"),
-            11,
+            first.expect("first migration, which applies all 12 real versions, must succeed"),
+            12,
             "a brand-new personal.db must apply every real migration version on first open"
         );
         assert!(
