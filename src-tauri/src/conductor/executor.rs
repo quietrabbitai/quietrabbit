@@ -9732,6 +9732,90 @@ mod tests {
         .await;
     }
 
+    /// items.id=931 stage 1, T3: THE MUTATION-PROOF TEST for the declared-field filter in
+    /// execute_once (the `.filter(|(name, _)| ctx.step.field_requirements.contains_key(..))`
+    /// over g1.approved_fields). The step is built DIRECTLY, bypassing the LOAD lint: it
+    /// declares job_title only, but its template also names {income_range}, and a
+    /// financial income_range row is held at `pass`. Gate 1 approves it, so ONLY the
+    /// declared-field filter keeps it out of the prompt and the disclosure buffer.
+    /// Remove the filter and this test fails. No behaviour change in this stage.
+    ///
+    /// The gate1 row is deliberately NOT asserted absent here: today it lists every
+    /// field Gate 1 approved (see fit_analysis_shows_declared_fields_at_pass), so it
+    /// OVER-reports. The assertion below pins that, and items.id=931 stage 2 (report_scope)
+    /// flips it to "absent".
+    #[tokio::test]
+    async fn an_undeclared_financial_field_the_template_names_never_reaches_the_prompt_or_the_buffer(
+    ) {
+        use crate::conductor::tokens::FieldRequirement;
+        with_temp_shared_db(|pool| async move {
+            let key_hex = hosted_pick_rig(&pool).await;
+            let mut ctx = hosted_ctx(RunAttendance::Attended, &key_hex);
+            ctx.step.prompt_template = "Role: {job_title} Income: {income_range} End".to_owned();
+            ctx.step.field_requirements.insert(
+                "job_title".to_owned(),
+                "recommended".parse::<FieldRequirement>().unwrap(),
+            );
+            ctx.floor_consent_preference = Some(FLOOR_CONSENT_MODIFIED.to_owned());
+            let mut pt = PersonalTrack::new();
+            pt.add_field(fixture_field(
+                "job_title",
+                "Staff Engineer",
+                "personal",
+                2,
+                "pass",
+            ))
+            .unwrap();
+            pt.add_field(fixture_field(
+                "income_range",
+                "INCOME-185000",
+                "financial",
+                3,
+                "pass",
+            ))
+            .unwrap();
+            let (forced, seen) = capturing_scanner();
+            let _g = step_review::forced::arm(&ctx, forced).await;
+
+            let mut track = TaskTrack::new();
+            let mut shared = SharedStateTrack::new();
+            let gateway = PrivacyGateway::new(TestLogger::new());
+            let out = StepExecutor::new()
+                .execute_once(
+                    &ctx,
+                    0,
+                    &pt,
+                    &mut track,
+                    &mut shared,
+                    &FailureHandler::new(ctx.effective_access),
+                    &gateway,
+                    &Arc::new(ConductorScheduler::new()),
+                    None,
+                    &pool,
+                )
+                .await;
+            let _ = out;
+
+            // The prompt: the declared field renders, the undeclared one renders empty.
+            let seen = seen.borrow();
+            assert_eq!(seen.len(), 1, "the review saw exactly one prompt");
+            assert_eq!(seen[0], "Role: Staff Engineer Income:  End");
+            assert!(!seen[0].contains("INCOME-185000"), "{}", seen[0]);
+            // The disclosure buffer: exactly the declared field.
+            let buf = shared.read_disclosure_buffer(&ctx.step.action_id);
+            assert_eq!(buf.keys().cloned().collect::<Vec<_>>(), ["job_title"]);
+            assert!(!buf.values().any(|v| v.contains("INCOME")), "{buf:?}");
+            // The gate1 row today (over-reports undeclared approved fields; stage 2's
+            // report_scope makes this ["job_title"] only).
+            let rows = gate1_entries(&gateway);
+            assert_eq!(rows.len(), 1);
+            let mut shared_names = rows[0].fields_shared.clone();
+            shared_names.sort();
+            assert_eq!(shared_names, ["income_range", "job_title"]);
+        })
+        .await;
+    }
+
     /// research, real template: location_city is the one declared field.
     #[tokio::test]
     async fn research_shows_only_the_declared_location_city() {
