@@ -1,0 +1,9 @@
+{
+  "catalogue_version": 1,
+  "fields": [
+    { "name": "location_city", "label": "City", "sensitivity": "personal", "tier2_default": "omit", "tier3_default": "omit", "tier3_selectable": false, "max_bytes": 80 },
+    { "name": "job_title", "label": "Job title", "sensitivity": "personal", "tier2_default": "omit", "tier3_default": "omit", "tier3_selectable": false, "max_bytes": 80 },
+    { "name": "employer", "label": "Employer", "sensitivity": "personal", "tier2_default": "omit", "tier3_default": "omit", "tier3_selectable": false, "max_bytes": 120 },
+    { "name": "industry", "label": "Industry", "sensitivity": "personal", "tier2_default": "omit", "tier3_default": "omit", "tier3_selectable": false, "max_bytes": 80 }
+  ]
+}

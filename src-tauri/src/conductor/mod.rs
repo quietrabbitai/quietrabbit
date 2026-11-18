@@ -32,6 +32,7 @@ pub mod model_resolver;
 pub mod model_resolver_input;
 pub mod model_selection;
 pub mod nightly_batch;
+pub mod personal_fact_fields;
 pub mod plan_approval;
 pub mod plan_memory;
 pub mod privacy;
