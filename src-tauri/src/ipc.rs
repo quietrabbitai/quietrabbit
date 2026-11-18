@@ -270,6 +270,12 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::run_plan::get_run_plan_approval,
         commands::run_plan::revoke_run_plan_approval,
         commands::run_plan::get_run_park,
+        // Group 37 in this list -- The user's disclosure policy for the catalogued
+        // personal facts that may reach an external step: the four fields with their
+        // choices and effective policy, and one choice per field and tier
+        // (items.id=930, decisions.id=953)
+        commands::fact_policy::get_fact_policies,
+        commands::fact_policy::set_fact_policy,
     ])
 }
 

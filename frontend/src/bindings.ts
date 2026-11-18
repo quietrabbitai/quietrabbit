@@ -1081,6 +1081,8 @@ export const commands = {
 	/**  A JSON object of ids, counts and reason words, at most 4096 bytes. */
 	params_json: string,
 } | null, string>(__TAURI_INVOKE("get_run_park", { personaId, runId })),
+	getFactPolicies: (personaId: string) => typedError<FactPolicyInfo[], string>(__TAURI_INVOKE("get_fact_policies", { personaId })),
+	setFactPolicy: (personaId: string, fieldName: string, tier: number, policy: string) => typedError<FactPolicyInfo, string>(__TAURI_INVOKE("set_fact_policy", { personaId, fieldName, tier, policy })),
 };
 
 /* Types */
@@ -1583,6 +1585,35 @@ export type EstimateCostRequest = {
  *  snake_case serde matching as_str()/FromStr exactly.
  */
 export type ExternalAccess = "local_only" | "anonymous_required" | "anonymous_preferred" | "unrestricted";
+
+export type FactPolicyInfo = {
+	field_name: string,
+	label: string,
+	/**  The catalogue's sensitivity (general, personal, medical or financial). */
+	sensitivity: string,
+	tier2: FactPolicyTier,
+	tier3: FactPolicyTier,
+};
+
+/**  One external tier of one field. */
+export type FactPolicyTier = {
+	/**  The tier number: 2 or 3. */
+	tier: number,
+	/**
+	 *  The user's stored choice (pass, summarize, omit or ask), or None when the user
+	 *  has made none or the stored value is not one a user may choose.
+	 */
+	choice: string | null,
+	/**  The catalogue default. */
+	default_policy: string,
+	/**
+	 *  What the resolver gives today: the choice if valid, else the default, after the
+	 *  floors.
+	 */
+	effective: string,
+	/**  Whether the user may choose pass here. */
+	can_share: boolean,
+};
 
 export type Fit = "comfortable" | "tight" | "slow";
 

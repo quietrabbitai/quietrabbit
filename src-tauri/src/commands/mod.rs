@@ -59,6 +59,7 @@ pub mod collection_consent;
 pub mod consent;
 pub mod device_library;
 pub mod execution;
+pub mod fact_policy;
 pub mod focus_builder;
 pub mod group;
 pub mod handoff;

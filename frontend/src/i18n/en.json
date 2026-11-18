@@ -561,6 +561,24 @@
       "caveat": "This is the provider's default; your account settings may differ."
     }
   },
+  "fact_policy": {
+    "error": {
+      "persona_not_found": "This persona is not available.",
+      "unknown_field": "This detail can't have a sharing choice.",
+      "invalid_tier": "That sharing level isn't available.",
+      "invalid_policy": "That choice isn't available.",
+      "pass_not_allowed": "This detail can't be shared.",
+      "tier3_not_selectable": "This detail can't be shared at that level.",
+      "catalogue_unavailable": "Sharing choices aren't available right now.",
+      "fact_policy_unavailable": "Couldn't save or read your sharing choice. Try again in a moment."
+    },
+    "policy": {
+      "pass": "Share",
+      "summarize": "Describe",
+      "omit": "Withhold",
+      "ask": "Ask me"
+    }
+  },
   "handoff": {
     "error": {
       "persona_not_found": "This persona is not available.",
