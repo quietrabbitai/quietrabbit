@@ -176,11 +176,16 @@ pub struct OmittedCrossPersonaFact {
 ///
 /// Deliberately narrower than the group_facts table itself: like
 /// EntityFact (which does not carry entity_facts.abstraction_tier2/tier3/
-/// extra_metadata either — nothing downstream consumes those yet), this
-/// struct only carries what load_group_facts_for_context actually selects
-/// today. abstraction_tier2/tier3 stay in the schema for the eventual
-/// Gate1 wiring; adding them here ahead of a real consumer would be
-/// speculative.
+/// extra_metadata either), this struct only carries what
+/// load_group_facts_for_context actually selects today.
+///
+/// items.id=931 (decisions.id=953): group facts are NOT bridged to Gate 1 and
+/// never reach PersonalTrack.fields (ruling 1 and 13), and the Gate 1 bridge
+/// (conductor/personal_fact_bridge.rs) never reads abstraction_tier2/tier3 of
+/// ANY facts table: those columns default to 'pass' and cannot tell a default
+/// from a choice, so the disclosure policy lives in personal.db's
+/// fact_disclosure_policy table instead (items.id=930). Adding the columns
+/// here would invite a reader of them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupFact {
     /// group_facts.id (TEXT PRIMARY KEY, group_002.sql).

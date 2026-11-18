@@ -9662,11 +9662,17 @@ mod tests {
     }
 
     // -- items.id=882 stage 4: the declared field_requirements path, from the REAL
-    // shipped templates. END-TO-END LIMIT: the personal track here is a FIXTURE
-    // (add_field in the test). In production PersonalTrack.fields is left empty at
-    // INITIALIZE (personal_store.rs, items.id=170) and nothing bridges entity facts to
-    // Gate 1 (items.id=929), so today these fields arrive empty in a real run. What
-    // these tests prove is the path from Gate 1 to the prompt, not the source.
+    // shipped templates. The personal track in THESE tests is a FIXTURE (add_field in
+    // the test, fixture_field's source_id "personal-specialist"): they prove the path
+    // from Gate 1 to the prompt for the shipped templates. Since items.id=931 a real
+    // run's PersonalTrack.fields is filled by the bridge (personal_fact_bridge.rs,
+    // from the user's catalogued entity facts at their disclosure policy), and the
+    // bridged path is tested from the bridge itself: the t1/t4/t5/t7/t8 tests below
+    // (executor), the T2/T9 tests over a real personal.db (lifecycle.rs) and the T6
+    // scans (personal_fact_bridge.rs). What is still NOT covered end to end is a
+    // hosted call that completes: the loopback client is not HTTPS, so a hosted step
+    // ends at the review or the call, and the sent request is read through the
+    // review's captured prompt.
 
     async fn shipped_step(
         pool: &sqlx::SqlitePool,
@@ -10108,6 +10114,455 @@ mod tests {
         // ordinary field: unchanged mapping
         assert_eq!(f("ordinary").sensitivity, Sensitivity::General);
         assert_eq!(f("ordinary").abstraction_tier2, AbstractionPolicy::Pass);
+    }
+
+    // -- items.id=931 stage 3: the test matrix of decisions.id=953 ruling 12 ------------
+    // T1 (table), T2 (lifecycle.rs bridge tests), T3 (above), T4, T5, T6 (scans in
+    // personal_fact_bridge.rs), T7, T8, T9 (lifecycle.rs).
+
+    /// A policy row as the INITIALIZE snapshot holds it: the same word at both tiers.
+    fn policy_row(
+        name: &str,
+        word: Option<&str>,
+    ) -> crate::persistence::fact_policy_store::FactPolicyRow {
+        crate::persistence::fact_policy_store::FactPolicyRow {
+            field_name: name.to_owned(),
+            tier2: word.map(str::to_owned),
+            tier3: word.map(str::to_owned),
+            set_at: String::new(),
+            set_by: "user".to_owned(),
+        }
+    }
+
+    /// The bridged track for `facts` (name, value) as `policies` (the snapshot) built it.
+    fn track_from(
+        facts: &[(&str, &str)],
+        policies: &crate::persistence::fact_policy_store::UserPolicies,
+    ) -> PersonalTrack {
+        let efs: Vec<_> = facts.iter().map(|(n, v)| bridge_fact(n, v)).collect();
+        let mut pt = PersonalTrack::new();
+        for f in crate::conductor::personal_fact_bridge::bridge_fields(
+            efs.iter(),
+            "persona-1",
+            crate::conductor::personal_fact_fields::registry().map_err(|_| ()),
+            policies,
+        ) {
+            pt.add_field(f).unwrap();
+        }
+        pt
+    }
+
+    /// What happens to personal.db's policy table between INITIALIZE and the step.
+    enum TableAtRun {
+        /// The table holds the same rows as the snapshot.
+        Same,
+        /// The table is gone (an unreadable table at the re-read).
+        Dropped,
+    }
+
+    /// An external step declaring `declared` and rendering `template`, run against the
+    /// bridged track `rows` built, with personal.db holding `rows` too (or not). Returns
+    /// the prompt the review saw, the task track and the gateway.
+    async fn matrix_run(
+        pool: &sqlx::SqlitePool,
+        facts: &[(&str, &str)],
+        rows: &[(&str, &str)],
+        table: TableAtRun,
+        template: &str,
+        declared: &[&str],
+    ) -> (Option<String>, TaskTrack, PrivacyGateway<TestLogger>) {
+        use crate::conductor::personal_fact_fields::Tier;
+        use crate::persistence::fact_policy_store::UserPolicies;
+        let snapshot =
+            UserPolicies::Rows(rows.iter().map(|(n, w)| policy_row(n, Some(w))).collect());
+        let track = track_from(facts, &snapshot);
+        let key_hex = hosted_pick_rig(pool).await;
+        let mut ctx = hosted_ctx(RunAttendance::Attended, &key_hex);
+        ctx.step.prompt_template = template.to_owned();
+        for d in declared {
+            declare_field(&mut ctx, d);
+        }
+        ctx.floor_consent_preference = Some(FLOOR_CONSENT_MODIFIED.to_owned());
+        let mut conn = crate::persistence::personal_store::open_personal_db(
+            &ctx.user_id,
+            &ctx.persona_id,
+            &ctx.key_hex,
+        )
+        .await
+        .expect("personal.db opens in the fixture");
+        for (n, w) in rows {
+            crate::persistence::fact_policy_store::set_fact_policy(
+                &mut conn,
+                n,
+                Tier::Two,
+                w,
+                "user",
+            )
+            .await
+            .unwrap();
+        }
+        if matches!(table, TableAtRun::Dropped) {
+            sqlx::query("DROP TABLE fact_disclosure_policy")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        drop(conn);
+        let (forced, seen) = capturing_scanner();
+        let _g = step_review::forced::arm(&ctx, forced).await;
+        let (_out, task, gateway) = run_once_with(&ctx, pool, &track).await;
+        let seen = seen.borrow();
+        (seen.first().cloned(), task, gateway)
+    }
+
+    /// T1: sensitivity x tier x user policy x origin, through the REAL bridge, the REAL
+    /// gate-track mapping (with and without the executor's re-read) and the REAL Gate 1.
+    /// The raw value is released iff the user policy is pass, at tier 2, for a field whose
+    /// effective sensitivity is general or personal, of this Persona. (The declared-name
+    /// dimension is the executor's filter, pinned by T3 and by the undeclared test below:
+    /// Gate 1's approved_fields stays unfiltered by design.)
+    #[tokio::test]
+    async fn t1_the_raw_value_is_released_only_for_an_explicit_pass_on_a_releasable_field() {
+        use crate::conductor::personal_fact_bridge::bridge_fields;
+        use crate::conductor::personal_fact_fields::registry;
+        use crate::persistence::fact_policy_store::UserPolicies;
+        let scope: std::collections::HashSet<String> = ["job_title".to_owned()].into();
+        let policies: [(&str, Option<&str>); 7] = [
+            ("none", None),
+            ("pass", Some("pass")),
+            ("summarize", Some("summarize")),
+            ("omit", Some("omit")),
+            ("ask", Some("ask")),
+            ("garbage", Some("???")),
+            ("table unreadable", None),
+        ];
+        let mut released_cases = 0;
+        let mut cases = 0;
+        for sens in ["general", "personal", "medical", "financial", "mystery"] {
+            for (label, word) in policies {
+                for origin in ["persona-1", "other"] {
+                    for tier in [2u8, 3] {
+                        for fresh in [false, true] {
+                            let user = if label == "table unreadable" {
+                                UserPolicies::Unreadable
+                            } else {
+                                UserPolicies::Rows(match word {
+                                    Some(w) => vec![policy_row("job_title", Some(w))],
+                                    None => Vec::new(),
+                                })
+                            };
+                            let mut fact = bridge_fact("job_title", "Staff Engineer");
+                            fact.sensitivity = sens.to_owned();
+                            fact.source_persona_id = origin.to_owned();
+                            let built = bridge_fields(
+                                [fact].iter(),
+                                "persona-1",
+                                registry().map_err(|_| ()),
+                                &user,
+                            );
+                            // The resolver's own floor, before any mapping: a field whose
+                            // effective sensitivity is closed, or of another Persona, is
+                            // not_permitted at both tiers whatever the user's row says.
+                            if !matches!(sens, "general" | "personal") || origin != "persona-1" {
+                                assert_eq!(built[0].abstraction_tier2, "not_permitted");
+                                assert_eq!(built[0].abstraction_tier3, "not_permitted");
+                            }
+                            // No user row: omit by default at both tiers.
+                            if label == "none" && sens == "personal" && origin == "persona-1" {
+                                assert_eq!(built[0].abstraction_tier2, "omit");
+                                assert_eq!(built[0].abstraction_tier3, "omit");
+                            }
+                            let mut ct = PersonalTrack::new();
+                            for f in built {
+                                ct.add_field(f).unwrap();
+                            }
+                            let gt = to_gate_track_with(&ct, fresh.then_some(&user));
+                            let gateway = PrivacyGateway::new(TestLogger::new());
+                            let r = gateway
+                                .gate1(
+                                    "s1",
+                                    "run-1",
+                                    &gt,
+                                    tier,
+                                    1,
+                                    tier,
+                                    ExternalAccess::AnonymousRequired,
+                                    None,
+                                    Some(&scope),
+                                )
+                                .await
+                                .unwrap();
+                            let released = r.approved_fields.get("job_title").map(String::as_str)
+                                == Some("Staff Engineer");
+                            let expected = tier == 2
+                                && word == Some("pass")
+                                && matches!(sens, "general" | "personal")
+                                && origin == "persona-1";
+                            assert_eq!(
+                                released, expected,
+                                "sens={sens} policy={label} origin={origin} tier={tier} fresh={fresh}"
+                            );
+                            cases += 1;
+                            released_cases += usize::from(released);
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 5 * 7 * 2 * 2 * 2);
+        // general and personal, this Persona, pass, tier 2, both mappings.
+        assert_eq!(released_cases, 2 * 2);
+    }
+
+    /// T1 (declared dimension, through execute_once): a bridged field at PASS that the
+    /// template names but the step does not declare never reaches the prompt or the buffer.
+    #[tokio::test]
+    async fn t1_an_undeclared_bridged_pass_field_the_template_names_stays_out() {
+        with_temp_shared_db(|pool| async move {
+            let (prompt, _task, gateway) = matrix_run(
+                &pool,
+                &[
+                    ("job_title", "Staff Engineer"),
+                    ("location_city", "Portland"),
+                ],
+                &[("job_title", "pass"), ("location_city", "pass")],
+                TableAtRun::Same,
+                "Role: {job_title} City: {location_city} End",
+                &["job_title"],
+            )
+            .await;
+            assert_eq!(prompt.as_deref(), Some("Role: Staff Engineer City:  End"));
+            let rows = gate1_entries(&gateway);
+            assert_eq!(rows[0].fields_shared, ["job_title"]);
+        })
+        .await;
+    }
+
+    /// T4: the gate1 row lists exactly the DECLARED names, split into sent, abstracted and
+    /// withheld, and carries no raw value. location_city is at pass but undeclared: with
+    /// report_scope removed the row would name it.
+    #[tokio::test]
+    async fn t4_the_gate1_row_lists_exactly_the_declared_names_and_no_raw_value() {
+        with_temp_shared_db(|pool| async move {
+            let (prompt, _task, gateway) = matrix_run(
+                &pool,
+                &[
+                    ("job_title", "Staff Engineer"),
+                    ("employer", "Acme Robotics"),
+                    ("industry", "Logistics"),
+                    ("location_city", "Portland"),
+                ],
+                &[
+                    ("job_title", "pass"),
+                    ("employer", "summarize"),
+                    ("location_city", "pass"),
+                ],
+                TableAtRun::Same,
+                "R: {job_title} E: {employer} I: {industry}",
+                &["job_title", "employer", "industry"],
+            )
+            .await;
+            assert_eq!(
+                prompt.as_deref(),
+                Some("R: Staff Engineer E: personal employer information I:")
+            );
+            let rows = gate1_entries(&gateway);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].fields_shared, ["job_title"]);
+            assert_eq!(
+                rows[0]
+                    .fields_abstracted
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                ["employer"]
+            );
+            assert_eq!(rows[0].fields_withheld, ["industry"]);
+            let dump = format!("{:?}", rows[0]);
+            for raw in ["Staff Engineer", "Acme Robotics", "Logistics", "Portland"] {
+                assert!(!dump.contains(raw), "{raw} in the row: {dump}");
+            }
+        })
+        .await;
+    }
+
+    /// T5: a policy table that cannot be read at the re-read (the snapshot said pass)
+    /// withholds every bridged field.
+    #[tokio::test]
+    async fn t5_a_policy_table_that_vanishes_after_the_snapshot_withholds_the_value() {
+        with_temp_shared_db(|pool| async move {
+            let (prompt, _task, gateway) = matrix_run(
+                &pool,
+                &[("job_title", "Staff Engineer")],
+                &[("job_title", "pass")],
+                TableAtRun::Dropped,
+                "Role: {job_title}",
+                &["job_title"],
+            )
+            .await;
+            if let Some(p) = &prompt {
+                assert!(!p.contains("Staff Engineer"), "{p}");
+            }
+            let rows = gate1_entries(&gateway);
+            assert_eq!(rows[0].fields_withheld, ["job_title"]);
+            assert!(rows[0].fields_shared.is_empty());
+        })
+        .await;
+    }
+
+    /// T7: review interplay. A value shared at pass IS in the prompt the outbound review
+    /// reads, and when the user answered keep_private for the span over it the step is
+    /// recorded Redacted (the review's own redaction path is unchanged).
+    #[tokio::test]
+    async fn t7_a_passed_value_is_in_the_reviewed_prompt_and_keep_private_redacts_it() {
+        with_temp_shared_db(|pool| async move {
+            let key_hex = hosted_pick_rig(&pool).await;
+            let mut ctx = hosted_ctx(RunAttendance::Attended, &key_hex);
+            ctx.step.prompt_template = "Role: {job_title}".to_owned();
+            declare_field(&mut ctx, "job_title");
+            ctx.floor_consent_preference = Some(FLOOR_CONSENT_MODIFIED.to_owned());
+            let policies =
+                crate::persistence::fact_policy_store::UserPolicies::Rows(vec![policy_row(
+                    "job_title",
+                    Some("pass"),
+                )]);
+            let track = track_from(&[("job_title", "Staff Engineer")], &policies);
+            {
+                let mut conn = crate::persistence::personal_store::open_personal_db(
+                    &ctx.user_id,
+                    &ctx.persona_id,
+                    &ctx.key_hex,
+                )
+                .await
+                .unwrap();
+                crate::persistence::fact_policy_store::set_fact_policy(
+                    &mut conn,
+                    "job_title",
+                    crate::conductor::personal_fact_fields::Tier::Two,
+                    "pass",
+                    "user",
+                )
+                .await
+                .unwrap();
+            }
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+            let sink = std::rc::Rc::clone(&seen);
+            let mut forced = step_review::forced::clean();
+            forced.result = std::rc::Rc::new(move |content: &str| {
+                sink.borrow_mut().push(content.to_owned());
+                Ok(crate::conductor::privacy::types::Gate3Result {
+                    pending_consent: true,
+                    review_spans: vec![step_review::fake::asked_span(
+                        "s-job",
+                        content,
+                        "Staff Engineer",
+                    )],
+                    ..Default::default()
+                })
+            });
+            let _g = step_review::forced::arm(&ctx, forced).await;
+
+            let (out, _t, _g1) = run_once_with(&ctx, &pool, &track).await;
+            let failure = out.unwrap().expect("parked for the user");
+            assert_eq!(failure.action, FailureAction::AwaitConsent);
+            assert_eq!(seen.borrow().as_slice(), ["Role: Staff Engineer"]);
+
+            let mut conn = crate::persistence::output_store::open_outputs_db(
+                &ctx.user_id,
+                &ctx.persona_id,
+                &ctx.key_hex,
+            )
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO consent_decisions
+                 (id, focus_run_id, decision_type, decision, span_id, created_at)
+                 VALUES ('d1', ?, 'element_consent', 'keep_private', 's-job', 't')",
+            )
+            .bind(&ctx.focus_run_id)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            drop(conn);
+
+            let _ = run_once_with(&ctx, &pool, &track).await;
+            let rows = review_rows(&ctx).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].outcome,
+                crate::persistence::step_review_store::ReviewOutcome::Redacted
+            );
+        })
+        .await;
+    }
+
+    /// T8: the collateral reads of PersonalTrack.fields. Under a LOCAL pick (nothing
+    /// leaves) a voice attribute that repeats a bridged value is stripped and logged, and
+    /// the step is scored at personal sensitivity (2) from the template's tokens.
+    #[tokio::test]
+    async fn t8_a_bridged_value_strips_a_voice_attribute_and_scores_the_local_step_personal() {
+        with_temp_shared_db(|pool| async move {
+            install_local_models(&pool).await;
+            let stub = LocalModelStub::start(1);
+            let ctx = resolved_ctx(
+                Some(requirement(
+                    QualityBar::Basic,
+                    &[Destination::Local, Destination::HostedApi],
+                    ExternalAccess::AnonymousPreferred,
+                )),
+                ExternalAccess::AnonymousPreferred,
+                Some("rma_letter"),
+                "Write it. {job_title}",
+            );
+            let mut personal = track_from(
+                &[("job_title", "Staff Engineer")],
+                &crate::persistence::fact_policy_store::UserPolicies::Rows(Vec::new()),
+            );
+            let mut voice = IndexMap::new();
+            voice.insert("tone".to_owned(), "Staff Engineer".to_owned());
+            personal.set_voice_profile(voice).unwrap();
+
+            let (out, track, gateway) = run_once_with(&ctx, &pool, &personal).await;
+            assert!(out.unwrap().is_none(), "a local step is not halted");
+            assert_eq!(stub.server.captured().len(), 1);
+            let all = gateway.logger.entries();
+            assert_eq!(
+                all.iter()
+                    .filter(|e| e.event_type == "voice_profile_contamination")
+                    .count(),
+                1,
+                "the voice attribute that repeats a bridged value is stripped and logged"
+            );
+            assert_eq!(track.steps()[0].sensitivity_severity, 2);
+        })
+        .await;
+    }
+
+    /// T8: Gate 2 flags a reply that echoes a bridged value (flag only), over the same
+    /// gate track Gate 1 saw.
+    #[tokio::test]
+    async fn t8_gate2_flags_a_reply_that_echoes_a_bridged_value() {
+        let ct = track_from(
+            &[("employer", "Acme Robotics")],
+            &crate::persistence::fact_policy_store::UserPolicies::Rows(Vec::new()),
+        );
+        let gt = to_gate_track_with(&ct, None);
+        let gateway = PrivacyGateway::new(TestLogger::new());
+        let r = gateway
+            .gate2(
+                "s1",
+                "run-1",
+                "Thanks, as someone at Acme Robotics you will want...",
+                &gt,
+                2,
+                ExternalAccess::AnonymousRequired,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(r.flagged);
+        assert_eq!(r.matched_field_names, ["employer"]);
     }
 
     /// research, real template: location_city is the one declared field.

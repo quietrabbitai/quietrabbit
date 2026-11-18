@@ -281,4 +281,112 @@ mod tests {
         ];
         assert!(bridge_fields(facts.iter(), "p1", registry().map_err(|_| ()), &none()).is_empty());
     }
+
+    // -- T6: source scans (items.id=931, decisions.id=953 ruling 12) ------------------
+
+    /// Production code of a source file: cut at the test module, drop comment lines.
+    fn code_of(src: &str) -> String {
+        let prod = src.split("#[cfg(test)]\nmod ").next().unwrap();
+        prod.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn source_files() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    let name = p.to_string_lossy().into_owned();
+                    out.push((name, std::fs::read_to_string(&p).unwrap()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut out,
+        );
+        out
+    }
+
+    /// ONE constructor of bridged fields: the marker is named nowhere else in
+    /// production code, and the only non-test callers of add_field are the bridge's one
+    /// call site in lifecycle.rs and the privacy gate-track conversion in executor.rs
+    /// (a different type, privacy::types::PersonalTrack).
+    #[test]
+    fn t6_one_constructor_and_one_add_field_caller() {
+        let mut add_field_callers: Vec<(String, usize)> = Vec::new();
+        for (name, src) in source_files() {
+            let code = code_of(&src);
+            if !name.ends_with("personal_fact_bridge.rs") {
+                assert!(
+                    !code.contains("BRIDGE_SOURCE_ID"),
+                    "{name} names the bridge marker"
+                );
+            }
+            let n = code.matches(".add_field(").count();
+            if n > 0 {
+                add_field_callers.push((name, n));
+            }
+        }
+        add_field_callers.sort();
+        let tails: Vec<(&str, usize)> = add_field_callers
+            .iter()
+            .map(|(n, c)| (n.rsplit("src/").next().unwrap(), *c))
+            .collect();
+        assert_eq!(
+            tails,
+            [("conductor/executor.rs", 1), ("conductor/lifecycle.rs", 1)],
+            "{tails:?}"
+        );
+        let lc = code_of(include_str!("lifecycle.rs"));
+        let site = lc.split(".add_field(").next().unwrap();
+        assert!(
+            site.rsplit("async fn ")
+                .next()
+                .unwrap()
+                .starts_with("bridge_personal_facts("),
+            "the one add_field call in lifecycle.rs is in bridge_personal_facts"
+        );
+        let ex = code_of(include_str!("executor.rs"));
+        assert!(
+            ex.contains("gt.add_field("),
+            "the executor call is the gate track's"
+        );
+    }
+
+    /// The bridge never reads the entity_facts abstraction columns: EntityFact does not
+    /// carry them, the loader does not select them and the bridge names neither them nor
+    /// any SQL.
+    #[test]
+    fn t6_the_bridge_never_reads_the_entity_facts_abstraction_columns() {
+        let types = include_str!("types.rs");
+        let body = types
+            .split("pub struct EntityFact {")
+            .nth(1)
+            .and_then(|r| r.split("\n}\n").next())
+            .expect("EntityFact is in types.rs");
+        assert!(!body.contains("abstraction"), "{body}");
+        let store = include_str!("../persistence/personal_store.rs");
+        let loader = store
+            .split("pub async fn load_entity_facts_for_context(")
+            .nth(1)
+            .and_then(|r| r.split("\n}\n").next())
+            .expect("the loader is in personal_store.rs");
+        assert!(!loader.contains("abstraction"), "{loader}");
+        let bridge = code_of(include_str!("personal_fact_bridge.rs"));
+        for banned in [
+            "sqlx",
+            "SELECT",
+            "entity_facts",
+            "fact.abstraction",
+            "FROM ",
+        ] {
+            assert!(!bridge.contains(banned), "the bridge names {banned}");
+        }
+    }
 }

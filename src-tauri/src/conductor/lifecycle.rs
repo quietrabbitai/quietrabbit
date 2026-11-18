@@ -7022,6 +7022,273 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // items.id=931 stage 3: the bridge against a REAL encrypted personal.db, through
+    // rehydrate_focus_run (which calls build_personal_track, and so the provenance
+    // check and bridge_personal_facts, exactly as a fresh run does).
+    // T2 (provenance), the explicit pass, T9 (resume honours a tightened policy), the
+    // unreadable table and the value that fails the validator.
+    // -------------------------------------------------------------------------
+
+    const BRIDGE_USER: &str = "bridge-user";
+    const BRIDGE_PERSONA: &str = "bridge-persona";
+
+    async fn bridge_fact_row(
+        name: &str,
+        value: &str,
+        entity: Option<&str>,
+        source_persona: &str,
+        cross: bool,
+    ) -> String {
+        crate::persistence::personal_store::create_entity_fact_with_provenance(
+            BRIDGE_USER,
+            BRIDGE_PERSONA,
+            RESUME_TEST_KEY_HEX,
+            entity,
+            name,
+            value,
+            "personal",
+            "interview",
+            source_persona,
+            cross,
+            cross.then_some(source_persona),
+            None,
+        )
+        .await
+        .expect("the fact is written")
+    }
+
+    async fn bridge_policy(name: &str, word: &str) {
+        let mut conn = crate::persistence::personal_store::open_personal_db(
+            BRIDGE_USER,
+            BRIDGE_PERSONA,
+            RESUME_TEST_KEY_HEX,
+        )
+        .await
+        .unwrap();
+        crate::persistence::fact_policy_store::set_fact_policy(
+            &mut conn,
+            name,
+            crate::conductor::personal_fact_fields::Tier::Two,
+            word,
+            "user",
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A paused quick-ask run row, rehydrated (twice is fine: the row is not consumed).
+    async fn bridge_rehydrate(
+        pool: &sqlx::SqlitePool,
+        run_id: &str,
+        confirmed: std::collections::HashSet<String>,
+    ) -> FocusRun {
+        rehydrate_focus_run(
+            BRIDGE_USER.to_owned(),
+            BRIDGE_PERSONA.to_owned(),
+            run_id.to_owned(),
+            pool.clone(),
+            Arc::new(ConductorScheduler::new()),
+            Some(RESUME_TEST_KEY_HEX.to_owned()),
+            confirmed,
+            None,
+        )
+        .await
+        .expect("rehydrate_focus_run must succeed")
+    }
+
+    async fn bridge_setup() -> (sqlx::SqlitePool, String) {
+        let pool = setup_shared_and_persona_for_resume_test(BRIDGE_USER, BRIDGE_PERSONA).await;
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let mut conn = open_outputs_db(BRIDGE_USER, BRIDGE_PERSONA, RESUME_TEST_KEY_HEX)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO focus_runs
+             (id, focus_id, status, is_fast_lane, is_quick_ask, topic_id, user_input, started_at)
+             VALUES (?, 'quick-ask', 'paused', 0, 1, NULL, 'input', ?)",
+        )
+        .bind(&run_id)
+        .bind(now())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        (pool, run_id)
+    }
+
+    fn bridged(run: &FocusRun, name: &str) -> Option<crate::conductor::types::PersonalField> {
+        run.personal_track
+            .as_ref()
+            .unwrap()
+            .fields()
+            .get(name)
+            .cloned()
+    }
+
+    /// T2: only same-Persona (or confirmed cross-Persona, as not_permitted), catalogued,
+    /// singleton facts reach PersonalTrack.fields.
+    #[tokio::test]
+    async fn t2_only_catalogued_singleton_facts_that_passed_provenance_are_bridged() {
+        use crate::conductor::personal_fact_bridge::BRIDGE_SOURCE_ID;
+        with_temp_data_root(async {
+            let (pool, run_id) = bridge_setup().await;
+            let entity = crate::persistence::entity_store::create_entity(
+                BRIDGE_USER,
+                BRIDGE_PERSONA,
+                RESUME_TEST_KEY_HEX,
+                "person",
+                "Contact",
+                &[],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            bridge_fact_row("job_title", "Staff Engineer", None, BRIDGE_PERSONA, false).await;
+            let confirmed_id =
+                bridge_fact_row("employer", "Acme Robotics", None, "other-persona", true).await;
+            // Cross-Persona and NOT confirmed: the provenance check omits it.
+            bridge_fact_row("industry", "Logistics", None, "other-persona", true).await;
+            // Entity-scoped and uncatalogued: not bridged.
+            bridge_fact_row(
+                "location_city",
+                "Portland",
+                Some(entity.as_str()),
+                BRIDGE_PERSONA,
+                false,
+            )
+            .await;
+            bridge_fact_row("gpa", "3.8", None, BRIDGE_PERSONA, false).await;
+            bridge_policy("job_title", "pass").await;
+            bridge_policy("employer", "pass").await;
+
+            let mut confirmed = std::collections::HashSet::new();
+            confirmed.insert(confirmed_id);
+            let run = bridge_rehydrate(&pool, &run_id, confirmed).await;
+            let fields = run.personal_track.as_ref().unwrap().fields();
+            let mut names: Vec<_> = fields.keys().cloned().collect();
+            names.sort();
+            assert_eq!(names, ["employer", "job_title"]);
+            assert!(fields.values().all(|f| f.source_id == BRIDGE_SOURCE_ID));
+            let job = bridged(&run, "job_title").unwrap();
+            assert_eq!(
+                (
+                    job.abstraction_tier2.as_str(),
+                    job.abstraction_tier3.as_str()
+                ),
+                ("pass", "omit")
+            );
+            // A confirmed cross-Persona fact is in the track but closed to external steps
+            // even though the user holds a pass row for its name.
+            let emp = bridged(&run, "employer").unwrap();
+            assert_eq!(emp.abstraction_tier2, "not_permitted");
+            assert_eq!(emp.abstraction_tier3, "not_permitted");
+        })
+        .await;
+    }
+
+    /// The default is omit at both tiers, an explicit pass is pass at tier 2 only, and
+    /// the stored sensitivity is the catalogue's (personal).
+    #[tokio::test]
+    async fn an_explicit_pass_is_pass_and_everything_else_defaults_to_omit() {
+        with_temp_data_root(async {
+            let (pool, run_id) = bridge_setup().await;
+            bridge_fact_row("job_title", "Staff Engineer", None, BRIDGE_PERSONA, false).await;
+            bridge_fact_row("industry", "Logistics", None, BRIDGE_PERSONA, false).await;
+            bridge_policy("job_title", "pass").await;
+            let run = bridge_rehydrate(&pool, &run_id, Default::default()).await;
+            let job = bridged(&run, "job_title").unwrap();
+            assert_eq!(job.abstraction_tier2, "pass");
+            assert_eq!(job.abstraction_tier3, "omit");
+            assert_eq!(job.sensitivity, "personal");
+            let ind = bridged(&run, "industry").unwrap();
+            assert_eq!(ind.abstraction_tier2, "omit");
+            assert_eq!(ind.abstraction_tier3, "omit");
+        })
+        .await;
+    }
+
+    /// T9: a resumed run builds its track again, so a policy tightened while the run was
+    /// parked is honoured; an explicit pass survives a NEW value of the same field.
+    #[tokio::test]
+    async fn t9_a_resumed_run_honours_a_tightened_policy_and_a_pass_survives_a_new_value() {
+        with_temp_data_root(async {
+            let (pool, run_id) = bridge_setup().await;
+            bridge_fact_row("job_title", "Staff Engineer", None, BRIDGE_PERSONA, false).await;
+            bridge_policy("job_title", "pass").await;
+            let first = bridge_rehydrate(&pool, &run_id, Default::default()).await;
+            assert_eq!(
+                bridged(&first, "job_title").unwrap().abstraction_tier2,
+                "pass"
+            );
+
+            // A new value (the old row is superseded): the pass still applies.
+            bridge_fact_row(
+                "job_title",
+                "Principal Engineer",
+                None,
+                BRIDGE_PERSONA,
+                false,
+            )
+            .await;
+            let second = bridge_rehydrate(&pool, &run_id, Default::default()).await;
+            let job = bridged(&second, "job_title").unwrap();
+            assert_eq!(job.field_value, "Principal Engineer");
+            assert_eq!(job.abstraction_tier2, "pass");
+
+            // The user tightens the policy while the run is parked.
+            bridge_policy("job_title", "omit").await;
+            let third = bridge_rehydrate(&pool, &run_id, Default::default()).await;
+            assert_eq!(
+                bridged(&third, "job_title").unwrap().abstraction_tier2,
+                "omit"
+            );
+        })
+        .await;
+    }
+
+    /// A policy table that cannot be read gives omit for every bridged field (the run is
+    /// not failed), and a value that fails the field validator keeps its CLEANED text in
+    /// PersonalTrack.fields (Gate 2, the voice scan and sensitivity still read it, which
+    /// can only widen protection) but is not_permitted at both tiers, so Gate 1 never
+    /// releases it.
+    #[tokio::test]
+    async fn an_unreadable_policy_table_is_omit_and_an_invalid_value_is_kept_but_closed() {
+        with_temp_data_root(async {
+            let (pool, run_id) = bridge_setup().await;
+            bridge_fact_row("job_title", "Staff Engineer", None, BRIDGE_PERSONA, false).await;
+            let long = format!("{{x}}{}", "y".repeat(500));
+            bridge_fact_row("employer", &long, None, BRIDGE_PERSONA, false).await;
+            bridge_policy("job_title", "pass").await;
+            {
+                let mut conn = crate::persistence::personal_store::open_personal_db(
+                    BRIDGE_USER,
+                    BRIDGE_PERSONA,
+                    RESUME_TEST_KEY_HEX,
+                )
+                .await
+                .unwrap();
+                sqlx::query("DROP TABLE fact_disclosure_policy")
+                    .execute(&mut conn)
+                    .await
+                    .unwrap();
+            }
+            let run = bridge_rehydrate(&pool, &run_id, Default::default()).await;
+            let job = bridged(&run, "job_title").unwrap();
+            assert_eq!(job.abstraction_tier2, "omit");
+            assert_eq!(job.abstraction_tier3, "omit");
+            let emp = bridged(&run, "employer").unwrap();
+            assert_eq!(emp.abstraction_tier2, "not_permitted");
+            assert_eq!(emp.abstraction_tier3, "not_permitted");
+            assert!(
+                emp.field_value.starts_with("(x)yyy"),
+                "cleaned, not blanked"
+            );
+            assert!(!emp.field_value.contains(['{', '}']));
+        })
+        .await;
+    }
+
+    // -------------------------------------------------------------------------
     // items.id=735 (decisions.id=883): Gate 2 flags on the TaskStep travel to
     // the step-completion status and through checkpoint and resume.
     // -------------------------------------------------------------------------

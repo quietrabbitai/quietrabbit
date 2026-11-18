@@ -245,19 +245,22 @@ pub async fn load_personal_track(
     let mut track = PersonalTrack::new();
     // items.id=170 fix (2026-07-26): personal_fields was dropped by the
     // entity-model migration; this function used to populate track.fields
-    // by reading that dead table via track.add_field(). track.fields is now
-    // left empty at INITIALIZE (PersonalField/PersonalTrack.fields is kept
-    // as a live type, not retired — it remains the IPC-facing shape for
-    // commands::personal -- but nothing currently needs it populated here).
-    // PersonalTrack.entity_facts (populated by build_personal_track() via
+    // by reading that dead table via track.add_field(). It does not populate
+    // track.fields now either, and still does not:
+    // PersonalTrack.entity_facts is filled by build_personal_track() via
     // load_entity_facts_for_context(), called separately right after this
-    // function returns) already carries every singleton fact a fresh
-    // install has. Populating both fields and entity_facts from the same
-    // underlying rows would be redundant duplication, not a fix. See
-    // items.id=170 handoff for the full verification trail (ownership_scope
-    // enforcement confirmed as a real write-time privacy gate,
-    // abstraction_tier2/tier3 domain match confirmed identical between
-    // personal_fields and entity_facts) behind this call.
+    // function returns, and populating both from the same rows here would be
+    // redundant duplication.
+    //
+    // items.id=931 (decisions.id=953): track.fields IS populated in
+    // production now, by exactly one caller: lifecycle.rs build_personal_track
+    // -> bridge_personal_facts -> conductor::personal_fact_bridge::bridge_fields,
+    // which turns the catalogued, singleton, same-Persona entity facts that
+    // passed the provenance check into PersonalField rows at the user's
+    // effective disclosure policy (fact_disclosure_policy, items.id=930).
+    // Nothing in this file adds a field, and the entity_facts
+    // abstraction_tier2/tier3 columns are never read for it (a scan test in
+    // personal_fact_bridge.rs pins both).
 
     let profile = resolve_voice_profile_conn(&mut conn, persona_id).await?;
     track

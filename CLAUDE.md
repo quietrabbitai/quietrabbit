@@ -1,5 +1,7 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: November 17, 2026 (items.id=883: new "External steps and chat history" section; the
+# Last updated: November 18, 2026 (items.id=931: new "Personal fact bridge" section; nothing else.
+# Items.id=930 built the catalogue and the policy store it uses; the older sections were not re-verified.).
+# Before that, November 17, 2026 (items.id=883: new "External steps and chat history" section; the
 # focus_runs.user_input bullet under "Model blocks", the starter's {user_input} line under "Manual
 # hand-off" and the RESUME paragraph under "Launch questions"; nothing else.).
 # Before that, November 17, 2026 (items.id=898: new "Focus development tool" section; the dev-only
@@ -1337,6 +1339,55 @@ Focus and items.id=916 flips it; the hard purge ships before that.
   baseline CREATE); no shared or outputs file was added. items.id=888 keeps clear_chat, the retention
   sweep, context_key persistence, the resume pin and re-deriving pass-local published ids (an
   entity id is re-derivable from its replay key); it does NOT build any entity purge.
+
+## Personal fact bridge (items.id=931, decisions.id=953; the catalogue and store are items.id=930)
+Before items.id=931 PersonalTrack.fields was empty in every real run, so a declared
+field_requirements token rendered empty. Now a singleton entity fact in the closed catalogue
+(block_data/personal_fact_fields.json: location_city, job_title, employer, industry, all personal,
+default OMIT at tiers 2 and 3) reaches Gate 1 at the user's disclosure policy.
+- ONE CONSTRUCTOR (conductor/personal_fact_bridge.rs, PURE, no I/O). lifecycle.rs
+  bridge_personal_facts is its only caller and the only production add_field on a conductor
+  PersonalTrack (executor.rs's gt.add_field is the separate privacy gate track): both are pinned by scans
+  in the bridge's tests (T6). Input: facts that PASSED apply_entity_fact_provenance_check, so an
+  unconfirmed cross-Persona fact never gets here; a confirmed one is bridged as not_permitted (v1).
+  Entity-scoped and uncatalogued facts are skipped, a duplicate name is dropped whole, an unreadable
+  catalogue bridges nothing. A bridged field is marked by source_id BRIDGE_SOURCE_ID, nothing else writes it.
+- POLICY. abstraction_tier2/3 on the field carry the effective policy word (personal_fact_fields::
+  effective_policy over fact_disclosure_policy, personal.db). The bridge NEVER reads the entity_facts
+  abstraction columns (EntityFact does not carry them, the loader does not select them, a scan pins both).
+  The default is omit, only an explicit user pass releases the raw value and only at tier 2 (tier 3 pass is
+  not selectable for any v1 field), medical and financial (and an unknown sensitivity) are not_permitted
+  whatever the user says. ask behaves as omit until items.id=924.
+- RE-READ. A run uses the INITIALIZE snapshot and execute_once reads fact_disclosure_policy AGAIN before
+  Gate 1 for a hosted step that holds a bridged field, taking the STRICTER word of the two (not_permitted >
+  omit, with ask and unknown as omit > summarize > pass; equal words keep the snapshot, so an explicit pass
+  survives a new value of the same field). An unreadable table or database is omit for every bridged field.
+  A resumed run builds its track again, so a policy tightened while it was parked is honoured (T9).
+- GATE 1 report_scope. gate1 takes an optional set of declared names (execute_once passes the step's
+  field_requirements keys): fields_shared, fields_abstracted, fields_withheld and floor_clamped_fields
+  (the log row and the floor-consent prompt) cover declared fields only. approved_fields stays unfiltered and
+  the declared-field filter in execute_once stays the live control (T3 proves it, step built bypassing the lint).
+  A floor-consent prompt therefore fires only for a field the step declares.
+- FAIL CLOSED MAPPING (executor.rs to_gate_track_with, bridged fields only): an unknown sensitivity maps to
+  financial; a field outside the catalogue or outside general/personal is not_permitted at both tiers. An
+  ordinary field keeps the old mapping (unknown is general).
+- VALUE. A bridged value has `{` and `}` turned into `(` and `)`, because render_template is NOT single
+  pass (it replaces token by token over a HashMap, so a value naming {user_input} could be expanded by a
+  later substitution). A single-pass renderer is a separate item (items.id=932). A value that fails the field
+  validator (length, content) keeps its CLEANED text in PersonalTrack.fields, which Gate 2, the voice scan and
+  step sensitivity still read, but is not_permitted at both tiers so Gate 1 never releases it.
+- LOAD LINT (declared_inputs::lint_field_requirements, both loaders): in an external step every
+  field_requirements name must be a catalogue name, be named as a {token} in the template and equal no
+  output_var, bound name or system token.
+- ACCEPTED SIDE EFFECTS (decisions.id=953 ruling 11), for any persona holding a catalogued fact even with
+  no policy: the first external run may park once on floor consent, voice-profile contamination can strip an
+  attribute (local) or halt an external step, Gate 2 can flag a reply echoing a value (flag only), step and
+  output sensitivity rise to personal, and checkpoint manifests carry name:value hashes. Local steps are
+  otherwise unchanged.
+- NOT BUILT: UI and copy, group facts and entity-scoped (device) facts (items.id=924), releasing medical,
+  financial or cross-Persona facts, the single-pass renderer (items.id=932), an end-to-end hosted call (the
+  loopback client is not HTTPS). Hand checks for the live app are listed in the items.id=931 handoff.
+  items.id=633 absorbs personal_012.sql (items.id=930).
 
 ## Naming Architecture — term map
 
