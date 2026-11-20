@@ -160,6 +160,12 @@ pub enum LifecycleError {
     /// finished since this FocusRun was rehydrated). Nothing was written.
     #[error("the run is not waiting to be resumed")]
     ResumeRaced,
+    /// items.id=888 stage 4: the run belongs to a one-time (latched) chat, or the chat's
+    /// latch cannot be read. Such a run is not resumed: nothing of that chat is to persist
+    /// or continue (decisions.id=509), and the failure direction is suppression.
+    /// rehydrate_focus_run writes nothing; the caller cancels (cancel_stale_resume).
+    #[error("a one-time chat cannot be resumed")]
+    ResumeOneTimeChat,
     #[error("Reentry: {0}")]
     Reentry(#[from] ReentryError),
 
@@ -2028,8 +2034,12 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     /// rehydrated or swept run has none; a bound API Chat run never resolves and is excluded
     /// here too. Any doubt is None, and None is today's look-ahead (over-prompt, never
     /// under-prompt).
+    ///
+    /// items.id=888 stage 4: a rehydrated run of a chat now holds an approval only after
+    /// rehydrate_focus_run's own plan_gate verified it, exactly as a fresh run does, so
+    /// `rehydrated` no longer excludes it here.
     fn look_ahead_plan(&self) -> Option<&crate::conductor::plan_approval::Approval> {
-        if self.rehydrated || self.chat_binding.is_some() {
+        if self.chat_binding.is_some() {
             return None;
         }
         self.plan.as_deref()
@@ -2230,7 +2240,10 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             self.launch = LaunchResolution::default();
             return Ok(());
         }
+        // items.id=888 stage 4: only a resumed run with NO chat (a row from before
+        // outputs_019, or a run that never had one) cannot read the answers.
         if self.rehydrated
+            && self.context_key.is_none()
             && config
                 .as_ref()
                 .is_some_and(|c| c.questions.iter().any(|q| q.asked))
@@ -2558,11 +2571,14 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 .await?;
             }
         } else {
+            // items.id=888 stage 4: the chat the run belongs to (outputs_019), so a resumed
+            // run reads its latch, launch answers and plan approval. Written for every run
+            // that has a chat; it is the chat id, not user content, and is never cleared.
             sqlx::query(
                 "INSERT INTO focus_runs
                  (id, focus_id, status, is_fast_lane, is_quick_ask,
-                  topic_id, user_input, external_input, started_at, notes)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  topic_id, user_input, external_input, started_at, notes, context_key)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(focus_run_id)
             .bind(&self.focus_id)
@@ -2574,6 +2590,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             .bind(keep_input.then_some(self.external_input.as_str()))
             .bind(now())
             .bind("{}")
+            .bind(self.context_key.as_deref())
             .execute(&mut conn)
             .await?;
         }
@@ -5168,7 +5185,7 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
 
     let run_row = sqlx::query(
         "SELECT focus_id, status, is_fast_lane, is_quick_ask, topic_id, user_input,
-                external_input
+                external_input, context_key
          FROM focus_runs WHERE id = ?",
     )
     .bind(&focus_run_id)
@@ -5191,6 +5208,21 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
     let external_input: String = run_row
         .try_get::<Option<String>, _>("external_input")?
         .unwrap_or_default();
+    // items.id=888 stage 4: the chat the run belongs to (outputs_019). NULL for a run with
+    // no chat and for a row from before outputs_019: such a run resumes as before.
+    let context_key: Option<String> = run_row
+        .try_get::<Option<String>, _>("context_key")?
+        .filter(|k| !k.is_empty());
+
+    // items.id=888 stage 4: a run of a one-time (latched) chat is not resumed, and neither
+    // is one whose latch cannot be read (suppression is the failure direction). Checked
+    // before anything else is built; nothing is written here, the caller cancels.
+    if let Some(chat) = context_key.as_deref() {
+        match crate::persistence::session_store::write_mode(&mut conn, chat).await {
+            Ok(crate::persistence::session_store::WriteMode::Open) => {}
+            Ok(_) | Err(_) => return Err(LifecycleError::ResumeOneTimeChat),
+        }
+    }
 
     // items.id=888 (F7): the same order as the claim's subquery (output_store::claim_run),
     // so the id read here is the id the claim compares.
@@ -5225,6 +5257,8 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
     // items.id=883: new() defaulted this to the full window. Replace it with the stored
     // user-turns-only copy (empty when there is none), never the window.
     run.external_input = external_input;
+    // items.id=888 stage 4: before load(), which reads the chat's launch answers.
+    run.context_key = context_key;
 
     // items.id=716: a resumed API Chat run goes back to the destination its
     // conversation was bound to, never to whatever the user's preference
@@ -5238,11 +5272,34 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
         run.chat_binding = Some(bound);
     }
 
-    // items.id=897: a resumed run cannot read the chat's launch answers.
+    // items.id=897: a resumed run with no chat cannot read the chat's launch answers.
     run.rehydrated = true;
     run.load().await?;
     run.resolve_tier_config().await?;
     run.failure_handler = Some(run.build_failure_handler().await);
+
+    // items.id=888 stage 4: the run's plan approval, read and verified exactly as at the
+    // run start (plan_gate: build the plan, read the chat's approval from the memory home
+    // then the persisted row, verify it against the plan). The memory home is the app's
+    // when there is an app handle, else an empty one (the persisted row only). A plan
+    // that needs an approval the run does not hold leaves `plan` empty, so a hosted pick
+    // stops with plan.exceeded no_approval, as before; a plan that cannot be built is
+    // logged and leaves it empty too. Nothing here can widen a gate.
+    if run.context_key.is_some() {
+        use tauri::Manager;
+        run.plan_memory = Some(
+            run.app_handle
+                .as_ref()
+                .and_then(|h| {
+                    h.try_state::<crate::conductor::plan_memory::PlanMemory>()
+                        .map(|s| s.inner().clone())
+                })
+                .unwrap_or_default(),
+        );
+        if let Err(e) = run.plan_gate().await {
+            log::info!("rehydrate_focus_run: no plan approval for the resumed run: {e}");
+        }
+    }
 
     let mut personal_track = run.build_personal_track().await?;
     personal_track.seal();
@@ -14356,7 +14413,7 @@ steps:
     /// Anything that is not a run started through the plan gate falls back to today's
     /// look-ahead: no approval, a rehydrated run and a bound API Chat run all give None.
     #[test]
-    fn the_look_ahead_uses_no_plan_for_a_rehydrated_or_bound_run() {
+    fn the_look_ahead_uses_no_plan_for_a_bound_run_and_a_verified_one_when_rehydrated() {
         use crate::conductor::plan_approval::Approval;
         let mut run: FocusRun = FocusRun::new(
             "u".to_owned(),
@@ -14379,8 +14436,25 @@ steps:
             pins: vec![],
         }));
         assert!(run.look_ahead_plan().is_some(), "started through the gate");
+        // items.id=888 stage 4: a rehydrated run of a chat now gets its approval from its own
+        // plan_gate (rehydrate_focus_run), verified exactly as at a run start, so the
+        // look-ahead uses it as it does for a fresh run. (Before, a rehydrated run never held
+        // one and this was None.) A rehydrated run with no verified approval holds none.
         run.rehydrated = true;
-        assert!(run.look_ahead_plan().is_none(), "a rehydrated run");
+        assert!(
+            run.look_ahead_plan().is_some(),
+            "a rehydrated run with a verified approval"
+        );
+        run.plan = None;
+        assert!(
+            run.look_ahead_plan().is_none(),
+            "a rehydrated run without one"
+        );
+        run.plan = Some(Arc::new(Approval {
+            digest: "d".repeat(64),
+            ceiling_micros: 0,
+            pins: vec![],
+        }));
         run.rehydrated = false;
         run.chat_binding = Some(crate::api_chat::BoundDestination {
             provider_id: "host".to_owned(),
@@ -17776,6 +17850,244 @@ steps:
         } else {
             std::env::remove_var("QR_DATA_ROOT");
         }
+    }
+
+    // -- items.id=888 stage 4: context_key on rehydrate, the latched-resume stop ----
+
+    /// Run a body against a fresh data root and a seeded persona for resume tests.
+    async fn with_resume_root<F, Fut>(user_id: &str, persona_id: &str, body: F)
+    where
+        F: FnOnce(sqlx::SqlitePool) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+        let pool = setup_shared_and_persona_for_resume_test(user_id, persona_id).await;
+        body(pool).await;
+        match saved_root {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
+    }
+
+    /// A paused quick-ask run of `chat` (or of no chat), holding its window.
+    async fn seed_paused_chat_run(user_id: &str, persona_id: &str, chat: Option<&str>) -> String {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let mut conn = open_outputs_db(user_id, persona_id, RESUME_TEST_KEY_HEX)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO focus_runs
+             (id, focus_id, status, is_fast_lane, is_quick_ask, topic_id, user_input,
+              external_input, started_at, context_key)
+             VALUES (?, 'quick-ask', 'paused', 0, 1, NULL, ?, ?, ?, ?)",
+        )
+        .bind(&run_id)
+        .bind(WINDOW)
+        .bind(EXTERNAL)
+        .bind(now())
+        .bind(chat)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        run_id
+    }
+
+    async fn rehydrate_for_test(
+        pool: &sqlx::SqlitePool,
+        user_id: &str,
+        persona_id: &str,
+        run_id: &str,
+    ) -> Result<FocusRun, LifecycleError> {
+        rehydrate_focus_run(
+            user_id.to_owned(),
+            persona_id.to_owned(),
+            run_id.to_owned(),
+            pool.clone(),
+            Arc::new(ConductorScheduler::new()),
+            Some(RESUME_TEST_KEY_HEX.to_owned()),
+            std::collections::HashSet::new(),
+            None,
+        )
+        .await
+    }
+
+    /// items.id=888 stage 4: the run row records its chat at the INSERT (a run with no
+    /// chat records NULL), and a resumed run carries it.
+    #[tokio::test]
+    async fn a_chat_run_records_its_chat_and_a_resumed_run_carries_it() {
+        with_temp_data_root(async {
+            let mut run = run_with_input();
+            run.context_key = Some("chat-888".to_owned());
+            run.write_focus_run_record("initializing").await.unwrap();
+            run.write_focus_run_record("awaiting_user").await.unwrap();
+            let none = run_with_input();
+            none.write_focus_run_record("initializing").await.unwrap();
+            let mut conn = open_outputs_db(&run.user_id, &run.persona_id, CRISIS_TEST_KEY_HEX)
+                .await
+                .unwrap();
+            for (r, want) in [(&run, Some("chat-888")), (&none, None)] {
+                let got: Option<String> =
+                    sqlx::query_scalar("SELECT context_key FROM focus_runs WHERE id = ?")
+                        .bind(r.focus_run_id.as_deref().unwrap())
+                        .fetch_one(&mut conn)
+                        .await
+                        .unwrap();
+                assert_eq!(got.as_deref(), want);
+            }
+        })
+        .await;
+        with_resume_root("ck-user-1", "ck-persona-1", |pool| async move {
+            let run_id = seed_paused_chat_run("ck-user-1", "ck-persona-1", Some("chat-open")).await;
+            let resumed = rehydrate_for_test(&pool, "ck-user-1", "ck-persona-1", &run_id)
+                .await
+                .expect("an open chat resumes");
+            assert_eq!(resumed.context_key.as_deref(), Some("chat-open"));
+            let legacy = seed_paused_chat_run("ck-user-1", "ck-persona-1", None).await;
+            let resumed = rehydrate_for_test(&pool, "ck-user-1", "ck-persona-1", &legacy)
+                .await
+                .expect("a run with no chat resumes as before");
+            assert!(resumed.context_key.is_none());
+        })
+        .await;
+    }
+
+    /// items.id=888 stage 4: a parked run of a one-time (latched) chat is not resumed.
+    /// rehydrate_focus_run returns ResumeOneTimeChat and writes nothing; the shared helper
+    /// then cancels it through the guarded cancel with the plain message, and the run keeps
+    /// no input and no snapshot.
+    #[tokio::test]
+    async fn a_resumed_run_of_a_latched_chat_stops_with_a_plain_message() {
+        with_resume_root("ck-user-2", "ck-persona-2", |pool| async move {
+            let (u, p) = ("ck-user-2", "ck-persona-2");
+            let run_id = seed_paused_chat_run(u, p, Some("chat-once")).await;
+            let mut conn = open_outputs_db(u, p, RESUME_TEST_KEY_HEX).await.unwrap();
+            crate::persistence::session_store::latch_write_suppressed(
+                &mut conn,
+                "chat-once",
+                "quick-ask",
+                "run-earlier",
+            )
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO focus_run_snapshots
+                 (id, focus_run_id, action_id, phase, checkpoint_hash, created_at)
+                 VALUES ('snap', ?, 'a', 4, 'h', ?)",
+            )
+            .bind(&run_id)
+            .bind(now())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            let err = match rehydrate_for_test(&pool, u, p, &run_id).await {
+                Err(e) => e,
+                Ok(_) => panic!("a latched chat's run must not rehydrate"),
+            };
+            assert!(matches!(err, LifecycleError::ResumeOneTimeChat), "{err:?}");
+            let status: String = sqlx::query_scalar("SELECT status FROM focus_runs WHERE id = ?")
+                .bind(&run_id)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(status, "paused", "rehydrate writes nothing");
+
+            assert!(
+                crate::conductor::resume_staleness::cancel_stale_resume(
+                    &err,
+                    u,
+                    p,
+                    RESUME_TEST_KEY_HEX,
+                    &run_id,
+                    None,
+                )
+                .await
+            );
+            let (status, input, external, reason): (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ) = sqlx::query_as(
+                "SELECT status, user_input, external_input,
+                        json_extract(notes, '$.cancel_reason') FROM focus_runs WHERE id = ?",
+            )
+            .bind(&run_id)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            assert_eq!(status, "cancelled");
+            assert_eq!((input, external), (None, None));
+            assert_eq!(
+                reason.as_deref(),
+                Some(crate::conductor::resume_staleness::ONE_TIME_CHAT_NOT_RESUMED)
+            );
+            let snaps: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM focus_run_snapshots WHERE focus_run_id = ?",
+            )
+            .bind(&run_id)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            assert_eq!(snaps, 0);
+        })
+        .await;
+    }
+
+    /// items.id=888 stage 4: a latch that cannot be read counts as latched (suppression is
+    /// the failure direction): the run is not resumed.
+    #[tokio::test]
+    async fn a_resumed_run_whose_latch_cannot_be_read_is_not_resumed() {
+        with_resume_root("ck-user-3", "ck-persona-3", |pool| async move {
+            let (u, p) = ("ck-user-3", "ck-persona-3");
+            let run_id = seed_paused_chat_run(u, p, Some("chat-x")).await;
+            let mut conn = open_outputs_db(u, p, RESUME_TEST_KEY_HEX).await.unwrap();
+            sqlx::query("DROP TABLE session_variables")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            let err = match rehydrate_for_test(&pool, u, p, &run_id).await {
+                Err(e) => e,
+                Ok(_) => panic!("an unreadable latch must not resume"),
+            };
+            assert!(matches!(err, LifecycleError::ResumeOneTimeChat), "{err:?}");
+        })
+        .await;
+    }
+
+    /// items.id=888 stage 4: the shape of the rehydrate path. The latch is checked before
+    /// load(); the chat is set before load() (which reads the launch answers); the plan
+    /// gate runs only for a run with a chat, after the ceiling is resolved; and the
+    /// look-ahead no longer excludes a rehydrated run.
+    #[test]
+    fn rehydrate_checks_the_latch_first_and_reads_the_approval_after_the_ceiling() {
+        let source = include_str!("lifecycle.rs");
+        let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let start = production.find("pub async fn rehydrate_focus_run").unwrap();
+        let body = &production[start..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let latch = body
+            .find("session_store::write_mode(&mut conn, chat)")
+            .expect("latch read");
+        let set_key = body
+            .find("run.context_key = context_key;")
+            .expect("key set");
+        let load = body.find("run.load().await?;").expect("load");
+        let ceiling = body
+            .find("run.resolve_tier_config().await?;")
+            .expect("ceiling");
+        let gate = body.find("run.plan_gate().await").expect("plan gate");
+        assert!(latch < load && set_key < load && ceiling < gate, "order");
+        assert!(body.contains("Ok(_) | Err(_) => return Err(LifecycleError::ResumeOneTimeChat)"));
+        assert!(body[..gate].contains("if run.context_key.is_some() {"));
+        let look = production
+            .split("fn look_ahead_plan(&self)")
+            .nth(1)
+            .unwrap();
+        let look = &look[..look.find("\n    }\n").unwrap()];
+        assert!(!look.contains("rehydrated"), "{look}");
     }
 
     /// Scan: rehydrate_focus_run never assigns external_input from user_input, the

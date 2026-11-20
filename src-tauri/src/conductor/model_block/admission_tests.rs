@@ -1872,6 +1872,23 @@ async fn a_resumed_run_of_a_focus_with_an_asked_question_fails_closed_with_its_o
     assert_eq!(nochat.launch.values["launch_mode"], "quick");
 }
 
+/// items.id=888 stage 4: a resumed run that carries its chat (focus_runs.context_key,
+/// outputs_019) reads the chat's stored answers, exactly as a fresh run of that chat does,
+/// instead of failing with LaunchAnswersUnavailableOnResume. A resumed run with no chat
+/// still fails closed (the test above).
+#[tokio::test]
+async fn a_resumed_run_with_its_chat_reads_the_stored_answers() {
+    let env = setup().await;
+    launch_focus(&env, "rs-resume-chat").await;
+    submit(&env, "rs-resume-chat", &[("kind", "cover_letter")], None)
+        .await
+        .unwrap();
+    let mut resumed = run_for(&env, "rs-resume-chat", Some(CHAT));
+    resumed.rehydrated = true;
+    resumed.load().await.unwrap();
+    assert_eq!(resumed.launch.values["document_type"], "cover_letter");
+}
+
 #[tokio::test]
 async fn a_focus_with_no_launch_config_and_no_model_block_is_untouched() {
     let env = setup().await;

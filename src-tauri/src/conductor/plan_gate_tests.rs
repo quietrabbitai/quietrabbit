@@ -234,6 +234,41 @@ async fn an_approval_in_the_memory_home_of_a_latched_chat_is_read_by_the_gate() 
     .await;
 }
 
+/// items.id=888 stage 4: a resumed run of a chat is given an EMPTY memory home when there is
+/// no app handle (rehydrate_focus_run), so it reads the PERSISTED approval of its chat and
+/// verifies it against the plan it builds, as a fresh run does.
+#[tokio::test]
+async fn an_empty_memory_home_still_reads_the_persisted_approval() {
+    with_temp_shared_db(|pool| async move {
+        let key_hex = fixture_key_hex();
+        hosted_rig(&pool, Some(crate::conductor::run_plan::tests::PRICE_TEXT)).await;
+        let memory = PlanMemory::default();
+        let mut run = run_for(pool.clone(), hosted_steps(), &key_hex, Some(memory.clone()));
+        let plan = required_plan(&mut run).await;
+        let a = approve(&plan, &plan.digest, 0, vec![]).unwrap();
+        let mut conn = outputs_conn(&key_hex).await;
+        assert!(matches!(
+            save_chat_approval(&memory, Some(&mut conn), &scope(), &a)
+                .await
+                .unwrap(),
+            Home::Persisted { .. }
+        ));
+        let mut resumed = run_for(
+            pool.clone(),
+            hosted_steps(),
+            &key_hex,
+            Some(PlanMemory::default()),
+        );
+        resumed.rehydrated = true;
+        assert!(matches!(resumed.plan_gate().await, Ok(PlanGate::Proceed)));
+        assert!(
+            resumed.plan.is_some(),
+            "the persisted approval was read and verified"
+        );
+    })
+    .await;
+}
+
 /// No plan memory (a rehydrated or swept run) reads no approval: it asks again, it never
 /// proceeds on one it could not read. An approval row that cannot be read is the same.
 #[tokio::test]

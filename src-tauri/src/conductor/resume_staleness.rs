@@ -121,10 +121,15 @@ pub fn check(
     }
 }
 
+/// items.id=888 stage 4: the plain message of a run stopped because its chat is a
+/// one-time chat (or its latch cannot be read).
+pub const ONE_TIME_CHAT_NOT_RESUMED: &str = "a one-time chat cannot be resumed";
+
 /// The one helper every resume path calls when rehydrate_focus_run failed:
-/// for ResumeStale it cancels the run (only if it is still parked: the same
-/// guarded UPDATE as the expiry sweep) and emits "run-status-update"; any other
-/// error does nothing here. Returns true when the run was cancelled.
+/// for ResumeStale and (items.id=888) ResumeOneTimeChat it cancels the run (only
+/// if it is still parked: the same guarded UPDATE as the expiry sweep) with that
+/// error's plain message and emits "run-status-update"; any other error does
+/// nothing here. Returns true when the run was cancelled.
 pub async fn cancel_stale_resume(
     err: &crate::conductor::lifecycle::LifecycleError,
     user_id: &str,
@@ -133,34 +138,26 @@ pub async fn cancel_stale_resume(
     run_id: &str,
     app_handle: Option<&tauri::AppHandle<tauri::Wry>>,
 ) -> bool {
-    if !matches!(
-        err,
-        crate::conductor::lifecycle::LifecycleError::ResumeStale(_)
-    ) {
-        return false;
-    }
+    use crate::conductor::lifecycle::LifecycleError;
+    let message = match err {
+        LifecycleError::ResumeStale(_) => PERSONAL_CHANGED_WHILE_WAITING,
+        LifecycleError::ResumeOneTimeChat => ONE_TIME_CHAT_NOT_RESUMED,
+        _ => return false,
+    };
     let cancelled = match crate::persistence::output_store::cancel_parked_run(
-        user_id,
-        persona_id,
-        key_hex,
-        run_id,
-        PERSONAL_CHANGED_WHILE_WAITING,
+        user_id, persona_id, key_hex, run_id, message,
     )
     .await
     {
         Ok(c) => c,
         Err(e) => {
-            log::warn!("resume_staleness: could not cancel the stale run: {e}");
+            log::warn!("resume_staleness: could not cancel the run: {e}");
             false
         }
     };
     if cancelled {
         if let Some(h) = app_handle {
-            crate::conductor::run_retention::emit_cancelled(
-                h,
-                run_id,
-                PERSONAL_CHANGED_WHILE_WAITING,
-            );
+            crate::conductor::run_retention::emit_cancelled(h, run_id, message);
         }
     }
     cancelled
