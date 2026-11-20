@@ -16218,4 +16218,144 @@ mod focus_search_tests {
 
         std::env::remove_var("QR_DATA_ROOT");
     }
+
+    // -----------------------------------------------------------------------
+    // items.id=932: no shipped template relies on re-expansion
+    // -----------------------------------------------------------------------
+
+    /// The pre-932 algorithm (reference only): replace per token on the running result
+    /// in the given order, then strip every leftover valid token from the whole result.
+    fn pre_932_render(template: &str, order: &[(String, String)]) -> String {
+        let mut result = template.to_owned();
+        for (token, value) in order {
+            result = result.replace(&format!("{{{token}}}"), value);
+        }
+        for token in crate::conductor::executor::find_tokens(&result) {
+            result = result.replace(&format!("{{{token}}}"), "");
+        }
+        result.trim().to_owned()
+    }
+
+    /// Every shipped template (the six .focus files and every Focus seeded in
+    /// shared.db, Writing Assistant's included) renders IDENTICALLY under the
+    /// single pass and under the old algorithm (both key orders) when the values are
+    /// brace-free, so none depends on a value being re-expanded. With an EMPTY map
+    /// every template token is stripped (fixed_tokens_of_step's input). The covered
+    /// templates are printed (cargo test -- --nocapture) and pinned by count.
+    #[tokio::test]
+    async fn no_shipped_template_relies_on_re_expansion() {
+        use crate::conductor::executor::{find_tokens, fixed_tokens_of_step, render_template};
+
+        let mut defs: Vec<(String, FocusDefinition)> = Vec::new();
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../app/core_artifacts/focuses");
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".focus"))
+            .collect();
+        names.sort();
+        for n in &names {
+            let text = std::fs::read_to_string(dir.join(n)).unwrap();
+            let def = parse_focus_text(&text).unwrap_or_else(|e| panic!("{n}: {e}"));
+            defs.push((format!("file:{n}"), def));
+        }
+        assert_eq!(names.len(), 6, "{names:?}");
+
+        {
+            let _lock = crate::test_support::ENV_MUTEX.lock().await;
+            let saved_root = std::env::var("QR_DATA_ROOT").ok();
+            let tempdir = tempfile::tempdir().unwrap();
+            std::env::set_var("QR_DATA_ROOT", tempdir.path());
+            crate::persistence::migrations::migrate_shared_db()
+                .await
+                .expect("shared.db migration");
+            let pool = sqlx::SqlitePool::connect_with(
+                crate::providers::utils::connect_options_unencrypted(
+                    &crate::providers::utils::db_path_shared(),
+                ),
+            )
+            .await
+            .unwrap();
+            let ids: Vec<(String,)> =
+                sqlx::query_as("SELECT focus_id FROM focuses ORDER BY focus_id")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            for (id,) in ids {
+                if let Some(def) = load_focus_definition_from_db(&pool, &id)
+                    .await
+                    .unwrap_or_else(|e| panic!("db:{id}: {e}"))
+                {
+                    defs.push((format!("db:{id}"), def));
+                }
+            }
+            pool.close().await;
+            match saved_root {
+                Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+                None => std::env::remove_var("QR_DATA_ROOT"),
+            }
+        }
+        assert!(
+            defs.iter().any(|(l, _)| l == "db:writing-assistant"),
+            "the seeded Writing Assistant is covered"
+        );
+
+        let mut covered: Vec<String> = Vec::new();
+        for (label, def) in &defs {
+            for step in &def.steps {
+                let template = &step.prompt_template;
+                let tokens = find_tokens(template);
+                // Canary values (brace-free), plus keys the template does not name.
+                let mut pairs: Vec<(String, String)> = tokens
+                    .iter()
+                    .map(|t| (t.clone(), format!("V_{t}_END")))
+                    .collect();
+                pairs.push(("decoy_one".to_owned(), "DECOY1".to_owned()));
+                pairs.push(("decoy_two".to_owned(), "DECOY2".to_owned()));
+                pairs.sort();
+                let map: HashMap<String, String> = pairs.iter().cloned().collect();
+                let new = render_template(template, &map, &step.action_id, label);
+                let fwd = pre_932_render(template, &pairs);
+                pairs.reverse();
+                let rev = pre_932_render(template, &pairs);
+                assert_eq!(new, fwd, "{label} {}: sorted order", step.action_id);
+                assert_eq!(new, rev, "{label} {}: reverse order", step.action_id);
+                for t in &tokens {
+                    assert!(new.contains(&format!("V_{t}_END")), "{label} {t}");
+                }
+                assert!(find_tokens(&new).is_empty(), "{label} {}", step.action_id);
+                // The empty map strips every template token.
+                let empty = HashMap::new();
+                let stripped = render_template(template, &empty, &step.action_id, label);
+                assert!(
+                    find_tokens(&stripped).is_empty(),
+                    "{label} {}",
+                    step.action_id
+                );
+                assert_eq!(
+                    stripped,
+                    pre_932_render(template, &[]),
+                    "{label} {}",
+                    step.action_id
+                );
+                assert_eq!(
+                    fixed_tokens_of_step(step, label),
+                    crate::providers::ollama_client::estimate_token_count(
+                        &stripped,
+                        &step.task_type
+                    ),
+                    "{label} {}",
+                    step.action_id
+                );
+                covered.push(format!("{label}/{} [{}]", step.action_id, tokens.join(",")));
+            }
+        }
+        println!(
+            "items.id=932 covered {} templates:\n{}",
+            covered.len(),
+            covered.join("\n")
+        );
+        assert!(covered.len() >= 12, "{}", covered.len());
+    }
 }

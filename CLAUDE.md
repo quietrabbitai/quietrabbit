@@ -1,5 +1,8 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: November 18, 2026 (items.id=931: new "Personal fact bridge" section; nothing else.
+# Last updated: November 19, 2026 (items.id=932: new "Single-pass render substitution" section; the VALUE
+# and NOT BUILT bullets under "Personal fact bridge", the Prompt Authoring Rule and the examples line under
+# "Calibration harness" (CI does build examples); nothing else.).
+# Before that, November 18, 2026 (items.id=931: new "Personal fact bridge" section; nothing else.
 # Items.id=930 built the catalogue and the policy store it uses; the older sections were not re-verified.).
 # Before that, November 17, 2026 (items.id=883: new "External steps and chat history" section; the
 # focus_runs.user_input bullet under "Model blocks", the starter's {user_input} line under "Manual
@@ -436,8 +439,9 @@ Flags: --approve-long-run (required for a real run, about 2 hours), --resume, --
   (decisions.id=857: no new schema file; the row keys collide, so INSERT OR IGNORE alone would
   have dropped them). A development database already at schema 45 does NOT get them (the seed
   only runs at migration): reseed it or apply a catalog.
-- EXAMPLES ARE NOT BUILT, LINTED OR TESTED IN CI (plain `cargo test` and the CI clippy skip
-  them). Locally, from src-tauri/: `cargo clippy --tests --examples -- -D warnings` and
+- EXAMPLES ARE NOT LINTED IN CI (the CI clippy runs `--tests` only); they ARE compiled there
+  (`cargo test --no-run` in .github/scripts/ci-test-shards.sh builds every target plain `cargo test`
+  does, examples included, items.id=932 checked the script). Locally, from src-tauri/: `cargo clippy --tests --examples -- -D warnings` and
   `cargo test --examples`.
 
 ## Focus development tool (items.id=898, decisions.id=951)
@@ -1371,9 +1375,10 @@ default OMIT at tiers 2 and 3) reaches Gate 1 at the user's disclosure policy.
 - FAIL CLOSED MAPPING (executor.rs to_gate_track_with, bridged fields only): an unknown sensitivity maps to
   financial; a field outside the catalogue or outside general/personal is not_permitted at both tiers. An
   ordinary field keeps the old mapping (unknown is general).
-- VALUE. A bridged value has `{` and `}` turned into `(` and `)`, because render_template is NOT single
-  pass (it replaces token by token over a HashMap, so a value naming {user_input} could be expanded by a
-  later substitution). A single-pass renderer is a separate item (items.id=932). A value that fails the field
+- VALUE. A bridged value has `{` and `}` turned into `(` and `)`, because render_template WAS not single
+  pass (it replaced token by token over a HashMap, so a value naming {user_input} could be expanded by a
+  later substitution). items.id=932 made it single-pass; the neutralization STAYS as defence in depth (see
+  "Single-pass render substitution"). A value that fails the field
   validator (length, content) keeps its CLEANED text in PersonalTrack.fields, which Gate 2, the voice scan and
   step sensitivity still read, but is not_permitted at both tiers so Gate 1 never releases it.
 - LOAD LINT (declared_inputs::lint_field_requirements, both loaders): in an external step every
@@ -1385,9 +1390,44 @@ default OMIT at tiers 2 and 3) reaches Gate 1 at the user's disclosure policy.
   output sensitivity rise to personal, and checkpoint manifests carry name:value hashes. Local steps are
   otherwise unchanged.
 - NOT BUILT: UI and copy, group facts and entity-scoped (device) facts (items.id=924), releasing medical,
-  financial or cross-Persona facts, the single-pass renderer (items.id=932), an end-to-end hosted call (the
+  financial or cross-Persona facts, an end-to-end hosted call (the
   loopback client is not HTTPS). Hand checks for the live app are listed in the items.id=931 handoff.
   items.id=633 absorbs personal_012.sql (items.id=930).
+
+## Single-pass render substitution (items.id=932, decisions.id=953 amendment of 2026-11-17)
+render_template (conductor/executor.rs) is ONE call to substitute_once: a left-to-right pass over the
+TEMPLATE. A substituted value is never scanned again, so a value holding {user_input}, {previous_output}
+or any token text appears literally, and the result does not depend on HashMap order. Before this,
+render_template did String::replace per token on the RUNNING result (so later tokens re-expanded earlier
+values, in HashMap order) and then stripped every leftover {x} from the whole result, values included.
+- SCANNING is find_tokens() exactly: at `{` look for `}`; a nested `{` or the end means the `{` is literal.
+  A closed span whose text is a KEY of the map is replaced by its value (ANY brace-free key is looked up:
+  cb-15 declared names and an ordinary output_var are not required to be snake_case, valid_name and
+  valid_var_name allow uppercase, and an ordinary output_var is not shape-checked at LOAD). Else a span shaped
+  [a-z_][a-z0-9_]* is an unresolved TEMPLATE token: removed, logged at DEBUG. Else the span is kept.
+- EVERY RENDER PATH goes through it: render_prompt (local), render_prompt_with_disclosure (every step with
+  treatment.hosted), fixed_tokens_of_step (empty map: strips every template token) and the cb-15 starter
+  (handoff_render::render_starter, which also still cleans values: braces become parentheses). No other
+  production code substitutes tokens (scan: token_substitution_has_one_site_and_it_is_single_pass).
+  examples/support/mod.rs keeps its own replace loop (the engine is pub(crate)); its comment says so.
+- BEHAVIOUR CHANGE, intended: braces in a VALUE (a user turn, a model output, a disclosure value) are no
+  longer stripped or expanded, they reach the prompt as typed. The outbound review sees the final text as
+  before. Gate 1, the disclosure buffer, report_scope and the treatment are untouched.
+- PARITY. The retired Python oracle (_render_template, git a27a2b1^) did sequential replace and so DID
+  re-expand; Rust deliberately differs on this one point. tests/golden_vectors.rs covers Gates 1 to 4 only
+  and has no render vector, so no vector changed.
+- NO SHIPPED TEMPLATE RELIES ON RE-EXPANSION: lifecycle.rs no_shipped_template_relies_on_re_expansion
+  renders every template of the six .focus files and every Focus seeded in shared.db (Writing Assistant
+  included) with brace-free canary values and requires the output equal to the old algorithm's in both key
+  orders. A community .focus file that relied on it is unknowable.
+- KEPT AS DEFENCE IN DEPTH: seeding::clean (braces to parentheses on seeded store names), the
+  personal_fact_bridge brace neutralization, StoreTokens::apply (which decides which seeds a step is given).
+- TESTS: render_template_never_re_expands_a_value, the_local_render_..., the_external_render_...,
+  a_value_arrives_cleaned_and_never_expands_in_the_starter (the starter test cannot fail from the engine alone
+  because clean() runs first), single_pass_against_the_pre_932_algorithm_by_class (every class of difference
+  is a row with its explanation: value naming another key, value wrapped in template braces, value with
+  unknown or malformed braces; nested {{a}}, unclosed braces, invalid shapes are identical). Mutations M1 to
+  M5 (old loop, post-pass strip, per-path post-render replace, fixpoint, unresolved token left) each fail a test.
 
 ## Naming Architecture — term map
 
@@ -1527,9 +1567,11 @@ the latter; the every_drop_table_is_fk_off_or_audited test enforces this
 (items.id=585/586).
 
 ## Prompt Authoring Rule
-render_template() (conductor/executor.rs) substitutes {token} with
-String::replace and strips unresolved {token} patterns. Templates must
-not use {token_name} syntax for any string not intended as a Conductor token.
+render_template() (conductor/executor.rs) substitutes {token} in ONE pass
+(substitute_once, items.id=932) and strips unresolved {token} patterns of the
+TEMPLATE. Templates must not use {token_name} syntax for any string not intended
+as a Conductor token. A substituted value is never re-scanned: a value that
+holds {x} text appears literally.
 
 ## Rust/Tauri Architecture
 
