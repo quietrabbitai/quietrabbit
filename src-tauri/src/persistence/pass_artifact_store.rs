@@ -417,6 +417,21 @@ pub(crate) async fn clear_chat_in_tx(
     Ok(done.rows_affected())
 }
 
+/// items.id=888 stage 7: remove the artifacts last written before `cutoff` (the writers'
+/// RFC 3339 text; idx_pass_artifacts_updated_at), inside a write transaction the caller
+/// holds (persistence::store_sweep). Not latch-gated: it only removes. Returns how many
+/// rows went.
+pub(crate) async fn sweep_older_than_in_tx(
+    conn: &mut SqliteConnection,
+    cutoff: &str,
+) -> Result<u64, PassArtifactError> {
+    let done = sqlx::query("DELETE FROM pass_artifacts WHERE updated_at < ?")
+        .bind(cutoff)
+        .execute(&mut *conn)
+        .await?;
+    Ok(done.rows_affected())
+}
+
 /// Remove one artifact of one Focus in one chat, so the next pass finds it
 /// ABSENT, as on a fresh chat. The only delete a pass can ask for (the archive
 /// hook's clear_chat_in_tx above removes a whole chat). Refused once the
@@ -985,9 +1000,10 @@ mod tests {
         ] {
             assert!(!code.contains(banned), "pass_artifact_store uses {banned}");
         }
-        // Two DELETEs: clear_artifact's (one kind, a pass asks for it) and, since
-        // items.id=888 stage 6, the archive hook's clear_chat_in_tx (a whole chat).
-        assert_eq!(code.matches("DELETE FROM").count(), 2);
+        // Three DELETEs: clear_artifact's (one kind, a pass asks for it), the archive
+        // hook's clear_chat_in_tx (a whole chat, items.id=888 stage 6) and the 30-day
+        // sweep's sweep_older_than_in_tx (items.id=888 stage 7).
+        assert_eq!(code.matches("DELETE FROM").count(), 3);
     }
 
     // -- the schema's own defence --------------------------------------------

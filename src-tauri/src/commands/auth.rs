@@ -1063,6 +1063,18 @@ async fn recover_interrupted_runs(
         {
             log::debug!("finish_login: post-output sweep skipped for persona={persona_id}: {e}")
         }
+        // items.id=888 stage 7: and the 30-day sweep of the chat stores (the one-time latch
+        // exempt). Best effort; a sweep that fails deletes nothing.
+        if let Err(e) = crate::persistence::store_sweep::sweep_stores(
+            user_id,
+            persona_id,
+            key_hex,
+            chrono::Utc::now(),
+        )
+        .await
+        {
+            log::debug!("finish_login: store sweep skipped for persona={persona_id}: {e}")
+        }
     }
     summary
 }

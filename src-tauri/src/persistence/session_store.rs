@@ -504,6 +504,22 @@ pub(crate) async fn clear_chat_in_tx(
     Ok(done.rows_affected())
 }
 
+/// items.id=888 stage 7: remove the session variables last written before `cutoff` (the
+/// writers' RFC 3339 text; idx_session_variables_updated_at), EXCEPT the one-time latch,
+/// inside a write transaction the caller holds (persistence::store_sweep). The latch is
+/// never swept: a one-time chat stays one-time. Returns how many rows went.
+pub(crate) async fn sweep_older_than_in_tx(
+    conn: &mut SqliteConnection,
+    cutoff: &str,
+) -> Result<u64, sqlx::Error> {
+    let done = sqlx::query("DELETE FROM session_variables WHERE updated_at < ? AND name <> ?")
+        .bind(cutoff)
+        .bind(WRITE_MODE_NAME)
+        .execute(&mut *conn)
+        .await?;
+    Ok(done.rows_affected())
+}
+
 /// The session variables session_clear resets (items.id=889). Exactly these two:
 /// the locked intent and the active case. The one-time latch, write_mode, is
 /// NOT here and no OTHER function in this store removes it (only the archive hook's

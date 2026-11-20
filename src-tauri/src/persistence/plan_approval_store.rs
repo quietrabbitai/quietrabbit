@@ -280,6 +280,21 @@ pub(crate) async fn delete_chat_in_tx(
     Ok(done.rows_affected())
 }
 
+/// items.id=888 stage 7: remove the approvals last written before `cutoff` (the writers'
+/// RFC 3339 text; idx_plan_approvals_updated_at), inside a write transaction the caller
+/// holds (persistence::store_sweep). NOT latch-gated: it only removes a permission.
+/// Returns how many rows went.
+pub(crate) async fn sweep_older_than_in_tx(
+    conn: &mut SqliteConnection,
+    cutoff: &str,
+) -> Result<u64, ApprovalStoreError> {
+    let done = sqlx::query("DELETE FROM plan_approvals WHERE updated_at < ?")
+        .bind(cutoff)
+        .execute(&mut *conn)
+        .await?;
+    Ok(done.rows_affected())
+}
+
 /// Withdraw the approval of one Focus in one chat. Returns whether there was one. NOT
 /// latch-gated (see the module comment): a revocation only removes a permission.
 pub async fn delete_approval(
@@ -299,6 +314,22 @@ pub async fn delete_approval(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Test only (items.id=888 stage 7): age a chat's approvals, so the sweep has something
+/// older than its period. Here because only this file may write the table.
+#[cfg(test)]
+pub(crate) async fn set_updated_at_for_test(
+    conn: &mut SqliteConnection,
+    context_key: &str,
+    at: &str,
+) {
+    sqlx::query("UPDATE plan_approvals SET updated_at = ? WHERE context_key = ?")
+        .bind(at)
+        .bind(context_key)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+}
 
 #[cfg(test)]
 mod tests {
@@ -612,9 +643,10 @@ mod tests {
         }
         assert_eq!(code.matches("INSERT INTO plan_approvals").count(), 1);
         assert_eq!(code.matches("UPDATE plan_approvals").count(), 1);
-        // items.id=888 stage 6: two deletes, the revocation's (one Focus) and the archive
-        // hook's (a whole chat, delete_chat_in_tx).
-        assert_eq!(code.matches("DELETE FROM plan_approvals").count(), 2);
+        // items.id=888: three deletes, the revocation's (one Focus), the archive hook's (a
+        // whole chat, delete_chat_in_tx, stage 6) and the 30-day sweep's
+        // (sweep_older_than_in_tx, stage 7).
+        assert_eq!(code.matches("DELETE FROM plan_approvals").count(), 3);
         // Inside put_inner the latch check comes before either write.
         let inner = code
             .split("async fn put_inner")

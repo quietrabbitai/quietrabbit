@@ -1790,8 +1790,9 @@ async fn session_clear_resets_the_intent_and_the_active_case_and_never_the_latch
     // which removes the whole chat, the latch included (persistence::chat_clear pins that
     // it is the only delete that can reach the latch).
     // Since the stage 6 delta the archive hook has two forms: every row but the latch
-    // (a run of the chat has not ended) and every row (none has).
-    assert_eq!(delete.len(), 4, "four deletes in the store: {delete:?}");
+    // (a run of the chat has not ended) and every row (none has). Stage 7 adds the 30-day
+    // sweep, which never reaches the latch.
+    assert_eq!(delete.len(), 5, "five deletes in the store: {delete:?}");
     assert!(
         delete[0]
             .starts_with("DELETE FROM session_variables WHERE context_key = ? AND name <> ?\""),
@@ -1804,14 +1805,19 @@ async fn session_clear_resets_the_intent_and_the_active_case_and_never_the_latch
         delete[1]
     );
     assert!(
-        delete[2].contains("AND name <> ?") && delete[2].contains("name IN (?, ?)"),
-        "the delete names its two variables and excludes the latch: {}",
+        delete[2].starts_with("DELETE FROM session_variables WHERE updated_at < ? AND name <> ?\""),
+        "the 30-day sweep, latch exempt: {}",
         delete[2]
     );
     assert!(
-        delete[3].contains("AND name = ?") && !delete[3].contains("name IN"),
-        "the hand-off delete names one variable: {}",
+        delete[3].contains("AND name <> ?") && delete[3].contains("name IN (?, ?)"),
+        "the delete names its two variables and excludes the latch: {}",
         delete[3]
+    );
+    assert!(
+        delete[4].contains("AND name = ?") && !delete[4].contains("name IN"),
+        "the hand-off delete names one variable: {}",
+        delete[4]
     );
     let at = flat
         .find("DELETE FROM session_variables WHERE context_key = ? AND focus_id = ? AND name = ?")

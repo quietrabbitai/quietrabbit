@@ -52,6 +52,7 @@ mod shared_db_privacy_tests;
 pub mod shared_db_residual;
 pub mod source_registry_store;
 pub mod step_review_store;
+pub mod store_sweep;
 pub mod topic_store;
 pub mod user_provider_preference_store;
 pub mod view_cache_store;

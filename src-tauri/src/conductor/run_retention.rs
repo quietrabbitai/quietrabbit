@@ -48,6 +48,11 @@ pub const EXPIRED_WHILE_WAITING: &str = "expired while waiting";
 /// paused by a crash recovery.
 pub const PARKED_STATUSES: &[&str] = &["awaiting_user", "awaiting_schedule", "paused"];
 
+/// items.id=888 stage 7: days a row of session_variables (the one-time latch exempt),
+/// pass_artifacts or plan_approvals is kept after it was last written (updated_at), the
+/// ONE period of the store sweep (persistence::store_sweep).
+pub const STORE_RETENTION_DAYS: i64 = 30;
+
 /// items.id=888 (F8): runs whose reply was saved (output() ran) and that wait for
 /// nothing that can arrive: awaiting_extract_confirm (no confirm screen yet,
 /// items.id=38) and awaiting_feedback (normally overwritten by `complete` at once, left
@@ -205,6 +210,14 @@ pub async fn expire_tick(
                 }
             }
             Err(e) => log::debug!("run_retention: persona '{persona_id}' not swept: {e}"),
+        }
+        // items.id=888 stage 7: the chat stores, in the same tick and lease. A sweep that
+        // fails deletes nothing (one transaction) and is tried again next tick.
+        if let Err(e) =
+            crate::persistence::store_sweep::sweep_stores(&user_id, &persona_id, &key_hex_str, now)
+                .await
+        {
+            log::debug!("run_retention: persona '{persona_id}' store sweep skipped: {e}");
         }
         // items.id=888 (F8): the post-output runs, in the same tick and lease.
         match sweep_post_output_runs(&user_id, &persona_id, &key_hex_str, now).await {
@@ -1050,6 +1063,49 @@ mod tests {
             assert_eq!(told, vec![("conf".to_owned(), Swept::Settled)]);
             assert_eq!(state(&mut c, "conf").await, ("complete".into(), None, 0));
             assert_eq!(candidates(&mut c, "conf").await, 0);
+        });
+    }
+
+    /// items.id=888 stage 7: the tick sweeps the chat stores only with the owner's key
+    /// resident; the latch is exempt.
+    #[tokio::test]
+    async fn the_tick_sweeps_the_chat_stores_only_with_the_key_resident() {
+        with_root!({
+            let (u, p) = ("ret-u12", "ret-p12");
+            let pool = setup(u, p).await;
+            let mut c = conn(u, p).await;
+            let now = t(2026, 6, 1);
+            let old = (now - Duration::days(STORE_RETENTION_DAYS + 1)).to_rfc3339();
+            sqlx::query(
+                "INSERT INTO session_variables (context_key, focus_id, name, value, version,
+                                                written_by_run, created_at, updated_at)
+                 VALUES ('chat-s', 'f', 'locked_intent', 'billing', 1, 'r', ?, ?)",
+            )
+            .bind(&old)
+            .bind(&old)
+            .execute(&mut c)
+            .await
+            .unwrap();
+            crate::persistence::session_store::latch_write_suppressed(&mut c, "chat-s", "f", "r")
+                .await
+                .unwrap();
+            sqlx::query("UPDATE session_variables SET updated_at = ? WHERE name = 'write_mode'")
+                .bind(&old)
+                .execute(&mut c)
+                .await
+                .unwrap();
+            let q = "SELECT name FROM session_variables ORDER BY name";
+            expire_tick(&pool, &KeyRegistry::default(), now, |_, _, _| {}).await;
+            let names: Vec<String> = sqlx::query_scalar(q).fetch_all(&mut c).await.unwrap();
+            assert_eq!(
+                names,
+                ["locked_intent", "write_mode"],
+                "no key: nothing swept"
+            );
+            let reg = registry_with_key(u).await;
+            expire_tick(&pool, &reg, now, |_, _, _| {}).await;
+            let names: Vec<String> = sqlx::query_scalar(q).fetch_all(&mut c).await.unwrap();
+            assert_eq!(names, ["write_mode"], "key resident: swept, latch exempt");
         });
     }
 
