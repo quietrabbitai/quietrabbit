@@ -4470,6 +4470,28 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         self.emit_status(final_status, None);
     }
 
+    /// items.id=888 (F5, F6): the one way an Err ends a run. Same as
+    /// cleanup("failed"): the tracks are dropped, the run's snapshots are purged
+    /// BEFORE the status is written, the row becomes `failed` (write_run_row clears
+    /// user_input and external_input at a terminal status) and the status is
+    /// emitted. Before this, execute_full's two error arms wrote `failed` without
+    /// purging, so a periodic checkpoint (step outputs and disclosure buffers)
+    /// outlived the run, and nothing sweeps a failed run. Every step is
+    /// best-effort, as in cleanup(): a purge that fails leaves the error the
+    /// caller already has.
+    async fn fail_run(&mut self) {
+        self.personal_track = None;
+        self.task_track = None;
+        self.shared_state = None;
+        self.privacy_gateway = None;
+        self._persona_context_rendered.clear();
+        if self.focus_run_id.is_some() {
+            self.purge_snapshots().await;
+            self.write_focus_run_record_logged("failed").await;
+        }
+        self.emit_status("failed", None);
+    }
+
     // =========================================================================
     // Convenience: execute_full
     // =========================================================================
@@ -4515,12 +4537,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                             metadata: None,
                         }
                     };
-                    self.write_focus_run_record_logged("failed").await;
-                    self.personal_track = None;
-                    self.task_track = None;
-                    self.shared_state = None;
-                    self.privacy_gateway = None;
-                    self.emit_status("failed", None);
+                    self.fail_run().await;
                     return Ok(RunResult {
                         focus_run_id: self.focus_run_id.clone().unwrap_or_default(),
                         status: "failed".to_owned(),
@@ -4535,15 +4552,8 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                     });
                 }
 
-                // Other errors: cleanup state and propagate.
-                if self.focus_run_id.is_some() {
-                    self.write_focus_run_record_logged("failed").await;
-                }
-                self.personal_track = None;
-                self.task_track = None;
-                self.shared_state = None;
-                self.privacy_gateway = None;
-                self.emit_status("failed", None);
+                // Other errors: fail the run and propagate.
+                self.fail_run().await;
                 Err(e)
             }
         }
@@ -4747,10 +4757,20 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     /// -- this method assumes personal_track/task_track/shared_state/
     /// focus_def/focus_run_id/failure_handler/privacy_gateway are all
     /// populated (the same preconditions execute() itself asserts).
+    ///
+    /// items.id=888 (F6): an Err from the resumed execution fails the run through
+    /// fail_run, exactly as execute_full's error arm does, so the row does not stay
+    /// `running` and the snapshot does not outlive it.
     pub async fn resume_execution(&mut self) -> Result<RunResult, LifecycleError> {
         self.write_focus_run_record("running").await?;
         self.emit_status("running", None);
-        self.execute_and_finish().await
+        match self.execute_and_finish().await {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                self.fail_run().await;
+                Err(e)
+            }
+        }
     }
 
     /// Named re-entry with delta scope (items.id=574 follow-up, cb-07):
@@ -15792,6 +15812,150 @@ steps:
             assert_eq!(n, 0, "the row after the failure never ran");
         })
         .await;
+    }
+
+    /// items.id=888 (F5, F6): a run row at `status` holding a chat window, with one
+    /// earlier checkpoint (the periodic kind, as a run that failed later would have).
+    async fn seed_run_with_snapshot(
+        run: &FocusRun<crate::conductor::privacy::logger::TestLogger>,
+        status: &str,
+    ) {
+        let run_id = run.focus_run_id.clone().unwrap();
+        let mut conn = outputs(run).await;
+        sqlx::query(
+            "INSERT INTO focus_runs (id, focus_id, status, started_at, user_input, external_input)
+             VALUES (?, 'f', ?, ?, 'User: the window', 'User: the window')",
+        )
+        .bind(&run_id)
+        .bind(status)
+        .bind(crate::providers::utils::now())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO focus_run_snapshots
+             (id, focus_run_id, action_id, phase, task_track_json, checkpoint_hash, created_at)
+             VALUES (?, ?, 'earlier', 4, '{\"steps\":\"step outputs\"}', 'h', ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&run_id)
+        .bind(crate::providers::utils::now())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    /// (status, user_input, external_input, snapshot count) of the run.
+    async fn failed_state(
+        run: &FocusRun<crate::conductor::privacy::logger::TestLogger>,
+    ) -> (String, Option<String>, Option<String>, i64) {
+        let run_id = run.focus_run_id.clone().unwrap();
+        let mut conn = outputs(run).await;
+        let (status, input, external): (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, user_input, external_input FROM focus_runs WHERE id = ?",
+        )
+        .bind(&run_id)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        let snaps: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM focus_run_snapshots WHERE focus_run_id = ?")
+                .bind(&run_id)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        (status, input, external, snaps)
+    }
+
+    fn failing_writer_run() -> FocusRun<crate::conductor::privacy::logger::TestLogger> {
+        // No chat: the session_put fails closed (NoContextKey), an Err from execute().
+        writer_run(
+            vec![writer_step(
+                "lock",
+                "session_put",
+                Some("locked_intent"),
+                serde_json::json!({"value": "intent_out"}),
+                None,
+            )],
+            None,
+            &[("intent_out", "billing")],
+        )
+    }
+
+    /// items.id=888 (F5): a run that ends through execute_full's error arm is
+    /// `failed` and keeps no snapshot and no chat window.
+    #[tokio::test]
+    async fn a_run_failing_through_execute_full_keeps_no_snapshot() {
+        with_temp_data_root(async {
+            let mut run = failing_writer_run();
+            seed_run_with_snapshot(&run, "running").await;
+            let err = run.execute_full().await.unwrap_err();
+            assert!(matches!(err, LifecycleError::StoreWrite(_)), "{err:?}");
+            assert_eq!(
+                failed_state(&run).await,
+                ("failed".to_owned(), None, None, 0)
+            );
+        })
+        .await;
+    }
+
+    /// items.id=888 (F6, and F5 on the resume path): a resumed run whose execution
+    /// errors is `failed`, not left `running`, and keeps no snapshot.
+    #[tokio::test]
+    async fn a_resumed_run_that_errors_is_failed_and_keeps_no_snapshot() {
+        with_temp_data_root(async {
+            let mut run = failing_writer_run();
+            seed_run_with_snapshot(&run, "awaiting_user").await;
+            let err = run.resume_execution().await.unwrap_err();
+            assert!(matches!(err, LifecycleError::StoreWrite(_)), "{err:?}");
+            assert_eq!(
+                failed_state(&run).await,
+                ("failed".to_owned(), None, None, 0)
+            );
+            assert!(run.task_track.is_none() && run.personal_track.is_none());
+        })
+        .await;
+    }
+
+    /// items.id=888 (F5, F6): every exit of execute_full and resume_execution that
+    /// writes `failed` goes through fail_run, and fail_run purges the snapshots
+    /// before it writes the status.
+    #[test]
+    fn every_error_exit_of_a_run_goes_through_fail_run() {
+        let source = include_str!("lifecycle.rs");
+        let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = |start: &str| -> String {
+            let from = production.find(start).unwrap_or_else(|| panic!("{start}"));
+            let rest = &production[from + start.len()..];
+            let end = rest.find("\n    }\n").unwrap();
+            rest[..end].to_owned()
+        };
+        let fail = body("async fn fail_run(&mut self)");
+        let purge = fail
+            .find("self.purge_snapshots().await")
+            .expect("fail_run purges");
+        let write = fail
+            .find("self.write_focus_run_record_logged(\"failed\").await")
+            .expect("fail_run writes failed");
+        assert!(purge < write, "purge before the status write");
+        for f in [
+            "pub async fn execute_full(&mut self)",
+            "pub async fn resume_execution(&mut self)",
+        ] {
+            let b = body(f);
+            assert!(
+                !b.contains("record_logged(\"failed\")") && !b.contains("record(\"failed\")"),
+                "{f} writes no `failed` itself"
+            );
+            assert!(b.contains("self.fail_run("), "{f} fails through fail_run");
+        }
+        assert_eq!(
+            body("pub async fn execute_full(&mut self)")
+                .matches("self.fail_run(")
+                .count(),
+            2,
+            "both error arms of execute_full"
+        );
     }
 
     /// A run that belongs to no chat cannot write: it fails closed.

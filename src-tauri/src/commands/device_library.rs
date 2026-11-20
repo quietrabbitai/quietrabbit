@@ -23,7 +23,9 @@
 //       exactly what a purge would remove, counted, for the confirmation.
 //   purge_device(persona_id, focus_id, device)
 //       the hard purge (persistence::entity_purge). Stops the Focus's live runs
-//       first and refuses with nothing deleted if one ignores the stop.
+//       first and refuses with nothing deleted if one ignores the stop, then
+//       cancels the Focus's parked runs (items.id=888, F15), as purge_all_devices
+//       does.
 //   purge_all_devices(persona_id, focus_id)
 //       the SEPARATE offered control after a withdrawal (decisions.id=944 (8)):
 //       every device the Focus owns, and the Focus's parked runs are cancelled.

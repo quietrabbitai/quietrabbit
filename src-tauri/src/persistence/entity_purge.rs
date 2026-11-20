@@ -647,7 +647,12 @@ pub async fn cancel_parked_runs(
 }
 
 /// Purge one device for the user: stop the Focus's live runs (refusing, with
-/// nothing deleted, if one ignores the stop), then purge it.
+/// nothing deleted, if one ignores the stop), cancel the Focus's parked runs, then
+/// purge it. items.id=888 (F15): a parked run's snapshot can hold a step output
+/// that rendered this device's facts (subject_context renders every catalogued
+/// fact into a local prompt), so the single-device purge cancels them as
+/// purge_all_devices does. The cancel cannot tell which parked run read which
+/// device, so it cancels every parked run of the Focus: the fail-closed direction.
 pub async fn purge_device(
     user_id: &str,
     persona_id: &str,
@@ -657,6 +662,7 @@ pub async fn purge_device(
     wait: Duration,
 ) -> Result<PurgeCounts, PurgeError> {
     stop_focus_runs(user_id, persona_id, focus, wait).await?;
+    cancel_parked_runs(user_id, persona_id, key_hex, focus).await?;
     let mut personal = open_personal_db(user_id, persona_id, key_hex).await?;
     let mut outputs = open_outputs_db(user_id, persona_id, key_hex).await?;
     purge_entity(&mut personal, &mut outputs, focus, entity_id).await
@@ -1780,12 +1786,19 @@ mod tests {
         assert_eq!(done, "complete");
     }
 
+    /// items.id=888 (F15): a single-device purge cancels the Focus's parked runs, as
+    /// purge_all_devices does, because a parked run's snapshot can hold a step output
+    /// that rendered the device's facts. Another Focus's run and a finished run are
+    /// left as they were.
     #[tokio::test]
-    async fn a_single_device_purge_leaves_parked_runs_alone() {
+    async fn a_single_device_purge_cancels_the_parked_runs_of_the_focus() {
         let _root = TestRoot::new().await;
         let mut db = dbs().await;
         let w = world(&mut db).await;
         park_run(&mut db, "run-parked", FOCUS, "awaiting_user").await;
+        park_run(&mut db, "run-sched", FOCUS, "awaiting_schedule").await;
+        park_run(&mut db, "run-other", OTHER, "awaiting_user").await;
+        park_run(&mut db, "run-done", FOCUS, "complete").await;
         purge_device(
             USER,
             PERSONA,
@@ -1796,12 +1809,39 @@ mod tests {
         )
         .await
         .unwrap();
-        let status: String =
-            sqlx::query_scalar("SELECT status FROM focus_runs WHERE id = 'run-parked'")
+        for run in ["run-parked", "run-sched"] {
+            let (status, input): (String, Option<String>) =
+                sqlx::query_as("SELECT status, user_input FROM focus_runs WHERE id = ?")
+                    .bind(run)
+                    .fetch_one(&mut db.outputs)
+                    .await
+                    .unwrap();
+            assert_eq!((status.as_str(), input), ("cancelled", None), "{run}");
+            assert_eq!(
+                n(
+                    &mut db.outputs,
+                    &format!(
+                        "SELECT COUNT(*) FROM focus_run_snapshots WHERE focus_run_id = '{run}'"
+                    )
+                )
+                .await,
+                0,
+                "{run}"
+            );
+        }
+        let other: (String, Option<String>) =
+            sqlx::query_as("SELECT status, user_input FROM focus_runs WHERE id = 'run-other'")
                 .fetch_one(&mut db.outputs)
                 .await
                 .unwrap();
-        assert_eq!(status, "awaiting_user");
+        assert_eq!(other.0, "awaiting_user");
+        assert!(other.1.is_some());
+        let done: String =
+            sqlx::query_scalar("SELECT status FROM focus_runs WHERE id = 'run-done'")
+                .fetch_one(&mut db.outputs)
+                .await
+                .unwrap();
+        assert_eq!(done, "complete");
     }
 
     // -- the one-module-deletes scan -------------------------------------------
