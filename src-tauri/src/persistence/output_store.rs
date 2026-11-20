@@ -1903,6 +1903,95 @@ pub async fn find_consent_decision_for_fact(
     }
 }
 
+/// items.id=923 (F1): the decision the USER gave for `fact_key` at the review
+/// this step is answering, for content Gate 3 forces to the High review. Three
+/// conditions, all from data that exists today (no schema change):
+///   1. the user wrote it: write_element_consent_decisions_conn always binds
+///      save_preference (0 or 1) and never writes original_text, while
+///      write_auto_reapplied_consent_decision writes save_preference NULL and the
+///      span text, so an auto-reapplied row never counts;
+///   2. it was given at THIS step's park: written after the latest PARKING
+///      checkpoint of this action (a parking checkpoint carries purge_after, a
+///      periodic one does not), so an answer from earlier in the run does not
+///      count. No parking checkpoint for this step: nothing counts (the first pass
+///      always asks);
+///   3. it is not an answer to this step's OUTBOUND review: a span id that a
+///      step_reviews row of this action asked about is excluded.
+///
+/// A standing preference is never read here. The newest qualifying row wins.
+/// Any time that does not parse is not "after" (the span is asked again).
+pub async fn find_review_answer_for_fact(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    focus_run_id: &str,
+    action_id: &str,
+    fact_key: &str,
+) -> Result<Option<PriorFactDecision>, OutputStoreError> {
+    if key_hex.is_empty() {
+        return Ok(None);
+    }
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+
+    let parked_at: Option<String> = sqlx::query_scalar(
+        "SELECT created_at FROM focus_run_snapshots
+         WHERE focus_run_id = ? AND action_id = ? AND purge_after IS NOT NULL
+         ORDER BY created_at DESC, rowid DESC LIMIT 1",
+    )
+    .bind(focus_run_id)
+    .bind(action_id)
+    .fetch_optional(&mut conn)
+    .await?;
+    let Some(parked_at) = parked_at
+        .as_deref()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+    else {
+        return Ok(None);
+    };
+
+    let outbound_asked: std::collections::HashSet<String> =
+        crate::persistence::step_review_store::list_reviews(&mut conn, focus_run_id, action_id)
+            .await
+            .map_err(|e| OutputStoreError::Validation(format!("step reviews unreadable: {e}")))?
+            .into_iter()
+            .flat_map(|r| r.spans.asked.into_iter().map(|a| a.span_id))
+            .collect();
+
+    let rows = sqlx::query(
+        "SELECT decision, suggestion_text, user_modified_text, span_id, created_at
+         FROM consent_decisions
+         WHERE focus_run_id = ? AND fact_key = ? AND decision_type = 'element_consent'
+           AND save_preference IS NOT NULL AND original_text IS NULL
+         ORDER BY created_at DESC, rowid DESC",
+    )
+    .bind(focus_run_id)
+    .bind(fact_key)
+    .fetch_all(&mut conn)
+    .await?;
+
+    for r in rows {
+        let span_id: Option<String> = r.try_get("span_id")?;
+        if span_id
+            .as_deref()
+            .is_some_and(|s| outbound_asked.contains(s))
+        {
+            continue;
+        }
+        let created_at: String = r.try_get("created_at")?;
+        let after_park =
+            chrono::DateTime::parse_from_rfc3339(&created_at).is_ok_and(|t| t > parked_at);
+        if !after_park {
+            continue;
+        }
+        return Ok(Some(PriorFactDecision {
+            decision: r.try_get("decision")?,
+            suggestion_text: r.try_get("suggestion_text")?,
+            user_modified_text: r.try_get("user_modified_text")?,
+        }));
+    }
+    Ok(None)
+}
+
 /// Writes the audit-trail row for a fact silently reapplied without a
 /// frontend round-trip (gate3.rs's partition_by_prior_decision). Mirrors
 /// write_element_consent_decisions_conn's INSERT shape but for exactly one

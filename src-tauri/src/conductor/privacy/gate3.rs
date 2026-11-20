@@ -30,9 +30,12 @@
 //       - PF error          → gate3_pf_error_block disclosure event + blocked result
 //                             (fail closed, items.id=613; not a timeout, no gate_timeout)
 //       - Zero spans, severity < 3 AND target_tier < 3 → gate3_pf_no_spans + approved (no modal)
-//       - Zero spans, severity >= 3 OR target_tier >= 3 → still routed to the
-//         consent gate (High tier, empty spans list) — see D6-362/decisions.id=405
-//         note below. NOT auto-approved.
+//       - Zero spans, severity >= 3 OR target_tier >= 3 → NOT auto-approved:
+//         gate3_pf_no_spans_forced_review written and pending_consent returned
+//         with an empty review_spans, but NO consent_request is emitted (an
+//         empty review cannot be answered). The executor's Step 13 stops the
+//         step with promotion.sensitive_blocked (items.id=923, F2); see the
+//         D6-362/decisions.id=405 note below.
 //       - Non-zero spans    → gate3_consent_pending written THEN consent_request emit
 //   2b. Legacy sensitivity block fallback (no PF or no handle — dev/test builds;
 //       a release build without PF never reaches it for target_tier >= 2):
@@ -103,6 +106,20 @@ const MEDIUM_SCORE_THRESHOLD: f32 = 0.70;
 /// even at high confidence. items.id=406: renamed from EASY_TIER_CATEGORIES.
 const LOW_TIER_CATEGORIES: &[&str] = &["private_email", "private_phone", "account_number"];
 
+/// items.id=923 (F14): what a pass does when EVERY flagged span was settled by an
+/// earlier keep_private decision (a standing preference or a decision in this run).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeptPrivate {
+    /// The interactive Gate 3 promotion rule (PRIVACY_GUARDIAN_GATE_SPEC.md: "Run
+    /// stops if all content is kept private"): blocked. Step 13 and the copy review.
+    StopsContent,
+    /// The text is sent with those spans removed, exactly as a live keep_private
+    /// answer is: approved, with the spans in auto_resolved for the caller to
+    /// remove. The outbound review and API Chat, which build the sent text from the
+    /// decisions server side.
+    RemovesSpans,
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -167,6 +184,9 @@ pub async fn gate3<L: DisclosureLogger>(
     user_id: &str,
     persona_id: &str,
     key_hex: &str,
+    // items.id=923 (F14): see KeptPrivate. Read only when every flagged span was
+    // settled by an earlier keep_private decision.
+    kept_private: KeptPrivate,
 ) -> Result<Gate3Result, DisclosureLogWriteError> {
     // Check 1: external-access ceiling block — fires first, before any other
     // check. See this function's header comment for why this is a
@@ -243,6 +263,7 @@ pub async fn gate3<L: DisclosureLogger>(
                 user_id,
                 persona_id,
                 key_hex,
+                kept_private,
             )
             .await;
         }
@@ -446,6 +467,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
     user_id: &str,
     persona_id: &str,
     key_hex: &str,
+    kept_private: KeptPrivate,
 ) -> Result<Gate3Result, DisclosureLogWriteError> {
     // items.id=406: the value that actually feeds the High-forcing side of
     // assign_review_tier_for_span's OR-condition -- a live per-provider risk
@@ -566,7 +588,15 @@ async fn gate3_with_pf<L: DisclosureLogger>(
     // -- only the needs-review subset should ever become a ConsentSpanItem
     // in the emitted payload, and an all-auto-resolved batch may mean
     // nothing left to review even when PF returned entities.
-    let partition = partition_by_prior_decision(
+    // items.id=923 (F1): the severity and destination rule decided BEFORE the
+    // partition, so a span on content this rule forces to High is settled only by
+    // the user's answer to this review, never by a standing preference.
+    let forced_high = !zero_spans_safe_to_auto_approve(
+        content_sensitivity_severity,
+        destination_risk,
+        severity_authoritative,
+    );
+    let partition = partition_with_rule(
         logger,
         user_id,
         persona_id,
@@ -575,6 +605,8 @@ async fn gate3_with_pf<L: DisclosureLogger>(
         focus_run_id,
         execution_tier,
         entities,
+        forced_high,
+        kept_private,
     )
     .await?;
     if let Some(result) = partition.early_result {
@@ -624,10 +656,15 @@ async fn gate3_with_pf<L: DisclosureLogger>(
     }
 
     // Non-zero spans, OR zero spans that severity/target_tier force to High:
-    // build consent payload (spans list may be empty in the forced-High/
-    // no-detection case — frontend must handle an empty spans list by still
-    // surfacing the High-tier consent gate, not by treating it as nothing to
-    // show), write audit record, THEN emit event.
+    // write the audit record, THEN emit the consent payload when it has a span.
+    // items.id=923 (F2): a forced-High review with NO span emits nothing. There
+    // is no question to answer, so a modal would be an empty interrupt the user
+    // could never pass. The result is still pending_consent with empty
+    // review_spans and the gate3_pf_no_spans_forced_review row is still written;
+    // the executor's Step 13 reads that shape as a block
+    // (promotion.sensitive_blocked). No other caller reaches it: the copy
+    // review, the outbound review and API Chat pass a placeholder severity with
+    // severity_authoritative false, so they are never forced High on zero spans.
     // Write-before-surface invariant: log write must precede emit() — if the write
     // fails (fatal DisclosureLogWriteError), the frontend must not receive the event.
     let spans = build_consent_spans(&entities, content_sensitivity_severity, destination_risk);
@@ -674,7 +711,9 @@ async fn gate3_with_pf<L: DisclosureLogger>(
         })
         .await?;
 
-    let _ = handle.emit("consent_request", &payload);
+    if emits_consent_request(&payload) {
+        let _ = handle.emit("consent_request", &payload);
+    }
 
     Ok(Gate3Result {
         pending_consent: true,
@@ -764,6 +803,9 @@ fn is_keep_private(decision: &str) -> bool {
     decision == "keep_private"
 }
 
+/// Today's rule, for the tests that pin it: not forced to High, and the
+/// interactive keep-private rule.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn partition_by_prior_decision<L: DisclosureLogger>(
     logger: &L,
@@ -774,6 +816,74 @@ async fn partition_by_prior_decision<L: DisclosureLogger>(
     focus_run_id: &str,
     execution_tier: u8,
     entities: Vec<PfEntityDecoded>,
+) -> Result<PartitionOutcome, DisclosureLogWriteError> {
+    partition_with_rule(
+        logger,
+        user_id,
+        persona_id,
+        key_hex,
+        action_id,
+        focus_run_id,
+        execution_tier,
+        entities,
+        false,
+        KeptPrivate::StopsContent,
+    )
+    .await
+}
+
+/// items.id=923: the early result of one partition, for tests in other modules
+/// (API Chat) that must feed a Gate3Result gate3 really returns.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn partition_early_result_for_test<L: DisclosureLogger>(
+    logger: &L,
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    action_id: &str,
+    focus_run_id: &str,
+    entities: Vec<PfEntityDecoded>,
+    forced_high: bool,
+    kept_private: KeptPrivate,
+) -> Option<Gate3Result> {
+    partition_with_rule(
+        logger,
+        user_id,
+        persona_id,
+        key_hex,
+        action_id,
+        focus_run_id,
+        1,
+        entities,
+        forced_high,
+        kept_private,
+    )
+    .await
+    .expect("partition")
+    .early_result
+}
+
+/// Partition one pass's entities by prior decision.
+///
+/// `forced_high` (items.id=923, F1): the severity and destination rule
+/// (zero_spans_safe_to_auto_approve is false) forces this content to the High
+/// review. A span is then settled ONLY by the user's answer to this review
+/// (output_store::find_review_answer_for_fact); a standing preference never
+/// settles it and an auto-reapplied row never counts. Otherwise the standing
+/// preference first, then a decision in this run, as before.
+#[allow(clippy::too_many_arguments)]
+async fn partition_with_rule<L: DisclosureLogger>(
+    logger: &L,
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    action_id: &str,
+    focus_run_id: &str,
+    execution_tier: u8,
+    entities: Vec<PfEntityDecoded>,
+    forced_high: bool,
+    kept_private: KeptPrivate,
 ) -> Result<PartitionOutcome, DisclosureLogWriteError> {
     if entities.is_empty() {
         return Ok(PartitionOutcome {
@@ -805,6 +915,30 @@ async fn partition_by_prior_decision<L: DisclosureLogger>(
 
         let prior_decision = match &fact_key {
             None => None,
+            // items.id=923 (F1): forced-High content. Only the user's answer to
+            // this review settles a span; no standing preference is consulted.
+            Some(fk) if forced_high => {
+                match crate::persistence::output_store::find_review_answer_for_fact(
+                    user_id,
+                    persona_id,
+                    key_hex,
+                    focus_run_id,
+                    action_id,
+                    fk,
+                )
+                .await
+                {
+                    Ok(found) => {
+                        found.map(|p| (p.decision, p.suggestion_text, p.user_modified_text))
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "gate3: review-answer query failed, treating as unresolved: {e}"
+                        );
+                        None
+                    }
+                }
+            }
             Some(fk) => {
                 // Persona-scoped standing preference takes priority over the
                 // conversation-scoped decision when both exist -- it's the
@@ -935,25 +1069,30 @@ async fn partition_by_prior_decision<L: DisclosureLogger>(
         // otherwise" rule (PRIVACY_GUARDIAN_GATE_SPEC.md post-decision
         // state) -- applied here since there is no interactive summary to
         // show for an all-auto-resolved pass.
+        // items.id=923 (F14): a caller that removes kept-private spans from the
+        // text it sends (KeptPrivate::RemovesSpans) gets them as an approval to
+        // apply, exactly as a live keep_private answer is applied.
         let all_kept_private = auto_resolved_decisions.iter().all(|d| is_keep_private(d));
-        Some(if all_kept_private {
-            Gate3Result {
-                blocked: true,
-                plain_language: Some(
-                    "This content was kept private based on your earlier decision for this \
+        Some(
+            if all_kept_private && kept_private == KeptPrivate::StopsContent {
+                Gate3Result {
+                    blocked: true,
+                    plain_language: Some(
+                        "This content was kept private based on your earlier decision for this \
                      information. [Use local only]"
-                        .to_string(),
-                ),
-                auto_resolved: auto_resolved.clone(),
-                ..Gate3Result::default()
-            }
-        } else {
-            Gate3Result {
-                approved: true,
-                auto_resolved: auto_resolved.clone(),
-                ..Gate3Result::default()
-            }
-        })
+                            .to_string(),
+                    ),
+                    auto_resolved: auto_resolved.clone(),
+                    ..Gate3Result::default()
+                }
+            } else {
+                Gate3Result {
+                    approved: true,
+                    auto_resolved: auto_resolved.clone(),
+                    ..Gate3Result::default()
+                }
+            },
+        )
     } else {
         None
     };
@@ -997,6 +1136,14 @@ fn build_consent_spans(
             fact_key: fact_key.clone(),
         })
         .collect()
+}
+
+/// items.id=923 (F2): whether gate3 surfaces a consent_request for this
+/// payload. Only a payload with at least one span asks the user anything; the
+/// forced-High review with no span is returned as pending_consent with empty
+/// review_spans and never emitted.
+fn emits_consent_request(payload: &ConsentRequestPayload) -> bool {
+    !payload.spans.is_empty()
 }
 
 /// True only when PF returning zero spans is safe to auto-approve without a
@@ -1239,6 +1386,7 @@ mod tests {
             "",
             "",
             "",
+            crate::conductor::privacy::gate3::KeptPrivate::StopsContent,
         )
         .await
         .unwrap()
@@ -2118,6 +2266,462 @@ mod tests {
             label: label.to_owned(),
             span_text: span_text.to_owned(),
         }
+    }
+
+    // -- items.id=923: F1 (forced-High provenance) and F14 (kept-private rule) ---
+
+    /// One run with a QR_DATA_ROOT of its own; restores the variable on drop.
+    struct Root {
+        _dir: tempfile::TempDir,
+        saved: Option<String>,
+    }
+    impl Drop for Root {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+                None => std::env::remove_var("QR_DATA_ROOT"),
+            }
+        }
+    }
+    fn fresh_root() -> Root {
+        let saved = std::env::var("QR_DATA_ROOT").ok();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("QR_DATA_ROOT", dir.path());
+        Root { _dir: dir, saved }
+    }
+
+    const F_USER: &str = "f1-user";
+    const F_PERSONA: &str = "f1-persona";
+    const F_RUN: &str = "run-f1";
+    const F_ACTION: &str = "draft";
+    const F_EMAIL: &str = "case9@example.com";
+
+    async fn f_seed_run() {
+        crate::persistence::output_store::test_seed_focus_run(
+            F_USER,
+            F_PERSONA,
+            TEST_KEY_HEX,
+            F_RUN,
+            "quick-ask",
+        )
+        .await
+        .expect("seed focus_run");
+    }
+
+    fn f_key() -> String {
+        expected_fact_key("private_email", F_EMAIL)
+    }
+
+    /// The checkpoint lifecycle writes when the run parks at this step (a
+    /// parking checkpoint carries purge_after; a periodic one does not).
+    async fn f_park_snapshot(action: &str, created_at: &str) {
+        let mut c =
+            crate::persistence::output_store::open_outputs_db(F_USER, F_PERSONA, TEST_KEY_HEX)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO focus_run_snapshots
+             (id, focus_run_id, action_id, phase, checkpoint_hash, purge_after, created_at)
+             VALUES (?, ?, ?, 4, 'h', '2099-01-01T00:00:00Z', ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(F_RUN)
+        .bind(action)
+        .bind(created_at)
+        .execute(&mut c)
+        .await
+        .unwrap();
+    }
+
+    /// The user's answer in the review modal (submit_element_consent_decision).
+    async fn f_user_answer(span_id: &str, decision: &str) {
+        let json = serde_json::json!([{
+            "span_id": span_id,
+            "decision": decision,
+            "suggestion_text": "[email address]",
+            "user_modified_text": null,
+            "category": "private_email",
+            "fact_key": f_key(),
+        }])
+        .to_string();
+        crate::persistence::output_store::write_element_consent_decisions(
+            F_USER,
+            F_PERSONA,
+            TEST_KEY_HEX,
+            F_RUN,
+            &json,
+        )
+        .await
+        .expect("user answer");
+    }
+
+    async fn f_standing(decision: &str) {
+        crate::persistence::personal_store::write_standing_preference(
+            F_USER,
+            F_PERSONA,
+            TEST_KEY_HEX,
+            &f_key(),
+            "private_email",
+            decision,
+            Some("[email address]"),
+            None,
+        )
+        .await
+        .expect("standing preference");
+    }
+
+    async fn f_partition(forced_high: bool, kept: KeptPrivate) -> PartitionOutcome {
+        partition_with_rule(
+            &TestLogger::new(),
+            F_USER,
+            F_PERSONA,
+            TEST_KEY_HEX,
+            F_ACTION,
+            F_RUN,
+            1,
+            vec![entity_with("private_email", F_EMAIL)],
+            forced_high,
+            kept,
+        )
+        .await
+        .expect("partition")
+    }
+
+    fn unsettled(o: &PartitionOutcome) -> bool {
+        o.early_result.is_none() && o.needs_review.len() == 1 && o.auto_resolved.is_empty()
+    }
+
+    const LONG_AGO: &str = "2020-01-01T00:00:00+00:00";
+
+    #[tokio::test]
+    async fn forced_high_a_standing_preference_leaves_the_span_unsettled() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let _root = fresh_root();
+        f_seed_run().await;
+        f_park_snapshot(F_ACTION, LONG_AGO).await;
+        f_standing("generalize").await;
+        let o = f_partition(true, KeptPrivate::StopsContent).await;
+        assert!(
+            unsettled(&o),
+            "a standing preference must not settle forced-High content"
+        );
+        // Not forced: the standing preference is reapplied, as before.
+        let o = f_partition(false, KeptPrivate::StopsContent).await;
+        assert!(o.early_result.expect("settled").approved);
+    }
+
+    #[tokio::test]
+    async fn forced_high_an_auto_reapplied_same_run_row_leaves_the_span_unsettled() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let _root = fresh_root();
+        f_seed_run().await;
+        f_park_snapshot(F_ACTION, LONG_AGO).await;
+        crate::persistence::output_store::write_auto_reapplied_consent_decision(
+            F_USER,
+            F_PERSONA,
+            TEST_KEY_HEX,
+            F_RUN,
+            "release_original",
+            None,
+            None,
+            "private_email",
+            &f_key(),
+            F_EMAIL,
+        )
+        .await
+        .unwrap();
+        let o = f_partition(true, KeptPrivate::StopsContent).await;
+        assert!(
+            unsettled(&o),
+            "a silently reapplied row is not the user's answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_high_the_users_answer_after_the_park_settles_and_passes() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let _root = fresh_root();
+        f_seed_run().await;
+        f_park_snapshot(F_ACTION, LONG_AGO).await;
+        f_user_answer("s-g3", "generalize").await;
+        let o = f_partition(true, KeptPrivate::StopsContent).await;
+        let r = o.early_result.expect("the user's answer settles the span");
+        assert!(r.approved && !r.blocked);
+        assert_eq!(r.auto_resolved.len(), 1);
+        assert_eq!(r.auto_resolved[0].decision, "generalize");
+    }
+
+    #[tokio::test]
+    async fn forced_high_an_answer_given_before_this_park_does_not_settle() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let _root = fresh_root();
+        f_seed_run().await;
+        f_user_answer("s-earlier", "release_original").await;
+        let later = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+        f_park_snapshot(F_ACTION, &later).await;
+        let o = f_partition(true, KeptPrivate::StopsContent).await;
+        assert!(
+            unsettled(&o),
+            "an earlier answer in the run is not an answer to this review"
+        );
+    }
+
+    /// A periodic checkpoint (no purge_after) written after the park, as a resume
+    /// may write before the step runs again, does not move the park.
+    #[tokio::test]
+    async fn forced_high_a_periodic_checkpoint_does_not_move_the_park() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let _root = fresh_root();
+        f_seed_run().await;
+        f_park_snapshot(F_ACTION, LONG_AGO).await;
+        f_user_answer("s-g3", "generalize").await;
+        let later = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+        let mut c =
+            crate::persistence::output_store::open_outputs_db(F_USER, F_PERSONA, TEST_KEY_HEX)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO focus_run_snapshots
+             (id, focus_run_id, action_id, phase, checkpoint_hash, purge_after, created_at)
+             VALUES ('periodic', ?, ?, 4, 'h', NULL, ?)",
+        )
+        .bind(F_RUN)
+        .bind(F_ACTION)
+        .bind(&later)
+        .execute(&mut c)
+        .await
+        .unwrap();
+        drop(c);
+        let o = f_partition(true, KeptPrivate::StopsContent).await;
+        assert!(o.early_result.expect("still settled").approved);
+    }
+
+    /// gate3_with_pf decides forced_high with the same rule as the zero-span
+    /// forced-High review and hands both rules to the partition (gate3_with_pf
+    /// needs a Wry AppHandle, so no unit test can drive it).
+    /// items.id=923 (F2, Chat-PM change): a forced-High review with no span
+    /// emits no consent_request; a review with a span still does.
+    #[test]
+    fn a_forced_high_review_with_no_span_emits_nothing() {
+        let empty = ConsentRequestPayload {
+            focus_run_id: "run".to_owned(),
+            focus_name: "Focus".to_owned(),
+            review_tier: ReviewTier::High,
+            spans: build_consent_spans(&[], 3, 1),
+        };
+        assert!(empty.spans.is_empty());
+        assert!(!emits_consent_request(&empty));
+        let one = ConsentRequestPayload {
+            spans: build_consent_spans(&[(entity(0.9, "private_person"), None)], 3, 1),
+            ..empty
+        };
+        assert_eq!(one.spans.len(), 1);
+        assert!(emits_consent_request(&one));
+    }
+
+    /// The emit is the only one in gate3_with_pf, it sits behind
+    /// emits_consent_request, and the disclosure row (including
+    /// gate3_pf_no_spans_forced_review) is written before it, unconditionally,
+    /// and the result is still pending_consent.
+    #[test]
+    fn the_consent_request_emit_is_behind_the_span_check_and_after_the_log() {
+        let src = include_str!("gate3.rs");
+        let body = src
+            .split("async fn gate3_with_pf<")
+            .nth(1)
+            .and_then(|r| r.split("\n}\n").next())
+            .unwrap();
+        assert_eq!(body.matches("handle.emit(\"consent_request\"").count(), 1);
+        let guarded = "    if emits_consent_request(&payload) {\n        \
+                       let _ = handle.emit(\"consent_request\", &payload);\n    }\n";
+        assert!(body.contains(guarded));
+        let log = body.find("\"gate3_pf_no_spans_forced_review\"").unwrap();
+        let emit = body.find(guarded).unwrap();
+        assert!(log < emit);
+        assert!(body[emit..].contains("pending_consent: true,"));
+    }
+
+    #[test]
+    fn the_partition_gets_the_forced_high_rule_and_the_kept_private_rule() {
+        let src = include_str!("gate3.rs");
+        let body = src
+            .split("async fn gate3_with_pf<")
+            .nth(1)
+            .and_then(|r| r.split("\n}\n").next())
+            .unwrap();
+        assert!(body.contains(
+            "let forced_high = !zero_spans_safe_to_auto_approve(\n        \
+             content_sensitivity_severity,\n        destination_risk,\n        \
+             severity_authoritative,\n    );"
+        ));
+        assert!(body.contains("        forced_high,\n        kept_private,\n    )\n    .await?;"));
+        let gate3_body = src
+            .split("pub async fn gate3<")
+            .nth(1)
+            .and_then(|r| r.split("\n}\n").next())
+            .unwrap();
+        assert!(gate3_body
+            .contains("                kept_private,\n            )\n            .await;"));
+    }
+
+    #[tokio::test]
+    async fn forced_high_with_no_park_at_this_step_nothing_settles() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let _root = fresh_root();
+        f_seed_run().await;
+        f_park_snapshot("another-step", LONG_AGO).await;
+        f_user_answer("s-g3", "generalize").await;
+        let o = f_partition(true, KeptPrivate::StopsContent).await;
+        assert!(unsettled(&o), "the first Gate 3 pass of a step always asks");
+    }
+
+    #[tokio::test]
+    async fn forced_high_an_outbound_review_answer_does_not_settle() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let _root = fresh_root();
+        f_seed_run().await;
+        f_park_snapshot(F_ACTION, LONG_AGO).await;
+        // The step's outbound review asked about span s-out (step_reviews).
+        let mut c =
+            crate::persistence::output_store::open_outputs_db(F_USER, F_PERSONA, TEST_KEY_HEX)
+                .await
+                .unwrap();
+        use crate::persistence::step_review_store as srs;
+        srs::insert_review(
+            &mut c,
+            &srs::NewReview {
+                focus_run_id: F_RUN,
+                action_id: F_ACTION,
+                prompt_sha: &"a".repeat(64),
+                prompt_len: 10,
+                spans: &srs::StoredSpans {
+                    asked: vec![srs::AskedSpan {
+                        span_id: "s-out".into(),
+                        start_byte: 0,
+                        end_byte: 3,
+                        category: "private_email".into(),
+                        review_tier: "high".into(),
+                    }],
+                    settled: vec![],
+                },
+                counts: srs::Counts::default(),
+                outcome: srs::ReviewOutcome::Pending,
+                reason: None,
+                outbound_sha: None,
+                outbound_len: None,
+                provider_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        drop(c);
+        f_user_answer("s-out", "release_original").await;
+        let o = f_partition(true, KeptPrivate::StopsContent).await;
+        assert!(
+            unsettled(&o),
+            "an answer to the outbound review is not one to Gate 3"
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_high_a_standing_preference_never_overrides_the_users_answer() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let _root = fresh_root();
+        f_seed_run().await;
+        f_park_snapshot(F_ACTION, LONG_AGO).await;
+        f_standing("keep_private").await;
+        f_user_answer("s-g3", "release_original").await;
+        let r = f_partition(true, KeptPrivate::StopsContent)
+            .await
+            .early_result
+            .expect("the answer settles it");
+        assert!(r.approved);
+        assert_eq!(r.auto_resolved[0].decision, "release_original");
+    }
+
+    /// The user's own answer and a silently reapplied row are told apart by data
+    /// both writers have always written: the answer binds save_preference (0 or 1)
+    /// and never names original_text; the reapplied row writes save_preference
+    /// NULL and the span text.
+    #[test]
+    fn the_two_consent_writers_stay_distinguishable() {
+        let src = include_str!("../../persistence/output_store.rs");
+        let user = src
+            .split("async fn write_element_consent_decisions_conn(")
+            .nth(1)
+            .and_then(|r| r.split("\n}\n").next())
+            .unwrap();
+        assert!(user.contains(".bind(d.save_for_persona as i64)"));
+        assert!(!user.contains("original_text"));
+        let auto = src
+            .split("pub async fn write_auto_reapplied_consent_decision(")
+            .nth(1)
+            .and_then(|r| r.split("\n}\n").next())
+            .unwrap();
+        assert!(auto.contains("VALUES (?, ?, 'element_consent', ?, NULL, NULL, ?"));
+        assert!(auto.contains("category, fact_key, original_text)"));
+        let reader = src
+            .split("pub async fn find_review_answer_for_fact(")
+            .nth(1)
+            .and_then(|r| r.split("\n}\n").next())
+            .expect("the bound reader");
+        assert!(reader.contains("save_preference IS NOT NULL AND original_text IS NULL"));
+    }
+
+    /// items.id=923 (F14): only the two callers that build the sent text from the
+    /// decisions remove kept-private spans; every other gate3 caller keeps the
+    /// promotion rule (the run stops if all is kept private).
+    #[test]
+    fn only_the_outbound_review_and_api_chat_remove_kept_private_spans() {
+        fn production(src: &str) -> &str {
+            src.split("#[cfg(test)]\nmod tests {").next().unwrap()
+        }
+        let removes = [
+            (
+                "conductor/step_review.rs",
+                include_str!("../step_review.rs"),
+            ),
+            (
+                "commands/api_chat.rs",
+                include_str!("../../commands/api_chat.rs"),
+            ),
+        ];
+        for (name, src) in removes {
+            let p = production(src);
+            assert_eq!(p.matches("KeptPrivate::RemovesSpans").count(), 1, "{name}");
+            assert_eq!(p.matches("KeptPrivate::StopsContent").count(), 0, "{name}");
+        }
+        let stops = [
+            ("conductor/executor.rs", include_str!("../executor.rs")),
+            (
+                "commands/consent.rs",
+                include_str!("../../commands/consent.rs"),
+            ),
+        ];
+        for (name, src) in stops {
+            let p = production(src);
+            assert_eq!(p.matches("KeptPrivate::StopsContent").count(), 1, "{name}");
+            assert_eq!(p.matches("KeptPrivate::RemovesSpans").count(), 0, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn removes_spans_sends_an_all_kept_private_pass_and_stops_content_blocks_it() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let _root = fresh_root();
+        f_seed_run().await;
+        f_standing("keep_private").await;
+        let r = f_partition(false, KeptPrivate::RemovesSpans)
+            .await
+            .early_result
+            .expect("settled");
+        assert!(r.approved && !r.blocked, "removed, not refused");
+        assert_eq!(r.auto_resolved[0].decision, "keep_private");
+        let r = f_partition(false, KeptPrivate::StopsContent)
+            .await
+            .early_result
+            .expect("settled");
+        assert!(r.blocked && !r.approved, "the promotion rule is unchanged");
     }
 
     async fn seed_run_and_prefs(

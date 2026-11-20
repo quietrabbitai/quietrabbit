@@ -653,5 +653,10 @@
       "refused": "You chose not to send this request, so it was stopped.",
       "too_long": "This request is too long for the privacy check, so it was not sent. Shorten it and try again."
     }
+  },
+  "promotion": {
+    "stop": {
+      "sensitive_blocked": "This step's result contains sensitive information that can't be passed to a service outside your device, so the run stopped here. Nothing was sent."
+    }
   }
 }

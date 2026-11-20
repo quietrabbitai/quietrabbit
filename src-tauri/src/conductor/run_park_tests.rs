@@ -155,13 +155,15 @@ fn a_code_outside_the_registry_or_the_families_leaves_no_park() {
 
 #[test]
 fn the_families_are_exactly_the_four_and_every_code_has_an_answer() {
+    // items.id=923 (F2): plus the Gate 3 promotion stop, a fifth family.
     let mut yes = 0;
     for c in Code::ALL {
         let s = c.as_str();
         let in_family = s.starts_with("resolver.")
             || s.starts_with("plan.")
             || s.starts_with("step_review.")
-            || s.starts_with("spend_block.");
+            || s.starts_with("spend_block.")
+            || s.starts_with("promotion.");
         assert_eq!(is_park_family(*c), in_family, "{s}");
         yes += usize::from(in_family);
     }

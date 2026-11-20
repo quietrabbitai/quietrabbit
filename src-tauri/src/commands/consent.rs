@@ -800,6 +800,7 @@ pub async fn request_chat_copy_gate3_review(
             &request.user_id,
             &request.persona_id,
             &key_hex_str,
+            crate::conductor::privacy::gate3::KeptPrivate::StopsContent,
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -1203,6 +1204,7 @@ mod tests {
             USER_ID,
             PERSONA_ID,
             &key_hex_str(),
+            crate::conductor::privacy::gate3::KeptPrivate::StopsContent,
         )
         .await
         .expect("gate3 must not error");
@@ -1240,6 +1242,7 @@ mod tests {
             USER_ID,
             PERSONA_ID,
             &key_hex_str(),
+            crate::conductor::privacy::gate3::KeptPrivate::StopsContent,
         )
         .await
         .expect("gate3 must not error");

@@ -81,6 +81,7 @@ const PRE_EXISTING_ORPHAN_KEYS: string[] = [
   'step_review.stop.blocked', // same
   'step_review.stop.refused', // same
   'step_review.stop.too_long', // items.id=923: same (the run status event carries no park reason)
+  'promotion.stop.sensitive_blocked', // items.id=923 (F2): same; the Gate 3 stop is a park reason no surface shows yet
   'fact_policy.error.persona_not_found', // items.id=930: the codes and policy words of get_fact_policies and set_fact_policy; the screen that shows them is not built
   'fact_policy.error.unknown_field', // items.id=930: the codes and policy words of get_fact_policies and set_fact_policy; the screen that shows them is not built
   'fact_policy.error.invalid_tier', // items.id=930: the codes and policy words of get_fact_policies and set_fact_policy; the screen that shows them is not built

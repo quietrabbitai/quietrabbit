@@ -406,6 +406,7 @@ async fn review_new_turn<L: crate::conductor::privacy::logger::DisclosureLogger>
             user_id,
             persona_id,
             key_hex_str,
+            crate::conductor::privacy::gate3::KeptPrivate::RemovesSpans,
         )
         .await
 }
@@ -1265,21 +1266,8 @@ mod tests {
             after_gate3(&clean, "k", &reg, USER, PERSONA, "c", "plain text"),
             ReviewStep::Send("plain text".into())
         );
-        let with_standing = Gate3Result {
-            approved: true,
-            auto_resolved: vec![AutoResolvedSpan {
-                start_byte: 4,
-                end_byte: 7,
-                decision: "keep_private".into(),
-                suggestion_text: None,
-                user_modified_text: None,
-            }],
-            ..Default::default()
-        };
-        assert_eq!(
-            after_gate3(&with_standing, "k", &reg, USER, PERSONA, "c", "ask Ann"),
-            ReviewStep::Send("ask [removed]".into())
-        );
+        // (A remembered keep_private is sent removed: see
+        // a_remembered_keep_private_is_sent_removed, fed by gate3's real result.)
         // A standing decision that cannot be applied safely stops the send.
         let unappliable = Gate3Result {
             approved: true,
@@ -1297,6 +1285,70 @@ mod tests {
             ReviewStep::Stop(Code::ApiChatReviewBlocked)
         );
         assert_eq!(reg.held_count(), 0, "only a pending review is held");
+    }
+
+    /// items.id=923 (F14): a remembered keep_private that covers every flagged
+    /// span is applied by removal, as the same answer given live is. The result is
+    /// gate3's own (its partition with the API Chat rule), not a hand-built one.
+    #[tokio::test]
+    async fn a_remembered_keep_private_is_sent_removed() {
+        use crate::conductor::privacy::gate3::{partition_early_result_for_test, KeptPrivate};
+        use crate::conductor::privacy::logger::TestLogger;
+        use crate::conductor::privacy::privacy_filter::PfEntityDecoded;
+        let _lock = ENV_MUTEX.lock().await;
+        let saved = std::env::var("QR_DATA_ROOT").ok();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("QR_DATA_ROOT", dir.path());
+        const KEY: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
+        let run = format!("{}f14", output_store::API_SEND_REVIEW_RUN_ID_PREFIX);
+        let text = "mail case4@example.com";
+        let email = "case4@example.com";
+        let canonical =
+            crate::conductor::privacy::fact_identity::canonicalize_fact("private_email", email)
+                .unwrap();
+        let fact_key =
+            crate::conductor::privacy::fact_identity::fact_hash("private_email", &canonical);
+        crate::persistence::personal_store::write_standing_preference(
+            USER,
+            PERSONA,
+            KEY,
+            &fact_key,
+            "private_email",
+            "keep_private",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let entity = PfEntityDecoded {
+            start_byte: 5,
+            end_byte: text.len(),
+            score: 0.95,
+            label: "private_email".into(),
+            span_text: email.into(),
+        };
+        let result = partition_early_result_for_test(
+            &TestLogger::new(),
+            USER,
+            PERSONA,
+            KEY,
+            "api-chat-send",
+            &run,
+            vec![entity],
+            false,
+            KeptPrivate::RemovesSpans,
+        )
+        .await
+        .expect("every span was settled");
+        let reg = ReviewRegistry::default();
+        assert_eq!(
+            after_gate3(&result, "k", &reg, USER, PERSONA, "c", text),
+            ReviewStep::Send("mail [removed]".into())
+        );
+        match saved {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
     }
 
     #[test]

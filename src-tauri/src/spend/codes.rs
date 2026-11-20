@@ -25,6 +25,8 @@
 //   step_review.*  the outbound review of an external step's rendered prompt
 //                  parked or ended the step before any network traffic
 //                  (items.id=884, decisions.id=943)
+//   promotion.*    Gate 3 (cross-tier promotion, executor Step 13) stopped a step's
+//                  output from reaching a step that may go out (items.id=923)
 
 use serde::{Deserialize, Serialize};
 
@@ -186,6 +188,13 @@ pub enum Code {
     /// part of it was scanned. Nothing was sent.
     StepReviewTooLong,
 
+    // -- Gate 3 promotion (items.id=923) ---------------------------------------
+    /// Gate 3 forced the High review (severity 3 or more, or a promotion to a
+    /// tier-3 step) but the Privacy Filter flagged nothing the user could answer,
+    /// so the step stops instead of parking for a review that can never be
+    /// passed. Nothing was sent. The parameters carry the action.
+    PromotionSensitiveBlocked,
+
     // -- cost basis, price state, limit state, consent state ------------------
     CostBasisListPriceEstimate,
     PriceStateKnown,
@@ -245,6 +254,7 @@ impl Code {
         Code::StepReviewBlocked,
         Code::StepReviewRefused,
         Code::StepReviewTooLong,
+        Code::PromotionSensitiveBlocked,
         Code::CostBasisListPriceEstimate,
         Code::PriceStateKnown,
         Code::PriceStateUnknown,
@@ -303,6 +313,7 @@ impl Code {
             Code::StepReviewBlocked => "step_review.blocked",
             Code::StepReviewRefused => "step_review.refused",
             Code::StepReviewTooLong => "step_review.too_long",
+            Code::PromotionSensitiveBlocked => "promotion.sensitive_blocked",
             Code::CostBasisListPriceEstimate => "cost_basis.list_price_estimate",
             Code::PriceStateKnown => "price_state.known",
             Code::PriceStateUnknown => "price_state.unknown",
@@ -395,6 +406,7 @@ mod tests {
             "step_review.blocked",
             "step_review.refused",
             "step_review.too_long",
+            "promotion.sensitive_blocked",
             "cost_basis.list_price_estimate",
             "price_state.known",
             "price_state.unknown",
@@ -423,9 +435,9 @@ mod tests {
     #[test]
     fn all_lists_every_variant() {
         // 17 warnings + 11 blocks + 6 API Chat stops + 2 resolver stops + 1 plan
-        // stop + 5 step review codes + 1 cost basis + 3 price states + 3 limit
-        // states + 4 consent states.
-        assert_eq!(Code::ALL.len(), 53);
+        // stop + 5 step review codes + 1 promotion stop + 1 cost basis + 3 price
+        // states + 3 limit states + 4 consent states.
+        assert_eq!(Code::ALL.len(), 54);
     }
 
     #[test]

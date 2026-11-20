@@ -265,6 +265,7 @@ impl<L: DisclosureLogger> ReviewScanner for Gate3Scanner<'_, L> {
                 self.user_id,
                 self.persona_id,
                 self.key_hex,
+                crate::conductor::privacy::gate3::KeptPrivate::RemovesSpans,
             )
             .await
     }

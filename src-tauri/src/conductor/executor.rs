@@ -69,7 +69,8 @@ use crate::conductor::failure::{
 use crate::conductor::model_selection::{resolve_hosted_model, ModelError};
 use crate::conductor::privacy::logger::{DisclosureLogEntry, DisclosureLogger};
 use crate::conductor::privacy::types::{
-    AbstractionPolicy, PersonalField as GateField, PersonalTrack as GateTrack, Sensitivity,
+    AbstractionPolicy, Gate3Result, PersonalField as GateField, PersonalTrack as GateTrack,
+    Sensitivity,
 };
 use crate::conductor::privacy::PrivacyGateway;
 use crate::conductor::step_review::{self, ReviewedPrompt};
@@ -1113,57 +1114,128 @@ impl StepExecutor {
                         &ctx.user_id,
                         &ctx.persona_id,
                         &ctx.key_hex,
+                        crate::conductor::privacy::gate3::KeptPrivate::StopsContent,
                     )
                     .await
                     .map_err(|e| ConductorError::DisclosureLogWrite {
                         plain_language: e.plain_language.clone(),
                     })?;
 
-                if g3.blocked {
-                    return Ok(Some(failure_handler.handle(
-                        &ConductorError::ContentPromotionBlocked {
-                            plain_language: g3.plain_language.unwrap_or_else(|| {
-                                "This content can't be shared with a higher-tier service. \
-                                 [Use local only]"
-                                    .to_owned()
-                            }),
-                        },
-                        Some(&ctx.step.action_id),
-                        Some(&ctx.focus_id),
-                        retry_count,
-                    )));
-                }
-
-                if g3.pending_consent {
-                    return Ok(Some(FailureResult {
-                        action: FailureAction::AwaitConsent,
-                        failure_mode: None,
-                        plain_language: "Quiet Rabbit identified personal information in this \
-                                         content. Please review before it leaves your device."
-                            .to_owned(),
-                        is_recoverable: true,
-                        severity: FailureSeverity::Pause,
-                        action_id: Some(ctx.step.action_id.clone()),
-                        focus_id: Some(ctx.focus_id.clone()),
-                        metadata: None,
-                    }));
-                }
-
-                // items.id=923 (F3): an audit record only. Nothing reads promotions
-                // in production (they are carried in the checkpoint), and neither the
-                // approval nor any span decision changes what the next step receives;
-                // a hosted next step is reviewed again by the outbound review.
-                if g3.approved {
-                    shared_state.promote_content(
-                        &ctx.step.action_id,
-                        content_key,
-                        &response.content,
-                    );
+                match step13_verdict(&g3) {
+                    Step13::Blocked => {
+                        return Ok(Some(failure_handler.handle(
+                            &ConductorError::ContentPromotionBlocked {
+                                plain_language: g3.plain_language.unwrap_or_else(|| {
+                                    "This content can't be shared with a higher-tier service. \
+                                     [Use local only]"
+                                        .to_owned()
+                                }),
+                            },
+                            Some(&ctx.step.action_id),
+                            Some(&ctx.focus_id),
+                            retry_count,
+                        )));
+                    }
+                    // items.id=923 (F2): a forced-High review with nothing to ask.
+                    Step13::Unanswerable => {
+                        return Ok(Some(promotion_sensitive_blocked(
+                            &ctx.step.action_id,
+                            &ctx.focus_id,
+                        )));
+                    }
+                    Step13::AwaitConsent => {
+                        return Ok(Some(FailureResult {
+                            action: FailureAction::AwaitConsent,
+                            failure_mode: None,
+                            plain_language: "Quiet Rabbit identified personal information in \
+                                             this content. Please review before it leaves your \
+                                             device."
+                                .to_owned(),
+                            is_recoverable: true,
+                            severity: FailureSeverity::Pause,
+                            action_id: Some(ctx.step.action_id.clone()),
+                            focus_id: Some(ctx.focus_id.clone()),
+                            metadata: None,
+                        }));
+                    }
+                    // items.id=923 (F3): an audit record only. Nothing reads
+                    // promotions in production (they are carried in the
+                    // checkpoint), and neither the approval nor any span decision
+                    // changes what the next step receives; a hosted next step is
+                    // reviewed again by the outbound review.
+                    Step13::Proceed { promote } => {
+                        if promote {
+                            shared_state.promote_content(
+                                &ctx.step.action_id,
+                                content_key,
+                                &response.content,
+                            );
+                        }
+                    }
                 }
             }
         }
 
         Ok(None) // step completed successfully
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Step 13: what a Gate 3 result does (items.id=923, F2)
+// ---------------------------------------------------------------------------
+
+/// What Step 13 does with a Gate 3 result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step13 {
+    /// gate3 blocked the content: the step fails (ContentPromotionBlocked).
+    Blocked,
+    /// gate3 forced the High review but there is nothing to ask about (no span):
+    /// no answer could ever pass it, so the step stops with a plain code instead
+    /// of parking for good and re-running its model call on every resume.
+    Unanswerable,
+    /// The user must answer the spans gate3 asked about: the run parks.
+    AwaitConsent,
+    /// Nothing to stop; `promote` records the audit promotion (F3: it changes
+    /// nothing the next step receives).
+    Proceed { promote: bool },
+}
+
+/// The one reading of a Gate 3 result in Step 13. The same guard as the outbound
+/// review's (step_review.rs: a pending result with no spans is blocked, not parked).
+fn step13_verdict(g3: &Gate3Result) -> Step13 {
+    if g3.blocked {
+        Step13::Blocked
+    } else if g3.pending_consent {
+        if g3.review_spans.is_empty() {
+            Step13::Unanswerable
+        } else {
+            Step13::AwaitConsent
+        }
+    } else {
+        Step13::Proceed {
+            promote: g3.approved,
+        }
+    }
+}
+
+/// The step's result for Step13::Unanswerable: F4, the run waits for the user
+/// (as a ContentPromotionBlocked does), the code travels as data and the
+/// plain_language is the stable code string, never prose (the copy is the
+/// frontend's, keyed by promotion.stop.sensitive_blocked).
+fn promotion_sensitive_blocked(action_id: &str, focus_id: &str) -> FailureResult {
+    let code = Code::PromotionSensitiveBlocked;
+    let mut meta: HashMap<String, serde_json::Value> = HashMap::new();
+    meta.insert("code".to_owned(), serde_json::json!(code.as_str()));
+    meta.insert("action_id".to_owned(), serde_json::json!(action_id));
+    FailureResult {
+        action: FailureAction::AwaitUser,
+        failure_mode: Some("F4".to_owned()),
+        plain_language: code.as_str().to_owned(),
+        is_recoverable: true,
+        severity: FailureSeverity::Stop,
+        action_id: Some(action_id.to_owned()),
+        focus_id: Some(focus_id.to_owned()),
+        metadata: Some(meta),
     }
 }
 
@@ -4730,6 +4802,7 @@ mod tests {
                 SPEND_USER,
                 "persona-1",
                 "",
+                crate::conductor::privacy::gate3::KeptPrivate::StopsContent,
             )
             .await
             .unwrap()
@@ -8054,6 +8127,7 @@ mod tests {
                         SPEND_USER,
                         "persona-1",
                         "",
+                        crate::conductor::privacy::gate3::KeptPrivate::StopsContent,
                     )
                     .await
                     .unwrap()
@@ -9309,6 +9383,99 @@ mod tests {
             .and_then(|r| r.split("\n}\n").next())
             .expect("StepContext");
         assert!(!ctx_struct.contains("treatment"));
+    }
+
+    /// items.id=923 (F2): how Step 13 reads a Gate 3 result. A pending result with
+    /// no span (gate3's forced-High review when the filter flagged nothing) can
+    /// never be answered, so it stops the step instead of parking it.
+    #[test]
+    fn step13_reads_a_gate3_result_one_way() {
+        use crate::conductor::privacy::types::{ConsentSpanItem, ReviewTier};
+        let span = ConsentSpanItem {
+            span_id: "s1".into(),
+            category: "private_person".into(),
+            user_label: "Person name".into(),
+            original_text: "Ann".into(),
+            suggestion: None,
+            start_byte: 0,
+            end_byte: 3,
+            score: 0.9,
+            review_tier: ReviewTier::High,
+            fact_key: None,
+        };
+        let cases = [
+            (
+                Gate3Result {
+                    blocked: true,
+                    ..Default::default()
+                },
+                Step13::Blocked,
+            ),
+            (
+                Gate3Result {
+                    pending_consent: true,
+                    ..Default::default()
+                },
+                Step13::Unanswerable,
+            ),
+            (
+                Gate3Result {
+                    pending_consent: true,
+                    review_spans: vec![span],
+                    ..Default::default()
+                },
+                Step13::AwaitConsent,
+            ),
+            (
+                Gate3Result {
+                    approved: true,
+                    ..Default::default()
+                },
+                Step13::Proceed { promote: true },
+            ),
+            (Gate3Result::default(), Step13::Proceed { promote: false }),
+        ];
+        for (g3, want) in cases {
+            assert_eq!(step13_verdict(&g3), want, "{g3:?}");
+        }
+    }
+
+    #[test]
+    fn an_unanswerable_promotion_review_stops_with_its_code() {
+        let f = promotion_sensitive_blocked("draft", "foc");
+        assert_eq!(f.action, FailureAction::AwaitUser);
+        assert_eq!(f.severity, FailureSeverity::Stop);
+        assert_eq!(f.failure_mode.as_deref(), Some("F4"));
+        assert_eq!(f.plain_language, "promotion.sensitive_blocked");
+        let m = f.metadata.as_ref().unwrap();
+        assert_eq!(m["code"], "promotion.sensitive_blocked");
+        assert_eq!(m["action_id"], "draft");
+        let park = crate::conductor::run_park::from_failure(&f).expect("it leaves a park");
+        assert_eq!(park.code, Code::PromotionSensitiveBlocked);
+        let en: serde_json::Value =
+            serde_json::from_str(include_str!("../../../frontend/src/i18n/en.json")).unwrap();
+        assert!(en["promotion"]["stop"]["sensitive_blocked"].is_string());
+    }
+
+    /// Step 13 reads the Gate 3 result only through step13_verdict.
+    #[test]
+    fn step13_reads_gate3_only_through_its_verdict() {
+        let src = include_str!("executor.rs");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let step13 = code
+            .split("// -- Step 13 — PG_GATE_3")
+            .nth(1)
+            .and_then(|r| r.split("Ok(None) // step completed successfully").next())
+            .expect("Step 13");
+        assert!(step13.contains("match step13_verdict(&g3) {"));
+        for direct in [
+            "g3.blocked",
+            "g3.pending_consent",
+            "g3.approved",
+            "g3.review_spans",
+        ] {
+            assert!(!step13.contains(direct), "Step 13 reads {direct} directly");
+        }
     }
 
     /// items.id=923 (F13): the reviews a step may reuse live exactly one retry

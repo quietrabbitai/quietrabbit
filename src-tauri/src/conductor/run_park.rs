@@ -72,7 +72,8 @@ pub fn registered_code(s: &str) -> Option<Code> {
     Code::ALL.iter().copied().find(|c| c.as_str() == s)
 }
 
-/// Whether a code is one a park may carry: the four families, by variant.
+/// Whether a code is one a park may carry: the four families, and the Gate 3
+/// promotion stop (items.id=923), by variant.
 pub fn is_park_family(code: Code) -> bool {
     matches!(
         code,
@@ -84,6 +85,7 @@ pub fn is_park_family(code: Code) -> bool {
             | Code::StepReviewBlocked
             | Code::StepReviewRefused
             | Code::StepReviewTooLong
+            | Code::PromotionSensitiveBlocked
             | Code::BlockConsentRequired
             | Code::BlockReconsentRequired
             | Code::BlockPriceUnknown
