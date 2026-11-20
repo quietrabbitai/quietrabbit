@@ -1150,6 +1150,120 @@ pub async fn cancel_focus_run(
     Ok(())
 }
 
+/// What `expire_parked_run` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpireOutcome {
+    /// The run was cancelled and its snapshots, input and park reason removed.
+    Expired,
+    /// The run's latest snapshot has not expired (or the run has no snapshot).
+    NotExpired,
+    /// The run is no longer in a parked status (it resumed, finished, or does
+    /// not exist), so nothing was changed.
+    NotParked,
+}
+
+/// items.id=681 (decisions.id=865): expire ONE parked run whose latest snapshot
+/// is past its retention. Everything happens in one BEGIN IMMEDIATE transaction,
+/// so it is atomic against a concurrent resume or re-park (the write lock is
+/// taken before the snapshot is read):
+///   1. read the run's latest snapshot and decide expiry (run_retention::
+///      snapshot_expired: its purge_after, else created_at + the awaiting_user
+///      period for a periodic one a crash left behind);
+///   2. UPDATE focus_runs SET status='cancelled', user_input and external_input
+///      NULL, the reason in notes WHERE id=? AND status IN (the parked set);
+///   3. only if exactly ONE row changed: delete the run's snapshots, its park
+///      reason and supersede a pending step review.
+///
+/// A run that resumed meanwhile is left alone (NotParked). This is a fourth site
+/// that clears focus_runs.user_input, beside the three writers: it is the purge
+/// items.id=894 named, because this cancel does not go through them.
+pub async fn expire_parked_run(
+    conn: &mut SqliteConnection,
+    run_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<ExpireOutcome, OutputStoreError> {
+    use crate::conductor::run_retention::{
+        parked_status_list_sql, snapshot_expired, EXPIRED_WHILE_WAITING,
+    };
+    crate::persistence::session_store::begin_write(conn).await?;
+    let result: Result<ExpireOutcome, OutputStoreError> = async {
+        let latest = sqlx::query(
+            "SELECT purge_after, created_at FROM focus_run_snapshots
+             WHERE focus_run_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )
+        .bind(run_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some(latest) = latest else {
+            return Ok(ExpireOutcome::NotExpired);
+        };
+        let purge_after: Option<String> = latest.try_get("purge_after")?;
+        let created_at: String = latest.try_get("created_at")?;
+        if !snapshot_expired(purge_after.as_deref(), &created_at, now) {
+            return Ok(ExpireOutcome::NotExpired);
+        }
+        let sql = format!(
+            "UPDATE focus_runs SET status = 'cancelled', user_input = NULL, external_input = NULL,
+             notes = CASE WHEN json_valid(notes) THEN json_set(notes, '$.cancel_reason', ?)
+                          ELSE json_object('cancel_reason', ?) END
+             WHERE id = ? AND status IN ({})",
+            parked_status_list_sql()
+        );
+        let changed = sqlx::query(&sql)
+            .bind(EXPIRED_WHILE_WAITING)
+            .bind(EXPIRED_WHILE_WAITING)
+            .bind(run_id)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected();
+        if changed != 1 {
+            return Ok(ExpireOutcome::NotParked);
+        }
+        sqlx::query("DELETE FROM focus_run_snapshots WHERE focus_run_id = ?")
+            .bind(run_id)
+            .execute(&mut *conn)
+            .await?;
+        clear_park_best_effort(conn, run_id).await;
+        crate::persistence::step_review_store::supersede_pending_for_run(conn, run_id)
+            .await
+            .map_err(|e| match e {
+                crate::persistence::step_review_store::StepReviewStoreError::Database(d) => {
+                    OutputStoreError::from(d)
+                }
+                other => OutputStoreError::Validation(other.to_string()),
+            })?;
+        Ok(ExpireOutcome::Expired)
+    }
+    .await;
+    crate::persistence::session_store::finish_write(conn, result).await
+}
+
+/// items.id=681: expire every parked run of one persona that is past its
+/// retention at `now`. Returns the ids it expired. One failing run does not stop
+/// the others (it is logged and left for the next pass).
+pub async fn expire_parked_runs(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<String>, OutputStoreError> {
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+    let sql = format!(
+        "SELECT id FROM focus_runs WHERE status IN ({}) ORDER BY started_at, id",
+        crate::conductor::run_retention::parked_status_list_sql()
+    );
+    let ids: Vec<String> = sqlx::query_scalar(&sql).fetch_all(&mut conn).await?;
+    let mut expired = Vec::new();
+    for id in ids {
+        match expire_parked_run(&mut conn, &id, now).await {
+            Ok(ExpireOutcome::Expired) => expired.push(id),
+            Ok(_) => {}
+            Err(e) => log::warn!("output_store: could not expire a parked run: {e}"),
+        }
+    }
+    Ok(expired)
+}
+
 /// Update focus_runs.status to an arbitrary value.
 /// Used by submit_extract_confirm to set status='complete' after all
 /// candidate decisions are written and verified.

@@ -1366,6 +1366,10 @@ mod tests {
             "scheduled_sweep::run_periodic_sweep takes a Sweep lease and a FocusRun lease per resumed run",
         ),
         (
+            "parked_run_expiry",
+            "run_retention::expire_tick takes a Sweep lease for the tick (items.id=681); no FocusRun lease: it cancels a parked run, it never resumes one",
+        ),
+        (
             "nightly_batch_sweep",
             "shared.db only today (nightly_batch::run_periodic_sweep); it must take a lease before it ever touches an account store",
         ),

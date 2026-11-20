@@ -828,6 +828,34 @@ async fn async_main() {
                 },
             );
 
+            // items.id=681 (decisions.id=865): expiry of parked runs' snapshots.
+            // Only does anything while the owner's key is resident (decisions.id=847);
+            // the login recovery also runs one pass. Hourly: the periods are 30 days.
+            let run_expiry_handle = app.handle().clone();
+            quietrabbit_lib::task_supervision::spawn_supervised(
+                "parked_run_expiry",
+                true,
+                move || {
+                    let run_expiry_handle = run_expiry_handle.clone();
+                    async move {
+                        let mut ticker =
+                            tokio::time::interval(std::time::Duration::from_secs(3600));
+                        loop {
+                            ticker.tick().await;
+                            let key_registry = run_expiry_handle
+                                .state::<quietrabbit_lib::auth::registry::KeyRegistry>();
+                            let pool = run_expiry_handle.state::<sqlx::SqlitePool>();
+                            quietrabbit_lib::conductor::run_retention::run_expiry_tick(
+                                &pool,
+                                &key_registry,
+                                Some(run_expiry_handle.clone()),
+                            )
+                            .await;
+                        }
+                    }
+                },
+            );
+
             // items.id=52 Part 1: nightly batch runner infrastructure. Fixed
             // local-clock schedule, not idle-detection -- auth/idle_timeout.rs's
             // own doc comment already concluded no reliable cross-platform

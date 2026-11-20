@@ -966,6 +966,8 @@ struct RecoverySummary {
     personas_failed: usize,
     /// Focus runs moved to paused across all personas.
     runs_demoted: u64,
+    /// Parked runs whose snapshots had expired and were cancelled (items.id=681).
+    runs_expired: u64,
     /// Personas not attempted because the loop stopped early (session no
     /// longer resident, or the writer gate left Open).
     personas_skipped: usize,
@@ -1031,6 +1033,23 @@ async fn recover_interrupted_runs(
                 );
             }
         }
+        // items.id=681: one expiry pass right after the demote, so a run a crash
+        // paused long ago does not wait for the first hourly tick. Best effort; a
+        // run in a live process is protected by the status guard. No AppHandle
+        // here: the UI reads run state after login.
+        match crate::persistence::output_store::expire_parked_runs(
+            user_id,
+            persona_id,
+            key_hex,
+            chrono::Utc::now(),
+        )
+        .await
+        {
+            Ok(ids) => summary.runs_expired += ids.len() as u64,
+            Err(e) => {
+                log::debug!("finish_login: parked-run expiry skipped for persona={persona_id}: {e}")
+            }
+        }
     }
     summary
 }
@@ -1071,13 +1090,14 @@ fn spawn_interrupted_run_recovery(
         let summary = recover_interrupted_runs(&user_id, &key_hex, key_epoch, &persona_ids).await;
         log::info!(
             "finish_login: interrupted-run recovery for user={user_id} took {} ms: {} personas \
-             done, {} deferred, {} failed, {} skipped, {} runs paused",
+             done, {} deferred, {} failed, {} skipped, {} runs paused, {} parked runs expired",
             started.elapsed().as_millis(),
             summary.personas_done,
             summary.personas_deferred,
             summary.personas_failed,
             summary.personas_skipped,
-            summary.runs_demoted
+            summary.runs_demoted,
+            summary.runs_expired
         );
     });
 }
