@@ -631,7 +631,8 @@ pub struct PromotedContentEntry {
 
 /// Holds content approved for cross-tier use via PG_GATE_3.
 ///
-/// step_disclosure_buffers: written by PG_GATE_1, read by Step 8 for Tier 2+.
+/// step_disclosure_buffers: written by PG_GATE_1, read by Step 8 for EVERY step (both
+///   renders, items.id=933; before it only the external render read it).
 ///   Contains the values approved for the step: the raw approved values at
 ///   abstraction tier 1, abstracted from tier 2 up. Held in the run's snapshot and
 ///   encrypted at rest in the persona's outputs.db (decisions.id=865). The names in

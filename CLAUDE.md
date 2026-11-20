@@ -1,5 +1,10 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: November 20, 2026 (items.id=923: new "Long-prompt review and the Gate 3 riders"
+# Last updated: November 20, 2026 (items.id=933: new "Local render of personal fields and the carry
+# scan" section; under "Key Architectural Decisions" the Step 8 line and the "raw values never appear"
+# line; under "Personal fact bridge" the VALUE bullet's tier-1 sentence; under "Single-pass render
+# substitution" the KEPT AS DEFENCE IN DEPTH list; under "Persona context, the output scan and
+# external-step scoring" one sentence on the A -> C -> B gap; nothing else.).
+# Before that, November 20, 2026 (items.id=923: new "Long-prompt review and the Gate 3 riders"
 # section; under "Run plan and strategy approval" the PARK REASON family list (promotion added); under
 # "Resume state, archive hook and store sweeps" the archive hook's "review_prompt reuses a live run's
 # own" (reuse is now one retry loop's); nothing else.).
@@ -1601,7 +1606,10 @@ default OMIT at tiers 2 and 3) reaches Gate 1 at the user's disclosure policy.
   later substitution). items.id=932 made it single-pass; the neutralization STAYS as defence in depth (see
   "Single-pass render substitution"). A value that fails the field
   validator (length, content) keeps its CLEANED text in PersonalTrack.fields, which Gate 2, the voice scan and
-  step sensitivity still read, but is not_permitted at both tiers so Gate 1 never releases it.
+  step sensitivity still read, but is not_permitted at tiers 2 and 3, so Gate 1 never releases it to an
+  external step. At tier 1 Gate 1 approves every field raw, so a LOCAL step that declares it renders its
+  cleaned text (items.id=933, accepted by Chat-PM, as is a confirmed cross-Persona fact; see "Local render
+  of personal fields and the carry scan").
 - LOAD LINT (declared_inputs::lint_field_requirements, both loaders): in an external step every
   field_requirements name must be a catalogue name, be named as a {token} in the template and equal no
   output_var, bound name or system token.
@@ -1642,7 +1650,9 @@ values, in HashMap order) and then stripped every leftover {x} from the whole re
   included) with brace-free canary values and requires the output equal to the old algorithm's in both key
   orders. A community .focus file that relied on it is unknowable.
 - KEPT AS DEFENCE IN DEPTH: seeding::clean (braces to parentheses on seeded store names), the
-  personal_fact_bridge brace neutralization, StoreTokens::apply (which decides which seeds a step is given).
+  personal_fact_bridge brace neutralization, insert_projected_fields (the same clean_braces on every
+  projected value, both renders, items.id=933), StoreTokens::apply (which decides which seeds a step is
+  given).
 - TESTS: render_template_never_re_expands_a_value, the_local_render_..., the_external_render_...,
   a_value_arrives_cleaned_and_never_expands_in_the_starter (the starter test cannot fail from the engine alone
   because clean() runs first), single_pass_against_the_pre_932_algorithm_by_class (every class of difference
@@ -1694,6 +1704,9 @@ Two reads that keyed off the run ceiling, and three gaps found with them, built 
   variables it consumed, so the legacy gate approves what it would block at severity 3; the outbound review
   at B screens the prompt with a placeholder severity (REVIEW_SEVERITY 1, not authoritative), so a prompt with
   no Privacy Filter span passes. The path is not ungated, but the severity-3 rule never sees A's label.
+  Since items.id=933 a bridged personal VALUE that A or C carries into B's prompt is caught by B's carry
+  scan (raised in the review, or removed when not_permitted), within its text-match limits; the severity
+  label is still lost.
   PRODUCER-SEVERITY INHERITANCE (rule 1 of handoff_render::inherit_from_inputs, for external model steps) is
   DEFERRED: an inherited 3 or 4 would block at Gate 3 (legacy) or force High review (Privacy Filter), label
   the output medical or financial and let the legacy output scan block export, so it needs its own decision.
@@ -1783,6 +1796,71 @@ stops if all content kept private").
   (e) Not verified: a full Step 13 resume against the real filter (needs the running app; no
       shipped Focus reaches it), Windows and macOS.
 
+## Local render of personal fields and the carry scan (items.id=933, privacy surface review 2026-11-20 F4, Jason's ruling option A, Chat-PM M2)
+A local step that declares a personal field now receives it, as an external step does; and since that
+lets a local step's output carry a raw value into a hosted step, the hosted step scans what it carries.
+- THE RENDER (unit 1, executor.rs). execute_once reads the step's disclosure buffer ONCE, before the
+  `treatment.hosted` branch, and both render_prompt (local) and render_prompt_with_disclosure (external)
+  insert it through ONE helper, insert_projected_fields (a scan pins one inserter, called by both). The
+  buffer is Gate 1's approved values filtered to the step's declared field_requirements (the declared-field
+  filter stays the control: an undeclared {field} still renders empty on both paths). At abstraction tier 1
+  that is the RAW value whatever the policy (not_permitted, omit, a validator-failed value and a confirmed
+  cross-Persona fact included: "Raw values permitted at Tier 1", accepted). Order: output_vars, then the
+  projected fields, then the system tokens, then the store seeds, so a field wins over an output_var of the
+  same name and a system token wins over a field. RIDER: there is NO LOAD lint against such a collision for a
+  LOCAL step (an external step's field names are linted, items.id=931); the precedence above is the rule.
+  Values are brace-cleaned with personal_fact_bridge::clean_braces on both paths (defence in depth;
+  production values are already clean at the bridge).
+- WHAT CHANGED MEANING (no code change): the local step's gate1_pass row (fields_shared now says what the
+  model saw), the snapshot's disclosure buffers (they now hold values the step used; the buffer is rewritten
+  before it is read in every attempt, so a restored one is never rendered), resume staleness (counting buffer
+  keys as used is now correct, not over-inclusive), Gate 2 (shared fields are excluded from its scan, so no
+  new flags). Step severity was and is scored from the field names the template mentions.
+- A BRIDGED FIELD CAN BE SEVERITY 3: a fact whose STORED sensitivity is medical or financial bridges at that
+  sensitivity (effective_sensitivity, severity_of), not_permitted at tiers 2 and 3. Its local step was already
+  scored 3; it now also holds the value, and Gate 3 at the next promotion acts on that severity as before.
+- THE CARRY SCAN (unit 2, conductor/carry_scan.rs, pure; called in execute_once for every step with
+  `treatment.hosted` and no bound API Chat run, after the render and before the outbound review):
+  - TRIGGER: gate2::scan_matches (Gate 2's rule: case-insensitive substring, at least 4 characters) over each
+    CARRIED value the template names (an output variable or {previous_output}; never {user_input}, the
+    projected fields or the seeds). Only bridged fields count (personal_fact_bridge::is_bridged_source).
+    A field this step released RAW is skipped: g1.fields_shared holds only approved values equal to the raw
+    value, so a summarize label is NOT in it and its raw value carried in is raised (tested). A pass field
+    the step did not declare is raised (over-asking).
+  - ACTION by the field's policy at the step's tier (tier 2 when the abstraction tier is 1): not_permitted ->
+    every occurrence is replaced by "[removed]" BEFORE the review, a disclosure row event
+    carry_not_permitted_removed names the fields (never a value; fatal on write failure), and it is never
+    shown, so no answer releases it; anything else -> every occurrence becomes a gate3::SourceSpan (category
+    qr_personal_field, label "Personal detail", placeholder wording Chat-BRAND's) whose suggestion is the
+    field's abstraction at that tier when it differs from the raw value (a summarize label), else none.
+  - EVERY OCCURRENCE in the final prompt is covered, THE USER'S OWN TYPED TEXT INCLUDED: a user-typed
+    occurrence of a flagged value is raised (or removed) too, because leaving one would send the value
+    anyway. Overlapping values: the longest wins.
+  - THE REVIEW: ReviewInput.source_spans -> ReviewScanner::scan -> gate3's new `source_spans` argument,
+    merged into the filter's spans BEFORE the partition (gate3::merge_source_spans; a filter span overlapping
+    one is dropped), so remembered answers, the step_reviews record, the consent request and the removal take
+    the ordinary path; a hit is an asked span, never a new park code. Only the outbound review passes any
+    (scan only_the_outbound_review_passes_source_spans; every other gate3 caller passes &[]). Check 2c: a
+    source span off the Privacy Filter path blocks (gate3_source_spans_unreviewed); the outbound review parks
+    first when the filter is unavailable, so this is a backstop.
+  - REMEMBERED ANSWERS: a carried span has no Layer-1 fact hash; Layer 3 resolves it to the bridged fact
+    when its text equals the stored value EXACTLY (trimmed), so a standing or in-run answer on that fact
+    applies. Another case ("LEEDS" for "Leeds") is asked again (errs toward asking).
+  - LIMITS, stated plainly: a text match MISSES A PARAPHRASE ("the Leeds area" is caught, "West Yorkshire" is
+    not); a value UNDER 4 CHARACTERS is not scanned and so not caught; a SUBSTRING inside a longer word is
+    caught; case folding is per character. Out of scope: device and group facts and their derived names
+    (items.id=924 builds source-flagged spans in general), persona_context, a cb-15 starter (copy-time review
+    only), the severity label (the A -> C -> B gap above).
+- TESTS: a_local_step_renders_its_declared_personal_field (red "Location:", green "Location: Leeds"), the
+  undeclared twin, both renders' precedence, a_summarize_field_whose_raw_value_is_carried_is_raised_in_the_review,
+  a_field_the_step_released_raw_or_nothing_carried_raises_nothing, a_not_permitted_carried_value_is_removed_and_never_shown,
+  a_value_a_local_step_carries_still_meets_gate_3_and_the_outbound_review (plan item 4: Gate 3 at the local
+  step approves at severity 2, the hosted step raises the carried value), carry_scan's pure tests, gate3's
+  merge, suggestion, Check 2c, remembered-answer and scan tests; mutations M1 to M5 and N1 to N10 killed.
+- NOT VERIFIED: the merge inside gate3_with_pf against the real filter (it needs an app handle: tested
+  through its pure parts and the forced scanner), the live app hand check (research-and-buy with a stored
+  city, role-assessment with a stored employer, industry and job title), Windows and macOS.
+
 ## Naming Architecture — term map
 
 Most legacy terms are retired; canonical terms are used in all new code.
@@ -1848,8 +1926,12 @@ Design sessions must all complete before shared infrastructure build begins.
   (raw at tier 1, abstracted from tier 2 up), encrypted at rest in the persona's outputs.db
   (decisions.id=865). Parked runs' snapshots are swept (items.id=681).
 - Step 6: PG_GATE_1 writes approved/abstracted fields to step_disclosure_buffer
-  Step 8: reads from step_disclosure_buffer for Tier 2+ (NEVER from PersonalTrack)
-  Raw personal values never appear in external prompt strings.
+  Step 8: BOTH renders read the step's step_disclosure_buffer (NEVER PersonalTrack): raw at
+  abstraction tier 1 for a local step, abstracted from tier 2 up (items.id=933; before it the local
+  render did not read the buffer and a declared field rendered empty).
+  Raw personal values never reach an external prompt through the buffer above tier 1. A bridged value
+  an earlier step's output carries into a hosted prompt is caught by the carry scan, within its limits
+  (items.id=933, "Local render of personal fields and the carry scan").
 - Tier 3 is a terminal boundary — execution loop breaks, status=awaiting_user.
 - Account creation order (items.id=614, 630): an account row is written only after its first per-account databases (integration_keys.db, cloud_chat_cookies.db) exist, and a failed first-run bootstrap removes users/<user_id>/ and leaves no row. A later login recreates a missing first database under the same data key.
 - focus_run created as status=initializing, promoted to running after Phase 3 only.
