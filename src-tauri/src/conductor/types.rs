@@ -614,7 +614,9 @@ impl Default for TaskTrack {
 // ---------------------------------------------------------------------------
 
 /// A single cross-tier content promotion approved by PG_GATE_3.
-/// Immutable record — provides audit trail for all promotions.
+/// Immutable record — provides audit trail for all promotions. An AUDIT record
+/// only (items.id=923, F3): it holds the step's output as the model wrote it,
+/// nothing in production reads it back, and the next step does not receive it.
 /// Python oracle: frozen=True dataclass.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromotedContentEntry {
@@ -636,7 +638,9 @@ pub struct PromotedContentEntry {
 ///   a completed step's buffer are what the resume staleness check treats as used
 ///   (items.id=681).
 ///
-/// promotions: append-only. PG_GATE_3 approved content entries.
+/// promotions: append-only. PG_GATE_3 approved content entries, an audit record
+///   carried in the checkpoint (items.id=923, F3: no production reader; a Gate 3
+///   approval or span decision does not change what the next step receives).
 ///   Fields are private to enforce append-only and replacement semantics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharedStateTrack {
@@ -693,6 +697,7 @@ impl SharedStateTrack {
     }
 
     /// Return the most recent promoted content for a given key, or None.
+    /// Tests only today: no production code reads a promotion (items.id=923, F3).
     /// Python oracle: get_promoted()
     pub fn get_promoted(&self, content_key: &str) -> Option<&str> {
         self.promotions

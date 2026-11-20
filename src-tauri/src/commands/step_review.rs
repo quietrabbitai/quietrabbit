@@ -319,7 +319,14 @@ mod tests {
             prompt: PROMPT,
             provider_id: Some("prov"),
         };
-        match review_prompt(&mut c, &scanner, &input).await {
+        match review_prompt(
+            &mut c,
+            &scanner,
+            &crate::conductor::step_review::ReviewReuse::default(),
+            &input,
+        )
+        .await
+        {
             ReviewDecision::Park(Park::Pending { review_id }) => review_id,
             other => panic!("expected a pending review, got {other:?}"),
         }

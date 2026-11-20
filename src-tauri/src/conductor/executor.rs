@@ -379,6 +379,7 @@ impl StepExecutor {
                 Arc::new(retry_wait::TauriRetryWaitNotice::new(h.clone()))
                     as Arc<dyn RetryWaitNotice>
             }),
+            review_reuse: step_review::ReviewReuse::default(),
         };
         retry_loop(&mut attempt, &ctx, failure_handler, random_ms).await
     }
@@ -409,6 +410,9 @@ impl StepExecutor {
         scheduler: &Arc<ConductorScheduler>,
         app_handle: Option<&tauri::AppHandle<tauri::Wry>>,
         pool: &sqlx::SqlitePool,
+        // items.id=923 (F13): the reviews this retry loop produced or applied;
+        // only these are reused (see step_review::ReviewReuse).
+        review_reuse: &step_review::ReviewReuse,
     ) -> Result<Option<FailureResult>, ConductorError> {
         // -- Floor invariants (ADR-012 Amendment 3, D6-348) --
         // Explicit Err() returns — never debug_assert!, which is stripped in release builds.
@@ -739,6 +743,7 @@ impl StepExecutor {
                 &prompt,
                 privacy_gateway,
                 app_handle,
+                review_reuse,
             )
             .await
             {
@@ -1144,6 +1149,10 @@ impl StepExecutor {
                     }));
                 }
 
+                // items.id=923 (F3): an audit record only. Nothing reads promotions
+                // in production (they are carried in the checkpoint), and neither the
+                // approval nor any span decision changes what the next step receives;
+                // a hosted next step is reviewed again by the outbound review.
                 if g3.approved {
                     shared_state.promote_content(
                         &ctx.step.action_id,
@@ -2232,6 +2241,9 @@ struct RealAttempt<'a, L: DisclosureLogger> {
     /// items.id=817: where the retry loop announces a hosted wait. None when
     /// there is no app handle (tests, headless runs).
     wait_notice: Option<Arc<dyn RetryWaitNotice>>,
+    /// items.id=923 (F13): this retry loop's reviews. A new loop (a resume after a
+    /// park) starts empty, so an earlier final review is not reused across a park.
+    review_reuse: step_review::ReviewReuse,
 }
 
 impl<L: DisclosureLogger> StepAttempt for RealAttempt<'_, L> {
@@ -2255,6 +2267,7 @@ impl<L: DisclosureLogger> StepAttempt for RealAttempt<'_, L> {
             self.scheduler,
             self.app_handle,
             self.pool,
+            &self.review_reuse,
         )
     }
 }
@@ -8239,6 +8252,7 @@ mod tests {
                 &Arc::new(ConductorScheduler::new()),
                 None,
                 pool,
+                &step_review::ReviewReuse::default(),
             )
             .await;
         (out, track, gateway)
@@ -9297,6 +9311,36 @@ mod tests {
         assert!(!ctx_struct.contains("treatment"));
     }
 
+    /// items.id=923 (F13): the reviews a step may reuse live exactly one retry
+    /// loop. The set is built once, in execute() where RealAttempt is made for
+    /// retry_loop, and every attempt of that loop gets the same one; nothing else
+    /// builds or holds one, so a resume (a new execute) starts empty.
+    #[test]
+    fn the_review_reuse_set_lives_one_retry_loop() {
+        let src = include_str!("executor.rs");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_eq!(code.matches("ReviewReuse::default()").count(), 1);
+        let execute = code
+            .split("let mut attempt = RealAttempt {")
+            .nth(1)
+            .and_then(|r| r.split("retry_loop(&mut attempt").next())
+            .expect("execute builds RealAttempt for retry_loop");
+        assert!(execute.contains("review_reuse: step_review::ReviewReuse::default(),"));
+        let once = code
+            .split("impl<L: DisclosureLogger> StepAttempt for RealAttempt<'_, L> {")
+            .nth(1)
+            .and_then(|r| r.split("fn once(").nth(1))
+            .and_then(|r| r.split("\n    }\n").next())
+            .expect("RealAttempt::once");
+        assert!(once.contains("&self.review_reuse,"));
+        let ctx_struct = code
+            .split("pub struct StepContext {")
+            .nth(1)
+            .and_then(|r| r.split("\n}\n").next())
+            .expect("StepContext");
+        assert!(!ctx_struct.contains("ReviewReuse"));
+    }
+
     /// Every read of the CEILING values in the production code of this file, pinned.
     /// execute_once reads ctx.effective_access for the three pre-selection decisions
     /// only (the bound-run stop, Step 4.5 and select_model); its tier fields only in
@@ -10346,6 +10390,7 @@ mod tests {
                     &Arc::new(ConductorScheduler::new()),
                     None,
                     &pool,
+                    &step_review::ReviewReuse::default(),
                 )
                 .await;
             let _ = out;
@@ -11261,7 +11306,13 @@ mod tests {
                 provider_id: Some("fixture-host-a"),
             };
             assert!(matches!(
-                review_prompt(&mut conn, &scanner, &input).await,
+                review_prompt(
+                    &mut conn,
+                    &scanner,
+                    &crate::conductor::step_review::ReviewReuse::default(),
+                    &input
+                )
+                .await,
                 ReviewDecision::Park(_)
             ));
             sqlx::query(
@@ -11273,7 +11324,13 @@ mod tests {
             .execute(&mut conn)
             .await
             .unwrap();
-            let ReviewDecision::Send(reviewed) = review_prompt(&mut conn, &scanner, &input).await
+            let ReviewDecision::Send(reviewed) = review_prompt(
+                &mut conn,
+                &scanner,
+                &crate::conductor::step_review::ReviewReuse::default(),
+                &input,
+            )
+            .await
             else {
                 panic!("the answered review sends")
             };

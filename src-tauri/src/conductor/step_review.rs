@@ -54,10 +54,15 @@
 //   * same hash, no answer at all (a restart, a closed modal): the review is asked
 //     again, the old row is superseded;
 //   * a changed hash: the old row is superseded and a new review runs.
-// There is no clock TTL. cancel_run supersedes pending rows. The retry loop and a
-// resume reuse a FINAL row with the same run, action and hash: the outbound text
-// is rebuilt from the stored descriptors and the recorded answers and must hash to
-// the stored outbound hash, or a new review runs.
+// There is no clock TTL. cancel_run supersedes pending rows. The retry loop
+// reuses a FINAL row with the same run, action and hash that THIS loop produced or
+// applied (ReviewReuse, items.id=923 F13): the outbound text is rebuilt from the
+// stored descriptors and the recorded answers and must hash to the stored outbound
+// hash, or a new review runs. A resume is a new loop, so a final row from before
+// the park is reviewed again: the standing decisions as they are now apply, and the
+// user's answers in this run come back through gate3's prior-decision partition.
+// (A PENDING review the user answered is still applied on resume with the settled
+// spans recorded when it was scanned.)
 //
 // WHAT IS HELD IN MEMORY ONLY. The text of the flagged spans, so that
 // get_pending_step_review can show a review whose consent_request event the front
@@ -699,11 +704,34 @@ async fn block(
     ReviewDecision::Park(Park::Blocked(reason))
 }
 
+/// items.id=923 (F13): the reviews ONE retry loop produced or applied. A final
+/// review is reused only by the loop that holds its id, so a retry does not ask
+/// or scan again, while a step resumed after a park (a new loop, an empty set)
+/// is reviewed afresh and sees the standing decisions as they are now. Owned by
+/// the executor's RealAttempt, which lives exactly one retry loop; never stored.
+#[derive(Debug, Default)]
+pub struct ReviewReuse(Mutex<Vec<String>>);
+
+impl ReviewReuse {
+    fn record(&self, review_id: &str) {
+        let mut ids = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if !ids.iter().any(|i| i == review_id) {
+            ids.push(review_id.to_owned());
+        }
+    }
+
+    fn allows(&self, review_id: &str) -> bool {
+        let ids = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        ids.iter().any(|i| i == review_id)
+    }
+}
+
 /// Review the rendered prompt of an external step and decide what, if anything,
 /// may be sent. See the module header for every branch.
 pub async fn review_prompt<S: ReviewScanner>(
     conn: &mut SqliteConnection,
     scanner: &S,
+    reuse: &ReviewReuse,
     input: &ReviewInput<'_>,
 ) -> ReviewDecision {
     let sha = sha256_hex(input.prompt);
@@ -715,7 +743,7 @@ pub async fn review_prompt<S: ReviewScanner>(
     };
     if let Some(row) = live {
         if row.prompt_sha == sha {
-            match resume_existing(conn, input, &sha, &row).await {
+            match resume_existing(conn, reuse, input, &sha, &row).await {
                 Existing::Decided(d) => return d,
                 Existing::ReviewAgain => {}
             }
@@ -879,7 +907,7 @@ pub async fn review_prompt<S: ReviewScanner>(
     };
     let (outcome, counts) = derive_outcome(&stored, &[]);
     let out_sha = sha256_hex(&outbound);
-    if store::insert_review(
+    let inserted = store::insert_review(
         conn,
         &NewReview {
             focus_run_id: input.run_id,
@@ -895,10 +923,10 @@ pub async fn review_prompt<S: ReviewScanner>(
             provider_id: input.provider_id,
         },
     )
-    .await
-    .is_err()
-    {
-        return block(conn, input, &sha, BlockReason::RecordUnavailable).await;
+    .await;
+    match inserted {
+        Ok(id) => reuse.record(&id),
+        Err(_) => return block(conn, input, &sha, BlockReason::RecordUnavailable).await,
     }
     log::info!(
         "step_review_clean: run={} action={} prompt_sha={} outcome={} spans={} outbound_sha={}",
@@ -921,6 +949,7 @@ enum Existing {
 /// the user has answered, or ask again.
 async fn resume_existing(
     conn: &mut SqliteConnection,
+    reuse: &ReviewReuse,
     input: &ReviewInput<'_>,
     sha: &str,
     row: &StepReviewRow,
@@ -939,9 +968,15 @@ async fn resume_existing(
     };
 
     if row.outcome.is_final() {
-        // The retry loop, or a resume after the review was applied: no new
-        // review, no second question. The text is rebuilt and must hash to what
-        // was released, or the review runs again.
+        // The retry loop: no new review, no second question. Only a review THIS
+        // loop produced or applied is reused (items.id=923, F13): after a park the
+        // step is reviewed again, so the standing decisions as they are now apply
+        // (the user's same-run answers come back through gate3's partition). The
+        // text is rebuilt and must hash to what was released, or the review runs
+        // again.
+        if !reuse.allows(&row.review_id) {
+            return Existing::ReviewAgain;
+        }
         let rebuilt = outbound_for(input.prompt, &row.spans, &answers);
         return match rebuilt {
             Some(text) => {
@@ -1004,6 +1039,7 @@ async fn resume_existing(
     {
         Ok(true) => {
             drop_held(&row.review_id);
+            reuse.record(&row.review_id);
             log::info!(
                 "step_review_applied: run={} action={} review={} reused=false outcome={} \
                  asked={} released={} generalized={} removed={} outbound_sha={}",
@@ -1041,6 +1077,7 @@ pub async fn review_hosted_step<L: DisclosureLogger>(
     prompt: &str,
     gateway: &PrivacyGateway<L>,
     app_handle: Option<&tauri::AppHandle<tauri::Wry>>,
+    reuse: &ReviewReuse,
 ) -> Result<ReviewedPrompt, FailureResult> {
     if let Some(bound) = &ctx.bound {
         return Ok(ReviewedPrompt::for_bound_run(bound, prompt));
@@ -1075,7 +1112,7 @@ pub async fn review_hosted_step<L: DisclosureLogger>(
                 ));
             }
         };
-    match review_prompt(&mut conn, &scanner, &input).await {
+    match review_prompt(&mut conn, &scanner, reuse, &input).await {
         ReviewDecision::Send(p) => Ok(p),
         ReviewDecision::Park(park) => Err(park_result(&park, &ctx.step.action_id, &ctx.focus_id)),
     }
@@ -1520,8 +1557,9 @@ mod tests {
     #[tokio::test]
     async fn a_clean_prompt_is_sent_as_it_is_and_recorded_clean() {
         let mut c = conn().await;
+        let r = ReviewReuse::default();
         let scanner = FakeScanner::clean();
-        let out = sent(review_prompt(&mut c, &scanner, &input(PROMPT)).await);
+        let out = sent(review_prompt(&mut c, &scanner, &r, &input(PROMPT)).await);
         assert_eq!(out, PROMPT);
         let r = rows(&mut c).await;
         assert_eq!(r.len(), 1);
@@ -1539,11 +1577,12 @@ mod tests {
     #[tokio::test]
     async fn standing_decisions_that_settle_every_span_proceed_with_no_park() {
         let mut c = conn().await;
+        let r = ReviewReuse::default();
         let scanner = FakeScanner::standing(vec![
             settled_span(PROMPT, "Ann Smith", "generalize", Some("[person]")),
             settled_span(PROMPT, "12 Oak Road", "keep_private", None),
         ]);
-        let out = sent(review_prompt(&mut c, &scanner, &input(PROMPT)).await);
+        let out = sent(review_prompt(&mut c, &scanner, &r, &input(PROMPT)).await);
         assert_eq!(out, "Write to [person] at [removed] about the invoice");
         let r = rows(&mut c).await;
         assert_eq!(r[0].outcome, ReviewOutcome::StandingApplied);
@@ -1563,8 +1602,9 @@ mod tests {
     #[tokio::test]
     async fn flagged_spans_park_the_step_with_a_pending_row_and_held_text() {
         let mut c = conn().await;
+        let r = ReviewReuse::default();
         let scanner = FakeScanner::pending(vec![asked_span("s-park", PROMPT, "Ann Smith")]);
-        let park = parked(review_prompt(&mut c, &scanner, &input(PROMPT)).await);
+        let park = parked(review_prompt(&mut c, &scanner, &r, &input(PROMPT)).await);
         let Park::Pending { review_id } = park else {
             panic!("expected pending")
         };
@@ -1587,9 +1627,10 @@ mod tests {
     #[tokio::test]
     async fn an_unavailable_filter_parks_the_step_and_calls_nothing() {
         let mut c = conn().await;
+        let r = ReviewReuse::default();
         let mut scanner = FakeScanner::clean();
         scanner.available = false;
-        let p = parked(review_prompt(&mut c, &scanner, &input(PROMPT)).await);
+        let p = parked(review_prompt(&mut c, &scanner, &r, &input(PROMPT)).await);
         assert_eq!(p, Park::FilterUnavailable);
         assert_eq!(
             scanner.calls(),
@@ -1607,9 +1648,10 @@ mod tests {
     async fn a_prompt_over_the_cap_is_refused_before_any_scan() {
         use crate::conductor::privacy::MAX_REVIEW_BYTES;
         let mut c = conn().await;
+        let r = ReviewReuse::default();
         let scanner = FakeScanner::clean();
         let long = "a".repeat(MAX_REVIEW_BYTES + 1);
-        let p = parked(review_prompt(&mut c, &scanner, &input(&long)).await);
+        let p = parked(review_prompt(&mut c, &scanner, &r, &input(&long)).await);
         assert_eq!(p, Park::TooLong);
         assert_eq!(scanner.calls(), 0, "no chunk is scanned");
         let r = rows(&mut c).await;
@@ -1619,8 +1661,9 @@ mod tests {
 
         // At the cap it is reviewed as usual.
         let mut c = conn().await;
+        let r = ReviewReuse::default();
         let at_cap = "a".repeat(MAX_REVIEW_BYTES);
-        let d = review_prompt(&mut c, &scanner, &input(&at_cap)).await;
+        let d = review_prompt(&mut c, &scanner, &r, &input(&at_cap)).await;
         assert!(matches!(d, ReviewDecision::Send(_)), "{d:?}");
         assert_eq!(scanner.calls(), 1);
     }
@@ -1628,9 +1671,10 @@ mod tests {
     #[tokio::test]
     async fn no_app_handle_parks_the_step_and_calls_nothing() {
         let mut c = conn().await;
+        let r = ReviewReuse::default();
         let mut scanner = FakeScanner::clean();
         scanner.has_handle = false;
-        let p = parked(review_prompt(&mut c, &scanner, &input(PROMPT)).await);
+        let p = parked(review_prompt(&mut c, &scanner, &r, &input(PROMPT)).await);
         assert_eq!(p, Park::Blocked(BlockReason::NoAppHandle));
         assert_eq!(scanner.calls(), 0, "without a handle gate3 would not scan");
     }
@@ -1645,7 +1689,8 @@ mod tests {
         ];
         for (scanner, reason) in cases {
             let mut c = conn().await;
-            let p = parked(review_prompt(&mut c, &scanner, &input(PROMPT)).await);
+            let r = ReviewReuse::default();
+            let p = parked(review_prompt(&mut c, &scanner, &r, &input(PROMPT)).await);
             assert_eq!(p, Park::Blocked(reason), "{reason:?}");
             let r = rows(&mut c).await;
             assert_eq!(r[0].outcome, ReviewOutcome::Blocked);
@@ -1668,8 +1713,9 @@ mod tests {
         mid.original_text = "x".to_owned(); // bytes 1..4 start inside 'É': get() is None
         for (p, span) in [(PROMPT, past), (PROMPT, wrong), (prompt, mid)] {
             let mut c = conn().await;
+            let r = ReviewReuse::default();
             let scanner = FakeScanner::pending(vec![span]);
-            let parked = parked(review_prompt(&mut c, &scanner, &input(p)).await);
+            let parked = parked(review_prompt(&mut c, &scanner, &r, &input(p)).await);
             assert_eq!(parked, Park::Blocked(BlockReason::Unappliable));
             assert!(
                 store::pending_review_for_run(&mut c, RUN)
@@ -1684,8 +1730,9 @@ mod tests {
     #[tokio::test]
     async fn a_pending_review_with_nothing_to_ask_is_blocked_not_parked_for_good() {
         let mut c = conn().await;
+        let r = ReviewReuse::default();
         let scanner = FakeScanner::pending(vec![]);
-        let p = parked(review_prompt(&mut c, &scanner, &input(PROMPT)).await);
+        let p = parked(review_prompt(&mut c, &scanner, &r, &input(PROMPT)).await);
         assert_eq!(p, Park::Blocked(BlockReason::Indeterminate));
         assert!(
             store::pending_review_for_run(&mut c, RUN)
@@ -1699,12 +1746,13 @@ mod tests {
     #[tokio::test]
     async fn an_unreadable_record_parks_the_step_and_calls_nothing() {
         let mut c = conn().await;
+        let r = ReviewReuse::default();
         sqlx::query("DROP TABLE step_reviews")
             .execute(&mut c)
             .await
             .unwrap();
         let scanner = FakeScanner::clean();
-        let p = parked(review_prompt(&mut c, &scanner, &input(PROMPT)).await);
+        let p = parked(review_prompt(&mut c, &scanner, &r, &input(PROMPT)).await);
         assert_eq!(p, Park::Blocked(BlockReason::RecordUnavailable));
         assert_eq!(scanner.calls(), 0);
     }
@@ -1712,7 +1760,7 @@ mod tests {
     // -- park and resume ----------------------------------------------------------
 
     async fn park_one(c: &mut SqliteConnection, scanner: &FakeScanner) -> String {
-        match parked(review_prompt(c, scanner, &input(PROMPT)).await) {
+        match parked(review_prompt(c, scanner, &ReviewReuse::default(), &input(PROMPT)).await) {
             Park::Pending { review_id } => review_id,
             other => panic!("expected pending, got {other:?}"),
         }
@@ -1721,6 +1769,7 @@ mod tests {
     #[tokio::test]
     async fn a_resume_applies_the_recorded_answers_server_side() {
         let mut c = conn().await;
+        let r = ReviewReuse::default();
         let scanner = FakeScanner::pending_with_auto(
             vec![
                 asked_span("s-a", PROMPT, "Ann Smith"),
@@ -1744,7 +1793,7 @@ mod tests {
             ],
         )
         .await;
-        let out = sent(review_prompt(&mut c, &scanner, &input(PROMPT)).await);
+        let out = sent(review_prompt(&mut c, &scanner, &r, &input(PROMPT)).await);
         assert_eq!(out, "Write to [person] at 12 Oak Road about the [document]");
         assert_eq!(
             scanner.calls(),
@@ -1775,11 +1824,12 @@ mod tests {
     #[tokio::test]
     async fn a_review_parked_before_a_restart_is_answered_after_it() {
         let mut c = conn().await;
+        let r = ReviewReuse::default();
         let scanner = FakeScanner::pending(vec![asked_span("s-a", PROMPT, "Ann Smith")]);
         let id = park_one(&mut c, &scanner).await;
         record(&mut c, &[answer("s-a", "generalize", Some("a client"))]).await;
         drop_held(&id); // the process memory is gone
-        let out = sent(review_prompt(&mut c, &scanner, &input(PROMPT)).await);
+        let out = sent(review_prompt(&mut c, &scanner, &r, &input(PROMPT)).await);
         assert_eq!(out, "Write to a client at 12 Oak Road about the invoice");
         assert_eq!(scanner.calls(), 1, "no second review");
         assert_eq!(rows(&mut c).await[0].outcome, ReviewOutcome::Edited);
@@ -1788,13 +1838,14 @@ mod tests {
     #[tokio::test]
     async fn an_unanswered_span_is_removed_and_never_sent() {
         let mut c = conn().await;
+        let r = ReviewReuse::default();
         let scanner = FakeScanner::pending(vec![
             asked_span("s-a", PROMPT, "Ann Smith"),
             asked_span("s-b", PROMPT, "12 Oak Road"),
         ]);
         park_one(&mut c, &scanner).await;
         record(&mut c, &[answer("s-a", "release_original", None)]).await;
-        let out = sent(review_prompt(&mut c, &scanner, &input(PROMPT)).await);
+        let out = sent(review_prompt(&mut c, &scanner, &r, &input(PROMPT)).await);
         assert_eq!(out, "Write to Ann Smith at [removed] about the invoice");
         assert!(!out.contains("Oak"));
         assert_eq!(rows(&mut c).await[0].outcome, ReviewOutcome::Redacted);
@@ -1818,6 +1869,7 @@ mod tests {
     #[tokio::test]
     async fn a_changed_prompt_is_a_new_review_never_the_old_answer() {
         let mut c = conn().await;
+        let r = ReviewReuse::default();
         let scanner = FakeScanner::pending(vec![asked_span("s-a", PROMPT, "Ann Smith")]);
         park_one(&mut c, &scanner).await;
         record(&mut c, &[answer("s-a", "release_original", None)]).await;
@@ -1825,7 +1877,7 @@ mod tests {
         // The text changed between the park and the resume.
         let changed = "Write to Ann Smith at 12 Oak Road about the refund";
         let scanner2 = FakeScanner::pending(vec![asked_span("s-new", changed, "Ann Smith")]);
-        let p = parked(review_prompt(&mut c, &scanner2, &input(changed)).await);
+        let p = parked(review_prompt(&mut c, &scanner2, &r, &input(changed)).await);
         assert!(
             matches!(p, Park::Pending { .. }),
             "the old answer is not applied"
@@ -1839,24 +1891,64 @@ mod tests {
     #[tokio::test]
     async fn a_retry_reuses_an_applied_review_and_never_scans_again() {
         let mut c = conn().await;
+        let r = ReviewReuse::default();
         let scanner = FakeScanner::pending(vec![asked_span("s-a", PROMPT, "Ann Smith")]);
         park_one(&mut c, &scanner).await;
         record(&mut c, &[answer("s-a", "keep_private", None)]).await;
-        let first = sent(review_prompt(&mut c, &scanner, &input(PROMPT)).await);
-        let again = sent(review_prompt(&mut c, &scanner, &input(PROMPT)).await);
-        let third = sent(review_prompt(&mut c, &scanner, &input(PROMPT)).await);
+        let first = sent(review_prompt(&mut c, &scanner, &r, &input(PROMPT)).await);
+        let again = sent(review_prompt(&mut c, &scanner, &r, &input(PROMPT)).await);
+        let third = sent(review_prompt(&mut c, &scanner, &r, &input(PROMPT)).await);
         assert_eq!(first, again);
         assert_eq!(first, third);
         assert_eq!(scanner.calls(), 1, "neither skipped nor repeated");
         assert_eq!(rows(&mut c).await.len(), 1);
     }
 
+    /// items.id=923 (F13): a final review is reused only by the retry loop that
+    /// produced it. After a park (a new loop) the step is reviewed again, so a
+    /// standing decision the user tightened while the run was parked applies.
+    #[tokio::test]
+    async fn a_final_review_is_not_reused_across_a_park() {
+        let mut c = conn().await;
+        let first_loop = ReviewReuse::default();
+        let released = FakeScanner::standing(vec![settled_span(
+            PROMPT,
+            "Ann Smith",
+            "release_original",
+            None,
+        )]);
+        let out = sent(review_prompt(&mut c, &released, &first_loop, &input(PROMPT)).await);
+        assert!(out.contains("Ann Smith"));
+        // (the run parks here, e.g. at the spend gate; the user then remembers
+        // "keep Ann Smith private" in another chat)
+
+        let resumed_loop = ReviewReuse::default();
+        let kept = FakeScanner::standing(vec![settled_span(
+            PROMPT,
+            "Ann Smith",
+            "keep_private",
+            None,
+        )]);
+        let out = sent(review_prompt(&mut c, &kept, &resumed_loop, &input(PROMPT)).await);
+        assert!(
+            !out.contains("Ann Smith"),
+            "the current decision applies: {out}"
+        );
+        assert_eq!(kept.calls(), 1, "reviewed again, not reused");
+
+        // Inside that loop a retry reuses its own review and scans nothing more.
+        let again = sent(review_prompt(&mut c, &kept, &resumed_loop, &input(PROMPT)).await);
+        assert_eq!(again, out);
+        assert_eq!(kept.calls(), 1);
+    }
+
     #[tokio::test]
     async fn a_clean_review_is_reused_for_a_retry_too() {
         let mut c = conn().await;
+        let r = ReviewReuse::default();
         let scanner = FakeScanner::clean();
-        sent(review_prompt(&mut c, &scanner, &input(PROMPT)).await);
-        sent(review_prompt(&mut c, &scanner, &input(PROMPT)).await);
+        sent(review_prompt(&mut c, &scanner, &r, &input(PROMPT)).await);
+        sent(review_prompt(&mut c, &scanner, &r, &input(PROMPT)).await);
         assert_eq!(scanner.calls(), 1);
         assert_eq!(rows(&mut c).await.len(), 1);
     }
@@ -1864,15 +1956,16 @@ mod tests {
     #[tokio::test]
     async fn a_reused_review_must_still_hash_to_what_was_released() {
         let mut c = conn().await;
+        let r = ReviewReuse::default();
         let scanner = FakeScanner::clean();
-        sent(review_prompt(&mut c, &scanner, &input(PROMPT)).await);
+        sent(review_prompt(&mut c, &scanner, &r, &input(PROMPT)).await);
         // The stored outbound hash no longer matches what the descriptors rebuild.
         sqlx::query("UPDATE step_reviews SET outbound_sha = ?")
             .bind("f".repeat(64))
             .execute(&mut c)
             .await
             .unwrap();
-        sent(review_prompt(&mut c, &scanner, &input(PROMPT)).await);
+        sent(review_prompt(&mut c, &scanner, &r, &input(PROMPT)).await);
         assert_eq!(
             scanner.calls(),
             2,
@@ -1883,6 +1976,7 @@ mod tests {
     #[tokio::test]
     async fn answers_that_cannot_be_applied_block_the_pending_review() {
         let mut c = conn().await;
+        let r = ReviewReuse::default();
         let scanner = FakeScanner::pending(vec![asked_span("s-a", PROMPT, "Ann Smith")]);
         let id = park_one(&mut c, &scanner).await;
         record(&mut c, &[answer("s-a", "release_original", None)]).await;
@@ -1898,7 +1992,7 @@ mod tests {
             .execute(&mut c)
             .await
             .unwrap();
-        let p = parked(review_prompt(&mut c, &scanner, &input(PROMPT)).await);
+        let p = parked(review_prompt(&mut c, &scanner, &r, &input(PROMPT)).await);
         assert_eq!(p, Park::Blocked(BlockReason::Unappliable));
         let r = rows(&mut c).await;
         assert_eq!(r[0].outcome, ReviewOutcome::Blocked);
@@ -1908,13 +2002,14 @@ mod tests {
     #[tokio::test]
     async fn a_refused_review_is_history_and_sends_nothing() {
         let mut c = conn().await;
+        let r = ReviewReuse::default();
         let scanner = FakeScanner::pending(vec![asked_span("s-a", PROMPT, "Ann Smith")]);
         let id = park_one(&mut c, &scanner).await;
         // The user refused (and answered) in another window while this attempt was
         // about to resume.
         record(&mut c, &[answer("s-a", "release_original", None)]).await;
         assert!(store::refuse_pending_review(&mut c, &id).await.unwrap());
-        let p = parked(review_prompt(&mut c, &scanner, &input(PROMPT)).await);
+        let p = parked(review_prompt(&mut c, &scanner, &r, &input(PROMPT)).await);
         assert!(
             matches!(p, Park::Pending { .. }),
             "the refused review is not reused: a new review asks again"

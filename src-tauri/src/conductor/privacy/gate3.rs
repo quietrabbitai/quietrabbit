@@ -39,6 +39,17 @@
 //       - severity >= 3 AND target_tier >= 2 → gate3_sensitivity_block + blocked
 //       - Otherwise → gate3_promotion_approved + approved
 //
+// WHAT A GATE 3 RESULT CHANGES (items.id=923, F3). In the executor's Step 13 only
+// `blocked` (the step fails) and `pending_consent` (the run parks for the review)
+// have an effect. An approval, the user's span decisions and the auto_resolved
+// spans do NOT alter the text the next step receives: the next step renders the
+// producer's output variable or {previous_output} as the model wrote it. The
+// "promotion" Step 13 records (SharedStateTrack::promote_content) is an audit
+// record carried in the checkpoint, with no production reader; it is not a
+// redacted hand-over. A hosted next step is reviewed again by the outbound review
+// (step_review.rs), which applies the decisions to the text it sends; a cb-15
+// starter has only the copy-time review.
+//
 // D6-362: PG_GATE_3 fires unconditionally when the just-completed step's own severity > 0 AND
 // content is about to cross a tier boundary. Fallback path preserves existing
 // golden-vector behavior for builds where Privacy Filter library is not compiled in.
@@ -668,7 +679,10 @@ async fn gate3_with_pf<L: DisclosureLogger>(
     Ok(Gate3Result {
         pending_consent: true,
         // items.id=501 slice 2: the spans NOT in this payload because they
-        // were silently resolved -- the caller must apply them too.
+        // were silently resolved. A caller that SENDS the text (the outbound
+        // review, API Chat) applies them with the user's answers. The executor's
+        // Step 13 does not: a Gate 3 decision changes nothing the next step
+        // receives (items.id=923, F3; see the header).
         auto_resolved,
         review_spans,
         ..Gate3Result::default()

@@ -55,8 +55,11 @@
 //   "per-session, non-persisted") -- there is no submit_ command here writing
 //   a decision record, unlike the other consent commands in this file.
 //
-// All commands are fire-and-respond: lifecycle checks consent_decisions when
-// the run is resumed. No direct signalling into the background task.
+// All commands are fire-and-respond: no direct signalling into the background
+// task. What a resumed run reads (items.id=923, F2 and F3): the element_consent
+// rows, through gate3's prior-decision partition (by run and fact key) and the
+// outbound review (by span id). The run-level decision_type 'gate3' row that
+// submit_consent_decision writes is NOT read by lifecycle or the executor.
 // (get_pending_cross_persona_confirmations is a plain read query -- no
 // consent_decisions write, since the decision it informs is carried as data
 // into submit_focus_run's request rather than persisted.)
