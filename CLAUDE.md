@@ -1,5 +1,13 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: November 20, 2026 (items.id=888 pass 1: new "Run failure, resume claim and post-output
+# Last updated: November 20, 2026 (items.id=888 pass 2: new "Resume state, archive hook and store
+# sweeps" section; the pass 1 section's "Pass 2 is NOT built" line; and the older lines pass 2 made
+# false: under "Model blocks" the user_input bullet and the store-writer-on-resume line; under "Privacy
+# treatment of a step attempt" the GATE 3 look-ahead line; under "Per-pass artifact store" RETENTION
+# AND PURGE; under "Launch questions" RESUME, ANSWER STORE's last sentence and NOT BUILT; under "Run
+# plan" the memory-home CLEARED line, known behaviours 3 and 7 and the items.id=888 and 913 pending
+# pointers; under "Parked-run retention" NOT BUILT; under "Focus-owned entities" the items.id=888
+# sentence; nothing else.).
+# Before that, November 20, 2026 (items.id=888 pass 1: new "Run failure, resume claim and post-output
 # runs" section; under "Parked-run retention" the opening "failed delete them at once" claim (false for
 # the error path until 888 stage 1), the HANDLING line that said resume_execution writes `running` and a
 # pointer to the post-output sweep; the user_input bullet under "Model blocks"
@@ -418,13 +426,13 @@ with no requirement still goes through select_model.
   (output_store::USER_INPUT_CLEARED_STATUSES; the last since items.id=888, F8) and is not
   written for a latched one-time chat. A run
   parked and never finished keeps it until the retention sweep expires it (items.id=681,
-  see "Parked-run retention and resume staleness": it clears both input columns) or
-  items.id=888 clears it.
+  see "Parked-run retention and resume staleness": it clears both input columns) or the
+  chat is archived (items.id=888's archive hook clears it on every run of the chat).
 - Resuming a requires_user_handoff step re-parks it (pinned by a characterization
   test in lifecycle.rs). items.id=387 does NOT change this: the manual hand-off runs on
   chat passes and parks nothing (see "Manual hand-off"). rehydrate_focus_run restores
-  neither context_key nor the turn text, so a resumed run cannot run a store writer
-  until items.id=888 persists context_key.
+  context_key (items.id=888, focus_runs.context_key) but never the turn text, so a resumed
+  run's store writers run, except handoff_ingest, which fails closed with no turn.
 - The unsupported-additions measures live in ONE shipped module, conductor/draft_check.rs
   (items.id=899, moved unchanged from examples/focus_calibration.rs; do not add a second
   copy). It is pure (no I/O, no model or provider id, scans pin both): check(text, &CheckInput)
@@ -685,8 +693,9 @@ selection and before Gate 1, through `derive_treatment(ctx, resolver_req, &selec
   the next step's own pick, so Gate 3 may also fire when that step resolves local. Refined by
   items.id=901 (see "Run plan and strategy approval"): under a verified approval a following
   model-block step with no PAID pin counts as tier 1, because the executor then stops any hosted
-  pick of it. With no approval, a rehydrated run or a bound API Chat run it is still the
-  ceiling look-ahead (over-prompt, never under-prompt).
+  pick of it. With no approval or on a bound API Chat run it is still the ceiling look-ahead
+  (over-prompt, never under-prompt). A rehydrated run of a chat holds the approval its own
+  plan_gate verified on rehydrate (items.id=888 stage 4) and uses it like a fresh run.
 - STREAMING: a resolved step never streams (step_streams has `!is_resolved(ctx)`, because
   retry_loop asks it without a selection). R1 streams only bound API Chat runs, which are never
   resolved. Streaming a resolved step needs a decision.
@@ -756,10 +765,10 @@ outputs_015 with the other outputs files.
   SHA-256 prefix), pass_artifact_store and seeding log nothing, Debug on PassArtifact and
   ArtifactWrite redacts the text, and source-scan tests pin all of it. Use fingerprint() if
   you must log one.
-- RETENTION AND PURGE: items.id=888's clear_chat and retention sweep MUST ALSO cover
-  pass_artifacts (delete by context_key, and by updated_at for the sweep), the same as
-  session_variables. Neither exists yet and this item added neither: until they do, a
-  chat's artifacts stay in the persona's outputs.db. clear_artifact is the only delete today.
+- RETENTION AND PURGE (items.id=888, see "Resume state, archive hook and store sweeps"): the
+  archive hook deletes a chat's artifacts (pass_artifact_store::clear_chat_in_tx) and the
+  30-day sweep deletes any not written for STORE_RETENTION_DAYS (sweep_older_than_in_tx, on
+  idx_pass_artifacts_updated_at). clear_artifact stays the only delete a pass can ask for.
   Not reached by the entity purge (an artifact names no entity id).
 
 ## Manual hand-off (items.id=387, decisions.id=942 point 7, decisions.id=846)
@@ -957,12 +966,12 @@ mechanism is exercised by fixture Focuses in tests.
 - STALE OR UNREADABLE. A stored answer that is not one of the question's options, a stored run_change
   that does not parse, an unreadable store or a config that does not validate fails the run
   (LifecycleError::LaunchAnswers), naming the question and never the value; no default replaces it.
-- RESUME. rehydrate_focus_run sets `rehydrated` and has no context_key, so it cannot read the
-  chat's answers, and the defaults could be looser than what the user chose. A resumed run of a Focus
-  with an ASKED launch question therefore fails with LifecycleError::LaunchAnswersUnavailableOnResume
-  until items.id=888 carries context_key on rehydrate (items.id=913 depends on it: a review park
-  resumes through rehydrate). A Focus whose questions are all fixed, and a run with no chat
-  (submit_focus_run), use the defaults. A run_change is lost on a resumed run.
+- RESUME. Since items.id=888 rehydrate_focus_run carries the run's chat (focus_runs.context_key), so a
+  resumed run reads the chat's stored answers and run_change exactly as a fresh run does. A resumed run
+  with NO chat (a row from before outputs_019, or a run that never had one) cannot read them, and the
+  defaults could be looser than what the user chose: if its Focus has an ASKED launch question it fails
+  with LifecycleError::LaunchAnswersUnavailableOnResume. A Focus whose questions are all fixed, and a
+  run with no chat (submit_focus_run), use the defaults.
   items.id=883 adds the same shape for the external text: focus_runs.external_input is stored beside
   user_input and a NULL resumes empty (see "External steps and chat history").
 - ANSWER STORE AND THE ONE-TIME LATCH (persistence/launch_answer_store.rs; no new table: rows of
@@ -973,8 +982,8 @@ mechanism is exercised by fixture Focuses in tests.
   latch is obeyed with no exemption: a latched chat refuses the whole submit (PutError::OneTimeChat,
   code one_time_chat), a latch that cannot be read fails it closed, and the run uses the Focus
   defaults. Answers stored BEFORE the latch was set stay (setting it deletes nothing), reads are not
-  latch-gated, and so they keep seeding later passes of that chat. No clear_chat or retention sweep
-  exists yet, so they stay until items.id=888 (session_variables rows are covered by it).
+  latch-gated, and so they keep seeding later passes of that chat. They go with the chat's archive
+  hook, or after STORE_RETENTION_DAYS unwritten (items.id=888's store sweep), like every session row.
 - RETRYING OPENER. The run-start read (read_answers_for_run) and the launch commands open outputs.db
   with output_store::open_outputs_db_retrying (commit 8d8d66f measured lock failures on the plain
   opener under contention, and a failed read here fails the run start closed). The scan test
@@ -994,9 +1003,8 @@ mechanism is exercised by fixture Focuses in tests.
   invalid_focus_id, invalid_context_key, no_launch_config, unknown_question, question_not_asked,
   invalid_answer, invalid_run_change, one_time_chat, launch_unavailable. The keys are in the orphan
   allowlist of styleAndI18nConsistency.test.ts until items.id=902 shows them. No screen is built.
-- NOT BUILT: saved adjustments and custom document types (items.id=905), carrying context_key on
-  rehydrate (items.id=888), a per-row mode selector, any real Focus question (items.id=903), the
-  generic launch screen (items.id=902).
+- NOT BUILT: saved adjustments and custom document types (items.id=905), a per-row mode selector, any
+  real Focus question (items.id=903), the generic launch screen (items.id=902).
 
 ## Run plan and strategy approval (items.id=901, decisions.id=942 Q2 and Q3)
 Before a run that has model-block steps starts, the user can see what it could do and approve
@@ -1049,8 +1057,9 @@ built: any screen (items.id=902 or 904).
   16 and 10 minutes, duplicate-turn markers 64 and 120 seconds (a hash only), run parks 64 and 2
   hours; the oldest are evicted on overflow and expired entries are dropped on every access.
   CLEARED: at logout or lock (main.rs, KeyRegistry on_key_leave -> clear_user, everything of the
-  user), when a chat is archived (archive_chat -> clear_chat: that chat's approvals and marker; a
-  park or an offer has no chat key and goes by TTL, logout or a later row write) and by TTL.
+  user), when a chat is archived (archive_chat -> PlanMemory::clear_chat: that chat's approvals and
+  marker; a park or an offer has no chat key and goes by TTL, logout or a later row write) and by
+  TTL. The PERSISTED approvals go with the archive hook and the 30-day store sweep (items.id=888).
 - plan.exceeded (spend::codes::Code::PlanExceeded; the IPC string for a start that needs an
   approval is the literal `plan_required`, a different thing). Parks the step (F10, AwaitUser)
   with nothing sent. In the executor, at selection and before derive_treatment and every gate:
@@ -1118,9 +1127,10 @@ built: any screen (items.id=902 or 904).
      hash of the content, 120 s) narrows the duplicate-turn gap: the next send skips the save
      only if the hash matches, the marked message is still the newest and a user turn. The marker
      is never persisted and is lost at an app restart, when the turn saves once more.
-  3. A rehydrated or swept run has no plan memory and no context_key, so it reads no approval: a
-     hosted pick stops with plan.exceeded `no_approval` until items.id=888 carries context_key on
-     rehydrate. The user's recovery today is to approve and send again, not to resume.
+  3. Since items.id=888 a rehydrated or swept run of a chat reads and verifies its approval through
+     plan_gate (the app's memory home when there is an app handle, else the persisted row only). A run
+     whose approval is missing, unreadable or no longer verifies still stops a hosted pick with
+     plan.exceeded `no_approval`, and so does a resumed run with no chat.
   4. The memory TTLs use a monotonic clock that may not advance while the machine is suspended, so
      an entry can outlive its nominal time across a suspend. Bounded by logout and the entry caps.
   5. The ceiling bounds the WHOLE run ledger (every metered step of the run, ordinary steps'
@@ -1128,7 +1138,8 @@ built: any screen (items.id=902 or 904).
   6. A restart re-asks every approval held in memory (a latched chat's, a chat whose latch or
      database could not be read, a chatless run's); a persisted approval of an unlatched chat
      survives it.
-  7. Persisted approvals have no retention sweep until items.id=888.
+  7. Persisted approvals are deleted by the archive hook and after STORE_RETENTION_DAYS unwritten
+     (items.id=888's store sweep).
   8. PlanIncluded is never produced: a hosted model is Free or Metered. (The open design question
      of recording which plan a user holds is not built.)
   9. EXTERNAL_MODEL_BLOCKS_ALLOWED is false, so no loadable Focus has a hosted range and the hosted
@@ -1139,14 +1150,13 @@ built: any screen (items.id=902 or 904).
   10. An approval and an offer never widen a gate: the executor, the spend gate and the outbound
       review still run for every approved step.
 - PENDING POINTERS:
-  - items.id=888: clear_chat and the retention sweep MUST call PlanMemory::clear_chat, delete
-    plan_approvals by context_key and by updated_at, and delete run_parks of the runs they remove;
-    it must also carry context_key on rehydrate (so a resumed run reads its approval).
+  - items.id=888: BUILT (see "Resume state, archive hook and store sweeps").
   - items.id=902 or 904 (the screens): show the plan, the approval and the park reason from the
     five commands, and the plan.error keys and the plan.stop.exceeded key (orphan-allowlisted
     today). items.id=906: named for this pass; its scope is not recorded in this repo and nothing
     here depends on it.
-  - items.id=913 (hosted blocks on): see known behaviour 9; depends on 888.
+  - items.id=913 (hosted blocks on): see known behaviour 9; its dependency on 888 (context_key on
+    rehydrate) is built.
   - ORDINARY EXTERNAL STEPS ARE NOT PLAN-GATED: Q3's "always" is open for them. A new item,
     opened by Chat-PM (number not named here), adds a second step kind to the plan list (the
     envelope: kind, action id, the provider the user prefers, the ceiling tier), the same
@@ -1245,13 +1255,13 @@ in the same tick and login pass, settles them (same section).
       policy. The executor still re-reads fact_disclosure_policy before each later hosted step (decisions.id=953).
   (c) Entity (device), group and persona_context facts are NOT covered: only the four catalogued singleton
       facts of items.id=931 are in the manifest.
-- NOT BUILT: a rewind-and-rerun of the affected steps (items.id=574's reenter_step could do it), a "continue
-  anyway" resume, the Library or clear_chat hooks (items.id=888), a banner for a stale cancel (the user sees
-  the cancelled run and its message).
+- NOT BUILT: a rewind-and-rerun of the affected steps (items.id=574's reenter_step could do it; deferred
+  as option B on items.id=888), a "continue anyway" resume, a Library hook, a banner for a stale cancel (the
+  user sees the cancelled run and its message). The archive hook is built (items.id=888).
 
 ## Run failure, resume claim and post-output runs (items.id=888 pass 1, privacy review 2026-11-20 F5 to F8 and F15)
-Pass 1 of items.id=888 (stages 1 to 3). Pass 2 (context_key on rehydrated runs, the seed version pin and
-published ids, clear_chat on archive, the 30-day store sweeps) is NOT built.
+Pass 1 of items.id=888 (stages 1 to 3). Pass 2 (stages 4 to 8) is built: see "Resume state, archive hook
+and store sweeps" below.
 - FAIL_RUN (lifecycle.rs, F5 and F6). The one way an Err ends a run: drop the tracks, purge the run's
   snapshots BEFORE writing `failed` (write_run_row clears both inputs), emit. Both error arms of
   execute_full (the F_SYSTEM one too) and resume_claimed_run use it; a source scan pins that neither
@@ -1300,6 +1310,79 @@ published ids, clear_chat on archive, the 30-day store sweeps) is NOT built.
   (e) Existing rows: the first login after the upgrade clears the inputs of every awaiting_extract_confirm
       run and settles every post-output run older than 30 days, deleting its candidates.
   (f) The purge confirmations do not say that parked runs are cancelled (Chat-BRAND).
+
+## Resume state, archive hook and store sweeps (items.id=888 pass 2, decisions.id=939 sections 4, 6 and 7)
+Pass 2 of items.id=888 (stages 4 to 8). Option B (rewind and re-run the affected steps on a stale resume)
+is deferred. The byte cap on the chat history window is not built and stays deferred on the item.
+- CONTEXT_KEY ON REHYDRATE (stage 4). focus_runs.context_key (schema/outputs_019.sql, nullable; items.id=633
+  must absorb it) is written at the INSERT of every run that has a chat (write_run_row), not only runs that
+  park: a crashed run becomes paused with no park write, and the archive hook needs every run of the chat.
+  It is the chat id, not user content, and is never cleared. rehydrate_focus_run reads it and, BEFORE
+  anything else is built, reads the chat's one-time latch: suppressed, or a latch that cannot be read,
+  returns LifecycleError::ResumeOneTimeChat and writes nothing; the shared helper
+  resume_staleness::cancel_stale_resume (resume_run, reenter_step, the scheduled sweep) then cancels the
+  run through the guarded cancel with "a one-time chat cannot be resumed". The key is set before load(),
+  so the run reads the chat's launch answers and run_change. After the ceiling is resolved, a run of a chat
+  runs the read-only plan_gate (the app's PlanMemory when there is an app handle, else an empty one, so
+  only the persisted row), and the Gate 3 look-ahead no longer excludes a rehydrated run (only plan_gate.rs
+  sets `plan`).
+- THE RESUME PIN (stage 5, conductor/resume_pin.rs). Every checkpoint (write_checkpoint_for, periodic and
+  parking) writes focus_run_snapshots.extra_metadata: `seed_versions`, the version of each VERSIONED bound
+  name the steps read (session names but the latch, launch names, artifacts; 0 for no row) in this chat and
+  Focus, and `published`, the ids store writers published this pass (FocusRun.store_vars: entity, case,
+  delta, hand-off draft handle). Names, integers and opaque ids only, never a stored value. A store that
+  cannot be read at checkpoint time records `seed_versions_unreadable`. On rehydrate, after the
+  personal-field staleness check and before the track is restored, check_resume_pin re-reads the versions
+  and re-verifies each id in its own store, scoped to the running Focus (an active owned entity; a case or
+  delta this Focus recorded; a draft handle that resolves among its replies), and refuses with
+  LifecycleError::ResumeStoreChanged on a changed version, an id that does not verify, the unreadable
+  marker, metadata that does not parse, or pinned versions with no chat. The ids are restored only when
+  every check passes. The shared helper cancels with "saved chat state changed while waiting".
+  Re-entry with writer rows is tested (lifecycle.rs reentry_with_writer_rows).
+- THE ARCHIVE HOOK (stage 6, persistence/chat_clear.rs). archive_chat archives the chat, then calls
+  clear_chat(context_key) best effort (a failure is logged; the archive stands) and PlanMemory::clear_chat.
+  In ONE BEGIN IMMEDIATE transaction: the chat's PARKED runs are cancelled through the guarded cancel
+  ("chat archived": snapshots, park, pending review go); user_input and external_input are NULLed on every
+  run of the chat; the park reason of every run of the chat goes; the chat's plan approvals, pass artifacts
+  and session variables go; and the reviews of the chat's ENDED runs (complete, failed, cancelled, after the
+  cancels) go through step_review_store::delete_reviews_of_ended_chat_runs_in_tx, that store's one delete
+  (a scan pins chat_clear as its only caller; nothing reads a review once its run has ended, and
+  review_prompt reuses a live run's own). THE ONE-TIME LATCH goes only when no run of the chat is still
+  non-terminal after the cancels; otherwise every session row but the latch goes. session_store::
+  clear_chat_in_tx is the only delete that can reach the latch (a scan pins it). Each delete lives in the
+  store that owns its table.
+- THE STORE SWEEP (stage 7, persistence/store_sweep.rs). run_retention::STORE_RETENTION_DAYS = 30, one
+  period for session_variables (the latch EXEMPT), pass_artifacts and plan_approvals, by updated_at, each
+  delete in its owning store and on that table's updated_at index. The cutoff is now minus the period as
+  RFC 3339 text and the compare is TEXTUAL: it is correct because all three stores stamp updated_at
+  through providers::utils::now() (RFC 3339, UTC). The three deletes run in ONE transaction, so a sweep
+  that fails deletes nothing (suppression). It runs in the hourly retention tick and the login pass,
+  after the post-output sweep, only while the owner's key is resident.
+- ACCEPTED LIMITS:
+  (a) An unreadable latch cancels the parked run on resume: suppression, and destructive.
+  (b) A row from before outputs_019 has no context_key: its latch cannot be checked on resume, it reads
+      no launch answers or approval, and the archive hook does not reach it.
+  (c) A resumed run's plan approval is read and verified through plan_gate; a missing one, and a resumed
+      run with no chat, still give plan.exceeded `no_approval`.
+  (d) A crashed run whose own store writer ran after its last checkpoint has a pin that no longer matches:
+      it is cancelled on resume, not resumed.
+  (e) A transient read failure at checkpoint time makes that snapshot unresumable.
+  (f) Derived names (case and delta texts, the device names) have no version and are not pinned.
+  (g) A run parked before stage 5 has no pin and resumes unchecked.
+  (h) The cancel messages are "a one-time chat cannot be resumed" and "saved chat state changed while
+      waiting"; wording is Chat-BRAND's.
+  (i) The archive hook does not stop a live run (no lease is bound to a chat): what it writes after the
+      clear stays, and its reviews stay (they are not ended runs' reviews and the store sweep deletes no
+      reviews); the latch stays for it.
+  (j) A chat still in use loses any session value, artifact or approval nobody wrote for 30 days (a launch
+      answer, a pending hand-off marker); a parked run that pinned one is then refused on resume.
+  (k) run_parks and step_reviews are not swept by the store sweep (parks go with their run's status
+      writes and the archive hook; reviews only with the archive hook, for ended runs).
+  (l) An updated_at in any format other than RFC 3339 is outside what the sweep promises: a value that
+      sorts after the cutoff is kept, one that sorts before it (a number) is swept.
+  (m) The archive hook emits no run-status event for the parked runs it cancels (it has no app handle);
+      the UI sees them cancelled when it next reads run state.
+  (n) Not verified: archive_chat and resume through Tauri, the live app, Windows and macOS.
 
 ## Collection consent (items.id=920 stage 1, decisions.id=944, decisions.id=509)
 A focus_level Focus (Tech Support) collects silently after ONE informed consent at
@@ -1473,9 +1556,10 @@ Focus and items.id=916 flips it; the hard purge ships before that.
 - Six-intent fixture (conductor/tech_support_draft.rs): 33 rows, 126 of 256 paths, 2..6 local calls
   per path; its device rows are entity_find_or_create writers and its templates use both device names.
 - items.id=633 must absorb personal_011.sql (the owner_focus column and its index into the entities
-  baseline CREATE); no shared or outputs file was added. items.id=888 keeps clear_chat, the retention
-  sweep, context_key persistence, the resume pin and re-deriving pass-local published ids (an
-  entity id is re-derivable from its replay key); it does NOT build any entity purge.
+  baseline CREATE); no shared or outputs file was added. items.id=888 built the archive hook, the store
+  sweep, context_key on rehydrate and the resume pin, which CHECKPOINTS the pass-local published ids
+  and re-verifies each on resume (an entity id against the running Focus's active owned entities); it
+  built no entity purge.
 
 ## Personal fact bridge (items.id=931, decisions.id=953; the catalogue and store are items.id=930)
 Before items.id=931 PersonalTrack.fields was empty in every real run, so a declared
