@@ -1066,13 +1066,7 @@ impl StepExecutor {
         let step_sensitivity =
             compute_step_sensitivity(ctx, &treatment, personal_track, &projected_fields);
 
-        let step = completed_step(
-            ctx,
-            &response.content,
-            step_sensitivity,
-            treatment.execution_tier,
-            &g2,
-        );
+        let step = recorded_step(ctx, &treatment, &response.content, step_sensitivity, &g2);
         let step_sensitivity = step.sensitivity_severity;
         task_track.add_step(step);
 
@@ -3005,6 +2999,55 @@ fn build_options(
 // Step sensitivity computation
 // ---------------------------------------------------------------------------
 
+/// The TaskStep execute_once records for a completed reply: completed_step, then the
+/// items.id=922 floor (the items.id=884 rider). A store-backed DECLARED input of a step
+/// that went to a hosted destination counts as personal on its record, as it does for a
+/// render row (handoff_render::inherit_from_inputs rule 2): severity at least Personal and
+/// personal_flagged. A floor only: it never lowers a severity, and nothing here reads a
+/// producer's severity (deferred). A step that went local is unchanged.
+fn recorded_step(
+    ctx: &StepContext,
+    treatment: &StepTreatment,
+    content: &str,
+    computed_sensitivity: i32,
+    g2: &ReplyGate2,
+) -> TaskStep {
+    let mut step = completed_step(
+        ctx,
+        content,
+        computed_sensitivity,
+        treatment.execution_tier,
+        g2,
+    );
+    apply_store_backed_floor(
+        &mut step,
+        &ctx.step.declared_inputs,
+        &ctx.store_tokens,
+        treatment.hosted,
+    );
+    step
+}
+
+/// items.id=922: the floor itself, split out so a test can drive it with a run's own
+/// StoreTokens (fresh or rehydrated). Applies only to a step that went to a hosted
+/// destination (`hosted` is `treatment.hosted`, the one predicate every privacy read of
+/// execute_once keys on) and only over its DECLARED inputs: the outbound review screens
+/// the prompt, this scores the record. Store-backed is StoreTokens::is_store_backed,
+/// seeded by every pass in execute().
+pub(crate) fn apply_store_backed_floor(
+    step: &mut TaskStep,
+    declared: &[String],
+    tokens: &crate::conductor::taint::StoreTokens,
+    hosted: bool,
+) {
+    if hosted && declared.iter().any(|d| tokens.is_store_backed(d)) {
+        step.sensitivity_severity = step
+            .sensitivity_severity
+            .max(crate::conductor::handoff_render::store_backed_input_severity());
+        step.personal_flagged = true;
+    }
+}
+
 /// Derive step sensitivity severity from projected fields (external access
 /// live) or template token scan (qr_local).
 ///
@@ -4420,6 +4463,358 @@ mod tests {
         let gt = to_gate_track(&ct);
         let gf = gt.fields().get("x").unwrap();
         assert!(matches!(gf.sensitivity, Sensitivity::General));
+    }
+
+    // -- items.id=922 stage 3: the store-backed floor on external steps ---------------
+
+    /// A step cloned from the hosted fixture with the fields a test cares about.
+    fn floor_step(
+        id: &str,
+        tier: ExternalAccess,
+        template: &str,
+        out: Option<&str>,
+        declared: &[&str],
+    ) -> crate::conductor::tokens::ActionDefinition {
+        let mut a = hosted_ctx(RunAttendance::Attended, "").step;
+        a.action_id = id.to_owned();
+        a.routing_tier = tier;
+        a.external_access_override = None;
+        a.prompt_template = template.to_owned();
+        a.output_var = out.map(str::to_owned);
+        a.declared_inputs = declared.iter().map(|d| (*d).to_owned()).collect();
+        a
+    }
+
+    /// The StoreTokens a pass of these steps would carry, minus the store reads: built by
+    /// the same seeding::store_state seed_pass uses.
+    fn floor_tokens(
+        steps: &[crate::conductor::tokens::ActionDefinition],
+    ) -> crate::conductor::taint::StoreTokens {
+        let vars: Vec<Option<String>> = steps.iter().map(|s| s.output_var.clone()).collect();
+        let (restricted, user_input_backed) = crate::conductor::seeding::store_state(steps, &vars);
+        crate::conductor::taint::StoreTokens {
+            seeds: Default::default(),
+            restricted,
+            user_input_backed,
+        }
+    }
+
+    fn ingest_row_step() -> crate::conductor::tokens::ActionDefinition {
+        let mut s = floor_step("ingest", ExternalAccess::LocalOnly, "", None, &[]);
+        s.store_op = crate::conductor::store_op::StoreOp::from_columns(
+            Some("handoff_ingest"),
+            Some("draft_ref"),
+            None,
+        )
+        .unwrap();
+        s
+    }
+
+    fn hosted_treatment() -> StepTreatment {
+        StepTreatment {
+            access: ExternalAccess::AnonymousRequired,
+            execution_tier: 2,
+            abstraction_tier: 2,
+            raw_abstraction: 1,
+            hosted: true,
+        }
+    }
+
+    fn local_treatment() -> StepTreatment {
+        StepTreatment {
+            access: ExternalAccess::LocalOnly,
+            execution_tier: 1,
+            abstraction_tier: 1,
+            raw_abstraction: 1,
+            hosted: false,
+        }
+    }
+
+    /// recorded_step for `steps[at]` with the run's tokens, a computed severity of
+    /// `computed` and no Gate 2 hit.
+    fn floor_record(
+        steps: &[crate::conductor::tokens::ActionDefinition],
+        at: usize,
+        treatment: &StepTreatment,
+        computed: i32,
+    ) -> TaskStep {
+        let mut ctx = hosted_ctx(RunAttendance::Attended, "");
+        ctx.step = steps[at].clone();
+        ctx.store_tokens = floor_tokens(steps);
+        recorded_step(&ctx, treatment, "out", computed, &ReplyGate2::default())
+    }
+
+    #[test]
+    fn a_declared_store_backed_input_floors_an_external_step_at_personal_and_flags_it() {
+        let ext = ExternalAccess::AnonymousRequired;
+        let loc = ExternalAccess::LocalOnly;
+        // (1) a registered bound name.
+        let steps = [floor_step(
+            "e",
+            ext,
+            "x {case_context}",
+            None,
+            &["case_context"],
+        )];
+        let r = floor_record(&steps, 0, &hosted_treatment(), 1);
+        assert_eq!(r.sensitivity_severity, 2);
+        assert!(r.personal_flagged && !r.audit_unavailable);
+        assert_eq!(r.routing_tier_used, 2);
+        // (2) a variable a tainted step produced.
+        let steps = [
+            floor_step("t", loc, "{case_context}", Some("tv"), &[]),
+            floor_step("e", ext, "use {tv}", None, &["tv"]),
+        ];
+        let r = floor_record(&steps, 1, &hosted_treatment(), 1);
+        assert_eq!((r.sensitivity_severity, r.personal_flagged), (2, true));
+        // (3) user_input, in a Focus that ingests a pasted reply, and not otherwise.
+        let with = [
+            ingest_row_step(),
+            floor_step("e", ext, "{user_input}", None, &["user_input"]),
+        ];
+        let r = floor_record(&with, 1, &hosted_treatment(), 1);
+        assert_eq!((r.sensitivity_severity, r.personal_flagged), (2, true));
+        let without = [floor_step("e", ext, "{user_input}", None, &["user_input"])];
+        let r = floor_record(&without, 0, &hosted_treatment(), 1);
+        assert_eq!((r.sensitivity_severity, r.personal_flagged), (1, false));
+    }
+
+    #[test]
+    fn the_floor_needs_a_declared_store_backed_input_and_a_hosted_destination() {
+        let ext = ExternalAccess::AnonymousRequired;
+        let loc = ExternalAccess::LocalOnly;
+        // Named in the template but not declared: the declared filter is the control.
+        let steps = [floor_step("e", ext, "x {case_context}", None, &[])];
+        let r = floor_record(&steps, 0, &hosted_treatment(), 1);
+        assert_eq!((r.sensitivity_severity, r.personal_flagged), (1, false));
+        // A declared clean variable and a declared system token do not count.
+        let steps = [
+            floor_step("c", loc, "x", Some("c"), &[]),
+            floor_step("e", ext, "{c} {user_input}", None, &["c", "user_input"]),
+        ];
+        let r = floor_record(&steps, 1, &hosted_treatment(), 1);
+        assert_eq!((r.sensitivity_severity, r.personal_flagged), (1, false));
+        // A step that went LOCAL is unchanged, whatever it declares.
+        let steps = [floor_step(
+            "l",
+            loc,
+            "x {case_context}",
+            None,
+            &["case_context"],
+        )];
+        let r = floor_record(&steps, 0, &local_treatment(), 1);
+        assert_eq!((r.sensitivity_severity, r.personal_flagged), (1, false));
+    }
+
+    #[test]
+    fn the_floor_never_lowers_a_severity_and_never_sets_audit_unavailable() {
+        let steps = [floor_step(
+            "e",
+            ExternalAccess::AnonymousRequired,
+            "{case_context}",
+            None,
+            &["case_context"],
+        )];
+        for computed in [3, 4] {
+            let r = floor_record(&steps, 0, &hosted_treatment(), computed);
+            assert_eq!(r.sensitivity_severity, computed);
+            assert!(r.personal_flagged && !r.audit_unavailable);
+        }
+    }
+
+    /// With items.id=931 a declared bridged field that Gate 1 withholds (the default
+    /// omit) is not projected, so a hosted step that sent nothing records 1: the floor
+    /// is about store-backed inputs only, and this pins what stays as it was.
+    #[test]
+    fn a_withheld_bridged_field_still_records_general_on_a_hosted_step() {
+        use crate::conductor::types::PersonalField as CF;
+        let mut pt = PersonalTrack::new();
+        pt.add_field(CF {
+            field_name: "job_title".to_owned(),
+            field_value: "Engineer".to_owned(),
+            sensitivity: "personal".to_owned(),
+            sensitivity_severity: 2,
+            source_id: crate::conductor::personal_fact_bridge::BRIDGE_SOURCE_ID.to_owned(),
+            abstraction_tier2: "omit".to_owned(),
+            abstraction_tier3: "omit".to_owned(),
+        })
+        .unwrap();
+        pt.seal();
+        let steps = [floor_step(
+            "e",
+            ExternalAccess::AnonymousRequired,
+            "{job_title}",
+            None,
+            &[],
+        )];
+        let mut ctx = hosted_ctx(RunAttendance::Attended, "");
+        ctx.step = steps[0].clone();
+        let computed = compute_step_sensitivity(
+            &ctx,
+            &hosted_treatment(),
+            &pt,
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(computed, 1);
+        assert_eq!(
+            floor_record(&steps, 0, &hosted_treatment(), computed).sensitivity_severity,
+            1
+        );
+    }
+
+    /// The floor is applied in one place, and execute_once records through it.
+    #[test]
+    fn execute_once_records_a_completed_step_only_through_recorded_step() {
+        let src = include_str!("executor.rs");
+        let production = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_eq!(
+            production.matches("completed_step(").count(),
+            2,
+            "its definition and recorded_step"
+        );
+        let once = production
+            .split("async fn execute_once<")
+            .nth(1)
+            .and_then(|r| r.split("\nfn ").next())
+            .expect("execute_once");
+        assert!(
+            once.contains("recorded_step("),
+            "execute_once records through the floor"
+        );
+        assert!(!once.contains("completed_step("));
+        // Nothing here reads a producer's severity: the floor is store-backed only.
+        let rec = production
+            .split("fn recorded_step(")
+            .nth(1)
+            .and_then(|r| r.split("\npub(crate) fn ").next())
+            .unwrap();
+        assert!(!rec.contains("task_track") && !rec.contains("sensitivity_ceiling"));
+    }
+
+    // -- items.id=922 stage 3: what Gate 3 does at A (local, severity 3) -> C (local)
+    // -> B (external), pinned as it is today (characterization, no behaviour change) --
+
+    async fn promote_at(
+        step: &TaskStep,
+        severity: i32,
+        next_tier: u8,
+        exec_tier: u8,
+    ) -> crate::conductor::privacy::types::Gate3Result {
+        PrivacyGateway::new(TestLogger::new())
+            .gate3(
+                &step.action_id,
+                "run-1",
+                "test",
+                &step.action_id,
+                &step.content,
+                severity as u8,
+                next_tier,
+                ExternalAccess::Unrestricted,
+                exec_tier,
+                None,
+                None,
+                true,
+                SPEND_USER,
+                "persona-1",
+                "",
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn gate_3_characterization_a_severity_3_local_step_then_local_then_external() {
+        use crate::conductor::lifecycle::next_execution_tier_under;
+        let ext = ExternalAccess::AnonymousRequired;
+        let steps = [
+            floor_step(
+                "a",
+                ExternalAccess::LocalOnly,
+                "{user_input}",
+                Some("a_out"),
+                &[],
+            ),
+            floor_step(
+                "c",
+                ExternalAccess::LocalOnly,
+                "rewrite {a_out}",
+                Some("c_out"),
+                &[],
+            ),
+            floor_step("b", ext, "use {c_out}", None, &["c_out"]),
+        ];
+        let ctx = hosted_ctx(RunAttendance::Attended, "");
+        let pt = PersonalTrack::new();
+        let none = std::collections::HashMap::new();
+
+        // A records severity 3 (it named a medical field, say).
+        let a = completed_step(&ctx, "a medical sentence", 3, 1, &ReplyGate2::default());
+        assert_eq!(a.sensitivity_severity, 3);
+
+        // CROSSING A -> C: the look-ahead is the next row's tier, 1, which is not above
+        // A's own tier 1, so execute_once never calls Gate 3 for A.
+        let after_a = next_execution_tier_under(&steps, 0, ext, None).unwrap();
+        assert_eq!(after_a, 1);
+        assert!(!(after_a > a.routing_tier_used as u8));
+
+        // CROSSING C -> B: the next row is external, so Gate 3 IS called, on C's reply
+        // with C's OWN record. C's severity comes from the PersonalTrack fields its
+        // template names (none): the variable it consumed does not enter it.
+        let mut cctx = ctx;
+        cctx.step = steps[1].clone();
+        let c_sev = compute_step_sensitivity(&cctx, &local_treatment(), &pt, &none);
+        assert_eq!(c_sev, 1, "A's severity 3 is not carried into C's record");
+        let c = completed_step(
+            &cctx,
+            "a medical sentence, reworded",
+            c_sev,
+            1,
+            &ReplyGate2::default(),
+        );
+        let after_c = next_execution_tier_under(&steps, 1, ext, None).unwrap();
+        assert_eq!(after_c, 2);
+        assert!(after_c > c.routing_tier_used as u8, "Gate 3 is called at C");
+        // The legacy gate (no Privacy Filter, as in tests) approves what C's record says...
+        assert!(
+            !promote_at(&c, c.sensitivity_severity, after_c, 1)
+                .await
+                .blocked
+        );
+        // ...and would have blocked the same text at A's severity, which is exactly the
+        // severity-3 rule the label never reaches (and does block A -> B directly).
+        assert!(
+            promote_at(&c, a.sensitivity_severity, after_c, 1)
+                .await
+                .blocked
+        );
+        assert!(promote_at(&a, a.sensitivity_severity, 2, 1).await.blocked);
+
+        // WHAT output_sensitivity() IS: the highest severity on the track, 3 here. It is
+        // read at output creation (the legacy output scan and the output's label) and
+        // never by Gate 3, which reads the step it just completed.
+        let mut tt = TaskTrack::new();
+        tt.add_step(a);
+        tt.add_step(c);
+        assert_eq!(tt.sensitivity_ceiling(), 3);
+        let src = include_str!("executor.rs");
+        let production = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        assert!(
+            !production.contains("sensitivity_ceiling"),
+            "Gate 3 never reads the ceiling"
+        );
+        assert!(!production.contains("output_sensitivity"));
+        let promotion = production
+            .split("PG_GATE_3: cross-tier content promotion")
+            .nth(1)
+            .and_then(|r| r.split("let g3 = ").nth(1))
+            .and_then(|r| r.split(".await").next())
+            .unwrap();
+        assert!(promotion.contains("step_sensitivity as u8"), "{promotion}");
+
+        // CROSSING INTO B: the outbound review screens B's rendered prompt with a
+        // placeholder severity, not the track's, and a zero-span prompt passes it.
+        const { assert!(crate::conductor::step_review::REVIEW_SEVERITY < 3) };
+        const { assert!(!crate::conductor::step_review::REVIEW_SEVERITY_AUTHORITATIVE) };
     }
 
     #[test]

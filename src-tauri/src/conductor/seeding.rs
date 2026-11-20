@@ -149,6 +149,20 @@ pub fn restricted_names(
     set
 }
 
+/// The two pure parts of a pass's StoreTokens that need no store read: the restricted
+/// names, and whether `user_input` is store-backed (a Focus with a handoff_ingest row,
+/// items.id=922). The one place both are computed, so a test can pin them against
+/// handoff_render::store_backed_inputs without a database.
+pub fn store_state(
+    steps: &[ActionDefinition],
+    row_vars: &[Option<String>],
+) -> (HashSet<String>, bool) {
+    (
+        restricted_names(steps, row_vars),
+        taint_closure(steps, row_vars, spec::NAMES).user_input,
+    )
+}
+
 /// Seed one pass: the production entry point FocusRun::execute() calls. Opens
 /// the persona's outputs.db only when some bound name is required.
 // 8 arguments: the persona and chat keys, the Focus, its steps and variables, and the
@@ -164,12 +178,13 @@ pub async fn seed_pass(
     row_vars: &[Option<String>],
     launch: &LaunchResolution,
 ) -> Result<StoreTokens, SeedError> {
-    let restricted = restricted_names(steps, row_vars);
+    let (restricted, user_input_backed) = store_state(steps, row_vars);
     let names = required_names(steps);
     if names.is_empty() {
         return Ok(StoreTokens {
             seeds: HashMap::new(),
             restricted,
+            user_input_backed,
         });
     }
     // items.id=897: the launch names are seeded from the run's launch resolution,
@@ -202,7 +217,11 @@ pub async fn seed_pass(
         .copied()
         .partition(|n| crate::conductor::device_seeding::is_device_seed(n));
     if store_names.is_empty() && device_names.is_empty() {
-        return Ok(StoreTokens { seeds, restricted });
+        return Ok(StoreTokens {
+            seeds,
+            restricted,
+            user_input_backed,
+        });
     }
     let mut conn = crate::persistence::output_store::open_outputs_db(user_id, persona_id, key_hex)
         .await
@@ -226,7 +245,11 @@ pub async fn seed_pass(
             .await?,
         );
     }
-    Ok(StoreTokens { seeds, restricted })
+    Ok(StoreTokens {
+        seeds,
+        restricted,
+        user_input_backed,
+    })
 }
 
 fn store_err(name: &'static str, e: impl std::fmt::Display) -> SeedError {
@@ -667,6 +690,70 @@ mod tests {
         let mut block = step("blk", "{case_context}");
         block.block_stable_id = Some("cb-06".to_owned());
         assert!(required_names(&[block]).is_empty());
+    }
+
+    /// items.id=922: the pass's StoreTokens answer "is this declared name store-backed?"
+    /// exactly as handoff_render::store_backed_inputs does for a render row, for every
+    /// class: a bound name, a tainted variable, user_input in a Focus that ingests a
+    /// pasted reply (and not in one that does not), and a clean name.
+    #[test]
+    fn the_pass_state_agrees_with_the_render_rows_store_backed_set() {
+        let ingest = {
+            let mut s = step("ingest", "");
+            s.store_op = crate::conductor::store_op::StoreOp::from_columns(
+                Some("handoff_ingest"),
+                Some("draft_ref"),
+                None,
+            )
+            .unwrap();
+            s
+        };
+        let mut t = step("t", "{case_context}");
+        t.output_var = Some("tv".to_owned());
+        let mut chat = step("chat", "{user_input}");
+        chat.output_var = Some("chat_out".to_owned());
+        let mut clean = step("clean", "plain");
+        clean.output_var = Some("clean_out".to_owned());
+        for focus in [
+            vec![ingest, t.clone(), chat.clone(), clean.clone()],
+            vec![t, chat, clean],
+        ] {
+            let vars: Vec<Option<String>> = focus.iter().map(|s| s.output_var.clone()).collect();
+            let (restricted, user_input_backed) = store_state(&focus, &vars);
+            let tokens = StoreTokens {
+                seeds: HashMap::new(),
+                restricted,
+                user_input_backed,
+            };
+            let render_rows = crate::conductor::handoff_render::store_backed_inputs(&focus, &vars);
+            for name in [
+                "case_context",
+                "handoff_pending",
+                "document_type",
+                "tv",
+                "chat_out",
+                "clean_out",
+                "user_input",
+                "previous_output",
+                "unrelated",
+            ] {
+                assert_eq!(
+                    tokens.is_store_backed(name),
+                    render_rows.contains(name),
+                    "{name} (ingest row present: {})",
+                    focus.iter().any(|s| s.store_op.is_some())
+                );
+            }
+        }
+        // And seed_pass, on all three of its return paths, carries the flag.
+        let src = include_str!("seeding.rs");
+        let prod = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        assert_eq!(prod.matches("user_input_backed,").count(), 3);
+        assert_eq!(
+            prod.matches("Ok(StoreTokens {").count(),
+            3,
+            "the three returns"
+        );
     }
 
     #[test]

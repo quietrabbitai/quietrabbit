@@ -7283,6 +7283,101 @@ mod tests {
         (r.get("status"), r.get("user_input"), r.get("n"))
     }
 
+    /// items.id=922 stage 3: a RESUMED run (a real rehydrate_focus_run) scores an external
+    /// step exactly as a fresh run does. The floor reads the pass's StoreTokens, and every
+    /// pass, fresh or resumed, seeds them in execute() from the Focus's own steps, so
+    /// nothing about the floor is restored or lost with the snapshot.
+    #[tokio::test]
+    async fn a_resumed_run_scores_an_external_step_like_a_fresh_one() {
+        with_temp_data_root(async {
+            let mut e = local_step("e", "use {tv} {user_input}", None);
+            e.routing_tier = ExternalAccess::AnonymousRequired;
+            e.declared_inputs = vec!["tv".to_owned(), "user_input".to_owned()];
+            let steps = vec![
+                writer_step(
+                    "ingest",
+                    "handoff_ingest",
+                    Some("draft_ref"),
+                    serde_json::Value::Null,
+                    Some(("handoff_pending", "present", None)),
+                ),
+                local_step("t", "{case_context}", Some("tv")),
+                local_step("clean", "plain", Some("clean_out")),
+                e,
+            ];
+            let declared = steps[3].declared_inputs.clone();
+
+            // A fresh run.
+            let mut fresh = writer_run(steps.clone(), None, &[]);
+            fresh.seed_store_tokens().await.unwrap();
+
+            // A resumed run: a real rehydrate, then the pass's own seeding.
+            let (pool, run_id) = bridge_setup().await;
+            let mut resumed = bridge_rehydrate(&pool, &run_id, Default::default()).await;
+            resumed.focus_def.as_mut().unwrap().steps = steps.clone();
+            resumed.seed_store_tokens().await.unwrap();
+
+            for name in [
+                "tv",
+                "user_input",
+                "case_context",
+                "handoff_pending",
+                "clean_out",
+                "unrelated",
+            ] {
+                assert_eq!(
+                    fresh.store_tokens.is_store_backed(name),
+                    resumed.store_tokens.is_store_backed(name),
+                    "{name}"
+                );
+            }
+            assert!(resumed.store_tokens.user_input_backed);
+            assert!(resumed.store_tokens.is_store_backed("tv"));
+            assert!(!resumed.store_tokens.is_store_backed("clean_out"));
+
+            let score = |tokens: &crate::conductor::taint::StoreTokens, hosted: bool| {
+                let mut step = recorded("e", None, "out");
+                crate::conductor::executor::apply_store_backed_floor(
+                    &mut step, &declared, tokens, hosted,
+                );
+                (step.sensitivity_severity, step.personal_flagged)
+            };
+            assert_eq!(score(&fresh.store_tokens, true), (2, true));
+            assert_eq!(
+                score(&resumed.store_tokens, true),
+                score(&fresh.store_tokens, true)
+            );
+            assert_eq!(score(&resumed.store_tokens, false), (1, false));
+
+            // Both paths reach execute(), which is where the pass is seeded.
+            let src = include_str!("lifecycle.rs");
+            let prod = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+            assert_eq!(prod.matches("self.seed_store_tokens().await?").count(), 1);
+            let execute = prod
+                .split("pub async fn execute(&mut self)")
+                .nth(1)
+                .and_then(|r| r.split("\n    pub async fn ").next())
+                .unwrap();
+            assert!(execute.contains("self.seed_store_tokens().await?"));
+            let and_finish = prod
+                .split("async fn execute_and_finish(")
+                .nth(1)
+                .and_then(|r| r.split("\n    pub async fn ").next())
+                .unwrap();
+            assert!(
+                and_finish.contains("self.execute()"),
+                "resume reaches execute()"
+            );
+            assert_eq!(
+                prod.matches("store_tokens: self.store_tokens.clone()")
+                    .count(),
+                1,
+                "the one StepContext carries the pass's tokens"
+            );
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn a_resume_with_an_unchanged_manifest_behaves_as_today() {
         with_temp_data_root(async {

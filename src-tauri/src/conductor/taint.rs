@@ -161,9 +161,21 @@ pub struct StoreTokens {
     pub seeds: HashMap<String, String>,
     /// Every bound name and every tainted variable of the Focus.
     pub restricted: HashSet<String>,
+    /// items.id=922: `user_input` counts as store-backed in this Focus (it has a
+    /// handoff_ingest row, so the chat window carries a pasted reply). Set by
+    /// seeding::seed_pass from the same closure as `restricted`; false otherwise.
+    pub user_input_backed: bool,
 }
 
 impl StoreTokens {
+    /// items.id=922: whether a declared input is STORE-BACKED, the same set as
+    /// handoff_render::store_backed_inputs (a registered bound name, a variable a tainted
+    /// step produced, and user_input in a Focus that ingests a pasted reply), read from
+    /// the pass's own state so the executor needs no Focus definition.
+    pub fn is_store_backed(&self, name: &str) -> bool {
+        self.restricted.contains(name) || (self.user_input_backed && name == "user_input")
+    }
+
     /// Adjust one step's token map (see the module header).
     pub fn apply(&self, template: &str, tokens: &mut HashMap<String, String>) {
         if self.restricted.is_empty() && self.seeds.is_empty() {
@@ -398,6 +410,7 @@ mod tests {
         StoreTokens {
             seeds: toks(seeds),
             restricted: restricted.iter().map(|s| (*s).to_owned()).collect(),
+            user_input_backed: false,
         }
     }
 
