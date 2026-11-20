@@ -4323,17 +4323,18 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         // later action (e.g. a Library copy) first triggers it -- outputs
         // are immutable after this point (output_store.rs's own header:
         // the only later mutation is delete-time content-zeroing), so a
-        // scan computed here can never go stale. execution_tier uses
-        // _focus_max_permitted_tier (the run's hard ceiling) since no single
-        // per-run "final" execution tier is tracked -- it's computed fresh
-        // per-step (see execute_step's own Axis-1 calculation), not
-        // persisted on FocusRun.
+        // scan computed here can never go stale. execution_tier is the HIGHEST tier
+        // any completed step of the run used (items.id=922: highest_tier_used over the
+        // TaskTrack's routing_tier_used, 1 when no step ran), not the run's ceiling:
+        // the tier is only the disclosure row's execution_tier (scan_output blocks on
+        // the Privacy Filter result and, without it, on severity), and a local pick
+        // under an external ceiling is tier 1.
         let scan_result = scan_output(
             &self.privacy_gateway.as_ref().unwrap().logger,
             "output-creation",
             &focus_run_id,
             &final_content,
-            execution_tier_ordinal(self._focus_max_permitted_tier),
+            self.task_track.as_ref().map(highest_tier_used).unwrap_or(1),
             sensitivity_severity(&sensitivity),
             ScanIntensity::Full,
         )
@@ -5118,6 +5119,18 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
     run.current_step = current_step;
 
     Ok(run)
+}
+
+/// items.id=922: the highest execution tier any completed step of the run actually used
+/// (`routing_tier_used`: 1 local, 2 external, 3 frontier), clamped to 1..=3, and 1 when no
+/// step has completed. What the output-creation scan logs as its execution_tier.
+pub(crate) fn highest_tier_used(track: &TaskTrack) -> u8 {
+    track
+        .steps()
+        .iter()
+        .map(|s| s.routing_tier_used.clamp(1, 3) as u8)
+        .max()
+        .unwrap_or(1)
 }
 
 /// Gate3 look-ahead: the execution tier of the step after `step_index`, under
@@ -6775,6 +6788,82 @@ mod tests {
         ));
         run.crisis_floor_triggered = crisis_floor_triggered;
         run
+    }
+
+    fn tiered(id: &str, tier: i32) -> TaskStep {
+        let mut s = recorded(id, Some(id), "out");
+        s.routing_tier_used = tier;
+        s
+    }
+
+    /// items.id=922: highest_tier_used is the highest tier a completed step used, 1 for an
+    /// empty track, and clamped to 1..=3 (a value out of range cannot leave the scale).
+    #[test]
+    fn the_highest_tier_used_is_the_max_over_completed_steps() {
+        let mut t = TaskTrack::new();
+        assert_eq!(highest_tier_used(&t), 1);
+        t.add_step(tiered("a", 1));
+        assert_eq!(highest_tier_used(&t), 1);
+        t.add_step(tiered("b", 2));
+        t.add_step(tiered("c", 1));
+        assert_eq!(
+            highest_tier_used(&t),
+            2,
+            "a later local step does not lower it"
+        );
+        t.add_step(tiered("d", 3));
+        assert_eq!(highest_tier_used(&t), 3);
+        let mut odd = TaskTrack::new();
+        odd.add_step(tiered("x", 0));
+        assert_eq!(highest_tier_used(&odd), 1);
+        odd.add_step(tiered("y", 9));
+        assert_eq!(highest_tier_used(&odd), 3);
+    }
+
+    /// items.id=922: the output-creation scan logs the tier the run's steps used, not the
+    /// Focus ceiling. A run whose ceiling is external but whose steps all went local logs
+    /// tier 1; one with an external step logs 2. What the scan blocks is unchanged (a
+    /// separate characterization below pins that it does not read the tier).
+    #[tokio::test]
+    async fn the_output_scan_logs_the_highest_tier_used_not_the_ceiling() {
+        with_temp_data_root(async {
+            for (steps, expected) in [
+                (vec![tiered("a", 1), tiered("b", 1)], 1u8),
+                (vec![tiered("a", 1), tiered("b", 2), tiered("c", 1)], 2u8),
+            ] {
+                let mut run = tier3_ready_run(false);
+                run._focus_max_permitted_tier = ExternalAccess::AnonymousRequired;
+                for s in steps {
+                    run.task_track.as_mut().unwrap().add_step(s);
+                }
+                crate::persistence::output_store::test_seed_focus_run(
+                    &run.user_id,
+                    &run.persona_id,
+                    CRISIS_TEST_KEY_HEX,
+                    run.focus_run_id.as_deref().unwrap(),
+                    "f",
+                )
+                .await
+                .expect("test_seed_focus_run must succeed");
+                run.output().await.unwrap();
+                let writes = run
+                    .privacy_gateway
+                    .as_ref()
+                    .unwrap()
+                    .logger
+                    .writes
+                    .lock()
+                    .unwrap()
+                    .clone();
+                let scan: Vec<_> = writes
+                    .iter()
+                    .filter(|w| w.action_id == "output-creation")
+                    .collect();
+                assert_eq!(scan.len(), 1, "{writes:?}");
+                assert_eq!(scan[0].execution_tier, expected);
+            }
+        })
+        .await;
     }
 
     #[tokio::test]

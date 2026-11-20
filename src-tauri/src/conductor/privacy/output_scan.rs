@@ -528,6 +528,37 @@ mod tests {
         assert!(result.plain_language.is_none());
     }
 
+    /// items.id=922: the block decision does not read the execution tier, only the
+    /// severity (and, off this path, the Privacy Filter result). The tier is the log row's
+    /// execution_tier, so changing which tier the output-creation scan is given changes
+    /// what is logged and nothing a user sees. The tier given is what is logged.
+    #[tokio::test]
+    async fn legacy_block_decision_does_not_depend_on_the_tier_but_the_log_row_records_it() {
+        for severity in [1u8, 2, 3, 4] {
+            let mut blocked = Vec::new();
+            for tier in [1u8, 2, 3] {
+                let logger = TestLogger::new();
+                let r = scan_legacy_fallback(
+                    &logger,
+                    "output-creation",
+                    "run-1",
+                    tier,
+                    severity,
+                    ScanIntensity::Full,
+                )
+                .await
+                .unwrap();
+                assert_eq!(logger.entries()[0].execution_tier, tier);
+                blocked.push(r.blocked);
+            }
+            assert!(
+                blocked.iter().all(|b| *b == blocked[0]),
+                "severity {severity}"
+            );
+            assert_eq!(blocked[0], severity >= 3);
+        }
+    }
+
     #[tokio::test]
     async fn legacy_fallback_never_produces_pf_findings() {
         // The legacy path has no detection engine, only the severity
