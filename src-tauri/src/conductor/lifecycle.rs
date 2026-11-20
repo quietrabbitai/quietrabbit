@@ -91,6 +91,7 @@ use crate::conductor::privacy::output_scan::{scan_output, ScanIntensity};
 use crate::conductor::privacy::types::sensitivity_severity;
 use crate::conductor::privacy::{logger::DisclosureLoggerForRun, PrivacyGateway};
 use crate::conductor::reentry::{self, ReentryError, ReentryPlan};
+use crate::conductor::run_retention::{purge_after_for, CheckpointPark};
 use crate::conductor::store_op;
 use crate::conductor::store_writer::Collection;
 use crate::conductor::tokens::{
@@ -3289,7 +3290,14 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                         log::warn!("lifecycle: schedule_trigger ledger write failed: {e}");
                     }
                     if !self._checkpointing_suspended {
-                        if let Err(e) = self.write_checkpoint(&step.action_id).await {
+                        if let Err(e) = self
+                            .write_checkpoint_for(
+                                &step.action_id,
+                                CheckpointPark::AwaitingSchedule(scheduled_for),
+                                Utc::now(),
+                            )
+                            .await
+                        {
                             log::warn!("lifecycle: schedule checkpoint write failed: {e}");
                         }
                     }
@@ -3312,7 +3320,14 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             // checkpoint (if not suspended), set status, return early.
             if step.requires_user_handoff {
                 if !self._checkpointing_suspended {
-                    if let Err(e) = self.write_checkpoint(&step.action_id).await {
+                    if let Err(e) = self
+                        .write_checkpoint_for(
+                            &step.action_id,
+                            CheckpointPark::AwaitingUser,
+                            Utc::now(),
+                        )
+                        .await
+                    {
                         log::warn!("lifecycle: Tier 3 checkpoint write failed: {e}");
                     }
                 }
@@ -3985,7 +4000,10 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             // into failure_handler.handle() (see executor.rs/failure.rs).
             if !self._checkpointing_suspended {
                 if let Some(action_id) = failure.action_id.clone() {
-                    if let Err(e) = self.write_checkpoint(&action_id).await {
+                    if let Err(e) = self
+                        .write_checkpoint_for(&action_id, CheckpointPark::AwaitingUser, Utc::now())
+                        .await
+                    {
                         log::warn!("lifecycle: consent-gate pause checkpoint write failed: {e}");
                     }
                 }
@@ -4045,6 +4063,21 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     /// SHA-256 of (task_json + shared_json + manifest_json) forms the integrity hash.
     /// Python oracle: FocusRun._write_checkpoint()
     async fn write_checkpoint(&self, action_id: &str) -> Result<(), LifecycleError> {
+        self.write_checkpoint_for(action_id, CheckpointPark::Running, Utc::now())
+            .await
+    }
+
+    /// items.id=681: the checkpoint writer. `park` says whether the run is parking
+    /// (and where), which decides the row's purge_after (conductor/run_retention.rs);
+    /// `at` is the clock, injected by tests. A periodic checkpoint of a running
+    /// run passes Running and stores no purge_after. Every site that parks a run
+    /// calls this with its park kind (a scan test pins the four sites).
+    async fn write_checkpoint_for(
+        &self,
+        action_id: &str,
+        park: CheckpointPark,
+        at: DateTime<Utc>,
+    ) -> Result<(), LifecycleError> {
         let personal_track = self.personal_track.as_ref().unwrap();
         let task_track = self.task_track.as_ref().unwrap();
         let shared_state = self.shared_state.as_ref().unwrap();
@@ -4100,8 +4133,8 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             "INSERT INTO focus_run_snapshots
              (id, focus_run_id, action_id, phase, task_track_json,
               shared_state_json, personal_context_manifest,
-              checkpoint_hash, created_at)
-             VALUES (?, ?, ?, 4, ?, ?, ?, ?, ?)",
+              checkpoint_hash, purge_after, created_at)
+             VALUES (?, ?, ?, 4, ?, ?, ?, ?, ?, ?)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(focus_run_id)
@@ -4110,7 +4143,8 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         .bind(&shared_json)
         .bind(&manifest_json)
         .bind(&checkpoint_hash)
-        .bind(now())
+        .bind(purge_after_for(park, at))
+        .bind(at.to_rfc3339())
         .execute(&mut conn)
         .await?;
 
@@ -4797,7 +4831,8 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         // rehydrate (e.g. after a crash before the next execute() call) to
         // land exactly there, not one step later.
         self.write_focus_run_record("awaiting_user").await?;
-        self.write_checkpoint(target_action_id).await?;
+        self.write_checkpoint_for(target_action_id, CheckpointPark::AwaitingUser, Utc::now())
+            .await?;
 
         Ok(plan)
     }
@@ -7641,6 +7676,141 @@ mod tests {
             Some(v) => std::env::set_var("QR_DATA_ROOT", v),
             None => std::env::remove_var("QR_DATA_ROOT"),
         }
+    }
+
+    /// items.id=681 stage 1: build a FocusRun with a sealed track, a step and an
+    /// empty shared state, bound to a seeded focus_runs row, so write_checkpoint_for
+    /// can run for real. Caller holds ENV_MUTEX and has set QR_DATA_ROOT.
+    async fn run_ready_to_checkpoint(user_id: &str, persona_id: &str) -> (FocusRun, String) {
+        let pool = setup_shared_and_persona_for_resume_test(user_id, persona_id).await;
+        let focus_run_id = uuid::Uuid::new_v4().to_string();
+        let mut conn = open_outputs_db(user_id, persona_id, RESUME_TEST_KEY_HEX)
+            .await
+            .expect("open_outputs_db must succeed");
+        sqlx::query(
+            "INSERT INTO focus_runs
+             (id, focus_id, status, is_fast_lane, is_quick_ask, topic_id, user_input, started_at)
+             VALUES (?, 'quick-ask', 'awaiting_user', 0, 1, NULL, 'x', ?)",
+        )
+        .bind(&focus_run_id)
+        .bind(now())
+        .execute(&mut conn)
+        .await
+        .expect("seed focus_runs insert must succeed");
+        let mut run: FocusRun = FocusRun::new(
+            user_id.to_owned(),
+            persona_id.to_owned(),
+            "quick-ask".to_owned(),
+            pool,
+            Arc::new(ConductorScheduler::new()),
+            "x".to_owned(),
+            false,
+            Some(RESUME_TEST_KEY_HEX.to_owned()),
+            None,
+            true,
+            std::collections::HashSet::new(),
+            None,
+        );
+        run.focus_run_id = Some(focus_run_id.clone());
+        let mut personal_track = PersonalTrack::new();
+        personal_track.seal();
+        run.personal_track = Some(personal_track);
+        run.task_track = Some(TaskTrack::new());
+        run.shared_state = Some(SharedStateTrack::new());
+        (run, focus_run_id)
+    }
+
+    async fn purge_afters(user_id: &str, persona_id: &str, run_id: &str) -> Vec<Option<String>> {
+        let mut conn = open_outputs_db(user_id, persona_id, RESUME_TEST_KEY_HEX)
+            .await
+            .unwrap();
+        sqlx::query_scalar(
+            "SELECT purge_after FROM focus_run_snapshots WHERE focus_run_id = ? ORDER BY created_at",
+        )
+        .bind(run_id)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap()
+    }
+
+    /// items.id=681: purge_after is written for each parked state, none for a
+    /// periodic checkpoint, and each new awaiting_user checkpoint carries a later one.
+    #[tokio::test]
+    async fn checkpoints_write_purge_after_for_each_parked_state() {
+        use crate::conductor::run_retention::CheckpointPark;
+        use chrono::TimeZone;
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+        let (user_id, persona_id) = ("ret-user", "ret-persona");
+        let (run, run_id) = run_ready_to_checkpoint(user_id, persona_id).await;
+
+        let t0 = Utc.with_ymd_and_hms(2026, 11, 1, 8, 0, 0).unwrap();
+        let t1 = Utc.with_ymd_and_hms(2026, 11, 5, 8, 0, 0).unwrap();
+        let sched = Utc.with_ymd_and_hms(2027, 2, 1, 9, 0, 0).unwrap();
+        run.write_checkpoint_for("a", CheckpointPark::Running, t0 - Duration::days(1))
+            .await
+            .unwrap();
+        run.write_checkpoint_for("a", CheckpointPark::AwaitingUser, t0)
+            .await
+            .unwrap();
+        run.write_checkpoint_for("a", CheckpointPark::AwaitingUser, t1)
+            .await
+            .unwrap();
+        run.write_checkpoint_for(
+            "a",
+            CheckpointPark::AwaitingSchedule(sched),
+            t1 + Duration::days(1),
+        )
+        .await
+        .unwrap();
+
+        let got = purge_afters(user_id, persona_id, &run_id).await;
+        assert_eq!(
+            got,
+            vec![
+                None,
+                Some("2026-12-01T08:00:00Z".to_owned()),
+                Some("2026-12-05T08:00:00Z".to_owned()),
+                Some("2027-03-03T09:00:00Z".to_owned()),
+            ]
+        );
+        // The unparameterised writer is the periodic one.
+        run.write_checkpoint("a").await.unwrap();
+        let got = purge_afters(user_id, persona_id, &run_id).await;
+        assert_eq!(got.len(), 5);
+        assert!(got.iter().filter(|p| p.is_none()).count() == 2);
+
+        match saved_root {
+            Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+            None => std::env::remove_var("QR_DATA_ROOT"),
+        }
+    }
+
+    /// items.id=681: every site that parks a run passes its park kind; the only
+    /// production caller of the plain write_checkpoint is the periodic one.
+    #[test]
+    fn every_parking_site_writes_its_park_kind() {
+        let src = include_str!("lifecycle.rs");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let live: String = code
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(live.matches("CheckpointPark::AwaitingUser,").count(), 3);
+        assert_eq!(
+            live.matches("CheckpointPark::AwaitingSchedule(scheduled_for)")
+                .count(),
+            1
+        );
+        assert_eq!(
+            live.matches("self.write_checkpoint(").count(),
+            1,
+            "only the periodic checkpoint uses the plain writer"
+        );
+        assert_eq!(live.matches("CheckpointPark::Running").count(), 1);
     }
 
     /// End-to-end (minus the model call) proof that a paused quick-ask run
