@@ -1,5 +1,9 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: November 20, 2026 (items.id=888 pass 2: new "Resume state, archive hook and store
+# Last updated: November 20, 2026 (items.id=923: new "Long-prompt review and the Gate 3 riders"
+# section; under "Run plan and strategy approval" the PARK REASON family list (promotion added); under
+# "Resume state, archive hook and store sweeps" the archive hook's "review_prompt reuses a live run's
+# own" (reuse is now one retry loop's); nothing else.).
+# Before that, November 20, 2026 (items.id=888 pass 2: new "Resume state, archive hook and store
 # sweeps" section; the pass 1 section's "Pass 2 is NOT built" line; and the older lines pass 2 made
 # false: under "Model blocks" the user_input bullet and the store-writer-on-resume line; under "Privacy
 # treatment of a step attempt" the GATE 3 look-ahead line; under "Per-pass artifact store" RETENTION
@@ -1080,8 +1084,8 @@ built: any screen (items.id=902 or 904).
   run_parks, written by lifecycle::write_run_row in the same function and on the same connection
   as the focus_runs row: every status write stores the park it is given or removes any earlier
   one, so a park exists exactly when the last status written for the run carried one. Which
-  failures: a code in Code::ALL of the resolver, spend_block, plan or step_review family (by Code
-  variant). What it carries: sanitize_params keeps keys of [a-z0-9_] and values that are numbers,
+  failures: a code in Code::ALL of the resolver, spend_block, plan, step_review or promotion family
+  (by Code variant; promotion since items.id=923). What it carries: sanitize_params keeps keys of [a-z0-9_] and values that are numbers,
   bools, null or identifier-shaped words (no spaces), at most three deep, and DROPS anything else,
   so prose cannot ride in a park; a TooWeak or NoCandidate park carries the resolver's ranked
   options, and when they would exceed 4096 bytes whole options are dropped from the worst-ranked
@@ -1347,7 +1351,7 @@ is deferred. The byte cap on the chat history window is not built and stays defe
   and session variables go; and the reviews of the chat's ENDED runs (complete, failed, cancelled, after the
   cancels) go through step_review_store::delete_reviews_of_ended_chat_runs_in_tx, that store's one delete
   (a scan pins chat_clear as its only caller; nothing reads a review once its run has ended, and
-  review_prompt reuses a live run's own). THE ONE-TIME LATCH goes only when no run of the chat is still
+  review_prompt reuses only a review its own retry loop made, items.id=923 F13). THE ONE-TIME LATCH goes only when no run of the chat is still
   non-terminal after the cancels; otherwise every session row but the latch goes. session_store::
   clear_chat_in_tx is the only delete that can reach the latch (a scan pins it). Each delete lives in the
   store that owns its table.
@@ -1704,6 +1708,80 @@ Two reads that keyed off the run ceiling, and three gaps found with them, built 
   end (blocks stay off, items.id=913; the floor is tested through the pure function), the rehydrate call
   site of the persona guard under a real resume, user-installed Focuses against the new LOAD refusals, and
   Windows or macOS.
+
+## Long-prompt review and the Gate 3 riders (items.id=923, privacy review 2026-11-20 F1 to F3, F13, F14)
+The Privacy Filter review of long text, and five Gate 3 and outbound-review defects. Units 1 to 3
+are code; the spec text is Chat-PM's (PRIVACY_GUARDIAN_GATE_SPEC.md disagreed with itself on
+keep-private before this item: line 148 "run stops at this step", lines 421, 487 and 551 "run
+stops if all content kept private").
+- LONG PROMPTS (privacy/mod.rs, privacy/privacy_filter.rs). privacy::MAX_REVIEW_BYTES = 128 KiB,
+  in BYTES of the text. The filter's time follows characters, so non-ASCII text reaches the cap
+  in fewer characters. Text over it is refused BEFORE any chunk is scanned: the outbound review
+  parks with step_review.too_long (Park::TooLong, a blocked step_reviews row with reason
+  prompt_too_long, nothing sent) and gate3 itself blocks with gate3_pf_too_long for every other
+  caller. Below it, classify_chunked runs CHUNK_TARGET_BYTES = 16 KiB chunks with
+  CHUNK_OVERLAP_BYTES = 1 KiB, cut after whitespace, ONE AFTER ANOTHER (the filter holds one
+  mutex), each under PF_TIMEOUT_SECS; spans come back in whole-text offsets (span_text re-cut from
+  the whole text) and overlapping spans from different chunks merge (union extent, lowest score,
+  the label of the member farther from a cut). Text of one chunk returns the classifier output
+  unchanged. The FIRST chunk that times out, panics or fails ends the review through gate3's
+  existing arms; later chunks are not scanned and nothing partial is ever sent. Measured with the
+  real filter: 16 KiB 1.4 s, 20 KiB 2.5 s, 24 KiB 2.8 s, 32 KiB 4.3 s, 48 KiB 7.2 s; 128 KiB in 9
+  chunks 11.9 s (432 of 432 seeded emails found, none twice). The user waits about 12 to 20 s for
+  a prompt near the cap, per review. Not changed: output_scan.rs still makes one call under the
+  timeout (a follow-up can reuse classify_chunked), and PF_TIMEOUT_SECS.
+- F13, REVIEW REUSE (step_review::ReviewReuse). A FINAL step_reviews row is reused only when THIS
+  retry loop produced or applied it: the set is owned by RealAttempt, built once per execute(),
+  passed to every attempt and never stored. A resume after a park is a new loop, so the step is
+  reviewed again and a standing decision tightened while the run was parked applies. A PENDING
+  review the user answered is still applied on resume (it keeps the settled spans recorded at
+  scan time).
+- F3, WHAT A GATE 3 RESULT CHANGES (comments corrected, no behaviour change). In Step 13 only
+  `blocked` and `pending_consent` act. An approval, the user's span decisions and auto_resolved
+  change nothing the next step receives; SharedStateTrack's "promotion" is an audit record in the
+  checkpoint with no production reader. A hosted next step is reviewed again by the outbound
+  review; a cb-15 starter has only the copy-time review. The run-level gate3 consent row is
+  written and never read.
+- F14, KEPT PRIVATE (gate3::KeptPrivate). gate3 takes StopsContent or RemovesSpans. ONLY the
+  outbound review (Gate3Scanner) and API Chat (review_new_turn) pass RemovesSpans: a REMEMBERED
+  keep_private on every span is then sent with the spans removed, as a live answer already was.
+  Step 13 and the copy review pass StopsContent and keep "stops if all kept private". A scan pins
+  both sets. The copy review is therefore still asymmetric: a live keep_private on every span
+  copies with [removed], a remembered one refuses the copy (outside the ruling, left alone).
+- F1, FORCED-HIGH PROVENANCE (gate3::partition_with_rule, output_store::find_review_answer_for_fact).
+  forced_high = !zero_spans_safe_to_auto_approve(severity, destination risk, authoritative), the same
+  rule as the zero-span check, decided before the partition. Under it a STANDING PREFERENCE NEVER
+  SETTLES A SPAN and never overrides the user's answer. A span is settled only by an element_consent
+  row that (1) the user wrote (save_preference NOT NULL and original_text NULL; the auto-reapplied
+  writer sets the reverse, and a scan keeps the two writers distinguishable), (2) is later than this
+  step's latest PARKING checkpoint (focus_run_snapshots with purge_after set; a periodic checkpoint
+  does not count) and (3) is not an answer to the step's own outbound review (its asked span ids in
+  step_reviews). Everything else is asked again. The outbound review, API Chat and the copy review
+  pass a placeholder severity with severity_authoritative false, so they are never forced High and
+  their partition is unchanged.
+- F2, A FORCED-HIGH REVIEW WITH NO SPAN (executor.rs step13_verdict, the one reader of a Gate3Result
+  in Step 13). pending_consent with empty review_spans is Unanswerable: the step stops with
+  promotion.sensitive_blocked (AwaitUser, F4, Stop, recoverable; spend::codes promotion.* prefix, the
+  FIFTH run_park family; en.json promotion.stop.sensitive_blocked placeholder copy, orphan-allowlisted,
+  Chat-BRAND's wording). gate3 still writes gate3_pf_no_spans_forced_review and returns
+  pending_consent, but EMITS NO consent_request for it (emits_consent_request: only a payload with a
+  span is surfaced). Only Step 13 reaches this case (see F1's last sentence).
+  THIS DEPARTS FROM decisions.id=405 Q1 (the gate fires when the filter finds nothing and the user
+  decides): here the user does not decide, the step is blocked. It is FAIL CLOSED (nothing leaves),
+  and NO SHIPPED FOCUS REACHES IT (none has a severity-3 step ahead of an external step). Restoring
+  the user's choice would mean reading the run-level gate3 consent row after the park, which nothing
+  reads today (F3).
+- ACCEPTED LIMITS:
+  (a) No parking checkpoint, as when checkpointing is suspended after a snapshot write failure (F8),
+      means a forced-High answer NEVER counts: the span is asked again on every resume.
+  (b) A span with no fact identity (no fact_key) is never settled under forced-High and is asked
+      on every resume (the decisions.id=888 point 5 limit, now without the standing escape).
+  (c) A manual resume after promotion.sensitive_blocked re-runs the step once (a new model call)
+      and stops again: no loop, no way through.
+  (d) An answer written in the instant before its parking checkpoint is written is older than the
+      park and is asked again (errs toward asking).
+  (e) Not verified: a full Step 13 resume against the real filter (needs the running app; no
+      shipped Focus reaches it), Windows and macOS.
 
 ## Naming Architecture — term map
 
