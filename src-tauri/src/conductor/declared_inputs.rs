@@ -52,7 +52,7 @@
 
 use std::collections::HashSet;
 
-use crate::conductor::executor::find_tokens;
+use crate::conductor::executor::{find_tokens, is_token_name};
 use crate::conductor::taint::{taint_closure, taint_closure_of, tainting_name, Taint};
 use crate::conductor::tokens::{is_system_token, ActionDefinition};
 
@@ -124,6 +124,10 @@ pub enum DeclaredInputsError {
     /// A declared name is not an earlier row's output variable, a system
     /// token, a field of the step, or a registered bound name.
     UnknownDeclared { action_id: String, name: String },
+    /// A row's output variable is not token-shaped, [a-z_][a-z0-9_]* (items.id=922).
+    /// The renderer resolves any brace-free span, but find_tokens (read by the
+    /// declared-inputs rule and both taint closures) sees only that shape.
+    OutputVarNotTokenShaped { action_id: String, name: String },
     /// A row's output variable has the name of a bound name (items.id=886): the
     /// seed and the output would fight over one token.
     OutputVarShadowsBoundName { action_id: String, name: String },
@@ -192,6 +196,13 @@ impl std::fmt::Display for DeclaredInputsError {
                 "step '{action_id}': declared_inputs names '{name}', which is not an earlier \
                  step's output variable, a system token, a field in this step's \
                  field_requirements, or a registered bound variable"
+            ),
+            Self::OutputVarNotTokenShaped { action_id, name } => write!(
+                f,
+                "step '{action_id}': output_var '{name}' must be lower-case letters, digits \
+                 and underscores and start with a letter or underscore: the renderer reads a \
+                 prompt's {{names}} in that shape only, so any other name could reach a step \
+                 that no input or taint rule can see (items.id=922)"
             ),
             Self::OutputVarShadowsBoundName { action_id, name } => write!(
                 f,
@@ -273,6 +284,16 @@ pub(crate) fn lint_with(
     let mut earlier: HashSet<&str> = HashSet::new();
     for (step, var) in steps.iter().zip(row_vars.iter()) {
         let var = var.as_deref().filter(|v| !v.is_empty());
+        // A row's output variable is shaped like a template token (items.id=922). Checked
+        // on row_vars, which holds every variable a row records: an ordinary output_var,
+        // a block handler's, a render row's and a store writer's published variable.
+        if let Some(v) = var.filter(|v| !is_token_name(v)) {
+            return Err(DeclaredInputsError::OutputVarNotTokenShaped {
+                action_id: step.action_id.clone(),
+                name: v.to_owned(),
+            }
+            .to_string());
+        }
         // A row's output variable must not be a bound name (items.id=886).
         if let Some(v) = var.filter(|v| bound.contains(v)) {
             return Err(DeclaredInputsError::OutputVarShadowsBoundName {
@@ -616,6 +637,53 @@ mod tests {
                 .contains("lint_device_names"),
             "the device refusal is not inside the flag's branch"
         );
+    }
+
+    /// items.id=922: a variable name that find_tokens cannot see is refused at LOAD. Before
+    /// this, a local step `Draft` fed `{Draft}` into an external step that never declared
+    /// it: the renderer resolved it, the declared-inputs rule did not see it.
+    #[test]
+    fn an_output_variable_that_is_not_token_shaped_is_refused() {
+        for bad in ["Draft", "myVar", "1draft", "a-b", "a b", "Ünï", "a.b"] {
+            let e = run(
+                &[
+                    (step("a", LOCAL, "x", &[], &[]), Some(bad)),
+                    (step("e", EXT, "use {Draft}", &[], &[]), None),
+                ],
+                &[],
+            )
+            .unwrap_err();
+            assert!(
+                e.contains("step 'a'") && e.contains(&format!("output_var '{bad}'")),
+                "{bad}: {e}"
+            );
+            assert!(
+                e.contains("items.id=922") && !e.contains("does not declare"),
+                "{e}"
+            );
+        }
+        // The refusal does not depend on the row being external or on a later reader.
+        assert!(run(&[(step("a", LOCAL, "x", &[], &[]), Some("Draft"))], &[]).is_err());
+    }
+
+    #[test]
+    fn a_token_shaped_output_variable_and_a_row_with_none_still_load() {
+        for good in ["draft", "_draft", "d1", "draft_output_2", "_"] {
+            run(
+                &[
+                    (step("a", LOCAL, "x", &[], &[]), Some(good)),
+                    (
+                        step("e", EXT, &format!("use {{{good}}}"), &[good], &[]),
+                        None,
+                    ),
+                ],
+                &[],
+            )
+            .unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
+        run(&[(step("a", LOCAL, "x", &[], &[]), None)], &[]).unwrap();
+        // An empty recorded variable is no variable (as before).
+        run(&[(step("a", LOCAL, "x", &[], &[]), Some(""))], &[]).unwrap();
     }
 
     #[test]

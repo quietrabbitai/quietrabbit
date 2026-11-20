@@ -11746,6 +11746,70 @@ steps:
         .await;
     }
 
+    /// items.id=922 on the database path: a variable the renderer resolves but find_tokens
+    /// cannot see is refused at LOAD, and a snake_case one loads.
+    #[tokio::test]
+    async fn token_shape_db_an_uppercase_output_variable_fails_load() {
+        with_temp_data_root(async {
+            let m = declared_load(
+                "ts-upper",
+                vec![
+                    dstep("a", 1, "x", &[], &[], Some("Draft")),
+                    dstep("e", 2, "use {Draft}", &[], &[], None),
+                ],
+            )
+            .await
+            .unwrap_err();
+            assert!(m.contains("Focus 'ts-upper'"), "{m}");
+            assert!(m.contains("step 'a': output_var 'Draft' must be"), "{m}");
+            declared_load(
+                "ts-lower",
+                vec![
+                    dstep("a", 1, "x", &[], &[], Some("draft")),
+                    dstep("e", 2, "use {draft}", &["draft"], &[], None),
+                ],
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+    }
+
+    /// items.id=922 on the YAML path.
+    #[test]
+    fn token_shape_yaml_an_uppercase_output_variable_fails_load() {
+        let text = |var: &str| {
+            format!(
+                r#"
+id: ts-yaml
+max_routing_tier: 2
+steps:
+  first:
+    routing_tier: 1
+    output_var: {var}
+    prompt_template: "x"
+  second:
+    routing_tier: 2
+    prompt_template: "use {{{var}}}"
+    declared_inputs:
+      - {var}
+"#
+            )
+        };
+        let def = parse_focus_text(&text("Draft")).unwrap();
+        let LifecycleError::ValidationFailed(m) =
+            lint_declared_inputs("ts-yaml", &def.steps).unwrap_err()
+        else {
+            panic!("expected ValidationFailed");
+        };
+        assert!(
+            m.contains("step 'first': output_var 'Draft' must be"),
+            "{m}"
+        );
+        let def = parse_focus_text(&text("draft")).unwrap();
+        lint_declared_inputs("ts-yaml", &def.steps).unwrap();
+    }
+
     #[tokio::test]
     async fn declared_inputs_db_a_declared_name_nothing_produces_fails_load() {
         with_temp_data_root(async {

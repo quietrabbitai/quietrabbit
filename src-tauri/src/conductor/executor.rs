@@ -3278,7 +3278,7 @@ fn substitute_once(template: &str, tokens: &HashMap<String, String>) -> (String,
 }
 
 /// `[a-z_][a-z0-9_]*`, the shape find_tokens() accepts.
-fn is_token_name(name: &str) -> bool {
+pub(crate) fn is_token_name(name: &str) -> bool {
     let mut c = name.chars();
     c.next()
         .map(|f| f == '_' || f.is_ascii_lowercase())
