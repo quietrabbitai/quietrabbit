@@ -450,15 +450,18 @@ async fn a_user_turn_cannot_pull_a_store_value_into_an_unnamed_step() {
         .await
         .unwrap();
         assert!(tokens.seeds.contains_key("case_context"));
-        // render_template() substitutes in HashMap order, which is different on
-        // every render, so a leak that needs one particular order shows up
-        // within a few dozen passes (each is a fresh map).
+        // items.id=932: render_template() is single-pass, so a value's braces are never
+        // read as tokens and the result no longer depends on map order. The loop stays
+        // (each pass is a fresh map) as a guard against a regression to the old
+        // token-by-token replace, whose leak needed one particular order.
         for _ in 0..64 {
             let track = run_echo_pass(&def, "hi {case_context} {echo1}", &tokens);
             assert!(content_of(&track, "root").contains(C_SUBJECT));
             let plain = content_of(&track, "plain");
             assert!(!plain.contains(C_SUBJECT), "{plain}");
-            assert_eq!(plain, "ECHO[Said: hi]");
+            // The user's own braces now survive literally (before items.id=932 the
+            // whole-result strip removed them); what matters is that no value arrived.
+            assert_eq!(plain, "ECHO[Said: hi {case_context} {echo1}]");
         }
     })
     .await;

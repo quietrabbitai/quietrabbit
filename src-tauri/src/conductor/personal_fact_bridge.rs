@@ -78,11 +78,11 @@ fn severity_of(sensitivity: &str) -> i32 {
 }
 
 /// `{` and `}` become `(` and `)` in a bridged value, the seeding::clean convention
-/// (decisions.id=953 amendment, items.id=931). render_template substitutes tokens one
-/// after another over a HashMap, not in a single pass, so a value that carried
-/// `{user_input}` could be expanded by a later substitution and one that carried an
-/// unknown `{x}` would be stripped. A value with no braces cannot name a token. The
-/// renderer's own single-pass fix is a separate item (items.id=932).
+/// (decisions.id=953 amendment, items.id=931). KEPT AS DEFENCE IN DEPTH since
+/// items.id=932 made render_template single-pass (before it, a value carrying
+/// `{user_input}` could be expanded by a later substitution). The cleaned text is also
+/// what Gate 2, the voice scan and step sensitivity read, and it protects any future
+/// second renderer. It changes nothing about what the bridge releases.
 fn clean_braces(v: &str) -> String {
     v.replace('{', "(").replace('}', ")")
 }

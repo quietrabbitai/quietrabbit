@@ -34,11 +34,12 @@
 // The fixpoint ignores row order on purpose: a template that names a variable
 // only a LATER row produces would otherwise escape.
 //
-// WHY A TOKEN FILTER IS NEEDED TOO. render_template() substitutes every key of
-// the token map into the whole template, repeatedly, including into text that
-// an earlier substitution inserted. Without a filter, a user turn that reads
-// "{case_context}" or "{echo1}" would pull a bound or tainted value into a step
-// whose template names neither, a step the closure rightly treats as clean.
+// WHY A TOKEN FILTER IS NEEDED TOO. Before items.id=932 render_template() substituted
+// every key of the token map into the whole template, repeatedly, including into text
+// that an earlier substitution inserted (single-pass substitution closed that). The
+// filter stays because it decides which values a step is GIVEN: without it a bound or
+// tainted value would be in the map of a step whose template names neither, a step the
+// closure rightly treats as clean, and a template that named it would read it.
 // StoreTokens::apply therefore (a) removes every bound name and tainted
 // variable from a step's token map unless that step's own template names it,
 // and (b) inserts a bound name's seed only for a step whose template names it.

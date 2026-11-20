@@ -1169,27 +1169,28 @@ impl StepExecutor {
 // ---------------------------------------------------------------------------
 
 /// Single token resolution engine for all prompt rendering.
-/// Merge order invariant: output_vars -> (disclosure) -> SYSTEM_TOKENS.
-/// Unresolved tokens are stripped (logged at DEBUG). Matches Python oracle.
+/// Merge order invariant: output_vars -> (disclosure) -> SYSTEM_TOKENS (the callers
+/// build the map; later wins).
+/// Unresolved TEMPLATE tokens are stripped (logged at DEBUG).
 ///
-/// Python oracle: StepExecutor._render_template()
+/// items.id=932: ONE pass over the template (substitute_once). A substituted value
+/// is never scanned again, so a value that holds `{user_input}` or any other token
+/// text appears literally, and the result does not depend on HashMap order. The
+/// retired Python oracle (StepExecutor._render_template) substituted token by token
+/// on the running string and so re-expanded; Rust deliberately differs on this one
+/// point (the gate golden vectors do not cover rendering).
 pub(crate) fn render_template(
     template: &str,
     tokens: &HashMap<String, String>,
     action_id: &str,
     focus_id: &str,
 ) -> String {
-    let mut result = template.to_owned();
-    for (token, value) in tokens {
-        result = result.replace(&format!("{{{token}}}"), value);
-    }
-    let unresolved = find_tokens(&result);
+    let (result, unresolved) = substitute_once(template, tokens);
     if !unresolved.is_empty() {
         log::debug!(
             "executor: unresolved tokens stripped: {:?} step={action_id} focus={focus_id}",
             unresolved
         );
-        result = strip_tokens(&result);
     }
     result.trim().to_owned()
 }
@@ -3224,15 +3225,65 @@ pub(crate) fn find_tokens(template: &str) -> Vec<String> {
     tokens
 }
 
-/// Strip all {token} patterns from a template string.
-/// Matches only valid snake_case tokens (same constraint as find_tokens).
-/// Python oracle: _TOKEN_PATTERN.sub("", template)
-fn strip_tokens(template: &str) -> String {
-    let mut result = template.to_owned();
-    for token in find_tokens(template) {
-        result = result.replace(&format!("{{{token}}}"), "");
+/// One left-to-right pass over `template` (items.id=932). Scanning is exactly
+/// find_tokens(): at `{` look for the closing `}`; a nested `{` or the end of the
+/// string means this `{` is literal and the scan moves one character on.
+///
+/// - a closed span whose text is a KEY of `tokens` is replaced by its value (any
+///   brace-free key is looked up, as the replace loop did: a cb-15 declared input
+///   or an output_var is not required to be snake_case);
+/// - else a span shaped `[a-z_][a-z0-9_]*` is an unresolved template token: it is
+///   removed and its name returned (deduplicated, in discovery order);
+/// - else the span is kept as it is.
+///
+/// The output of a substitution is never read again. Deterministic: the result
+/// depends only on the template and the map's contents.
+fn substitute_once(template: &str, tokens: &HashMap<String, String>) -> (String, Vec<String>) {
+    let chars: Vec<char> = template.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(template.len());
+    let mut unresolved: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if chars[i] != '{' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut j = start;
+        while j < n && chars[j] != '}' && chars[j] != '{' {
+            j += 1;
+        }
+        if j >= n || chars[j] != '}' {
+            out.push('{');
+            i += 1;
+            continue;
+        }
+        let name: String = chars[start..j].iter().collect();
+        if let Some(value) = tokens.get(&name) {
+            out.push_str(value);
+        } else if is_token_name(&name) {
+            if !unresolved.contains(&name) {
+                unresolved.push(name);
+            }
+        } else {
+            out.push('{');
+            out.push_str(&name);
+            out.push('}');
+        }
+        i = j + 1;
     }
-    result
+    (out, unresolved)
+}
+
+/// `[a-z_][a-z0-9_]*`, the shape find_tokens() accepts.
+fn is_token_name(name: &str) -> bool {
+    let mut c = name.chars();
+    c.next()
+        .map(|f| f == '_' || f.is_ascii_lowercase())
+        .unwrap_or(false)
+        && c.all(|c| c == '_' || c.is_ascii_digit() || c.is_ascii_lowercase())
 }
 
 /// Case-insensitive whole-word substring match.
@@ -3400,18 +3451,6 @@ mod tests {
     #[test]
     fn find_tokens_unclosed_brace_skipped() {
         assert!(find_tokens("hello {unclosed world").is_empty());
-    }
-
-    #[test]
-    fn strip_tokens_removes_valid() {
-        let stripped = strip_tokens("Hello {user_input} world");
-        assert!(!stripped.contains("{user_input}"));
-    }
-
-    #[test]
-    fn strip_tokens_leaves_invalid() {
-        let stripped = strip_tokens("value: {1bad}");
-        assert!(stripped.contains("{1bad}"));
     }
 
     #[test]
@@ -11490,5 +11529,264 @@ mod tests {
             next_execution_tier_under(&steps, 0, ceiling, None),
             Some(hosted_tier)
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // items.id=932: single-pass, deterministic substitution
+    // -----------------------------------------------------------------------
+
+    fn map_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    /// The pre-932 algorithm, kept ONLY as the reference of the differential test:
+    /// replace per token on the running result in the given order, then strip every
+    /// leftover valid token from the whole result.
+    fn pre_932_render(template: &str, order: &[(&str, &str)]) -> String {
+        let mut result = template.to_owned();
+        for (token, value) in order {
+            result = result.replace(&format!("{{{token}}}"), value);
+        }
+        for token in find_tokens(&result) {
+            result = result.replace(&format!("{{{token}}}"), "");
+        }
+        result.trim().to_owned()
+    }
+
+    /// A value holding {b} or {user_input} appears literally, whatever the map order
+    /// (each render builds a fresh HashMap with its own random state).
+    #[test]
+    fn render_template_never_re_expands_a_value() {
+        for _ in 0..64 {
+            let tokens = map_of(&[
+                ("a", "see {b} and {user_input}"),
+                ("b", "BEE"),
+                ("user_input", "UI"),
+            ]);
+            let out = render_template("A: {a}\nB: {b}\nC: {user_input}", &tokens, "s", "f");
+            assert_eq!(out, "A: see {b} and {user_input}\nB: BEE\nC: UI");
+        }
+    }
+
+    /// A value whose braces are not a key stays literal: it is not an unresolved
+    /// TEMPLATE token, so it is not stripped. A template token with no value is
+    /// still stripped.
+    #[test]
+    fn render_template_keeps_value_braces_and_strips_template_tokens() {
+        for _ in 0..16 {
+            let tokens = map_of(&[("a", "keep {missing} here")]);
+            let out = render_template("{missing}X {a} {1bad}", &tokens, "s", "f");
+            assert_eq!(out, "X keep {missing} here {1bad}");
+        }
+    }
+
+    #[test]
+    fn the_local_render_never_re_expands_a_value() {
+        let mut ctx = hosted_ctx(RunAttendance::Attended, "unused");
+        ctx.step.prompt_template = "U: {user_input}\nP: {previous_output}\nV: {draft}".to_owned();
+        ctx.user_input = "turn {previous_output} {draft}".to_owned();
+        let vars = map_of(&[("draft", "model {user_input} {previous_output}")]);
+        for _ in 0..64 {
+            let out = render_prompt(&ctx, &vars, "PREV {user_input}", "");
+            assert_eq!(
+                out,
+                "U: turn {previous_output} {draft}\nP: PREV {user_input}\nV: model {user_input} {previous_output}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_external_render_never_re_expands_a_value() {
+        let mut ctx = hosted_ctx(RunAttendance::Attended, "unused");
+        ctx.step.prompt_template =
+            "U: {user_input}\nP: {previous_output}\nV: {draft}\nF: {job_title}".to_owned();
+        ctx.external_input = "turn {previous_output} {job_title}".to_owned();
+        let vars = map_of(&[("draft", "model {user_input} {job_title}")]);
+        let disclosure = map_of(&[("job_title", "dev {user_input} {previous_output}")]);
+        for _ in 0..64 {
+            let out =
+                render_prompt_with_disclosure(&ctx, &vars, "PREV {user_input}", &disclosure, "");
+            assert_eq!(
+                out,
+                "U: turn {previous_output} {job_title}\nP: PREV {user_input}\nV: model {user_input} {job_title}\nF: dev {user_input} {previous_output}"
+            );
+        }
+    }
+
+    /// The differential test. Every class of difference between the pre-932 algorithm
+    /// (run in sorted and in reverse key order, the two orders a HashMap can give) and
+    /// the single pass is a row here with its explanation; none is excluded.
+    #[test]
+    fn single_pass_against_the_pre_932_algorithm_by_class() {
+        // (class, template, tokens, expected new output, old == new in sorted order,
+        //  old == new in reverse order)
+        type Case = (
+            &'static str,
+            &'static str,
+            &'static [(&'static str, &'static str)],
+            &'static str,
+            bool,
+            bool,
+        );
+        let cases: &[Case] = &[
+            (
+                "brace-free values: identical",
+                "A {a} B {b}",
+                &[("a", "1"), ("b", "2")],
+                "A 1 B 2",
+                true,
+                true,
+            ),
+            ("no tokens", "plain", &[], "plain", true, true),
+            (
+                "template token without a value: stripped in both",
+                "x{gone}y",
+                &[],
+                "xy",
+                true,
+                true,
+            ),
+            (
+                "invalid token shape is literal in both",
+                "{1bad} {} {Upper}",
+                &[],
+                "{1bad} {} {Upper}",
+                true,
+                true,
+            ),
+            (
+                "non-snake KEY still substitutes in both",
+                "{Upper} {a-b}",
+                &[("Upper", "U"), ("a-b", "D")],
+                "U D",
+                true,
+                true,
+            ),
+            (
+                "nested {{a}}: inner token substitutes, outer braces stay (both)",
+                "{{a}}",
+                &[("a", "X")],
+                "{X}",
+                true,
+                true,
+            ),
+            (
+                "unclosed brace before a token (both)",
+                "{unclosed {a} x",
+                &[("a", "V")],
+                "{unclosed V x",
+                true,
+                true,
+            ),
+            (
+                "lone braces (both)",
+                "}{a}{",
+                &[("a", "V")],
+                "}V{",
+                true,
+                true,
+            ),
+            (
+                "value brace-free but ends in a brace",
+                "{a}",
+                &[("a", "tail{")],
+                "tail{",
+                true,
+                true,
+            ),
+            // DIFFERENCES.
+            // a then b: the value's {b} is replaced too (BEE|BEE). b then a: {b} is left
+            // by the later pass and stripped as unresolved (|BEE). Old = order dependent.
+            (
+                "value names another key: old result depends on key order",
+                "{a}|{b}",
+                &[("a", "{b}"), ("b", "BEE")],
+                "{b}|BEE",
+                false,
+                false,
+            ),
+            (
+                "value wrapped in template braces: {{a}} with a={b}",
+                "{{a}}",
+                &[("a", "b"), ("b", "B")],
+                "{b}",
+                false,
+                false,
+            ),
+            (
+                "value names an unknown token: old stripped it from the value",
+                "{a}",
+                &[("a", "keep {nope} here")],
+                "keep {nope} here",
+                false,
+                false,
+            ),
+            (
+                "value holds a malformed brace pair: old stripped the valid-shaped part",
+                "{a}",
+                &[("a", "x {ok} {1bad}")],
+                "x {ok} {1bad}",
+                false,
+                false,
+            ),
+        ];
+        for (class, template, pairs, expect_new, fwd_same, rev_same) in cases {
+            let tokens = map_of(pairs);
+            let new = render_template(template, &tokens, "s", "f");
+            assert_eq!(&new, expect_new, "new output: {class}");
+            let mut sorted: Vec<(&str, &str)> = pairs.to_vec();
+            sorted.sort();
+            let old_fwd = pre_932_render(template, &sorted);
+            sorted.reverse();
+            let old_rev = pre_932_render(template, &sorted);
+            assert_eq!(
+                old_fwd == new,
+                *fwd_same,
+                "old sorted {old_fwd:?} vs new: {class}"
+            );
+            assert_eq!(
+                old_rev == new,
+                *rev_same,
+                "old reverse {old_rev:?} vs new: {class}"
+            );
+        }
+    }
+
+    /// items.id=932 scan: render_template() is one call to substitute_once() and no
+    /// string replace; no production code of the executor or the cb-15 starter
+    /// substitutes a token by `.replace(&format!("{{{...`; and no renderer calls a
+    /// helper that scans a result again.
+    #[test]
+    fn token_substitution_has_one_site_and_it_is_single_pass() {
+        fn live(src: &str) -> String {
+            src.split("#[cfg(test)]\nmod tests {")
+                .next()
+                .unwrap()
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        let exec = live(include_str!("executor.rs"));
+        let body = exec
+            .split("pub(crate) fn render_template(")
+            .nth(1)
+            .and_then(|r| r.split("\n/// qr_local prompt render.").next())
+            .expect("render_template");
+        assert!(body.contains("substitute_once(template, tokens)"), "{body}");
+        assert!(!body.contains(".replace("), "{body}");
+        assert!(!body.contains("for (token, value)"), "{body}");
+        assert!(
+            !exec.contains("replace(&format!(\"{{{"),
+            "a token replace loop"
+        );
+        assert!(!exec.contains("fn strip_tokens("));
+        assert_eq!(exec.matches("substitute_once(").count(), 2, "def + 1 call");
+        let starter = live(include_str!("handoff_render.rs"));
+        assert!(!starter.contains("replace(&format!(\"{{{"), "starter");
+        assert!(starter.contains("render_template(&step.prompt_template"));
     }
 }

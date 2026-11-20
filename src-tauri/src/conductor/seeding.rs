@@ -51,9 +51,9 @@
 // that fails its validator (an over-long or blank row) fails the pass closed.
 // Nothing here logs a value.
 //
-// VALUES ARE CLEANED: '{' and '}' become '(' and ')'. render_template() would
-// otherwise strip a stored "{code}" as an unresolved token and substitute a
-// stored "{persona_context}" with the persona context.
+// VALUES ARE CLEANED: '{' and '}' become '(' and ')'. Before items.id=932 render_template()
+// would have stripped a stored "{code}" as an unresolved token and substituted a stored
+// "{persona_context}"; it is single-pass now and this stays as defence in depth.
 //
 // READS ONLY. Nothing here writes to either store (store writers are
 // items.id=887).

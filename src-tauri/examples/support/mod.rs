@@ -157,7 +157,12 @@ pub async fn start_sidecar(
     base
 }
 
-/// Same rule as executor.rs render_template(): replace each {token}, strip any
+/// NOTE (items.id=932): executor.rs render_template() is now a SINGLE pass (a value is
+/// never re-scanned); this example copy still replaces token by token, so a value that
+/// holds `{x}` text can differ. Not shipped (CI's `cargo test --no-run` does compile it, the
+/// CI clippy does not lint it); its inputs are the harness's own brace-free data. Kept
+/// unchanged because the engine is pub(crate).
+/// Same rule as executor.rs render_template() before that: replace each {token}, strip any
 /// leftover {token}, trim. A leftover here is a bug in this example, so it panics.
 pub fn render_template(template: &str, tokens: &BTreeMap<&str, String>) -> String {
     let mut out = template.to_owned();

@@ -598,6 +598,28 @@ mod tests {
         }
     }
 
+    /// items.id=932: the starter keeps clean() (braces become parentheses), so a value
+    /// arrives cleaned and never expands; the engine below it is single-pass as well.
+    #[test]
+    fn a_value_arrives_cleaned_and_never_expands_in_the_starter() {
+        let v = json!({"display_name":"n","output_var":"o",
+                       "template":"A: {a}\nU: {user_input}",
+                       "declared_inputs":["a","user_input"]});
+        let step = step_of(v);
+        for _ in 0..32 {
+            let out = render_starter(
+                &step,
+                &vals(&[
+                    ("a", "see {user_input} {previous_output}"),
+                    ("user_input", "TURN {a}"),
+                ]),
+                "f",
+            )
+            .unwrap();
+            assert_eq!(out, "A: see (user_input) (previous_output)\nU: TURN (a)");
+        }
+    }
+
     #[test]
     fn a_missing_declared_input_is_stripped_and_an_empty_result_is_an_error() {
         let step = step_of(ex());
