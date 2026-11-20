@@ -1210,6 +1210,51 @@ async fn cancel_parked_in_tx(
     Ok(true)
 }
 
+/// items.id=888 (F7): the guarded claim of a run that is not live, ONE statement (so
+/// atomic: SQLite holds the write lock for the whole UPDATE, subquery included):
+///   UPDATE focus_runs SET status = `to_status`
+///    WHERE id = ? AND status = `expected_status` AND status IN (`allowed`)
+///      AND the id of the run's latest snapshot (created_at DESC, rowid DESC, '' when
+///          there is none) = `expected_snapshot` ('' for None).
+/// Returns whether exactly one row changed. `expected_status` and `expected_snapshot`
+/// are what the caller's rehydrate read, so a second resume of the same run, a resume
+/// of a run that re-parked with a new checkpoint meanwhile, and a resume of a live or
+/// finished run all lose. It changes the status and nothing else: no input, no
+/// snapshot, no park, no review. A loser has written nothing.
+pub async fn claim_run(
+    conn: &mut SqliteConnection,
+    run_id: &str,
+    to_status: &str,
+    expected_status: &str,
+    allowed: &[&str],
+    expected_snapshot: Option<&str>,
+) -> Result<bool, OutputStoreError> {
+    if allowed.is_empty() {
+        return Ok(false);
+    }
+    let placeholders = vec!["?"; allowed.len()].join(", ");
+    let sql = format!(
+        "UPDATE focus_runs SET status = ?
+         WHERE id = ? AND status = ? AND status IN ({placeholders})
+           AND COALESCE((SELECT s.id FROM focus_run_snapshots s
+                         WHERE s.focus_run_id = focus_runs.id
+                         ORDER BY s.created_at DESC, s.rowid DESC LIMIT 1), '') = ?"
+    );
+    let mut q = sqlx::query(&sql)
+        .bind(to_status)
+        .bind(run_id)
+        .bind(expected_status);
+    for status in allowed {
+        q = q.bind(*status);
+    }
+    let changed = q
+        .bind(expected_snapshot.unwrap_or(""))
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+    Ok(changed == 1)
+}
+
 /// items.id=681 stage 3: cancel one run with `reason` if it is still parked, in its
 /// own BEGIN IMMEDIATE transaction. Used when a resume found the run stale
 /// (conductor::resume_staleness). Returns whether it cancelled.

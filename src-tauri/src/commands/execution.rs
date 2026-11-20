@@ -559,6 +559,17 @@ pub(crate) async fn cancel_run_for_session(
         .map_err(|e| e.to_string())
 }
 
+/// items.id=888 (F7): the error a resume or a re-entry gets when the guarded claim
+/// did not change the run (someone else resumed or re-entered it first, it re-parked
+/// with a new checkpoint, or it finished). Nothing was written for this call.
+pub(crate) const RUN_NOT_RESUMABLE: &str = "run_not_resumable";
+
+/// items.id=888 (F7): the error for a resume or re-entry of a run whose status says it
+/// is live (`running` or `initializing`).
+fn live_run_refusal(status: &str) -> String {
+    format!("run_live:{status}")
+}
+
 /// Resume a paused focus run.
 ///
 /// Routes by focus_runs.status (schema/outputs_001.sql CHECK, extended by
@@ -675,7 +686,12 @@ pub async fn resume_run(
         // handling -- rehydrate_focus_run()'s resume-index derivation
         // already treats it like awaiting_user (both checkpoint the step
         // BEFORE it runs), so no new branch is needed here either.
-        "awaiting_user" | "awaiting_schedule" | "paused" | "running" | "initializing" => {
+        // items.id=888 (F7): a run that is `running` or `initializing` is live (or was
+        // left by a crash and becomes `paused` at the next login), so it is never
+        // resumed: a second copy would run every remaining step twice.
+        "running" | "initializing" => return Err(live_run_refusal(&status)),
+
+        "awaiting_user" | "awaiting_schedule" | "paused" => {
             let run_lease = crate::auth::writer_gate::lease_for_session(
                 &key_registry,
                 crate::auth::writer_gate::Kind::FocusRun,
@@ -712,6 +728,13 @@ pub async fn resume_run(
             // A user pressed resume (items.id=710): attended.
             run.attendance = crate::spend::gate::RunAttendance::Attended;
             run.attach_lease(run_lease).map_err(|e| e.to_string())?;
+            // items.id=888 (F7): the guarded claim, BEFORE the spawn, so a second
+            // resume of the same run (a double click, the step review and Try again
+            // together) gets its refusal here and has written nothing.
+            run.claim_resume().await.map_err(|e| match e {
+                LifecycleError::ResumeRaced => RUN_NOT_RESUMABLE.to_owned(),
+                other => other.to_string(),
+            })?;
 
             // Spawn resume_execution() in the background, matching
             // submit_focus_run's fire-and-forget shape -- progress arrives via
@@ -726,7 +749,7 @@ pub async fn resume_run(
             let bg_key_hex = key_hex_str.clone();
             let bg_run_id = request.run_id.clone();
             tokio::spawn(async move {
-                let result = run.resume_execution().await;
+                let result = run.resume_claimed_run().await;
                 crate::commands::messages::finalize_chat_reply(
                     &bg_user_id,
                     &bg_persona_id,
@@ -887,8 +910,9 @@ pub async fn reenter_step(
         "awaiting_extract_confirm" => {
             return Err("not_resumable:awaiting_extract_confirm".to_string());
         }
-        "awaiting_user" | "awaiting_schedule" | "awaiting_feedback" | "paused" | "running"
-        | "initializing" => {}
+        // items.id=888 (F7): never rewind a live run under its actor.
+        "running" | "initializing" => return Err(live_run_refusal(&status)),
+        "awaiting_user" | "awaiting_schedule" | "awaiting_feedback" | "paused" => {}
         other => return Err(format!("not_implemented:unrecognized_status:{other}")),
     }
 
@@ -955,6 +979,7 @@ pub async fn reenter_step(
             LifecycleError::Reentry(ReentryError::NothingToDiscard(id)) => {
                 format!("nothing_to_discard:{id}")
             }
+            LifecycleError::ResumeRaced => RUN_NOT_RESUMABLE.to_owned(),
             other => other.to_string(),
         })?;
 

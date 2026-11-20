@@ -155,6 +155,11 @@ pub enum LifecycleError {
     /// writes nothing; the caller cancels the run (cancel_stale_resume).
     #[error("personal information changed while waiting")]
     ResumeStale(crate::conductor::resume_staleness::StaleReason),
+    /// items.id=888 (F7): the guarded claim did not change the run (it is live, was
+    /// resumed or re-entered by someone else, re-parked with a new checkpoint, or
+    /// finished since this FocusRun was rehydrated). Nothing was written.
+    #[error("the run is not waiting to be resumed")]
+    ResumeRaced,
     #[error("Reentry: {0}")]
     Reentry(#[from] ReentryError),
 
@@ -1760,6 +1765,14 @@ async fn open_outputs_db(
 ///   default (items.id=173). Tests inject FocusRun<TestLogger> or
 ///   FocusRun<NoopLogger> explicitly. See the module doc comment's
 ///   "Privacy gateway" section for the full rationale.
+/// items.id=888 (F7): what rehydrate_focus_run read and the resume rests on: the run's
+/// status and the id of its latest snapshot (None when it had none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResumeBasis {
+    pub(crate) status: String,
+    pub(crate) snapshot_id: Option<String>,
+}
+
 pub struct FocusRun<L: DisclosureLoggerForRun = SqliteDisclosureLogger> {
     // Constructor parameters
     pub user_id: String,
@@ -1910,6 +1923,13 @@ pub struct FocusRun<L: DisclosureLoggerForRun = SqliteDisclosureLogger> {
     /// items.id=897: set by rehydrate_focus_run before load(), because a resumed run
     /// has no context_key and so cannot read the chat's launch answers.
     pub(crate) rehydrated: bool,
+    /// items.id=888 (F7): the status and latest snapshot id rehydrate_focus_run read,
+    /// which the guarded claim (claim_resume, reenter_step) compares. None for a run
+    /// that was not rehydrated: such a run cannot be claimed.
+    pub(crate) resume_basis: Option<ResumeBasis>,
+    /// items.id=888 (F7): set only by a successful claim_resume, consumed by
+    /// resume_claimed_run. In memory only.
+    resume_claimed: bool,
     /// items.id=778 (decisions.id=896): this run's writer lease. Taken by the
     /// caller that starts or resumes the run, BEFORE the run can touch a
     /// database, and held until the run is dropped, which for a spawned run is
@@ -1994,6 +2014,8 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             store_vars: HashMap::new(),
             launch: crate::conductor::run_settings::LaunchResolution::default(),
             rehydrated: false,
+            resume_basis: None,
+            resume_claimed: false,
             lease: None,
             plan_memory: None,
             plan_token: None,
@@ -4085,6 +4107,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     async fn write_checkpoint(&self, action_id: &str) -> Result<(), LifecycleError> {
         self.write_checkpoint_for(action_id, CheckpointPark::Running, Utc::now())
             .await
+            .map(|_| ())
     }
 
     /// items.id=681: the checkpoint writer. `park` says whether the run is parking
@@ -4097,7 +4120,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         action_id: &str,
         park: CheckpointPark,
         at: DateTime<Utc>,
-    ) -> Result<(), LifecycleError> {
+    ) -> Result<String, LifecycleError> {
         let personal_track = self.personal_track.as_ref().unwrap();
         let task_track = self.task_track.as_ref().unwrap();
         let shared_state = self.shared_state.as_ref().unwrap();
@@ -4149,6 +4172,9 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
 
         let mut conn = open_outputs_db(&self.user_id, &self.persona_id, key_hex).await?;
 
+        // items.id=888 (F7): the id is returned so reenter_step can carry it as its
+        // new resume basis.
+        let snapshot_id = Uuid::new_v4().to_string();
         sqlx::query(
             "INSERT INTO focus_run_snapshots
              (id, focus_run_id, action_id, phase, task_track_json,
@@ -4156,7 +4182,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
               checkpoint_hash, purge_after, created_at)
              VALUES (?, ?, ?, 4, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(Uuid::new_v4().to_string())
+        .bind(&snapshot_id)
         .bind(focus_run_id)
         .bind(action_id)
         .bind(&task_json)
@@ -4168,7 +4194,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         .execute(&mut conn)
         .await?;
 
-        Ok(())
+        Ok(snapshot_id)
     }
 
     /// items.id=574 piece (c), pulled in as a prerequisite by items.id=496's
@@ -4758,11 +4784,62 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     /// focus_def/focus_run_id/failure_handler/privacy_gateway are all
     /// populated (the same preconditions execute() itself asserts).
     ///
-    /// items.id=888 (F6): an Err from the resumed execution fails the run through
-    /// fail_run, exactly as execute_full's error arm does, so the row does not stay
-    /// `running` and the snapshot does not outlive it.
+    /// items.id=888 (F7): first the guarded claim (claim_resume), OUTSIDE any error
+    /// arm: a loser gets LifecycleError::ResumeRaced and has written nothing (no
+    /// status, no snapshot purge, no event). Only a winner continues
+    /// (resume_claimed_run), and from then on an Err fails the run (F6).
     pub async fn resume_execution(&mut self) -> Result<RunResult, LifecycleError> {
-        self.write_focus_run_record("running").await?;
+        self.claim_resume().await?;
+        self.resume_claimed_run().await
+    }
+
+    /// items.id=888 (F7): claim this rehydrated run for a resume with ONE guarded
+    /// UPDATE (output_store::claim_run): status becomes `running` only if it is still
+    /// the status rehydrate read, that status is one of RESUMABLE_STATUSES, and the
+    /// run's latest snapshot is still the one rehydrate used. Two resumes of one run
+    /// (a double click, the step review and Try again together, the sweep and a user)
+    /// therefore run it once. A run that was not rehydrated has no basis and is
+    /// refused. On a refusal NOTHING is written. `resume_run` calls this before it
+    /// spawns, so the second caller gets its error at once.
+    pub async fn claim_resume(&mut self) -> Result<(), LifecycleError> {
+        let Some(basis) = self.resume_basis.clone() else {
+            return Err(LifecycleError::ResumeRaced);
+        };
+        let run_id = self
+            .focus_run_id
+            .clone()
+            .ok_or_else(|| LifecycleError::RunNotFound(String::new()))?;
+        let key_hex = self.key_hex.as_deref().ok_or(LifecycleError::NoKey)?;
+        let mut conn = open_outputs_db(&self.user_id, &self.persona_id, key_hex).await?;
+        let claimed = crate::persistence::output_store::claim_run(
+            &mut conn,
+            &run_id,
+            "running",
+            &basis.status,
+            crate::conductor::run_retention::RESUMABLE_STATUSES,
+            basis.snapshot_id.as_deref(),
+        )
+        .await
+        .map_err(|e| LifecycleError::OutputStore(e.to_string()))?;
+        if !claimed {
+            return Err(LifecycleError::ResumeRaced);
+        }
+        self.resume_claimed = true;
+        Ok(())
+    }
+
+    /// items.id=888 (F6, F7): continue a run this FocusRun has CLAIMED (claim_resume).
+    /// Refuses, writing nothing, if it has not. The status write that follows the
+    /// claim applies write_run_row's input and park rules as before; from here on an
+    /// Err fails the run through fail_run, so the row never stays `running`.
+    pub async fn resume_claimed_run(&mut self) -> Result<RunResult, LifecycleError> {
+        if !std::mem::take(&mut self.resume_claimed) {
+            return Err(LifecycleError::ResumeRaced);
+        }
+        if let Err(e) = self.write_focus_run_record("running").await {
+            self.fail_run().await;
+            return Err(e);
+        }
         self.emit_status("running", None);
         match self.execute_and_finish().await {
             Ok(result) => Ok(result),
@@ -4771,6 +4848,37 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                 Err(e)
             }
         }
+    }
+
+    /// Test only: take the resume basis from the run's row and latest snapshot, as
+    /// rehydrate_focus_run does, for a FocusRun a test built by hand.
+    #[cfg(test)]
+    pub(crate) async fn adopt_resume_basis_for_test(&mut self) {
+        let mut conn = open_outputs_db(
+            &self.user_id,
+            &self.persona_id,
+            self.key_hex.as_deref().unwrap(),
+        )
+        .await
+        .unwrap();
+        let run_id = self.focus_run_id.clone().unwrap();
+        let status: String = sqlx::query_scalar("SELECT status FROM focus_runs WHERE id = ?")
+            .bind(&run_id)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        let snapshot_id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM focus_run_snapshots WHERE focus_run_id = ?
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )
+        .bind(&run_id)
+        .fetch_optional(&mut conn)
+        .await
+        .unwrap();
+        self.resume_basis = Some(ResumeBasis {
+            status,
+            snapshot_id,
+        });
     }
 
     /// Named re-entry with delta scope (items.id=574 follow-up, cb-07):
@@ -4802,6 +4910,34 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             focus_step_order,
             target_action_id,
         )?;
+
+        // items.id=888 (F7): the guarded claim, before anything is changed in memory
+        // or written. The run moves to awaiting_user (the status this function ends
+        // in anyway) only if it is still the status rehydrate read, one of
+        // REENTERABLE_STATUSES (never a live run), with the same latest snapshot. A
+        // refusal writes nothing: no step row, no checkpoint, no status.
+        let basis = self
+            .resume_basis
+            .clone()
+            .ok_or(LifecycleError::ResumeRaced)?;
+        {
+            let focus_run_id = self.focus_run_id.as_deref().unwrap();
+            let key_hex = self.key_hex.as_deref().ok_or(LifecycleError::NoKey)?;
+            let mut conn = open_outputs_db(&self.user_id, &self.persona_id, key_hex).await?;
+            let claimed = crate::persistence::output_store::claim_run(
+                &mut conn,
+                focus_run_id,
+                "awaiting_user",
+                &basis.status,
+                crate::conductor::run_retention::REENTERABLE_STATUSES,
+                basis.snapshot_id.as_deref(),
+            )
+            .await
+            .map_err(|e| LifecycleError::OutputStore(e.to_string()))?;
+            if !claimed {
+                return Err(LifecycleError::ResumeRaced);
+            }
+        }
 
         self.task_track = Some(reentry::rebuild_preserved_track(
             self.task_track.as_ref().unwrap(),
@@ -4872,8 +5008,15 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         // rehydrate (e.g. after a crash before the next execute() call) to
         // land exactly there, not one step later.
         self.write_focus_run_record("awaiting_user").await?;
-        self.write_checkpoint_for(target_action_id, CheckpointPark::AwaitingUser, Utc::now())
+        let snapshot_id = self
+            .write_checkpoint_for(target_action_id, CheckpointPark::AwaitingUser, Utc::now())
             .await?;
+        // items.id=888 (F7): this FocusRun wrote the row's state itself, so it now rests
+        // on that state: awaiting_user and the checkpoint just written.
+        self.resume_basis = Some(ResumeBasis {
+            status: "awaiting_user".to_owned(),
+            snapshot_id: Some(snapshot_id),
+        });
 
         Ok(plan)
     }
@@ -5041,11 +5184,13 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
         .try_get::<Option<String>, _>("external_input")?
         .unwrap_or_default();
 
+    // items.id=888 (F7): the same order as the claim's subquery (output_store::claim_run),
+    // so the id read here is the id the claim compares.
     let snapshot_row = sqlx::query(
-        "SELECT action_id, task_track_json, shared_state_json, personal_context_manifest
+        "SELECT id, action_id, task_track_json, shared_state_json, personal_context_manifest
          FROM focus_run_snapshots
          WHERE focus_run_id = ?
-         ORDER BY created_at DESC
+         ORDER BY created_at DESC, rowid DESC
          LIMIT 1",
     )
     .bind(&focus_run_id)
@@ -5101,6 +5246,10 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
     )));
     run._persona_context_rendered = run.assemble_persona_context().await;
 
+    let snapshot_id: Option<String> = match &snapshot_row {
+        Some(row) => Some(row.try_get("id")?),
+        None => None,
+    };
     let (task_track, shared_state, current_step) = match snapshot_row {
         Some(row) => {
             let action_id: String = row.try_get("action_id")?;
@@ -5152,6 +5301,10 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
     run.task_track = Some(task_track);
     run.shared_state = Some(shared_state);
     run.current_step = current_step;
+    run.resume_basis = Some(ResumeBasis {
+        status,
+        snapshot_id,
+    });
 
     Ok(run)
 }
@@ -8847,6 +9000,22 @@ mod tests {
             run.current_step = 0;
 
             let focus_run_id = run.focus_run_id.clone().unwrap();
+            // items.id=888 (F7): a resume claims a parked row, so the run has one.
+            {
+                let mut conn = open_outputs_db("u", "p", CRISIS_TEST_KEY_HEX)
+                    .await
+                    .unwrap();
+                sqlx::query(
+                    "INSERT INTO focus_runs (id, focus_id, status, started_at)
+                     VALUES (?, 'f', 'paused', ?)",
+                )
+                .bind(&focus_run_id)
+                .bind(now())
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            }
+            run.adopt_resume_basis_for_test().await;
             let result = run
                 .resume_execution()
                 .await
@@ -9645,7 +9814,7 @@ mod tests {
             sqlx::query(
                 "INSERT INTO focus_runs
                  (id, focus_id, status, is_fast_lane, is_quick_ask, topic_id, user_input, started_at)
-                 VALUES (?, 'sched-focus', 'initializing', 0, 0, ?, 'hello', ?)",
+                 VALUES (?, 'sched-focus', 'paused', 0, 0, ?, 'hello', ?)",
             )
             .bind(&focus_run_id)
             .bind(&topic_id)
@@ -9826,7 +9995,7 @@ mod tests {
             sqlx::query(
                 "INSERT INTO focus_runs
                  (id, focus_id, status, is_fast_lane, is_quick_ask, topic_id, user_input, started_at)
-                 VALUES (?, 'sched-focus', 'initializing', 0, 0, ?, 'the scheduler', ?)",
+                 VALUES (?, 'sched-focus', 'paused', 0, 0, ?, 'the scheduler', ?)",
             )
             .bind(&focus_run_id)
             .bind(&topic_id)
@@ -11454,6 +11623,17 @@ mod tests {
             run.execute().await.unwrap();
             let original = ran_ids(&run);
             assert_eq!(original, ["draft_writing", "check_a", "check_b", "check_c"]);
+            // items.id=888 (F7): re-entry claims a run that is not live, as the
+            // command's rehydrate sees it (here: parked after its output).
+            {
+                let mut conn = outputs(&run).await;
+                sqlx::query("UPDATE focus_runs SET status = 'awaiting_feedback' WHERE id = ?")
+                    .bind(&focus_run_id)
+                    .execute(&mut conn)
+                    .await
+                    .unwrap();
+            }
+            run.adopt_resume_basis_for_test().await;
 
             // check_c's guard (second_verdict present) holds on the finished
             // track, skip_plain2's (second_verdict absent) does not.
@@ -15906,6 +16086,7 @@ steps:
         with_temp_data_root(async {
             let mut run = failing_writer_run();
             seed_run_with_snapshot(&run, "awaiting_user").await;
+            run.adopt_resume_basis_for_test().await;
             let err = run.resume_execution().await.unwrap_err();
             assert!(matches!(err, LifecycleError::StoreWrite(_)), "{err:?}");
             assert_eq!(
@@ -15940,7 +16121,7 @@ steps:
         assert!(purge < write, "purge before the status write");
         for f in [
             "pub async fn execute_full(&mut self)",
-            "pub async fn resume_execution(&mut self)",
+            "pub async fn resume_claimed_run(&mut self)",
         ] {
             let b = body(f);
             assert!(
@@ -15955,6 +16136,501 @@ steps:
                 .count(),
             2,
             "both error arms of execute_full"
+        );
+        // items.id=888 (F7): the claim sits OUTSIDE every error arm. resume_execution
+        // propagates a lost claim with `?` before anything that could fail the run,
+        // and claim_resume itself writes no status and purges nothing.
+        let resume = body("pub async fn resume_execution(&mut self)");
+        let claim_at = resume
+            .find("self.claim_resume().await?;")
+            .expect("the claim, propagated");
+        let go_at = resume
+            .find("self.resume_claimed_run().await")
+            .expect("then the claimed run");
+        assert!(claim_at < go_at);
+        assert!(!resume.contains("fail_run"), "{resume}");
+        let claim = body("pub async fn claim_resume(&mut self)");
+        for forbidden in [
+            "fail_run",
+            "purge_snapshots",
+            "write_focus_run_record",
+            "write_run_row",
+            "emit_status",
+        ] {
+            assert!(!claim.contains(forbidden), "claim_resume: {forbidden}");
+        }
+    }
+
+    // -- items.id=888 stage 2 (F7): the guarded resume claim ----------------------
+
+    /// Everything a resume or its loser could touch, for a before/after compare:
+    /// status, both inputs, the snapshot ids, the park row and the review rows.
+    #[derive(Debug, PartialEq)]
+    struct RunState {
+        status: String,
+        user_input: Option<String>,
+        external_input: Option<String>,
+        snapshots: Vec<String>,
+        park: Option<String>,
+        reviews: Vec<(String, String)>,
+    }
+
+    async fn run_state(run: &FocusRun<crate::conductor::privacy::logger::TestLogger>) -> RunState {
+        let run_id = run.focus_run_id.clone().unwrap();
+        let mut conn = outputs(run).await;
+        let (status, user_input, external_input): (String, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT status, user_input, external_input FROM focus_runs WHERE id = ?",
+            )
+            .bind(&run_id)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        let snapshots: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM focus_run_snapshots WHERE focus_run_id = ? ORDER BY rowid",
+        )
+        .bind(&run_id)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        let park: Option<String> =
+            sqlx::query_scalar("SELECT code FROM run_parks WHERE run_id = ?")
+                .bind(&run_id)
+                .fetch_optional(&mut conn)
+                .await
+                .unwrap();
+        let reviews: Vec<(String, String)> = sqlx::query_as(
+            "SELECT review_id, outcome FROM step_reviews WHERE focus_run_id = ? ORDER BY review_id",
+        )
+        .bind(&run_id)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        RunState {
+            status,
+            user_input,
+            external_input,
+            snapshots,
+            park,
+            reviews,
+        }
+    }
+
+    /// A second FocusRun for the same run row, as a second resume_run would rehydrate.
+    fn same_run_again(
+        first: &FocusRun<crate::conductor::privacy::logger::TestLogger>,
+    ) -> FocusRun<crate::conductor::privacy::logger::TestLogger> {
+        let mut again = failing_writer_run();
+        again.focus_run_id = first.focus_run_id.clone();
+        again
+    }
+
+    /// A parked run with a park reason and a pending step review, as a run parked on an
+    /// outbound review looks after an app restart (the step review's needs_resume).
+    async fn seed_review_park(run: &FocusRun<crate::conductor::privacy::logger::TestLogger>) {
+        let run_id = run.focus_run_id.clone().unwrap();
+        let mut conn = outputs(run).await;
+        sqlx::query(
+            "INSERT INTO run_parks (run_id, action_id, code, created_at)
+             VALUES (?, 'lock', 'step_review.pending', ?)",
+        )
+        .bind(&run_id)
+        .bind(now())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO step_reviews
+             (review_id, focus_run_id, action_id, prompt_sha, prompt_len, outcome,
+              created_at, updated_at)
+             VALUES ('rev-1', ?, 'lock', ?, 10, 'pending', ?, ?)",
+        )
+        .bind(&run_id)
+        .bind("a".repeat(64))
+        .bind(now())
+        .bind(now())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    /// items.id=888 (F7): the loser of a resume race returns ResumeRaced and has
+    /// written NOTHING: the winner's run (status, both inputs, snapshot, park and
+    /// review) is exactly as the winner's claim left it, and the loser did not fail
+    /// the run (its own tracks are untouched, so fail_run never ran).
+    #[tokio::test]
+    async fn a_lost_resume_writes_nothing_and_the_winners_run_is_unchanged() {
+        with_temp_data_root(async {
+            let mut winner = failing_writer_run();
+            seed_run_with_snapshot(&winner, "awaiting_user").await;
+            seed_review_park(&winner).await;
+            winner.adopt_resume_basis_for_test().await;
+            let mut loser = same_run_again(&winner);
+            loser.adopt_resume_basis_for_test().await;
+
+            winner.claim_resume().await.expect("the first claim wins");
+            let after_win = run_state(&winner).await;
+            assert_eq!(after_win.status, "running");
+            assert_eq!(after_win.user_input.as_deref(), Some("User: the window"));
+            assert_eq!(
+                after_win.external_input.as_deref(),
+                Some("User: the window")
+            );
+            assert_eq!(after_win.snapshots.len(), 1);
+            assert_eq!(after_win.park.as_deref(), Some("step_review.pending"));
+            assert_eq!(
+                after_win.reviews,
+                [("rev-1".to_owned(), "pending".to_owned())]
+            );
+
+            let err = loser.resume_execution().await.unwrap_err();
+            assert!(matches!(err, LifecycleError::ResumeRaced), "{err:?}");
+            assert_eq!(
+                run_state(&winner).await,
+                after_win,
+                "the loser changed nothing"
+            );
+            assert!(
+                loser.task_track.is_some() && loser.personal_track.is_some(),
+                "the loser was not failed"
+            );
+        })
+        .await;
+    }
+
+    /// items.id=888 (F7): two claims racing on one parked run: exactly one wins.
+    #[tokio::test]
+    async fn two_concurrent_claims_of_one_parked_run_have_exactly_one_winner() {
+        with_temp_data_root(async {
+            let mut a = failing_writer_run();
+            seed_run_with_snapshot(&a, "awaiting_user").await;
+            a.adopt_resume_basis_for_test().await;
+            let mut b = same_run_again(&a);
+            b.adopt_resume_basis_for_test().await;
+            let (ra, rb) = tokio::join!(a.claim_resume(), b.claim_resume());
+            let wins = [ra.is_ok(), rb.is_ok()].iter().filter(|w| **w).count();
+            assert_eq!(wins, 1, "{ra:?} {rb:?}");
+            for r in [ra, rb] {
+                if let Err(e) = r {
+                    assert!(matches!(e, LifecycleError::ResumeRaced), "{e:?}");
+                }
+            }
+            assert_eq!(run_state(&a).await.status, "running");
+        })
+        .await;
+    }
+
+    /// items.id=888 (F7): a run that re-parked with a NEW checkpoint after it was
+    /// rehydrated is not resumed from the old one, even though its status is the same.
+    #[tokio::test]
+    async fn a_claim_is_refused_when_the_run_re_parked_with_a_new_checkpoint() {
+        with_temp_data_root(async {
+            let mut run = failing_writer_run();
+            seed_run_with_snapshot(&run, "awaiting_user").await;
+            run.adopt_resume_basis_for_test().await;
+            // Someone else resumed it, and it parked again at awaiting_user.
+            let mut conn = outputs(&run).await;
+            sqlx::query(
+                "INSERT INTO focus_run_snapshots
+                 (id, focus_run_id, action_id, phase, checkpoint_hash, created_at)
+                 VALUES ('newer', ?, 'lock', 4, 'h2', ?)",
+            )
+            .bind(run.focus_run_id.as_deref().unwrap())
+            .bind(now())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            drop(conn);
+            let before = run_state(&run).await;
+            let err = run.resume_execution().await.unwrap_err();
+            assert!(matches!(err, LifecycleError::ResumeRaced), "{err:?}");
+            assert_eq!(run_state(&run).await, before);
+        })
+        .await;
+    }
+
+    /// items.id=888 (F7): a run whose status moved between two resumable statuses
+    /// after it was rehydrated (resumed meanwhile, then crash-demoted to paused, with
+    /// no new checkpoint) is refused: rehydrate chose its resume index from the old
+    /// status (AT the checkpoint for awaiting_user, AFTER it for paused).
+    #[tokio::test]
+    async fn a_claim_is_refused_when_the_status_changed_since_rehydrate() {
+        with_temp_data_root(async {
+            let mut run = failing_writer_run();
+            seed_run_with_snapshot(&run, "awaiting_user").await;
+            run.adopt_resume_basis_for_test().await;
+            let mut conn = outputs(&run).await;
+            sqlx::query("UPDATE focus_runs SET status = 'paused' WHERE id = ?")
+                .bind(run.focus_run_id.as_deref().unwrap())
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            drop(conn);
+            let before = run_state(&run).await;
+            let err = run.claim_resume().await.unwrap_err();
+            assert!(matches!(err, LifecycleError::ResumeRaced), "{err:?}");
+            assert_eq!(run_state(&run).await, before);
+        })
+        .await;
+    }
+
+    /// items.id=888 (F7): only awaiting_user, awaiting_schedule and paused can be
+    /// claimed for a resume. A live run (running, initializing), a finished one and the
+    /// two post-output statuses are refused with nothing written, even when the basis
+    /// matches exactly.
+    #[tokio::test]
+    async fn a_claim_is_refused_for_every_status_that_is_not_resumable() {
+        with_temp_data_root(async {
+            for status in [
+                "running",
+                "initializing",
+                "complete",
+                "cancelled",
+                "failed",
+                "awaiting_feedback",
+                "awaiting_extract_confirm",
+            ] {
+                let mut run = failing_writer_run();
+                seed_run_with_snapshot(&run, status).await;
+                run.adopt_resume_basis_for_test().await;
+                let before = run_state(&run).await;
+                let err = run.claim_resume().await.unwrap_err();
+                assert!(
+                    matches!(err, LifecycleError::ResumeRaced),
+                    "{status}: {err:?}"
+                );
+                assert_eq!(run_state(&run).await, before, "{status}");
+            }
+            for status in crate::conductor::run_retention::RESUMABLE_STATUSES {
+                let mut run = failing_writer_run();
+                seed_run_with_snapshot(&run, status).await;
+                run.adopt_resume_basis_for_test().await;
+                run.claim_resume()
+                    .await
+                    .unwrap_or_else(|e| panic!("{status}: {e:?}"));
+            }
+        })
+        .await;
+    }
+
+    /// items.id=888 (F7): a FocusRun that was not rehydrated has no basis and cannot be
+    /// claimed, and an unclaimed run cannot be continued; neither writes anything.
+    #[tokio::test]
+    async fn a_run_without_a_basis_or_a_claim_is_refused_and_writes_nothing() {
+        with_temp_data_root(async {
+            let mut run = failing_writer_run();
+            seed_run_with_snapshot(&run, "awaiting_user").await;
+            let before = run_state(&run).await;
+            assert!(matches!(
+                run.claim_resume().await,
+                Err(LifecycleError::ResumeRaced)
+            ));
+            assert!(matches!(
+                run.resume_claimed_run().await,
+                Err(LifecycleError::ResumeRaced)
+            ));
+            assert_eq!(run_state(&run).await, before);
+        })
+        .await;
+    }
+
+    /// items.id=888 (F7), the step review's auto-resume chain. After a restart a run
+    /// parked on an outbound review reads needs_resume; the host answers with
+    /// resume_run, at most MAX_AUTO_RESUMES (2) times in a row (stepReview.ts). The
+    /// first resume claims the run; a repeat that reaches the backend while the first
+    /// is still running loses and leaves the run and its review as they were, so the
+    /// host's `resume_failed` path is taken and the review is asked once, by the run
+    /// that won. A later resume, after the winner parked again on the review with a new
+    /// checkpoint, is claimed normally.
+    #[tokio::test]
+    async fn the_step_review_auto_resume_chain_runs_the_run_once() {
+        with_temp_data_root(async {
+            let mut first = failing_writer_run();
+            seed_run_with_snapshot(&first, "awaiting_user").await;
+            seed_review_park(&first).await;
+            first.adopt_resume_basis_for_test().await;
+            first
+                .claim_resume()
+                .await
+                .expect("the first auto-resume claims the run");
+            let claimed = run_state(&first).await;
+
+            let mut repeat = same_run_again(&first);
+            repeat.adopt_resume_basis_for_test().await; // reads `running` now
+            let err = repeat.resume_execution().await.unwrap_err();
+            assert!(matches!(err, LifecycleError::ResumeRaced), "{err:?}");
+            assert_eq!(run_state(&first).await, claimed);
+
+            // The winner parks again on the review (a new checkpoint at awaiting_user),
+            // and the next resume (the user's answers) is claimed.
+            let mut conn = outputs(&first).await;
+            sqlx::query("UPDATE focus_runs SET status = 'awaiting_user' WHERE id = ?")
+                .bind(first.focus_run_id.as_deref().unwrap())
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO focus_run_snapshots
+                 (id, focus_run_id, action_id, phase, checkpoint_hash, created_at)
+                 VALUES ('reparked', ?, 'lock', 4, 'h3', ?)",
+            )
+            .bind(first.focus_run_id.as_deref().unwrap())
+            .bind(now())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            drop(conn);
+            let mut answers = same_run_again(&first);
+            answers.adopt_resume_basis_for_test().await;
+            answers
+                .claim_resume()
+                .await
+                .expect("the answers' resume is claimed");
+        })
+        .await;
+    }
+
+    /// items.id=888 (F7): re-entry claims the run too. A run that a resume claimed
+    /// after this FocusRun was rehydrated is refused, with nothing written: no step
+    /// row, no checkpoint, no status, and the in-memory track untouched.
+    #[tokio::test]
+    async fn reenter_step_refuses_a_run_claimed_since_rehydrate_and_writes_nothing() {
+        with_temp_data_root(async {
+            let full = guarded_hand_built_def();
+            let order: Vec<String> = full.steps.iter().map(|s| s.action_id.clone()).collect();
+            let mut run = tier3_ready_run(false);
+            run.focus_def = Some(full.clone());
+            run.task_track
+                .as_mut()
+                .unwrap()
+                .add_step(draft_step("the assessed draft"));
+            let focus_run_id = run.focus_run_id.clone().unwrap();
+            crate::persistence::output_store::test_seed_focus_run(
+                &run.user_id,
+                &run.persona_id,
+                CRISIS_TEST_KEY_HEX,
+                &focus_run_id,
+                "f",
+            )
+            .await
+            .unwrap();
+            run.execute().await.unwrap();
+            let mut conn = outputs(&run).await;
+            sqlx::query("UPDATE focus_runs SET status = 'awaiting_feedback' WHERE id = ?")
+                .bind(&focus_run_id)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            drop(conn);
+            run.adopt_resume_basis_for_test().await;
+            // A resume claims it meanwhile.
+            let mut conn = outputs(&run).await;
+            sqlx::query("UPDATE focus_runs SET status = 'running' WHERE id = ?")
+                .bind(&focus_run_id)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            drop(conn);
+            let ran = ran_ids(&run);
+            let snaps_before = run_state(&run).await.snapshots;
+            let (user_id, persona_id) = (run.user_id.clone(), run.persona_id.clone());
+            let step_rows = || async {
+                let mut conn = open_outputs_db(&user_id, &persona_id, CRISIS_TEST_KEY_HEX)
+                    .await
+                    .unwrap();
+                sqlx::query_as::<_, (String, i64, String)>(
+                    "SELECT action_id, attempt, status FROM focus_run_steps
+                     WHERE focus_run_id = ? ORDER BY action_id, attempt",
+                )
+                .bind(&focus_run_id)
+                .fetch_all(&mut conn)
+                .await
+                .unwrap()
+            };
+            let steps_before = step_rows().await;
+            let err = run.reenter_step(&order, "check_b").await.unwrap_err();
+            assert!(matches!(err, LifecycleError::ResumeRaced), "{err:?}");
+            let after = run_state(&run).await;
+            assert_eq!(after.status, "running");
+            assert_eq!(after.snapshots, snaps_before);
+            assert_eq!(
+                step_rows().await,
+                steps_before,
+                "no step row changed or added"
+            );
+            assert_eq!(ran_ids(&run), ran, "the track is untouched");
+        })
+        .await;
+    }
+
+    /// items.id=888 (F7): the callers. resume_run refuses `running` and `initializing`,
+    /// claims BEFORE it spawns and spawns only the claimed continuation; reenter_step
+    /// refuses the two live statuses; the scheduled sweep skips a lost claim before it
+    /// would finalize the chat reply. Nothing else resumes a rehydrated run.
+    #[test]
+    fn the_resume_callers_claim_first_and_refuse_a_live_run() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let read = |p: &str| std::fs::read_to_string(root.join(p)).unwrap();
+        let exec = read("commands/execution.rs");
+        let exec = exec.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let resume = &exec[exec.find("pub async fn resume_run(").unwrap()..];
+        let resume = &resume[..resume.find("\n}\n").unwrap()];
+        assert!(resume.contains("\"running\" | \"initializing\" => return Err(live_run_refusal("));
+        let claim = resume
+            .find("run.claim_resume().await")
+            .expect("claim in resume_run");
+        let spawn = resume.find("tokio::spawn(").expect("spawn");
+        assert!(claim < spawn, "the claim is before the spawn");
+        assert!(resume[spawn..].contains("run.resume_claimed_run().await"));
+        assert!(!resume.contains("run.resume_execution()"));
+        let reenter = &exec[exec.find("pub async fn reenter_step(").unwrap()..];
+        let reenter = &reenter[..reenter.find("\n}\n").unwrap()];
+        assert!(reenter.contains("\"running\" | \"initializing\" => return Err(live_run_refusal("));
+        assert!(reenter.contains("LifecycleError::ResumeRaced => RUN_NOT_RESUMABLE"));
+
+        let sweep = read("conductor/scheduled_sweep.rs");
+        let raced = sweep
+            .find("LifecycleError::ResumeRaced")
+            .expect("sweep handles a lost claim");
+        let fin = sweep.find("finalize_chat_reply(").expect("finalize");
+        assert!(
+            raced < fin,
+            "a lost claim is skipped before finalize_chat_reply"
+        );
+
+        // Outside lifecycle.rs, only these resume a run, and they go through the claim.
+        let mut files = Vec::new();
+        fn walk(d: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        walk(&root, &mut files);
+        let mut callers = Vec::new();
+        for f in files {
+            let text = std::fs::read_to_string(&f).unwrap();
+            let prod = text.split("#[cfg(test)]\nmod tests {").next().unwrap();
+            if f.ends_with("conductor/lifecycle.rs") {
+                continue;
+            }
+            if prod.contains(".resume_execution()") || prod.contains(".resume_claimed_run()") {
+                callers.push(
+                    f.strip_prefix(&root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+        callers.sort();
+        assert_eq!(
+            callers,
+            ["commands/execution.rs", "conductor/scheduled_sweep.rs"]
         );
     }
 
@@ -17111,7 +17787,7 @@ steps:
             sqlx::query(
                 "INSERT INTO focus_runs
                  (id, focus_id, status, is_fast_lane, is_quick_ask, topic_id, user_input, started_at)
-                 VALUES (?, 'handoff-focus', 'initializing', 0, 0, NULL, 'hello', ?)",
+                 VALUES (?, 'handoff-focus', 'paused', 0, 0, NULL, 'hello', ?)",
             )
             .bind(&focus_run_id)
             .bind(now())

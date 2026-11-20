@@ -39,6 +39,22 @@ pub const EXPIRED_WHILE_WAITING: &str = "expired while waiting";
 /// paused by a crash recovery.
 pub const PARKED_STATUSES: &[&str] = &["awaiting_user", "awaiting_schedule", "paused"];
 
+/// items.id=888 (F7): the statuses a rehydrated run may be RESUMED from (the guarded
+/// claim, output_store::claim_run). `running` and `initializing` are not here: a run
+/// in either is live, or was left by a crash and becomes `paused` at the next login
+/// (demote_interrupted_runs). Kept apart from PARKED_STATUSES, which is what the sweep
+/// expires, because the two sets need not stay equal.
+pub const RESUMABLE_STATUSES: &[&str] = &["awaiting_user", "awaiting_schedule", "paused"];
+
+/// items.id=888 (F7): the statuses reenter_step may rewind from: the resumable ones and
+/// awaiting_feedback (a revision after the output, items.id=574). Never a live status.
+pub const REENTERABLE_STATUSES: &[&str] = &[
+    "awaiting_user",
+    "awaiting_schedule",
+    "awaiting_feedback",
+    "paused",
+];
+
 /// `'a','b','c'` for an SQL IN list (the statuses are fixed words, never input).
 pub fn parked_status_list_sql() -> String {
     PARKED_STATUSES

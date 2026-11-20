@@ -165,6 +165,16 @@ pub async fn run_periodic_sweep(
                 continue;
             }
             let result = run.resume_execution().await;
+            // items.id=888 (F7): the guarded claim lost (a user resumed or cancelled the
+            // run since this tick read it). This tick wrote nothing; the winner owns the
+            // run and its chat reply, so there is nothing to finalize here.
+            if matches!(
+                result,
+                Err(crate::conductor::lifecycle::LifecycleError::ResumeRaced)
+            ) {
+                log::info!("scheduled_sweep: run '{focus_run_id}' was claimed elsewhere, skipped");
+                continue;
+            }
             if let Err(e) = &result {
                 log::warn!(
                     "scheduled_sweep: resume_execution failed for run '{focus_run_id}': {e}"
