@@ -11746,6 +11746,73 @@ steps:
         .await;
     }
 
+    /// items.id=922 persona carry, database path: a local step naming {persona_context}
+    /// whose variable an external step declares fails LOAD; a local-only reader loads.
+    #[tokio::test]
+    async fn persona_carry_db_a_persona_variable_in_an_external_step_fails_load() {
+        with_temp_data_root(async {
+            let m = declared_load(
+                "pcarry-bad",
+                vec![
+                    dstep("p", 1, "ctx {persona_context}", &[], &[], Some("v")),
+                    dstep("e", 2, "use {v}", &["v"], &[], None),
+                ],
+            )
+            .await
+            .unwrap_err();
+            assert!(m.contains("Focus 'pcarry-bad'"), "{m}");
+            assert!(
+                m.contains("step 'e': an external step cannot take 'v'"),
+                "{m}"
+            );
+            declared_load(
+                "pcarry-ok",
+                vec![
+                    dstep("p", 1, "ctx {persona_context}", &[], &[], Some("v")),
+                    dstep("l", 1, "use {v}", &[], &[], None),
+                ],
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+    }
+
+    /// items.id=922 persona carry, YAML path.
+    #[test]
+    fn persona_carry_yaml_a_persona_variable_in_an_external_step_fails_load() {
+        let text = |second_tier: u8| {
+            format!(
+                r#"
+id: pcarry-yaml
+max_routing_tier: 2
+steps:
+  first:
+    routing_tier: 1
+    output_var: v
+    prompt_template: "ctx {{persona_context}}"
+  second:
+    routing_tier: {second_tier}
+    prompt_template: "use {{v}}"
+    declared_inputs:
+      - v
+"#
+            )
+        };
+        let def = parse_focus_text(&text(2)).unwrap();
+        let LifecycleError::ValidationFailed(m) =
+            lint_declared_inputs("pcarry-yaml", &def.steps).unwrap_err()
+        else {
+            panic!("expected ValidationFailed");
+        };
+        assert!(
+            m.contains("step 'second': an external step cannot take 'v'"),
+            "{m}"
+        );
+        let def = parse_focus_text(&text(1)).unwrap();
+        lint_declared_inputs("pcarry-yaml", &def.steps).unwrap();
+    }
+
     /// items.id=922 on the database path: a variable the renderer resolves but find_tokens
     /// cannot see is refused at LOAD, and a snake_case one loads.
     #[tokio::test]

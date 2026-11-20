@@ -142,6 +142,11 @@ pub enum DeclaredInputsError {
     /// template that names it, or a declaration of it, is refused rather than left as
     /// a silent no-op. Declared or not.
     PersonaContextInExternalStep { action_id: String },
+    /// An external step names or declares a variable derived from a LOCAL step that named
+    /// {persona_context}, or reads {previous_output} after such a step (items.id=922,
+    /// decisions.id=952 requirement). The external render of the token is empty, but the
+    /// local render carries the slice, and a local step's output can repeat it.
+    PersonaContextCarriedToExternalStep { action_id: String, name: String },
     /// An external step's field_requirements names a field that cannot work
     /// (items.id=931, decisions.id=953 ruling 5): not a name in the personal fact
     /// catalogue, not named as a {token} in the template, or equal to an output
@@ -233,6 +238,14 @@ impl std::fmt::Display for DeclaredInputsError {
                  but {} (items.id=931)",
                 reason.text()
             ),
+            Self::PersonaContextCarriedToExternalStep { action_id, name } => write!(
+                f,
+                "step '{action_id}': an external step cannot take '{name}', which carries the \
+                 output of a local step that names '{{{PERSONA_CONTEXT}}}': that output can \
+                 repeat the user's memory, and nothing re-checks it on the way out. Move the \
+                 persona-aware step's result out of the path to this step, or personalise this \
+                 step through its field_requirements (items.id=922, decisions.id=952)"
+            ),
             Self::PersonaContextInExternalStep { action_id } => write!(
                 f,
                 "step '{action_id}': an external step cannot name or declare \
@@ -278,6 +291,9 @@ pub(crate) fn lint_with(
     // undeclared any more than it can name the bound name itself.
     let taint = taint_closure(steps, row_vars, bound);
     let device_taint = taint_closure_of(steps, row_vars, DEVICE_NAMES_NEVER_EXTERNAL, false);
+    // items.id=922: the closure of {persona_context}, a system token the store closure
+    // leaves untainted. Used only by lint_persona_carry; it changes no extraction.
+    let persona_taint = taint_closure_of(steps, row_vars, &[PERSONA_CONTEXT], false);
     let mut bound_like: HashSet<&str> = bound.iter().copied().collect();
     bound_like.extend(taint.vars.iter().map(String::as_str));
 
@@ -312,6 +328,7 @@ pub(crate) fn lint_with(
             // before the undeclared-name rule so the refusal is the explicit one
             // (items.id=882).
             lint_persona_context(step).map_err(|e| e.to_string())?;
+            lint_persona_carry(step, &persona_taint).map_err(|e| e.to_string())?;
             lint_step(step, &earlier, bound, &bound_like).map_err(|e| e.to_string())?;
             lint_field_requirements(step, row_vars, bound).map_err(|e| e.to_string())?;
             if !store_names_external_allowed {
@@ -345,6 +362,49 @@ fn lint_persona_context(step: &ActionDefinition) -> Result<(), DeclaredInputsErr
         });
     }
     Ok(())
+}
+
+/// items.id=922 (decisions.id=952 requirement): an external step may not name or declare
+/// a variable derived from a local step that named {persona_context}, nor be a step that
+/// reads {previous_output} after such a row. REFUSED, not tainted: persona_context is a
+/// system token, not a bound name, and the render of it is empty at an external
+/// destination, so the only way persona text reaches one is through a local step's
+/// output. The closure is taint_closure_of over [persona_context], so it follows
+/// variables transitively and keeps the {previous_output} over-approximation (it can
+/// refuse a Focus that is in fact clean, never admit one that carries). A local step that
+/// reads such a variable is fine. No runtime backstop exists for this carry.
+fn lint_persona_carry(
+    step: &ActionDefinition,
+    persona_taint: &Taint,
+) -> Result<(), DeclaredInputsError> {
+    if !step.is_external_for_lint() {
+        return Ok(());
+    }
+    let derived = |n: &str| persona_taint.vars.contains(n);
+    let offending = step
+        .declared_inputs
+        .iter()
+        .find(|d| derived(d))
+        .cloned()
+        .or_else(|| {
+            find_tokens(&step.prompt_template)
+                .into_iter()
+                .find(|n| derived(n))
+        })
+        .or_else(|| {
+            persona_taint
+                .actions
+                .contains(&step.action_id)
+                .then(|| tainting_name(step, persona_taint, &[PERSONA_CONTEXT]))
+                .flatten()
+        });
+    match offending {
+        Some(name) => Err(DeclaredInputsError::PersonaContextCarriedToExternalStep {
+            action_id: step.action_id.clone(),
+            name,
+        }),
+        None => Ok(()),
+    }
 }
 
 /// DEVICE_NAMES_NEVER_EXTERNAL: an external step may not name or declare a device
@@ -664,6 +724,124 @@ mod tests {
         }
         // The refusal does not depend on the row being external or on a later reader.
         assert!(run(&[(step("a", LOCAL, "x", &[], &[]), Some("Draft"))], &[]).is_err());
+    }
+
+    // -- items.id=922: persona_context carried to an external step ---------------------
+
+    fn persona_step(id: &str) -> ActionDefinition {
+        step(id, LOCAL, "ctx {persona_context}", &[], &[])
+    }
+
+    #[test]
+    fn a_variable_derived_from_a_persona_step_is_refused_in_an_external_step() {
+        let e = run(
+            &[
+                (persona_step("p"), Some("v")),
+                (step("e", EXT, "use {v}", &["v"], &[]), None),
+            ],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("step 'e'") && e.contains("'v'") && e.contains("persona_context"),
+            "{e}"
+        );
+        assert!(
+            e.contains("items.id=922") && !e.contains("does not declare"),
+            "{e}"
+        );
+        // Declared only (the template does not name it) is refused too.
+        let e = run(
+            &[
+                (persona_step("p"), Some("v")),
+                (step("e", EXT, "none", &["v"], &[]), None),
+            ],
+            &[],
+        )
+        .unwrap_err();
+        assert!(e.contains("step 'e'") && e.contains("'v'"), "{e}");
+    }
+
+    #[test]
+    fn the_persona_carry_is_followed_through_variables_and_previous_output() {
+        // Transitive: p -> v1 -> (local b reads v1) -> v2 -> external.
+        let e = run(
+            &[
+                (persona_step("p"), Some("v1")),
+                (step("b", LOCAL, "rewrite {v1}", &[], &[]), Some("v2")),
+                (step("e", EXT, "use {v2}", &["v2"], &[]), None),
+            ],
+            &[],
+        )
+        .unwrap_err();
+        assert!(e.contains("step 'e'") && e.contains("'v2'"), "{e}");
+        // {previous_output} after a persona row is the over-approximation.
+        let e = run(
+            &[
+                (persona_step("p"), Some("v")),
+                (
+                    step("e", EXT, "use {previous_output}", &["previous_output"], &[]),
+                    None,
+                ),
+            ],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("step 'e'") && e.contains("persona_context"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_persona_step_that_feeds_only_local_steps_or_nothing_loads() {
+        // The persona step's variable is read by a local step only; the external step
+        // declares an unrelated, clean variable.
+        run(
+            &[
+                (step("clean", LOCAL, "x", &[], &[]), Some("c")),
+                (persona_step("p"), Some("v")),
+                (step("l", LOCAL, "use {v}", &[], &[]), Some("w")),
+                (step("e", EXT, "use {c}", &["c"], &[]), None),
+            ],
+            &[],
+        )
+        .unwrap();
+        // A persona step with no variable at all, then an external step on a clean one.
+        run(
+            &[
+                (step("clean", LOCAL, "x", &[], &[]), Some("c")),
+                (persona_step("p"), None),
+                (step("e", EXT, "use {c}", &["c"], &[]), None),
+            ],
+            &[],
+        )
+        .unwrap();
+        // The local step that reads a persona variable is itself fine.
+        run(
+            &[
+                (persona_step("p"), Some("v")),
+                (step("l", LOCAL, "use {v}", &[], &[]), None),
+            ],
+            &[],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_external_step_naming_the_token_itself_keeps_the_items_882_refusal() {
+        let e = run(
+            &[
+                (persona_step("p"), Some("v")),
+                (step("e", EXT, "ctx {persona_context}", &[], &[]), None),
+            ],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("cannot name or declare '{persona_context}'") && !e.contains("items.id=922"),
+            "{e}"
+        );
     }
 
     #[test]
