@@ -41,6 +41,7 @@ pub mod propose_route;
 pub mod provider_selection;
 pub mod quality;
 pub mod reentry;
+pub mod resume_pin;
 pub mod resume_staleness;
 pub mod run_park;
 pub mod run_plan;

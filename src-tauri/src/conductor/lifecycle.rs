@@ -166,6 +166,11 @@ pub enum LifecycleError {
     /// rehydrate_focus_run writes nothing; the caller cancels (cancel_stale_resume).
     #[error("a one-time chat cannot be resumed")]
     ResumeOneTimeChat,
+    /// items.id=888 stage 5: the chat's saved state the run was pinned to changed while
+    /// it waited (a seed version differs, a published id is gone, or the pin cannot be
+    /// read). rehydrate_focus_run writes nothing; the caller cancels.
+    #[error("saved chat state changed while waiting")]
+    ResumeStoreChanged,
     #[error("Reentry: {0}")]
     Reentry(#[from] ReentryError),
 
@@ -4189,6 +4194,32 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
 
         let mut conn = open_outputs_db(&self.user_id, &self.persona_id, key_hex).await?;
 
+        // items.id=888 stage 5: the pin of the chat's stores (conductor::resume_pin): the
+        // version of each versioned seed the steps read and the ids published this pass.
+        // Names, integers and opaque ids only, never a stored value. A store that cannot
+        // be read is recorded as unreadable, and a resume of this snapshot is refused.
+        let extra_metadata = {
+            let names = self
+                .focus_def
+                .as_ref()
+                .map(|d| crate::conductor::resume_pin::versioned_names(&d.steps))
+                .unwrap_or_default();
+            let versions = if names.is_empty() || self.context_key.is_none() {
+                None
+            } else {
+                Some(
+                    crate::conductor::resume_pin::read_versions(
+                        &mut conn,
+                        self.context_key.as_deref(),
+                        &self.focus_id,
+                        &names,
+                    )
+                    .await,
+                )
+            };
+            crate::conductor::resume_pin::checkpoint_metadata(versions, &self.store_vars)
+        };
+
         // items.id=888 (F7): the id is returned so reenter_step can carry it as its
         // new resume basis.
         let snapshot_id = Uuid::new_v4().to_string();
@@ -4196,8 +4227,8 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             "INSERT INTO focus_run_snapshots
              (id, focus_run_id, action_id, phase, task_track_json,
               shared_state_json, personal_context_manifest,
-              checkpoint_hash, purge_after, created_at)
-             VALUES (?, ?, ?, 4, ?, ?, ?, ?, ?, ?)",
+              checkpoint_hash, purge_after, created_at, extra_metadata)
+             VALUES (?, ?, ?, 4, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&snapshot_id)
         .bind(focus_run_id)
@@ -4208,6 +4239,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         .bind(&checkpoint_hash)
         .bind(purge_after_for(park, at))
         .bind(at.to_rfc3339())
+        .bind(&extra_metadata)
         .execute(&mut conn)
         .await?;
 
@@ -4875,6 +4907,73 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         }
     }
 
+    /// items.id=888 stage 5: check a snapshot's pin (conductor::resume_pin) against the
+    /// chat's stores as they are now, and give the run back its published ids. Writes
+    /// nothing. Refuses (ResumeStoreChanged) when: the metadata does not parse; the store
+    /// was unreadable at checkpoint time; a pinned seed's version differs now (or there is
+    /// no chat to read it from, or it cannot be read); a published id does not verify.
+    /// The ids are restored only after every check passed.
+    pub(crate) async fn check_resume_pin(
+        &mut self,
+        extra: Option<&str>,
+    ) -> Result<(), LifecycleError> {
+        use crate::conductor::resume_pin;
+        let changed = || LifecycleError::ResumeStoreChanged;
+        let pinned = resume_pin::parse(extra).map_err(|_| changed())?;
+        if pinned.unreadable {
+            return Err(changed());
+        }
+        let needs_versions = pinned.versions.as_ref().is_some_and(|v| !v.is_empty());
+        if !needs_versions && pinned.published.is_empty() {
+            return Ok(());
+        }
+        let key_hex = self.key_hex.as_deref().ok_or(LifecycleError::NoKey)?;
+        let mut conn = open_outputs_db(&self.user_id, &self.persona_id, key_hex).await?;
+        if let Some(pinned_versions) = pinned.versions.as_ref().filter(|v| !v.is_empty()) {
+            let chat = self.context_key.as_deref().ok_or_else(changed)?;
+            let names: Vec<&str> = pinned_versions.keys().map(String::as_str).collect();
+            let now = resume_pin::read_versions(&mut conn, Some(chat), &self.focus_id, &names)
+                .await
+                .map_err(|_| changed())?;
+            if &now != pinned_versions {
+                return Err(changed());
+            }
+        }
+        if !pinned.published.is_empty() {
+            let steps = &self
+                .focus_def
+                .as_ref()
+                .expect("check_resume_pin() requires load()")
+                .steps;
+            let mut personal = if resume_pin::needs_personal(steps, &pinned.published) {
+                Some(
+                    crate::persistence::personal_store::open_personal_db(
+                        &self.user_id,
+                        &self.persona_id,
+                        key_hex,
+                    )
+                    .await
+                    .map_err(|_| changed())?,
+                )
+            } else {
+                None
+            };
+            if !resume_pin::verify_published(
+                &mut conn,
+                personal.as_mut(),
+                &self.focus_id,
+                steps,
+                &pinned.published,
+            )
+            .await
+            {
+                return Err(changed());
+            }
+            self.store_vars = pinned.published.into_iter().collect();
+        }
+        Ok(())
+    }
+
     /// Test only: take the resume basis from the run's row and latest snapshot, as
     /// rehydrate_focus_run does, for a FocusRun a test built by hand.
     #[cfg(test)]
@@ -5227,7 +5326,8 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
     // items.id=888 (F7): the same order as the claim's subquery (output_store::claim_run),
     // so the id read here is the id the claim compares.
     let snapshot_row = sqlx::query(
-        "SELECT id, action_id, task_track_json, shared_state_json, personal_context_manifest
+        "SELECT id, action_id, task_track_json, shared_state_json, personal_context_manifest,
+                extra_metadata
          FROM focus_run_snapshots
          WHERE focus_run_id = ?
          ORDER BY created_at DESC, rowid DESC
@@ -5355,6 +5455,11 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
                 }
                 return Err(LifecycleError::ResumeStale(reason));
             }
+
+            // items.id=888 stage 5: the pin of the chat's stores (seed versions and
+            // published ids). Writes nothing; the caller cancels on ResumeStoreChanged.
+            let extra: Option<String> = row.try_get("extra_metadata")?;
+            run.check_resume_pin(extra.as_deref()).await?;
 
             let resume_at =
                 resume_index(&run.focus_def.as_ref().unwrap().steps, &action_id, &status);
@@ -16714,6 +16819,436 @@ steps:
             callers,
             ["commands/execution.rs", "conductor/scheduled_sweep.rs"]
         );
+    }
+
+    // -- items.id=888 stage 5: the seed version pin and the published ids ---------
+
+    const PIN_CHAT: &str = "chat-pin";
+
+    /// A run of chat PIN_CHAT whose template reads {locked_intent} and whose two writer
+    /// rows publish an entity and a case.
+    fn pin_run() -> FocusRun<crate::conductor::privacy::logger::TestLogger> {
+        let mut reads = single_tier3_step_focus_def().steps[0].clone();
+        reads.action_id = "reads".to_owned();
+        reads.routing_tier = ExternalAccess::LocalOnly;
+        reads.external_access_override = None;
+        reads.requires_user_handoff = false;
+        reads.prompt_template = "Intent: {locked_intent}".to_owned();
+        writer_run(
+            vec![
+                reads,
+                writer_step(
+                    "ent",
+                    "entity_find_or_create",
+                    Some("ent_out"),
+                    serde_json::json!({"label": "label_out"}),
+                    None,
+                ),
+                writer_step(
+                    "open",
+                    "case_open",
+                    Some("new_case"),
+                    serde_json::json!({"entity": "ent_out", "label": "label_out"}),
+                    None,
+                ),
+            ],
+            Some(PIN_CHAT),
+            &[],
+        )
+    }
+
+    async fn put_intent(run: &FocusRun<crate::conductor::privacy::logger::TestLogger>, v: &str) {
+        let mut conn = outputs(run).await;
+        let current = crate::persistence::session_store::get_session_variable(
+            &mut conn,
+            PIN_CHAT,
+            &run.focus_id,
+            "locked_intent",
+        )
+        .await
+        .unwrap();
+        crate::persistence::session_store::put_session_variable(
+            &mut conn,
+            &crate::persistence::session_store::SessionWrite {
+                context_key: PIN_CHAT,
+                focus_id: &run.focus_id,
+                name: "locked_intent",
+                value: v,
+                written_by_run: "run-x",
+                expected_version: current.map(|c| c.version),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn add_case(run: &FocusRun<crate::conductor::privacy::logger::TestLogger>, id: &str) {
+        let mut conn = outputs(run).await;
+        sqlx::query(
+            "INSERT INTO case_records (case_id, opened_by_run, opened_at, updated_at, focus_id)
+             VALUES (?, 'run-x', 't', 't', ?)",
+        )
+        .bind(id)
+        .bind(&run.focus_id)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    /// A checkpoint of `run` and its extra_metadata text.
+    async fn pinned_checkpoint(
+        run: &FocusRun<crate::conductor::privacy::logger::TestLogger>,
+    ) -> String {
+        crate::persistence::output_store::test_seed_focus_run(
+            &run.user_id,
+            &run.persona_id,
+            CRISIS_TEST_KEY_HEX,
+            run.focus_run_id.as_deref().unwrap(),
+            &run.focus_id,
+        )
+        .await
+        .unwrap();
+        let id = run
+            .write_checkpoint_for("reads", CheckpointPark::AwaitingUser, Utc::now())
+            .await
+            .unwrap();
+        let mut conn = outputs(run).await;
+        sqlx::query_scalar("SELECT extra_metadata FROM focus_run_snapshots WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    /// items.id=888 stage 5: a checkpoint pins the version of every versioned seed the
+    /// steps read, and the ids published this pass; never a stored value.
+    #[tokio::test]
+    async fn a_checkpoint_pins_seed_versions_and_published_ids_never_values() {
+        with_temp_data_root(async {
+            let mut run = pin_run();
+            put_intent(&run, "billing").await;
+            run.store_vars
+                .insert("new_case".to_owned(), "case-1".to_owned());
+            let extra = pinned_checkpoint(&run).await;
+            assert!(!extra.contains("billing"), "{extra}");
+            let pinned = crate::conductor::resume_pin::parse(Some(&extra)).unwrap();
+            assert_eq!(
+                pinned.versions,
+                Some([("locked_intent".to_owned(), 1)].into())
+            );
+            assert_eq!(pinned.published["new_case"], "case-1");
+            assert!(!pinned.unreadable);
+        })
+        .await;
+    }
+
+    /// items.id=888 stage 5: a resume on the same stored state passes and gets its
+    /// published ids back; a seed rewritten while the run waited, or a published id that
+    /// is gone, refuses it (ResumeStoreChanged) and restores nothing.
+    #[tokio::test]
+    async fn a_resume_is_refused_when_a_pinned_seed_or_a_published_id_changed() {
+        with_temp_data_root(async {
+            let mut run = pin_run();
+            put_intent(&run, "billing").await;
+            add_case(&run, "case-1").await;
+            run.store_vars
+                .insert("new_case".to_owned(), "case-1".to_owned());
+            let extra = pinned_checkpoint(&run).await;
+
+            let mut same = pin_run();
+            same.check_resume_pin(Some(&extra))
+                .await
+                .expect("unchanged");
+            assert_eq!(
+                same.store_vars.get("new_case").map(String::as_str),
+                Some("case-1")
+            );
+
+            let mut conn = outputs(&run).await;
+            sqlx::query("DELETE FROM case_records WHERE case_id = 'case-1'")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            drop(conn);
+            let mut gone = pin_run();
+            let err = gone.check_resume_pin(Some(&extra)).await.unwrap_err();
+            assert!(matches!(err, LifecycleError::ResumeStoreChanged), "{err:?}");
+            assert!(gone.store_vars.is_empty());
+
+            add_case(&run, "case-1").await;
+            put_intent(&run, "refund").await;
+            let mut changed = pin_run();
+            let err = changed.check_resume_pin(Some(&extra)).await.unwrap_err();
+            assert!(matches!(err, LifecycleError::ResumeStoreChanged), "{err:?}");
+            assert!(changed.store_vars.is_empty());
+        })
+        .await;
+    }
+
+    /// items.id=888 stage 5: fail closed on everything the check cannot read: a store
+    /// unreadable at checkpoint time, metadata that does not parse, a pin with no chat
+    /// to read it from. Nothing pinned ('{}', every older snapshot) passes.
+    #[tokio::test]
+    async fn the_resume_pin_fails_closed_on_what_it_cannot_read() {
+        with_temp_data_root(async {
+            let mut run = pin_run();
+            for bad in [r#"{"seed_versions_unreadable": true}"#, "not json"] {
+                let err = run.check_resume_pin(Some(bad)).await.unwrap_err();
+                assert!(matches!(err, LifecycleError::ResumeStoreChanged), "{bad}");
+            }
+            run.check_resume_pin(Some("{}"))
+                .await
+                .expect("nothing pinned");
+            run.check_resume_pin(None).await.expect("nothing pinned");
+            let mut no_chat = pin_run();
+            no_chat.context_key = None;
+            let err = no_chat
+                .check_resume_pin(Some(r#"{"seed_versions": {"locked_intent": 1}}"#))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, LifecycleError::ResumeStoreChanged));
+        })
+        .await;
+    }
+
+    /// items.id=888 stage 5 (Chat-PM's condition): a published hand-off draft handle (the
+    /// handoff_ingest row's draft_ref) is verified on resume like every other published id.
+    /// A handle that resolves among THIS Focus's replies passes and comes back; one whose
+    /// reply is gone, or one minted for another Focus's reply, refuses the resume with
+    /// ResumeStoreChanged and restores nothing.
+    #[tokio::test]
+    async fn a_published_draft_handle_is_verified_on_resume() {
+        with_temp_data_root(async {
+            let ingest_run = || {
+                writer_run(
+                    vec![writer_step(
+                        "ingest",
+                        "handoff_ingest",
+                        Some("draft_ref"),
+                        serde_json::Value::Null,
+                        Some(("handoff_pending", "present", None)),
+                    )],
+                    Some(PIN_CHAT),
+                    &[],
+                )
+            };
+            let probe = ingest_run();
+            let (u, p) = (probe.user_id.clone(), probe.persona_id.clone());
+            let ours = crate::persistence::handoff_draft_store::store_draft(
+                &u,
+                &p,
+                CRISIS_TEST_KEY_HEX,
+                &probe.focus_id,
+                "the pasted reply",
+            )
+            .await
+            .unwrap();
+            let theirs = crate::persistence::handoff_draft_store::store_draft(
+                &u,
+                &p,
+                CRISIS_TEST_KEY_HEX,
+                "another-focus",
+                "another Focus's reply",
+            )
+            .await
+            .unwrap();
+            let pin = |handle: &str| format!(r#"{{"published": {{"draft_ref": "{handle}"}}}}"#);
+            let ours_handle = crate::persistence::handles::draft_handle(&probe.focus_id, &ours);
+
+            let mut good = ingest_run();
+            good.check_resume_pin(Some(&pin(&ours_handle)))
+                .await
+                .expect("this Focus's reply verifies");
+            assert_eq!(
+                good.store_vars.get("draft_ref").map(String::as_str),
+                Some(ours_handle.as_str())
+            );
+
+            let gone = crate::persistence::handles::draft_handle(
+                &probe.focus_id,
+                &uuid::Uuid::new_v4().to_string(),
+            );
+            let foreign = crate::persistence::handles::draft_handle("another-focus", &theirs);
+            for (label, handle) in [
+                ("a reply that is gone", gone),
+                ("another Focus's reply", foreign),
+            ] {
+                let mut run = ingest_run();
+                let err = run.check_resume_pin(Some(&pin(&handle))).await.unwrap_err();
+                assert!(
+                    matches!(err, LifecycleError::ResumeStoreChanged),
+                    "{label}: {err:?}"
+                );
+                assert!(run.store_vars.is_empty(), "{label}");
+            }
+        })
+        .await;
+    }
+
+    /// items.id=888 stage 5: the shared cancel helper stops a run refused on its pin with
+    /// the plain message.
+    #[tokio::test]
+    async fn a_run_refused_on_its_pin_is_cancelled_with_a_plain_message() {
+        with_resume_root("pin-user-1", "pin-persona-1", |_pool| async move {
+            let (u, p) = ("pin-user-1", "pin-persona-1");
+            let run_id = seed_paused_chat_run(u, p, Some("chat-pin")).await;
+            assert!(
+                crate::conductor::resume_staleness::cancel_stale_resume(
+                    &LifecycleError::ResumeStoreChanged,
+                    u,
+                    p,
+                    RESUME_TEST_KEY_HEX,
+                    &run_id,
+                    None,
+                )
+                .await
+            );
+            let mut conn = open_outputs_db(u, p, RESUME_TEST_KEY_HEX).await.unwrap();
+            let reason: Option<String> = sqlx::query_scalar(
+                "SELECT json_extract(notes, '$.cancel_reason') FROM focus_runs WHERE id = ?",
+            )
+            .bind(&run_id)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            assert_eq!(
+                reason.as_deref(),
+                Some(crate::conductor::resume_pin::SAVED_STATE_CHANGED)
+            );
+        })
+        .await;
+    }
+
+    /// items.id=888 stage 5: the wiring. Every checkpoint writes the pin; rehydrate reads
+    /// the snapshot's extra_metadata and checks it after the personal-field staleness
+    /// check and before it restores the track.
+    #[test]
+    fn checkpoints_write_the_pin_and_rehydrate_checks_it() {
+        let source = include_str!("lifecycle.rs");
+        let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let ck = production
+            .split("async fn write_checkpoint_for(")
+            .nth(1)
+            .unwrap();
+        let ck = &ck[..ck.find("\n    }\n").unwrap()];
+        assert!(ck.contains("resume_pin::checkpoint_metadata("));
+        assert!(ck.contains("extra_metadata"));
+        let start = production.find("pub async fn rehydrate_focus_run").unwrap();
+        let body = &production[start..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(body.contains("extra_metadata"));
+        let stale = body
+            .find("return Err(LifecycleError::ResumeStale(reason));")
+            .unwrap();
+        let pin = body.find("run.check_resume_pin(").expect("pin check");
+        let restore = body.find("run.task_track = Some(task_track);").unwrap();
+        assert!(stale < pin && pin < restore);
+    }
+
+    /// items.id=888 stage 5: re-entry with writer rows. A writer row records nothing on
+    /// the track, so it is not a re-entry target (step_not_found, nothing written); a
+    /// re-entry BEFORE a writer row runs that writer again on the way forward, and its
+    /// write goes through the store as a new version. (A writer that writes the same text
+    /// for the same run is an idempotent replay, so the test changes the stored text first:
+    /// the writer puts its own text back, which only a re-run can do.)
+    #[tokio::test]
+    async fn reentry_with_writer_rows() {
+        with_temp_data_root(async {
+            let base = guarded_hand_built_def();
+            let mut def = base.clone();
+            def.steps = vec![
+                base.steps[0].clone(), // check_a: quality_verdict
+                writer_step(
+                    "keep",
+                    "artifact_put",
+                    Some("content_brief"),
+                    serde_json::json!({"value": "quality_verdict"}),
+                    None,
+                ),
+                base.steps[2].clone(), // check_b (guard: quality_verdict present)
+            ];
+            let order: Vec<String> = def.steps.iter().map(|s| s.action_id.clone()).collect();
+            let mut run = tier3_ready_run(false);
+            run.focus_def = Some(def);
+            run.context_key = Some("chat-reenter".to_owned());
+            run.task_track
+                .as_mut()
+                .unwrap()
+                .add_step(draft_step("the assessed draft"));
+            let focus_run_id = run.focus_run_id.clone().unwrap();
+            crate::persistence::output_store::test_seed_focus_run(
+                &run.user_id,
+                &run.persona_id,
+                CRISIS_TEST_KEY_HEX,
+                &focus_run_id,
+                &run.focus_id,
+            )
+            .await
+            .unwrap();
+            run.execute().await.unwrap();
+            assert_eq!(ran_ids(&run), ["draft_writing", "check_a", "check_b"]);
+            let version = |run: &FocusRun<crate::conductor::privacy::logger::TestLogger>| {
+                let (u, p, f) = (
+                    run.user_id.clone(),
+                    run.persona_id.clone(),
+                    run.focus_id.clone(),
+                );
+                async move {
+                    let mut conn = open_outputs_db(&u, &p, CRISIS_TEST_KEY_HEX).await.unwrap();
+                    crate::persistence::pass_artifact_store::get_artifact(
+                        &mut conn,
+                        "chat-reenter",
+                        &f,
+                        crate::persistence::pass_artifact_store::ArtifactKind::ContentBrief,
+                    )
+                    .await
+                    .unwrap()
+                    .map(|a| a.version)
+                }
+            };
+            assert_eq!(version(&run).await, Some(1));
+            let mut conn = outputs(&run).await;
+            sqlx::query(
+                "UPDATE pass_artifacts SET content = 'changed meanwhile', version = 2
+                 WHERE context_key = 'chat-reenter'",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            sqlx::query("UPDATE focus_runs SET status = 'awaiting_feedback' WHERE id = ?")
+                .bind(&focus_run_id)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            drop(conn);
+            run.adopt_resume_basis_for_test().await;
+
+            // The writer row is not a target: refused before the claim, nothing written.
+            let err = run.reenter_step(&order, "keep").await.unwrap_err();
+            assert!(
+                matches!(err, LifecycleError::Reentry(ReentryError::StepNotFound(_))),
+                "{err:?}"
+            );
+            assert_eq!(run_state(&run).await.status, "awaiting_feedback");
+
+            // Re-entry at check_a: the writer runs again on the way forward.
+            run.reenter_step(&order, "check_a")
+                .await
+                .expect("re-entry at check_a");
+            assert_eq!(run.current_step, 0);
+            run.execute().await.unwrap();
+            assert_eq!(ran_ids(&run), ["draft_writing", "check_a", "check_b"]);
+            assert_eq!(version(&run).await, Some(3), "the writer ran again");
+            let mut conn = outputs(&run).await;
+            let text: String = sqlx::query_scalar(
+                "SELECT content FROM pass_artifacts WHERE context_key = 'chat-reenter'",
+            )
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            assert_ne!(text, "changed meanwhile");
+        })
+        .await;
     }
 
     /// A run that belongs to no chat cannot write: it fails closed.

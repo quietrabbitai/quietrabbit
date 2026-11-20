@@ -142,6 +142,7 @@ pub async fn cancel_stale_resume(
     let message = match err {
         LifecycleError::ResumeStale(_) => PERSONAL_CHANGED_WHILE_WAITING,
         LifecycleError::ResumeOneTimeChat => ONE_TIME_CHAT_NOT_RESUMED,
+        LifecycleError::ResumeStoreChanged => crate::conductor::resume_pin::SAVED_STATE_CHANGED,
         _ => return false,
     };
     let cancelled = match crate::persistence::output_store::cancel_parked_run(
