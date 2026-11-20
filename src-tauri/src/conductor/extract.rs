@@ -83,6 +83,16 @@ pub const SOURCE_QUICK_CLOSE: &str = "quick_close";
 // Types
 // ---------------------------------------------------------------------------
 
+/// items.id=888 (F8): whether the screen that confirms extraction candidates exists.
+/// It does not (items.id=38 builds it): nothing in the frontend listens for
+/// extract_confirm_request or calls submit_extract_confirm, so a run whose extraction
+/// pass found a candidate parked at awaiting_extract_confirm for good, holding its
+/// chat window and the extracted values. While this is false,
+/// FocusRun::execute_and_finish skips the WHOLE pass (no read of existing field names,
+/// no model call, no candidate, no park) and completes the run. items.id=38 flips it;
+/// a test pins it false until then.
+pub const EXTRACT_CONFIRM_SCREEN_BUILT: bool = false;
+
 /// A single candidate returned by extract_candidates() -- not yet persisted.
 #[derive(Debug, Clone)]
 pub struct ExtractCandidate {

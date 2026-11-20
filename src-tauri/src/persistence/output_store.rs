@@ -1351,6 +1351,126 @@ pub async fn expire_parked_runs(
     Ok(expired)
 }
 
+/// What sweep_post_output_runs did for one persona (items.id=888, F8).
+#[derive(Debug, Default)]
+pub struct PostOutputSweep {
+    /// awaiting_extract_confirm rows whose user_input and external_input were cleared.
+    pub inputs_cleared: u64,
+    /// Runs settled as complete.
+    pub settled: Vec<String>,
+}
+
+/// items.id=888 (F8): the sweep of runs whose reply was saved and that wait for
+/// nothing that can arrive (run_retention::POST_OUTPUT_STATUSES), run by the hourly
+/// tick and the login pass, only while the owner's key is resident.
+///   1. Every pass, whatever the run's age: user_input and external_input of every
+///      awaiting_extract_confirm row become NULL. Nothing reads them: such a run cannot
+///      resume (resume_run only replays its confirmed candidates) and the confirm
+///      screen does not exist (items.id=38).
+///   2. At started_at + POST_OUTPUT_RETENTION_DAYS a run in the set is settled as
+///      `complete` (settle_post_output_in_tx), with every candidate row of the run
+///      deleted, whatever its status.
+///
+/// One failing run does not stop the others.
+pub async fn sweep_post_output_runs(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<PostOutputSweep, OutputStoreError> {
+    use crate::conductor::run_retention::{post_output_run_expired, POST_OUTPUT_STATUSES};
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+    let inputs_cleared = sqlx::query(
+        "UPDATE focus_runs SET user_input = NULL, external_input = NULL
+         WHERE status = 'awaiting_extract_confirm'
+           AND (user_input IS NOT NULL OR external_input IS NOT NULL)",
+    )
+    .execute(&mut conn)
+    .await?
+    .rows_affected();
+
+    let placeholders = vec!["?"; POST_OUTPUT_STATUSES.len()].join(", ");
+    let sql = format!(
+        "SELECT id, started_at FROM focus_runs WHERE status IN ({placeholders})
+         ORDER BY started_at, id"
+    );
+    let mut q = sqlx::query_as::<_, (String, String)>(&sql);
+    for status in POST_OUTPUT_STATUSES {
+        q = q.bind(*status);
+    }
+    let rows = q.fetch_all(&mut conn).await?;
+    let mut settled = Vec::new();
+    for (id, started_at) in rows {
+        if !post_output_run_expired(&started_at, now) {
+            continue;
+        }
+        crate::persistence::session_store::begin_write(&mut conn).await?;
+        let result = settle_post_output_in_tx(&mut conn, &id).await;
+        match crate::persistence::session_store::finish_write(&mut conn, result).await {
+            Ok(true) => settled.push(id),
+            Ok(false) => {}
+            Err(e) => log::warn!("output_store: could not settle a post-output run: {e}"),
+        }
+    }
+    Ok(PostOutputSweep {
+        inputs_cleared,
+        settled,
+    })
+}
+
+/// items.id=888 (F8): settle ONE post-output run inside a write transaction the caller
+/// holds:
+///   UPDATE focus_runs SET status='complete', user_input and external_input NULL, the
+///   reason in notes WHERE id=? AND status IN (POST_OUTPUT_STATUSES);
+/// only if exactly one row changed are ALL its extraction candidates (pending,
+/// declined and confirmed alike: each holds an extracted value), any snapshot, its park
+/// reason and a pending step review removed. The status guard is what keeps the settle
+/// and the resume or re-entry claim apart: the two sets are disjoint, so whichever
+/// UPDATE runs first moves the run out of the other's set.
+async fn settle_post_output_in_tx(
+    conn: &mut SqliteConnection,
+    run_id: &str,
+) -> Result<bool, OutputStoreError> {
+    use crate::conductor::run_retention::{EXPIRED_WHILE_WAITING, POST_OUTPUT_STATUSES};
+    let placeholders = vec!["?"; POST_OUTPUT_STATUSES.len()].join(", ");
+    let sql = format!(
+        "UPDATE focus_runs SET status = 'complete', user_input = NULL, external_input = NULL,
+         notes = CASE WHEN json_valid(notes) THEN json_set(notes, '$.cancel_reason', ?)
+                      ELSE json_object('cancel_reason', ?) END
+         WHERE id = ? AND status IN ({})",
+        placeholders
+    );
+    let mut q = sqlx::query(&sql)
+        .bind(EXPIRED_WHILE_WAITING)
+        .bind(EXPIRED_WHILE_WAITING)
+        .bind(run_id);
+    for status in POST_OUTPUT_STATUSES {
+        q = q.bind(*status);
+    }
+    let changed = q.execute(&mut *conn).await?.rows_affected();
+    if changed != 1 {
+        return Ok(false);
+    }
+    sqlx::query("DELETE FROM extract_confirm_candidates WHERE focus_run_id = ?")
+        .bind(run_id)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("DELETE FROM focus_run_snapshots WHERE focus_run_id = ?")
+        .bind(run_id)
+        .execute(&mut *conn)
+        .await?;
+    clear_park_best_effort(conn, run_id).await;
+    crate::persistence::step_review_store::supersede_pending_for_run(conn, run_id)
+        .await
+        .map_err(|e| match e {
+            crate::persistence::step_review_store::StepReviewStoreError::Database(d) => {
+                OutputStoreError::from(d)
+            }
+            other => OutputStoreError::Validation(other.to_string()),
+        })?;
+    Ok(true)
+}
+
 /// Update focus_runs.status to an arbitrary value.
 /// Used by submit_extract_confirm to set status='complete' after all
 /// candidate decisions are written and verified.
@@ -1395,7 +1515,15 @@ pub async fn set_focus_run_status(
 /// these statuses can no longer resume. A run parked and never finished keeps its
 /// copy until items.id=681's retention sweep (expire_parked_run clears both input
 /// columns) or items.id=888's archive hook clears it.
-pub const USER_INPUT_CLEARED_STATUSES: &[&str] = &["complete", "cancelled", "failed"];
+/// items.id=888 (F8): awaiting_extract_confirm too. It is not terminal, but it never
+/// resumes through rehydrate (resume_run only replays its confirmed candidates) and
+/// reenter_step refuses it, so the copy had no reader.
+pub const USER_INPUT_CLEARED_STATUSES: &[&str] = &[
+    "complete",
+    "cancelled",
+    "failed",
+    "awaiting_extract_confirm",
+];
 
 /// Record a Gate 3 consent decision for a paused focus run (D6-352).
 /// decision: "approved" | "declined"

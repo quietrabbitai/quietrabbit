@@ -1050,6 +1050,19 @@ async fn recover_interrupted_runs(
                 log::debug!("finish_login: parked-run expiry skipped for persona={persona_id}: {e}")
             }
         }
+        // items.id=888 (F8): and the post-output runs (the chat window of a run at
+        // awaiting_extract_confirm cleared at once, such runs and awaiting_feedback ones
+        // settled as complete after 30 days). Best effort, like the expiry.
+        if let Err(e) = crate::persistence::output_store::sweep_post_output_runs(
+            user_id,
+            persona_id,
+            key_hex,
+            chrono::Utc::now(),
+        )
+        .await
+        {
+            log::debug!("finish_login: post-output sweep skipped for persona={persona_id}: {e}")
+        }
     }
     summary
 }

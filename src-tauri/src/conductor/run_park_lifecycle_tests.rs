@@ -551,8 +551,10 @@ fn the_two_output_store_clears_are_best_effort_with_one_fixed_log_line() {
     );
     assert_eq!(
         code.matches("clear_park_best_effort(").count(),
-        4,
-        "helper plus three callers (cancel_focus_run, set_focus_run_status, and items.id=681's expire_parked_run)"
+        5,
+        "helper plus four callers (cancel_focus_run, set_focus_run_status, items.id=681's \
+         expire_parked_run, and items.id=888's settle_post_output_in_tx: a settled run is \
+         not parked any more)"
     );
     let helper = code
         .split("async fn clear_park_best_effort(")

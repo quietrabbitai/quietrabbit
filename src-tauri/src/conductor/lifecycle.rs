@@ -4642,6 +4642,14 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         // Either way, output content is correctly saved before parking or completion.
         let output_result = self.output().await?;
 
+        // items.id=888 (F8): the extraction pass is OFF until items.id=38 builds the
+        // screen that confirms its candidates (EXTRACT_CONFIRM_SCREEN_BUILT). Nothing of
+        // the pass runs: no personal.db read, no model call, no candidate, no park.
+        if !crate::conductor::extract::EXTRACT_CONFIRM_SCREEN_BUILT {
+            self.cleanup("complete").await;
+            return Ok(output_result);
+        }
+
         // Build excluded fields: focus field_requirements + existing personal.db field names.
         // Field names only -- values never leave the PersonalTrack boundary.
         // Deduplicated via HashSet to avoid redundant model prompt context.
@@ -17381,12 +17389,17 @@ steps:
             run.write_focus_run_record("initializing").await.unwrap();
             assert_eq!(stored_user_input(&run).await.as_deref(), Some(WINDOW));
             // Every non-terminal status keeps it, awaiting_user above all.
+            // items.id=888 (F8): except awaiting_extract_confirm, removed from this list
+            // on purpose. Nothing reads the input of a run parked there (resume_run's
+            // branch for it only replays confirmed candidates, it never rehydrates, and
+            // reenter_step refuses it), and the confirm screen does not exist
+            // (items.id=38), so a copy kept there was only retained chat text. It is
+            // pinned NOT kept in the test below.
             for status in [
                 "running",
                 "awaiting_user",
                 "awaiting_schedule",
                 "paused",
-                "awaiting_extract_confirm",
                 "awaiting_feedback",
             ] {
                 run.write_focus_run_record(status).await.unwrap();
@@ -17423,6 +17436,88 @@ steps:
         .await;
     }
 
+    /// items.id=888 (F8): a run parked at awaiting_extract_confirm keeps neither input,
+    /// through the lifecycle writer (cleanup's park) or set_focus_run_status. It cannot
+    /// resume, so the copy has no reader.
+    #[tokio::test]
+    async fn no_input_is_kept_at_awaiting_extract_confirm() {
+        with_temp_data_root(async {
+            let run = run_with_input();
+            run.write_focus_run_record("awaiting_feedback")
+                .await
+                .unwrap();
+            assert_eq!(stored_user_input(&run).await.as_deref(), Some(WINDOW));
+            run.write_focus_run_record("awaiting_extract_confirm")
+                .await
+                .unwrap();
+            assert_eq!(stored_pair(&run).await, (None, None), "lifecycle writer");
+
+            let run = run_with_input();
+            run.write_focus_run_record("awaiting_feedback")
+                .await
+                .unwrap();
+            crate::persistence::output_store::set_focus_run_status(
+                &run.user_id,
+                &run.persona_id,
+                CRISIS_TEST_KEY_HEX,
+                run.focus_run_id.as_deref().unwrap(),
+                "awaiting_extract_confirm",
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                stored_pair(&run).await,
+                (None, None),
+                "set_focus_run_status"
+            );
+        })
+        .await;
+    }
+
+    /// items.id=888 (F8): the extraction pass is OFF until items.id=38 builds the screen
+    /// that confirms its candidates. Nothing in the frontend answers the confirm, so a
+    /// run that found a candidate parked for good with its candidates. items.id=38 flips
+    /// this constant, and this test with it.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn the_extraction_pass_is_off_until_the_confirm_screen_exists() {
+        assert!(!crate::conductor::extract::EXTRACT_CONFIRM_SCREEN_BUILT);
+    }
+
+    /// items.id=888 (F8): while the constant is false execute_and_finish skips the WHOLE
+    /// pass: the check comes after output() and before anything the pass does (the
+    /// personal.db read of existing field names, the model call, the candidate write,
+    /// the park), and the skip completes the run.
+    #[test]
+    fn execute_and_finish_checks_the_flag_before_any_part_of_the_pass() {
+        let source = include_str!("lifecycle.rs");
+        let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let start = production
+            .find("async fn execute_and_finish(&mut self)")
+            .unwrap();
+        let body = &production[start..];
+        let body = &body[..body.find("\n    }\n").unwrap()];
+        let output = body.find("self.output().await?").expect("output()");
+        let flag = body
+            .find("if !crate::conductor::extract::EXTRACT_CONFIRM_SCREEN_BUILT {")
+            .expect("the flag check");
+        assert!(output < flag, "the reply is saved first");
+        for part in [
+            "list_personal_fields",
+            "extract_candidates(",
+            "persist_candidates(",
+            "extract_confirm_request",
+            "self.cleanup(\"awaiting_extract_confirm\")",
+        ] {
+            let at = body.find(part).unwrap_or_else(|| panic!("{part}"));
+            assert!(flag < at, "{part} comes after the flag check");
+        }
+        let skip = &body[flag..];
+        let skip = &skip[..skip.find("\n        }\n").unwrap()];
+        assert!(skip.contains("self.cleanup(\"complete\").await;"), "{skip}");
+        assert!(skip.contains("return Ok(output_result);"), "{skip}");
+    }
+
     #[tokio::test]
     async fn the_other_writers_of_a_terminal_status_clear_user_input_too() {
         with_temp_data_root(async {
@@ -17445,7 +17540,9 @@ steps:
                     "set_focus_run_status {terminal}"
                 );
             }
-            // A non-terminal status through the same writer keeps it.
+            // A non-terminal status through the same writer keeps it. (items.id=888:
+            // awaiting_feedback, not awaiting_extract_confirm as before: that status no
+            // longer keeps the input, see no_input_is_kept_at_awaiting_extract_confirm.)
             let run = run_with_input();
             run.write_focus_run_record("awaiting_user").await.unwrap();
             crate::persistence::output_store::set_focus_run_status(
@@ -17453,7 +17550,7 @@ steps:
                 &run.persona_id,
                 CRISIS_TEST_KEY_HEX,
                 run.focus_run_id.as_deref().unwrap(),
-                "awaiting_extract_confirm",
+                "awaiting_feedback",
             )
             .await
             .unwrap();
