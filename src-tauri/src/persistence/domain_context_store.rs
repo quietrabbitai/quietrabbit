@@ -395,6 +395,24 @@ pub async fn get_standing_summary(
     }
 }
 
+/// TEST ONLY (items.id=922): put text in the standing summary row, so a test can see
+/// whether a run's persona context was assembled at all. Not a production writer.
+#[cfg(test)]
+pub(crate) async fn test_set_standing_summary(
+    user_id: &str,
+    persona_id: &str,
+    focus_id: &str,
+    key_hex: &str,
+    content: &str,
+) -> Result<(), DomainContextStoreError> {
+    let mut conn = open_domain_context_db(user_id, persona_id, focus_id, key_hex).await?;
+    sqlx::query("UPDATE standing_summary SET content = ?, token_count = 8 WHERE id = 1")
+        .bind(content)
+        .execute(&mut conn)
+        .await?;
+    Ok(())
+}
+
 /// List all pending_review extraction cards for user review.
 pub async fn list_pending_extractions(
     user_id: &str,

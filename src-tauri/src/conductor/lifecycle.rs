@@ -2691,7 +2691,22 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     /// Call MemoryBroker to assemble context slice; render to string; clear slice.
     /// Returns empty string on failure — non-fatal for unnamed/Quick Ask sessions.
     /// Python oracle: FocusRun._assemble_persona_context()
+    ///
+    /// items.id=922: assembled ONLY when some step of the Focus names {persona_context}.
+    /// The slice has exactly one consumer, the local render (an external render inserts
+    /// an empty string, items.id=882), so a Focus whose templates never name it has no use
+    /// for it, and not reading the persona's memory stores is the least that can reach a
+    /// run. Both call sites (the run start and rehydrate_focus_run) come through here.
+    /// The tier it is assembled at is unchanged (the Focus ceiling: strict, and a wider
+    /// tier-1 slice was ruled out on items.id=922's plan).
     async fn assemble_persona_context(&self) -> String {
+        if !self
+            .focus_def
+            .as_ref()
+            .is_some_and(|d| steps_name_persona_context(&d.steps))
+        {
+            return String::new();
+        }
         let key_hex = match self.key_hex.as_deref() {
             Some(k) if !k.is_empty() => k,
             _ => return String::new(),
@@ -5121,6 +5136,19 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
     Ok(run)
 }
 
+/// items.id=922: whether any step's own prompt template names {persona_context}: the only
+/// way the assembled slice is ever read (the local render). A block row has no template
+/// of its own (a model block was expanded into an ordinary step at LOAD), a render block
+/// row has one but is external and may not name it.
+pub(crate) fn steps_name_persona_context(steps: &[ActionDefinition]) -> bool {
+    steps.iter().any(|s| {
+        s.reads_template()
+            && crate::conductor::executor::find_tokens(&s.prompt_template)
+                .iter()
+                .any(|t| t == "persona_context")
+    })
+}
+
 /// items.id=922: the highest execution tier any completed step of the run actually used
 /// (`routing_tier_used`: 1 local, 2 external, 3 frontier), clamped to 1..=3, and 1 when no
 /// step has completed. What the output-creation scan logs as its execution_tier.
@@ -6788,6 +6816,104 @@ mod tests {
         ));
         run.crisis_floor_triggered = crisis_floor_triggered;
         run
+    }
+
+    #[test]
+    fn a_step_naming_persona_context_is_found_and_nothing_else_is() {
+        let named = [local_step("a", "ctx {persona_context}", None)];
+        assert!(steps_name_persona_context(&named));
+        let mixed = [
+            local_step("a", "plain", None),
+            local_step("b", "{user_input} {persona_context}", None),
+        ];
+        assert!(steps_name_persona_context(&mixed));
+        for none in [
+            "plain",
+            "{persona_context_x}",
+            "{{persona_context}",
+            "persona_context",
+            "{Persona_Context}",
+            "",
+        ] {
+            let steps = [local_step("a", none, None)];
+            // A malformed span is not a token: only a real {persona_context} counts.
+            assert_eq!(
+                steps_name_persona_context(&steps),
+                none == "{{persona_context}",
+                "{none}"
+            );
+        }
+        assert!(!steps_name_persona_context(&[]));
+        // A writer row has no template.
+        let w = writer_step("w", "session_clear", None, serde_json::Value::Null, None);
+        assert!(!steps_name_persona_context(&[w]));
+    }
+
+    /// items.id=922: the persona's memory is assembled only for a Focus that names the
+    /// token. With a standing summary in the persona's domain context, a run whose steps
+    /// name {persona_context} gets it, and one whose steps do not gets nothing (the
+    /// summary is never read). Both call sites go through assemble_persona_context.
+    #[tokio::test]
+    async fn persona_context_is_assembled_only_when_a_step_names_it() {
+        with_temp_data_root(async {
+            const MARKER: &str = "ZQ-STANDING-SUMMARY-MARKER";
+            let run_with = |steps: Vec<ActionDefinition>| {
+                let mut run = tier3_ready_run(false);
+                let mut def = single_tier3_step_focus_def();
+                def.steps = steps;
+                run.focus_def = Some(def);
+                run
+            };
+            let named = run_with(vec![local_step("a", "ctx {persona_context}", None)]);
+            crate::persistence::domain_context_store::ensure_domain_context_db(
+                &named.user_id,
+                &named.persona_id,
+                &named.focus_id,
+                CRISIS_TEST_KEY_HEX,
+            )
+            .await
+            .unwrap();
+            crate::persistence::domain_context_store::test_set_standing_summary(
+                &named.user_id,
+                &named.persona_id,
+                &named.focus_id,
+                CRISIS_TEST_KEY_HEX,
+                MARKER,
+            )
+            .await
+            .unwrap();
+
+            // Not vacuous: the named run really reads the summary.
+            let slice = named.assemble_persona_context().await;
+            assert!(slice.contains(MARKER), "named run got: {slice:?}");
+            // A Focus that never names the token gets nothing.
+            let unnamed = run_with(vec![
+                local_step("a", "plain {user_input}", None),
+                local_step("b", "{persona_context_extra}", None),
+            ]);
+            assert_eq!(unnamed.assemble_persona_context().await, "");
+            // No definition at all: nothing.
+            let mut bare = run_with(vec![]);
+            bare.focus_def = None;
+            assert_eq!(bare.assemble_persona_context().await, "");
+
+            // The two call sites are the only callers, and the broker is reached only
+            // through the guarded function, whose first act is the guard.
+            let src = include_str!("lifecycle.rs");
+            let prod = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+            assert_eq!(prod.matches("self.assemble_persona_context()").count(), 1);
+            assert_eq!(prod.matches("run.assemble_persona_context()").count(), 1);
+            assert_eq!(prod.matches("MemoryBroker::new()").count(), 1);
+            let body = prod
+                .split("async fn assemble_persona_context(&self)")
+                .nth(1)
+                .unwrap();
+            assert!(
+                body.find("steps_name_persona_context").unwrap()
+                    < body.find("MemoryBroker::new()").unwrap()
+            );
+        })
+        .await;
     }
 
     fn tiered(id: &str, tier: i32) -> TaskStep {
