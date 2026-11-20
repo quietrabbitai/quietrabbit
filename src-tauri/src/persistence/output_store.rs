@@ -1172,7 +1172,7 @@ pub enum ExpireOutcome {
 /// parked any more (it resumed, or finished) is left alone. This is a fourth site
 /// that clears focus_runs.user_input, beside the three writers: the purge
 /// items.id=894 named, because this cancel does not go through them.
-async fn cancel_parked_in_tx(
+pub(crate) async fn cancel_parked_in_tx(
     conn: &mut SqliteConnection,
     run_id: &str,
     reason: &str,

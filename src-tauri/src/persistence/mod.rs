@@ -2,6 +2,7 @@
 
 pub mod case_store;
 pub mod chat_binding_store;
+pub mod chat_clear;
 pub mod chat_store;
 pub mod cloud_chat_cookie_store;
 pub mod consent_audit_store;

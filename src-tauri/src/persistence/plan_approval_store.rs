@@ -266,6 +266,20 @@ async fn put_inner(
     }
 }
 
+/// items.id=888 stage 6: remove every approval of the chat, every Focus, inside a write
+/// transaction the caller holds (persistence::chat_clear, the archive hook). NOT
+/// latch-gated: it only removes a permission. Returns how many rows went.
+pub(crate) async fn delete_chat_in_tx(
+    conn: &mut SqliteConnection,
+    context_key: &str,
+) -> Result<u64, ApprovalStoreError> {
+    let done = sqlx::query("DELETE FROM plan_approvals WHERE context_key = ?")
+        .bind(context_key)
+        .execute(&mut *conn)
+        .await?;
+    Ok(done.rows_affected())
+}
+
 /// Withdraw the approval of one Focus in one chat. Returns whether there was one. NOT
 /// latch-gated (see the module comment): a revocation only removes a permission.
 pub async fn delete_approval(
@@ -598,7 +612,9 @@ mod tests {
         }
         assert_eq!(code.matches("INSERT INTO plan_approvals").count(), 1);
         assert_eq!(code.matches("UPDATE plan_approvals").count(), 1);
-        assert_eq!(code.matches("DELETE FROM plan_approvals").count(), 1);
+        // items.id=888 stage 6: two deletes, the revocation's (one Focus) and the archive
+        // hook's (a whole chat, delete_chat_in_tx).
+        assert_eq!(code.matches("DELETE FROM plan_approvals").count(), 2);
         // Inside put_inner the latch check comes before either write.
         let inner = code
             .split("async fn put_inner")

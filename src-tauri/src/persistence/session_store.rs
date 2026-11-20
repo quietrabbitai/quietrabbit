@@ -30,10 +30,12 @@
 // THE LATCH (decisions.id=939 section 4, decisions.id=509 one-time session):
 // one row of session_variables named write_mode with the value suppressed,
 // scoped to the chat (context_key, any focus_id). Rules, all enforced here:
-//   - monotonic: latch_write_suppressed only ever inserts. There is no function
-//     that updates or deletes the row, and the schema CHECK lets the row hold
-//     only the value suppressed at version 1. (Removal on archive or retention
-//     is items.id=888.)
+//   - monotonic: latch_write_suppressed only ever inserts. Nothing updates the
+//     row, and the schema CHECK lets the row hold only the value suppressed at
+//     version 1. The ONE delete that reaches it is clear_chat_in_tx, the archive
+//     hook of items.id=888 (persistence::chat_clear), which removes the whole
+//     chat. The 30-day retention sweep never removes it (failure direction:
+//     suppression), and otherwise only removing the persona's database does.
 //   - the name write_mode is reserved: put_session_variable refuses it.
 //   - every other write of session_store and case_store calls ensure_writable
 //     inside its transaction and is refused once the latch exists.
@@ -476,9 +478,36 @@ async fn put_inner(
     }
 }
 
+/// items.id=888 stage 6: remove the session variables of the chat inside a write
+/// transaction the caller holds (persistence::chat_clear, the archive hook). With
+/// `keep_latch` false EVERY row goes, the one-time latch included: the only delete that
+/// reaches the latch row. With `keep_latch` true (a run of the chat has not ended, so it
+/// may still write) every row but the latch goes. Not latch-gated: it only removes.
+/// Returns how many rows went.
+pub(crate) async fn clear_chat_in_tx(
+    conn: &mut SqliteConnection,
+    context_key: &str,
+    keep_latch: bool,
+) -> Result<u64, sqlx::Error> {
+    let done = if keep_latch {
+        sqlx::query("DELETE FROM session_variables WHERE context_key = ? AND name <> ?")
+            .bind(context_key)
+            .bind(WRITE_MODE_NAME)
+            .execute(&mut *conn)
+            .await?
+    } else {
+        sqlx::query("DELETE FROM session_variables WHERE context_key = ?")
+            .bind(context_key)
+            .execute(&mut *conn)
+            .await?
+    };
+    Ok(done.rows_affected())
+}
+
 /// The session variables session_clear resets (items.id=889). Exactly these two:
 /// the locked intent and the active case. The one-time latch, write_mode, is
-/// NOT here and no function in this store removes it, so clearing a chat's
+/// NOT here and no OTHER function in this store removes it (only the archive hook's
+/// clear_chat_in_tx above, which removes the whole chat), so clearing a chat's
 /// session state can never reopen a one-time chat (decisions.id=939 addendum:
 /// the latch is irreversible within a chat). A test pins that the list never
 /// holds the latch name.

@@ -427,6 +427,27 @@ fn row_of(r: &sqlx::sqlite::SqliteRow) -> Result<StepReviewRow, StepReviewStoreE
     })
 }
 
+/// items.id=888 stage 6: delete every review of the chat's ENDED runs (complete, failed,
+/// cancelled; focus_runs.context_key = the chat), inside a write transaction the caller
+/// holds. The ONE delete of this store, called only by persistence::chat_clear (the
+/// archive hook; a scan pins both). Nothing reads a review once its run has ended; a run
+/// that has not ended keeps its reviews, because review_prompt reuses an earlier one of
+/// the same run (latest_live_review). Returns how many rows went.
+pub(crate) async fn delete_reviews_of_ended_chat_runs_in_tx(
+    conn: &mut SqliteConnection,
+    context_key: &str,
+) -> Result<u64, StepReviewStoreError> {
+    let done = sqlx::query(
+        "DELETE FROM step_reviews WHERE focus_run_id IN
+         (SELECT f.id FROM focus_runs f
+          WHERE f.context_key = ? AND f.status IN ('complete', 'failed', 'cancelled'))",
+    )
+    .bind(context_key)
+    .execute(&mut *conn)
+    .await?;
+    Ok(done.rows_affected())
+}
+
 /// The newest review of one action of a run that is still LIVE: pending or
 /// final. Blocked, refused and superseded rows are history and never reused.
 pub async fn latest_live_review(
@@ -940,10 +961,13 @@ mod tests {
         ] {
             assert!(!code.contains(banned), "step_review_store uses {banned}");
         }
+        // items.id=888 stage 6 delta: one delete, delete_reviews_of_ended_chat_runs_in_tx,
+        // the archive hook's (reviews of a chat's ENDED runs only; nothing reads a review
+        // once its run has ended). persistence::chat_clear's tests pin its single caller.
         assert_eq!(
             code.matches("DELETE FROM").count(),
-            0,
-            "this store deletes nothing"
+            1,
+            "this store's one delete is the archive hook's"
         );
     }
 }

@@ -127,6 +127,16 @@ pub async fn archive_chat(
     chat_store::archive_chat(&user_id, &persona_id, &key_hex_str, &chat_id)
         .await
         .map_err(|e| e.to_string())?;
+    // items.id=888 stage 6: the archive hook. Removes what QR saved for the chat (its
+    // session variables and one-time latch, artifacts, plan approvals, park reasons, its
+    // runs' inputs) and cancels its parked runs, in one transaction. Best effort: the
+    // chat is archived either way, and a failure is logged without its cause's data.
+    if let Err(e) =
+        crate::persistence::chat_clear::clear_chat(&user_id, &persona_id, &key_hex_str, &chat_id)
+            .await
+    {
+        log::warn!("archive_chat: the chat's saved state could not be cleared: {e}");
+    }
     // items.id=901: what the run plan held in memory for this chat (approvals of a
     // latched chat, the duplicate-turn marker) goes with it. A chat deletion, when
     // items.id=888 builds one, must make the same call.

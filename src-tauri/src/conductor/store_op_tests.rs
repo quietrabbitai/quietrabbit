@@ -1785,18 +1785,33 @@ async fn session_clear_resets_the_intent_and_the_active_case_and_never_the_latch
         .match_indices("DELETE FROM session_variables")
         .map(|(i, _)| &flat[i..i + 200])
         .collect::<Vec<_>>();
-    // items.id=387: exactly two deletes, session_clear's and the hand-off return's
-    // removal of the one pending row.
-    assert_eq!(delete.len(), 2, "two deletes in the store: {delete:?}");
+    // items.id=387: session_clear's and the hand-off return's removal of the one pending
+    // row; items.id=888 stage 6: and FIRST in the file the archive hook's clear_chat_in_tx,
+    // which removes the whole chat, the latch included (persistence::chat_clear pins that
+    // it is the only delete that can reach the latch).
+    // Since the stage 6 delta the archive hook has two forms: every row but the latch
+    // (a run of the chat has not ended) and every row (none has).
+    assert_eq!(delete.len(), 4, "four deletes in the store: {delete:?}");
     assert!(
-        delete[0].contains("AND name <> ?") && delete[0].contains("name IN (?, ?)"),
-        "the delete names its two variables and excludes the latch: {}",
+        delete[0]
+            .starts_with("DELETE FROM session_variables WHERE context_key = ? AND name <> ?\""),
+        "the archive hook's delete that keeps the latch: {}",
         delete[0]
     );
     assert!(
-        delete[1].contains("AND name = ?") && !delete[1].contains("name IN"),
-        "the hand-off delete names one variable: {}",
+        delete[1].starts_with("DELETE FROM session_variables WHERE context_key = ?\""),
+        "the archive hook's whole-chat delete: {}",
         delete[1]
+    );
+    assert!(
+        delete[2].contains("AND name <> ?") && delete[2].contains("name IN (?, ?)"),
+        "the delete names its two variables and excludes the latch: {}",
+        delete[2]
+    );
+    assert!(
+        delete[3].contains("AND name = ?") && !delete[3].contains("name IN"),
+        "the hand-off delete names one variable: {}",
+        delete[3]
     );
     let at = flat
         .find("DELETE FROM session_variables WHERE context_key = ? AND focus_id = ? AND name = ?")
