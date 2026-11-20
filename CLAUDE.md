@@ -1,5 +1,12 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: November 20, 2026 (items.id=922: new "Persona context, the output scan and external-step
+# Last updated: November 20, 2026 (items.id=888 pass 1: new "Run failure, resume claim and post-output
+# runs" section; under "Parked-run retention" the opening "failed delete them at once" claim (false for
+# the error path until 888 stage 1), the HANDLING line that said resume_execution writes `running` and a
+# pointer to the post-output sweep; the user_input bullet under "Model blocks"
+# (awaiting_extract_confirm keeps no input); the single-device purge under "Focus-owned entities"
+# (cancels parked runs too); nothing else. Pass 2 of 888 (context_key, seed pin, clear_chat, sweeps)
+# is not built.).
+# Before that, November 20, 2026 (items.id=922: new "Persona context, the output scan and external-step
 # scoring" section; the external-model-step gap note under "Manual hand-off", the persona_context and
 # scan_output item (2) under "Privacy treatment of a step attempt" (KNOWN BEHAVIOURS) and the Prompt
 # Authoring Rule; nothing else.).
@@ -407,8 +414,9 @@ with no requirement still goes through select_model.
 - focus_runs.user_input holds the blended chat window so a parked run can resume (and
   focus_runs.external_input, items.id=883, its user-turns-only copy: see "External steps and
   chat history"; both are written together and cleared together). It
-  is NULLed when the status becomes complete, cancelled or failed (output_store::
-  USER_INPUT_CLEARED_STATUSES) and is not written for a latched one-time chat. A run
+  is NULLed when the status becomes complete, cancelled, failed or awaiting_extract_confirm
+  (output_store::USER_INPUT_CLEARED_STATUSES; the last since items.id=888, F8) and is not
+  written for a latched one-time chat. A run
   parked and never finished keeps it until the retention sweep expires it (items.id=681,
   see "Parked-run retention and resume staleness": it clears both input columns) or
   items.id=888 clears it.
@@ -1182,8 +1190,14 @@ turn can carry persona-derived text from an earlier local run. The local render 
 ## Parked-run retention and resume staleness (items.id=681, decisions.id=865)
 A parked run's snapshot holds step outputs and disclosure buffers with the values approved for each
 step (raw at tier 1, abstracted from tier 2 up), encrypted at rest in the persona's outputs.db.
-Only runs parked in awaiting_user, awaiting_schedule or paused keep snapshots (complete, cancelled and
-failed delete them at once). This item bounds how long, and refuses a resume on changed data.
+A run keeps snapshots while it runs (the periodic checkpoints, until output() purges them) and while it is
+parked in awaiting_user, awaiting_schedule or paused. complete, cancelled and
+failed delete them when the status is written (cleanup, fail_run, the cancel writers; best effort, and no
+sweep selects a finished run). That was FALSE for a run failing through execute_full's error arms until
+items.id=888 stage 1 (see "Run failure, resume claim and post-output runs"). This item bounds how long a
+parked run keeps them, and refuses a resume on changed data. Runs whose reply was saved and that wait for
+nothing (awaiting_extract_confirm, awaiting_feedback) are not parked: items.id=888's post-output sweep,
+in the same tick and login pass, settles them (same section).
 - PURGE_AFTER (conductor/run_retention.rs, CheckpointPark). Written when a run parks, by
   FocusRun::write_checkpoint_for (the one writer; write_checkpoint is the periodic one and stores NULL):
   awaiting_user = checkpoint time + AWAITING_USER_RETENTION_DAYS (30; each new checkpoint is a new row, so
@@ -1219,7 +1233,7 @@ failed delete them at once). This item bounds how long, and refuses a resume on 
   attempt and rewrites that step's buffer, and Gate 1 needs no AppHandle. What goes stale is the OUTPUT text of
   completed steps, which Gate 1 cannot change.
 - HANDLING. rehydrate_focus_run returns LifecycleError::ResumeStale and writes NOTHING (it runs before the run
-  is promoted: resume_execution writes `running`). The one helper resume_staleness::cancel_stale_resume is called
+  is promoted: since items.id=888 the guarded claim writes `running`). The one helper resume_staleness::cancel_stale_resume is called
   by resume_run, reenter_step (commands/execution.rs) and scheduled_sweep: it cancels with "personal information
   changed while waiting" through the same guarded UPDATE (only if the run is still parked) and emits the event.
   A scan test pins the three callers.
@@ -1234,6 +1248,58 @@ failed delete them at once). This item bounds how long, and refuses a resume on 
 - NOT BUILT: a rewind-and-rerun of the affected steps (items.id=574's reenter_step could do it), a "continue
   anyway" resume, the Library or clear_chat hooks (items.id=888), a banner for a stale cancel (the user sees
   the cancelled run and its message).
+
+## Run failure, resume claim and post-output runs (items.id=888 pass 1, privacy review 2026-11-20 F5 to F8 and F15)
+Pass 1 of items.id=888 (stages 1 to 3). Pass 2 (context_key on rehydrated runs, the seed version pin and
+published ids, clear_chat on archive, the 30-day store sweeps) is NOT built.
+- FAIL_RUN (lifecycle.rs, F5 and F6). The one way an Err ends a run: drop the tracks, purge the run's
+  snapshots BEFORE writing `failed` (write_run_row clears both inputs), emit. Both error arms of
+  execute_full (the F_SYSTEM one too) and resume_claimed_run use it; a source scan pins that neither
+  function writes `failed` itself. A resumed run that errors is therefore `failed`, not left `running`,
+  and loses its parked state (before, the next login demoted it to paused and it could be retried).
+- THE GUARDED CLAIM (F7). rehydrate_focus_run records a ResumeBasis (the status it read and the id of the
+  latest snapshot, ordered created_at DESC, rowid DESC). output_store::claim_run is ONE UPDATE:
+  status := to WHERE id AND status = basis.status AND status IN (allowed) AND latest snapshot id =
+  basis.snapshot_id ('' for none); true only if one row changed. It changes the status and nothing else.
+  - resume_execution = claim_resume()? (OUTSIDE any error arm) then resume_claimed_run(). A loser gets
+    LifecycleError::ResumeRaced and has written nothing: no status, no purge, no event. resume_claimed_run
+    refuses a FocusRun that did not win a claim. allowed = run_retention::RESUMABLE_STATUSES
+    (awaiting_user, awaiting_schedule, paused).
+  - resume_run (commands/execution.rs) refuses `running` and `initializing` (run_live:<status>), claims
+    BEFORE it spawns (a lost claim: run_not_resumable) and spawns resume_claimed_run. reenter_step refuses
+    the two live statuses and claims to awaiting_user (REENTERABLE_STATUSES adds awaiting_feedback) after
+    plan_reentry and before any change; after a re-entry it carries its new checkpoint as its basis. The
+    scheduled sweep skips a lost claim before finalize_chat_reply. A scan pins the two callers outside
+    lifecycle.rs.
+  - write_checkpoint_for returns the new snapshot id.
+  - Checked with the claim: the step review's needs_resume auto-resume (at most 2, stepReview.ts; a repeat
+    loses and takes resume_failed), Try again (ChatPane), lateReplyRecovery (reads status only).
+- THE EXTRACTION FLAG (F8). conductor/extract.rs EXTRACT_CONFIRM_SCREEN_BUILT = false, pinned by a test:
+  execute_and_finish skips the WHOLE pass after output() (no personal.db read, no model call, no
+  candidate, no park) and completes the run. items.id=38 flips it with its confirm screen. resume_run's
+  replay branch and submit_extract_confirm are unchanged. awaiting_extract_confirm keeps no input
+  (USER_INPUT_CLEARED_STATUSES).
+- THE POST-OUTPUT SWEEP (F8). run_retention::POST_OUTPUT_STATUSES = awaiting_extract_confirm,
+  awaiting_feedback (disjoint from RESUMABLE_STATUSES and PARKED_STATUSES, pinned).
+  output_store::sweep_post_output_runs, in the hourly tick and the login pass, key resident only:
+  every pass NULLs both inputs of every awaiting_extract_confirm row, any age; at started_at +
+  POST_OUTPUT_RETENTION_DAYS (30) settle_post_output_in_tx sets `complete`, both inputs NULL and
+  notes.cancel_reason "expired while waiting" WHERE id AND status IN (the set), and only if one row changed
+  deletes EVERY candidate row of the run (pending, declined, confirmed), any snapshot, the park and a
+  pending review. Settle and claim cannot both act: both are single UPDATEs guarded on disjoint status sets.
+  The tick emits run-status-update `complete` for a settled run (Swept::Settled).
+- F15. purge_device cancels the Focus's parked runs, as purge_all_devices does.
+- KNOWN LIMITS, accepted:
+  (a) A re-entry that fails after its claim (a database error mid-way) leaves the run at awaiting_user with
+      its EARLIER checkpoint, so a resume of a run that was paused re-runs the checkpointed step.
+  (b) A crashed `running` run cannot be resumed in-session: it becomes paused at the next login
+      (demote_interrupted_runs).
+  (c) The raw codes run_not_resumable and run_live:<status> reach the user (Try again notice, review modal
+      error), like run_already_finished:. Wording is Chat-BRAND's.
+  (d) Extraction is off everywhere (chat, Board, resume, scheduled sweep) until items.id=38.
+  (e) Existing rows: the first login after the upgrade clears the inputs of every awaiting_extract_confirm
+      run and settles every post-output run older than 30 days, deleting its candidates.
+  (f) The purge confirmations do not say that parked runs are cancelled (Chat-BRAND).
 
 ## Collection consent (items.id=920 stage 1, decisions.id=944, decisions.id=509)
 A focus_level Focus (Tech Support) collects silently after ONE informed consent at
@@ -1384,7 +1450,8 @@ Focus and items.id=916 flips it; the hard purge ships before that.
   and in purge_all_devices. A purge stops the Focus's live runs first
   (writer_gate::request_stop_for_focus + wait_focus_runs_ended, bound by attach_lease to
   persona+Focus) and REFUSES with nothing changed if one ignores the stop for 60 s
-  (RunsStillRunning). purge_all_devices also cancels the Focus's parked runs. NOT reached: chat
+  (RunsStillRunning). Both purge_device (since items.id=888, F15) and purge_all_devices cancel the
+  Focus's parked runs (every one: the code cannot tell which run read which device). NOT reached: chat
   messages, run outputs, focus_runs text of other runs, disclosure_log, fact-hash preference rows.
   Fail-injection hooks (PurgeStep) exist for tests only.
 - Commands (commands/device_library.rs, Group 32, the consent-command pattern, none consent-gated):

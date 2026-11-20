@@ -4,9 +4,18 @@
 //
 // A snapshot (focus_run_snapshots) holds step outputs and disclosure buffers
 // with the values approved for the step, encrypted at rest in the persona's
-// outputs.db. Only a run parked in awaiting_user or awaiting_schedule keeps
-// its snapshots (complete, cancelled and failed delete them at once). This
-// module owns WHEN such a snapshot expires:
+// outputs.db. A run keeps snapshots while it runs (the periodic checkpoints,
+// until output() purges them) and while it is parked (awaiting_user,
+// awaiting_schedule, paused). complete, cancelled and failed delete them when the
+// status is written: cleanup() and fail_run() in lifecycle.rs, the cancel writers
+// in output_store.rs. Until items.id=888 stage 1 this was FALSE for a run that
+// failed through execute_full's error arms (F5 of the 2026-11-20 privacy review):
+// the snapshot outlived it. The delete is best effort: a purge that fails leaves
+// the snapshot, and no sweep selects a finished run. output() purges before
+// awaiting_feedback, so a post-output run (awaiting_feedback,
+// awaiting_extract_confirm) has none; items.id=888 settles those runs
+// (POST_OUTPUT_STATUSES, output_store::sweep_post_output_runs). This module owns
+// WHEN a parked run's snapshot expires:
 //   awaiting_user:     checkpoint time + AWAITING_USER_RETENTION_DAYS; every
 //                      new checkpoint writes a new row, so it refreshes.
 //   awaiting_schedule: the step's scheduled_for + AWAITING_SCHEDULE_RETENTION_DAYS.

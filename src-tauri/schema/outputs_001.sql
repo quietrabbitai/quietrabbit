@@ -167,8 +167,13 @@ END;
 -- A snapshot still holds step outputs and disclosure buffers with the values approved
 -- for each step, encrypted at rest in the persona outputs.db (decisions.id=865).
 -- Retention (items.id=681, decisions.id=865):
---   complete, cancelled, failed: the snapshot is deleted at once.
---   awaiting_feedback: no snapshot.
+--   A run keeps snapshots while it runs (periodic checkpoints, until output() purges
+--   them) and while it is parked (awaiting_user, awaiting_schedule, paused).
+--   complete, cancelled, failed: the snapshot is deleted when the status is written
+--   (best effort). Until items.id=888 stage 1 a run that failed through the error
+--   path kept its snapshot, and nothing sweeps a finished run.
+--   awaiting_feedback, awaiting_extract_confirm: no snapshot (output() purges first).
+--   items.id=888 settles both as complete 30 days after started_at.
 --   awaiting_user: purge_after = 30 days after the latest checkpoint.
 --   awaiting_schedule: purge_after = 30 days after the step scheduled_for time.
 --   a periodic checkpoint of a running run has no purge_after, so for a crashed run
