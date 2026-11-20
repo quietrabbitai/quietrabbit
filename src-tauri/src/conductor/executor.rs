@@ -714,8 +714,11 @@ impl StepExecutor {
 
         // items.id=921: keyed on the destination (treatment.hosted), which for an
         // ordinary step is the ceiling test it always was.
+        // items.id=933: both renders read the step's ONE projection (the buffer Gate 1's
+        // approved, declared fields were just written to): raw at abstraction tier 1,
+        // abstracted from tier 2 up.
+        let disclosure = shared_state.read_disclosure_buffer(&ctx.step.action_id);
         let prompt = if treatment.hosted {
-            let disclosure = shared_state.read_disclosure_buffer(&ctx.step.action_id);
             render_prompt_with_disclosure(
                 ctx,
                 &output_vars,
@@ -724,7 +727,13 @@ impl StepExecutor {
                 &voice_profile_str,
             )
         } else {
-            render_prompt(ctx, &output_vars, &previous_output, &voice_profile_str)
+            render_prompt(
+                ctx,
+                &output_vars,
+                &previous_output,
+                &disclosure,
+                &voice_profile_str,
+            )
         };
 
         // -- items.id=884 — outbound review of the rendered prompt --
@@ -1270,19 +1279,44 @@ pub(crate) fn render_template(
     result.trim().to_owned()
 }
 
-/// qr_local prompt render. Never reads disclosure buffer.
-/// Token merge order: output_vars -> SYSTEM_TOKENS.
-/// Python oracle: StepExecutor._render_prompt()
+/// The step's projected personal fields (its disclosure buffer) over the output
+/// variables: a field of the same name as an output_var wins, and the system tokens
+/// and store seeds inserted after this win over a field. ONE helper for both renders
+/// (items.id=933), so a local and an external step receive the same projection.
+/// Braces in a value become parentheses (the items.id=931 convention, defence in
+/// depth: render_template is single-pass since items.id=932, and a bridged value is
+/// already cleaned at the bridge).
+fn insert_projected_fields(
+    tokens: &mut HashMap<String, String>,
+    disclosure: &HashMap<String, String>,
+) {
+    for (k, v) in disclosure {
+        tokens.insert(
+            k.clone(),
+            crate::conductor::personal_fact_bridge::clean_braces(v),
+        );
+    }
+}
+
+/// qr_local prompt render (every step without `treatment.hosted`).
+/// Token merge order: output_vars -> projected fields -> SYSTEM_TOKENS -> seeds.
+/// items.id=933 (F4 of the 2026-11-20 privacy surface review): the step's projected
+/// fields are inserted, as on the external path. At abstraction tier 1 they are the raw
+/// values Gate 1 approved for the step's declared field_requirements; before this they
+/// were approved, buffered and logged as shared but rendered empty.
+/// Python oracle: StepExecutor._render_prompt() (which did not insert them).
 pub(crate) fn render_prompt(
     ctx: &StepContext,
     output_vars: &HashMap<String, String>,
     previous_output: &str,
+    disclosure: &HashMap<String, String>,
     voice_profile_str: &str,
 ) -> String {
     let mut tokens: HashMap<String, String> = output_vars
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    insert_projected_fields(&mut tokens, disclosure);
     // SYSTEM_TOKENS (later wins — override output_vars with same key)
     tokens.insert("user_input".to_owned(), ctx.user_input.clone());
     tokens.insert("previous_output".to_owned(), previous_output.to_owned());
@@ -1301,8 +1335,9 @@ pub(crate) fn render_prompt(
     )
 }
 
-/// Tier 2+ prompt render. NEVER reads PersonalTrack directly — only disclosure buffer.
-/// Token merge order: output_vars -> disclosure -> SYSTEM_TOKENS.
+/// External prompt render (every step with `treatment.hosted`). NEVER reads
+/// PersonalTrack directly — only the disclosure buffer.
+/// Token merge order: output_vars -> projected fields -> SYSTEM_TOKENS -> seeds.
 /// Python oracle: StepExecutor._render_prompt_with_disclosure()
 fn render_prompt_with_disclosure(
     ctx: &StepContext,
@@ -1316,9 +1351,7 @@ fn render_prompt_with_disclosure(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     // Disclosure fields override output_vars (same key -> disclosure wins)
-    for (k, v) in disclosure {
-        tokens.insert(k.clone(), v.clone());
-    }
+    insert_projected_fields(&mut tokens, disclosure);
     // SYSTEM_TOKENS override everything
     // items.id=883 (decisions.id=937 point 3): the user's own turns only. The full
     // window (ctx.user_input, which holds model turns) is never read on this path, and a
@@ -9876,8 +9909,10 @@ mod tests {
         // Site 1.
         assert!(flat.contains("let hosted_step = treatment.hosted;"));
         // Site 2: the render keys on the same flag.
+        // items.id=933: the buffer is read once, before the branch, so both renders
+        // take the same projection; the branch itself is unchanged.
         assert!(flat.contains(
-            "let prompt = if treatment.hosted { let disclosure = shared_state.read_disclosure_buffer(&ctx.step.action_id);"
+            "let disclosure = shared_state.read_disclosure_buffer(&ctx.step.action_id); let prompt = if treatment.hosted { render_prompt_with_disclosure( ctx, &output_vars, &previous_output, &disclosure, &voice_profile_str, ) } else { render_prompt( ctx, &output_vars, &previous_output, &disclosure, &voice_profile_str, ) };"
         ));
         // Site 3: the provider still comes from the selection for a resolved step and
         // from the preference otherwise. items.id=884 added a third element to the
@@ -10024,7 +10059,7 @@ mod tests {
         ctx.step.prompt_template = PERSONA_TEMPLATE.to_owned();
         ctx.persona_context = PERSONA_FACT.to_owned();
         let vars = HashMap::new();
-        let local = render_prompt(&ctx, &vars, "", "");
+        let local = render_prompt(&ctx, &vars, "", &HashMap::new(), "");
         assert_eq!(
             local,
             format!("Plan the work. Context: {PERSONA_FACT} End of context.")
@@ -10108,7 +10143,7 @@ mod tests {
         ctx.step.prompt_template = WINDOW_TEMPLATE.to_owned();
         with_window(&mut ctx);
         let vars = HashMap::new();
-        let local = render_prompt(&ctx, &vars, "", "");
+        let local = render_prompt(&ctx, &vars, "", &HashMap::new(), "");
         assert_eq!(local, format!("Help with: {} End.", ctx.user_input));
         assert!(local.contains(MODEL_FACT));
         let external = render_prompt_with_disclosure(&ctx, &vars, "", &HashMap::new(), "");
@@ -10134,7 +10169,7 @@ mod tests {
         let external = render_prompt_with_disclosure(&ctx, &vars, "", &HashMap::new(), "");
         assert_eq!(external, "Help with:  End.");
         assert!(!external.contains(USER_TURN) && !external.contains(MODEL_FACT));
-        let local = render_prompt(&ctx, &vars, "", "");
+        let local = render_prompt(&ctx, &vars, "", &HashMap::new(), "");
         assert!(local.contains(USER_TURN) && local.contains(MODEL_FACT));
     }
 
@@ -12209,7 +12244,7 @@ mod tests {
         ctx.user_input = "turn {previous_output} {draft}".to_owned();
         let vars = map_of(&[("draft", "model {user_input} {previous_output}")]);
         for _ in 0..64 {
-            let out = render_prompt(&ctx, &vars, "PREV {user_input}", "");
+            let out = render_prompt(&ctx, &vars, "PREV {user_input}", &HashMap::new(), "");
             assert_eq!(
                 out,
                 "U: turn {previous_output} {draft}\nP: PREV {user_input}\nV: model {user_input} {previous_output}"
@@ -12225,12 +12260,20 @@ mod tests {
         ctx.external_input = "turn {previous_output} {job_title}".to_owned();
         let vars = map_of(&[("draft", "model {user_input} {job_title}")]);
         let disclosure = map_of(&[("job_title", "dev {user_input} {previous_output}")]);
+        // items.id=933: a projected field value is brace-cleaned by insert_projected_fields
+        // on both renders (the items.id=931 convention), so its braces arrive as
+        // parentheses; every other value still arrives literally, never expanded.
         for _ in 0..64 {
             let out =
                 render_prompt_with_disclosure(&ctx, &vars, "PREV {user_input}", &disclosure, "");
             assert_eq!(
                 out,
-                "U: turn {previous_output} {job_title}\nP: PREV {user_input}\nV: model {user_input} {job_title}\nF: dev {user_input} {previous_output}"
+                "U: turn {previous_output} {job_title}\nP: PREV {user_input}\nV: model {user_input} {job_title}\nF: dev (user_input) (previous_output)"
+            );
+            let local = render_prompt(&ctx, &vars, "PREV {user_input}", &disclosure, "");
+            assert!(
+                local.ends_with("F: dev (user_input) (previous_output)"),
+                "{local}"
             );
         }
     }
@@ -12407,5 +12450,183 @@ mod tests {
         let starter = live(include_str!("handoff_render.rs"));
         assert!(!starter.contains("replace(&format!(\"{{{"), "starter");
         assert!(starter.contains("render_template(&step.prompt_template"));
+    }
+
+    // -- items.id=933: a local step renders its approved personal fields --------------
+
+    /// An ordinary local step (routing_tier LocalOnly, the shipped research-and-buy
+    /// requirements_capture shape) declaring `names`, with template `template`.
+    fn local_field_ctx(template: &str, names: &[&str]) -> StepContext {
+        let mut ctx = hosted_ctx(RunAttendance::Attended, "");
+        ctx.step.prompt_template = template.to_owned();
+        ctx.step.routing_tier = ExternalAccess::LocalOnly;
+        ctx.step.external_access_override = Some(ExternalAccess::LocalOnly);
+        ctx.focus_external_access = ExternalAccess::LocalOnly;
+        ctx.effective_access = ExternalAccess::LocalOnly;
+        ctx.execution_tier = 1;
+        ctx.abstraction_tier = 1;
+        ctx.raw_abstraction = 1;
+        ctx.qr_hosted_provider_preference = None;
+        for n in names {
+            declare_field(&mut ctx, n);
+        }
+        ctx
+    }
+
+    /// F4 of the 2026-11-20 privacy surface review, THE RED TEST. A local step that
+    /// declares location_city receives the value Gate 1 approved at tier 1 (raw), as an
+    /// external step receives its projection. The track is built the production way
+    /// (bridge_fields) with the DEFAULT policy (omit at tiers 2 and 3): omit is not read
+    /// at tier 1. Before items.id=933 the token rendered empty ("Location:").
+    #[tokio::test]
+    async fn a_local_step_renders_its_declared_personal_field() {
+        with_temp_shared_db(|pool| async move {
+            install_local_models(&pool).await;
+            let stub = LocalModelStub::start(1);
+            let ctx = local_field_ctx("Location: {location_city}", &["location_city"]);
+            let pt = bridged_track(&[("location_city", "Leeds")], false);
+            let (out, track, gateway) = run_once_with(&ctx, &pool, &pt).await;
+            assert!(out.unwrap().is_none(), "the step completed");
+            let seen = stub.server.captured();
+            assert_eq!(seen.len(), 1, "one local call");
+            assert!(seen[0].path.contains("/api/generate"));
+            assert_eq!(seen[0].json()["prompt"], "Location: Leeds");
+            // The gate1 row says what the model saw: the declared field, shared, no
+            // provider.
+            let rows = gate1_entries(&gateway);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].fields_shared, ["location_city"]);
+            assert!(rows[0].provider.is_none());
+            // Scored from the field, as before.
+            assert_eq!(track.steps()[0].sensitivity_severity, 2);
+        })
+        .await;
+    }
+
+    /// The undeclared case, on the local path: a step that declares job_title only but
+    /// whose template also names {location_city} renders the declared field and leaves
+    /// the other empty, and the buffer holds the declared field only. The
+    /// declared-field filter in execute_once is the control for both renders (this is
+    /// the local twin of the items.id=931 T3 test, and kills the filter's removal here).
+    #[tokio::test]
+    async fn a_local_step_that_does_not_declare_the_field_still_renders_it_empty() {
+        with_temp_shared_db(|pool| async move {
+            install_local_models(&pool).await;
+            let stub = LocalModelStub::start(1);
+            let ctx = local_field_ctx(
+                "Role: {job_title} Location: {location_city}",
+                &["job_title"],
+            );
+            let pt = bridged_track(
+                &[("job_title", "Engineer"), ("location_city", "Leeds")],
+                false,
+            );
+            let mut track = TaskTrack::new();
+            let mut shared = SharedStateTrack::new();
+            let gateway = PrivacyGateway::new(TestLogger::new());
+            let out = StepExecutor::new()
+                .execute_once(
+                    &ctx,
+                    0,
+                    &pt,
+                    &mut track,
+                    &mut shared,
+                    &FailureHandler::new(ctx.effective_access),
+                    &gateway,
+                    &Arc::new(ConductorScheduler::new()),
+                    None,
+                    &pool,
+                    &step_review::ReviewReuse::default(),
+                )
+                .await;
+            assert!(out.unwrap().is_none());
+            assert_eq!(
+                stub.server.captured()[0].json()["prompt"],
+                "Role: Engineer Location:"
+            );
+            let buf = shared.read_disclosure_buffer(&ctx.step.action_id);
+            assert_eq!(buf.keys().cloned().collect::<Vec<_>>(), ["job_title"]);
+            assert_eq!(gate1_entries(&gateway)[0].fields_shared, ["job_title"]);
+        })
+        .await;
+    }
+
+    fn projection(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    /// The same projection reaches both renders: one helper inserts it, with the same
+    /// precedence (a field over an output_var of the same name, the system tokens over a
+    /// field) and the same brace cleaning (a value cannot carry a token, and the cleaning
+    /// is visible: braces become parentheses).
+    #[test]
+    fn both_renders_insert_the_same_projection_with_the_same_precedence() {
+        let mut ctx = hosted_ctx(RunAttendance::Attended, "");
+        ctx.user_input = "TYPED".to_owned();
+        ctx.external_input = "TYPED".to_owned();
+        ctx.step.prompt_template =
+            "L={location_city} J={job_title} U={user_input} E={employer}".to_owned();
+        let vars = projection(&[("job_title", "FROM-OUTPUT"), ("employer", "Acme")]);
+        let disclosure = projection(&[
+            ("location_city", "Le{user_input}eds"),
+            ("job_title", "Engineer"),
+            ("user_input", "FIELD-LOSES"),
+        ]);
+        let want = "L=Le(user_input)eds J=Engineer U=TYPED E=Acme";
+        assert_eq!(render_prompt(&ctx, &vars, "", &disclosure, ""), want);
+        assert_eq!(
+            render_prompt_with_disclosure(&ctx, &vars, "", &disclosure, ""),
+            want
+        );
+        // An empty projection leaves an undeclared field token empty on both paths.
+        let none = HashMap::new();
+        let want = "L= J=FROM-OUTPUT U=TYPED E=Acme";
+        assert_eq!(render_prompt(&ctx, &vars, "", &none, ""), want);
+        assert_eq!(
+            render_prompt_with_disclosure(&ctx, &vars, "", &none, ""),
+            want
+        );
+    }
+
+    /// Scan: the projection is inserted by ONE helper, called once by each render and
+    /// by nothing else, and neither render inserts a disclosure value any other way.
+    #[test]
+    fn the_projection_has_one_inserter_and_both_renders_call_it() {
+        let src = include_str!("executor.rs");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let live: String = code
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            live.matches("insert_projected_fields(&mut tokens, disclosure);")
+                .count(),
+            2
+        );
+        assert_eq!(live.matches("insert_projected_fields(").count(), 3);
+        let local = live
+            .split("pub(crate) fn render_prompt(")
+            .nth(1)
+            .and_then(|r| r.split("fn render_prompt_with_disclosure(").next())
+            .expect("render_prompt");
+        assert!(local.contains("insert_projected_fields(&mut tokens, disclosure);"));
+        assert!(!local.contains("for (k, v) in disclosure"));
+        let external = live
+            .split("fn render_prompt_with_disclosure(")
+            .nth(1)
+            .and_then(|r| r.split("\nfn ").next())
+            .expect("render_prompt_with_disclosure");
+        assert!(external.contains("insert_projected_fields(&mut tokens, disclosure);"));
+        assert!(!external.contains("for (k, v) in disclosure"));
+        let helper = live
+            .split("fn insert_projected_fields(")
+            .nth(1)
+            .and_then(|r| r.split("\n}\n").next())
+            .expect("insert_projected_fields");
+        assert!(helper.contains("personal_fact_bridge::clean_braces(v)"));
     }
 }

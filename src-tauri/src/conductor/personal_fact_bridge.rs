@@ -81,9 +81,10 @@ fn severity_of(sensitivity: &str) -> i32 {
 /// (decisions.id=953 amendment, items.id=931). KEPT AS DEFENCE IN DEPTH since
 /// items.id=932 made render_template single-pass (before it, a value carrying
 /// `{user_input}` could be expanded by a later substitution). The cleaned text is also
-/// what Gate 2, the voice scan and step sensitivity read, and it protects any future
-/// second renderer. It changes nothing about what the bridge releases.
-fn clean_braces(v: &str) -> String {
+/// what Gate 2, the voice scan and step sensitivity read. The executor's renders apply
+/// it again to every projected value (executor::insert_projected_fields, items.id=933).
+/// It changes nothing about what the bridge releases.
+pub(crate) fn clean_braces(v: &str) -> String {
     v.replace('{', "(").replace('}', ")")
 }
 

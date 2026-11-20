@@ -144,6 +144,7 @@ fn run_echo_pass(
             &ctx(s, user_input, store_tokens),
             &collect_output_vars(track.steps()),
             track.last_output().unwrap_or(""),
+            &std::collections::HashMap::new(),
             "",
         );
         track.add_step(TaskStep {
