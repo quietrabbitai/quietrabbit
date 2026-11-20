@@ -2880,6 +2880,7 @@ mod tests {
 
         let db_path = crate::providers::utils::db_path_outputs(&user.id, &persona_id);
         let run_id = uuid::Uuid::new_v4().to_string();
+        let expired_id = uuid::Uuid::new_v4().to_string();
         {
             let outputs_key = crate::auth::subkeys::test_key_hex(
                 &user.id,
@@ -2894,15 +2895,27 @@ mod tests {
                     .await
                     .expect("must reopen outputs.db under its key");
             // started_at is far enough in the past to be stale under any
-            // QR_INTERRUPT_THRESHOLD_MINUTES value -- no env var needed.
+            // QR_INTERRUPT_THRESHOLD_MINUTES value -- no env var needed -- but inside
+            // the 30-day retention (items.id=681: a paused run with no snapshot
+            // older than that is expired by the login pass, tested just below).
             sqlx::query(
                 "INSERT INTO focus_runs (id, focus_id, status, started_at)
-                 VALUES (?, 'test-focus', 'running', '2020-01-01T00:00:00Z')",
+                 VALUES (?, 'test-focus', 'running', ?)",
             )
             .bind(&run_id)
+            .bind((chrono::Utc::now() - chrono::Duration::days(10)).to_rfc3339())
             .execute(&mut conn)
             .await
             .expect("seeding a stale focus_runs row must succeed");
+            // items.id=681: a run parked long ago with no snapshot at all.
+            sqlx::query(
+                "INSERT INTO focus_runs (id, focus_id, status, started_at, user_input)
+                 VALUES (?, 'test-focus', 'awaiting_user', '2020-01-01T00:00:00Z', 'window')",
+            )
+            .bind(&expired_id)
+            .execute(&mut conn)
+            .await
+            .expect("seeding an old parked focus_runs row must succeed");
         }
 
         // Simulate a process restart -- KeyRegistry loses its resident key,
@@ -2944,6 +2957,18 @@ mod tests {
         assert_eq!(
             status, "paused",
             "finish_login must demote a stale running focus_run to paused"
+        );
+        // items.id=681: and the same recovery task expires a parked run that is past
+        // its retention (no snapshot: started_at + 30 days), clearing its input.
+        let (expired_status, expired_input): (String, Option<String>) =
+            sqlx::query_as("SELECT status, user_input FROM focus_runs WHERE id = ?")
+                .bind(&expired_id)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            (expired_status.as_str(), expired_input),
+            ("cancelled", None)
         );
     }
 
@@ -2992,9 +3017,12 @@ mod tests {
         let mut conn = outputs_conn(user_id, &persona_id, personal_key_hex).await;
         sqlx::query(
             "INSERT INTO focus_runs (id, focus_id, status, started_at)
-             VALUES (?, 'test-focus', 'running', '2020-01-01T00:00:00Z')",
+             VALUES (?, 'test-focus', 'running', ?)",
         )
         .bind(&run_id)
+        // Stale for the demote under any threshold, but inside the 30-day retention
+        // (items.id=681: the login pass expires an older paused run with no snapshot).
+        .bind((chrono::Utc::now() - chrono::Duration::days(10)).to_rfc3339())
         .execute(&mut conn)
         .await
         .expect("seeding a stale focus_runs row must succeed");

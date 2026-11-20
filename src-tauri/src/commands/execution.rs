@@ -682,7 +682,8 @@ pub async fn resume_run(
             )
             .await?;
             let scheduler = Arc::clone(&*scheduler);
-            let mut run: FocusRun = rehydrate_focus_run(
+            // items.id=681: a stale resume cancels the run (the one shared helper).
+            let rehydrated: Result<FocusRun, LifecycleError> = rehydrate_focus_run(
                 request.user_id.clone(),
                 request.persona_id.clone(),
                 request.run_id.clone(),
@@ -690,10 +691,24 @@ pub async fn resume_run(
                 scheduler,
                 Some(key_hex_str.clone()),
                 std::collections::HashSet::new(),
-                Some(app_handle),
+                Some(app_handle.clone()),
             )
-            .await
-            .map_err(|e| e.to_string())?;
+            .await;
+            let mut run = match rehydrated {
+                Ok(run) => run,
+                Err(e) => {
+                    crate::conductor::resume_staleness::cancel_stale_resume(
+                        &e,
+                        &request.user_id,
+                        &request.persona_id,
+                        &key_hex_str,
+                        &request.run_id,
+                        Some(&app_handle),
+                    )
+                    .await;
+                    return Err(e.to_string());
+                }
+            };
             // A user pressed resume (items.id=710): attended.
             run.attendance = crate::spend::gate::RunAttendance::Attended;
             run.attach_lease(run_lease).map_err(|e| e.to_string())?;
@@ -878,18 +893,33 @@ pub async fn reenter_step(
     }
 
     let scheduler = Arc::clone(&*scheduler);
-    let mut run: FocusRun = rehydrate_focus_run(
+    // items.id=681: a stale resume cancels the run (the one shared helper).
+    let rehydrated: Result<FocusRun, LifecycleError> = rehydrate_focus_run(
         request.user_id.clone(),
         request.persona_id.clone(),
         request.run_id.clone(),
         pool.inner().clone(),
         scheduler,
-        Some(key_hex_str),
+        Some(key_hex_str.clone()),
         std::collections::HashSet::new(),
-        Some(app_handle),
+        Some(app_handle.clone()),
     )
-    .await
-    .map_err(|e| e.to_string())?;
+    .await;
+    let mut run = match rehydrated {
+        Ok(run) => run,
+        Err(e) => {
+            crate::conductor::resume_staleness::cancel_stale_resume(
+                &e,
+                &request.user_id,
+                &request.persona_id,
+                &key_hex_str,
+                &request.run_id,
+                Some(&app_handle),
+            )
+            .await;
+            return Err(e.to_string());
+        }
+    };
     // A user asked to revisit a step (items.id=710): attended.
     run.attendance = crate::spend::gate::RunAttendance::Attended;
 

@@ -90,7 +90,8 @@
 --
 -- RETENTION (a real gap in the original design, not just this draft --
 -- focus_run_snapshots, this table's sibling, already has one: a purge_after
--- column with status-dependent rules, outputs_001.sql, swept on startup).
+-- column with status-dependent rules, outputs_001.sql, written and swept by
+-- items.id=681).
 -- focus_run_steps needs the equivalent, but NOT the same mechanism:
 -- focus_run_snapshots' checkpoint cadence is SYSTEM-driven and bounded by
 -- QR_CHECKPOINT_EVERY_N_STEPS -- an age-based purge_after works there

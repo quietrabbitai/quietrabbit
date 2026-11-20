@@ -150,6 +150,11 @@ pub enum LifecycleError {
     RunNotFound(String),
 
     // reenter_step() (items.id=574 follow-up)
+    /// items.id=681: a resume found that a field a completed step used changed
+    /// while the run waited (conductor::resume_staleness). rehydrate_focus_run
+    /// writes nothing; the caller cancels the run (cancel_stale_resume).
+    #[error("personal information changed while waiting")]
+    ResumeStale(crate::conductor::resume_staleness::StaleReason),
     #[error("Reentry: {0}")]
     Reentry(#[from] ReentryError),
 
@@ -5001,7 +5006,7 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
         .unwrap_or_default();
 
     let snapshot_row = sqlx::query(
-        "SELECT action_id, task_track_json, shared_state_json
+        "SELECT action_id, task_track_json, shared_state_json, personal_context_manifest
          FROM focus_run_snapshots
          WHERE focus_run_id = ?
          ORDER BY created_at DESC
@@ -5068,6 +5073,38 @@ pub async fn rehydrate_focus_run<L: DisclosureLoggerForRun>(
 
             let task_track = deserialize_task_track(&task_json)?;
             let shared_state = deserialize_shared_state_track(&shared_json)?;
+
+            // items.id=681: staleness check, before the run is resumed. Writes nothing;
+            // the caller cancels. The step re-run at resume (awaiting_user and
+            // awaiting_schedule resume AT the checkpointed step) is excluded.
+            let manifest: Option<String> = row.try_get("personal_context_manifest")?;
+            let rerun = matches!(status.as_str(), "awaiting_user" | "awaiting_schedule")
+                .then_some(action_id.as_str());
+            if let crate::conductor::resume_staleness::Staleness::Stale(reason) =
+                crate::conductor::resume_staleness::check(
+                    manifest.as_deref(),
+                    run.personal_track.as_ref().expect("track set above"),
+                    &task_track,
+                    &shared_state,
+                    rerun,
+                )
+            {
+                match reason {
+                    crate::conductor::resume_staleness::StaleReason::ManifestUnreadable => {
+                        log::warn!(
+                            "rehydrate_focus_run: the snapshot's manifest is unreadable, \
+                             treating the run as stale"
+                        );
+                    }
+                    crate::conductor::resume_staleness::StaleReason::FieldsChanged { count } => {
+                        log::info!(
+                            "rehydrate_focus_run: {count} field(s) used by completed steps \
+                             changed while the run waited"
+                        );
+                    }
+                }
+                return Err(LifecycleError::ResumeStale(reason));
+            }
 
             let resume_at =
                 resume_index(&run.focus_def.as_ref().unwrap().steps, &action_id, &status);
@@ -7157,6 +7194,321 @@ mod tests {
             .fields()
             .get(name)
             .cloned()
+    }
+
+    // -------------------------------------------------------------------------
+    // items.id=681 stage 3: the resume staleness check, end to end against a real
+    // personal.db and a real checkpoint written by write_checkpoint_for.
+    // -------------------------------------------------------------------------
+
+    async fn delete_bridge_fact(name: &str) {
+        let mut conn = crate::persistence::personal_store::open_personal_db(
+            BRIDGE_USER,
+            BRIDGE_PERSONA,
+            RESUME_TEST_KEY_HEX,
+        )
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM entity_facts WHERE field_name = ?")
+            .bind(name)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    /// Rehydrate the bridge run once (a fresh track holding the current facts),
+    /// give it a completed step `draft` whose buffer approved `buffer_fields`, and
+    /// write a real checkpoint from it. The manifest is the real one.
+    async fn stale_check_checkpoint(pool: &sqlx::SqlitePool, run_id: &str, buffer_fields: &[&str]) {
+        use crate::conductor::run_retention::CheckpointPark;
+        let mut run = bridge_rehydrate(pool, run_id, std::collections::HashSet::new()).await;
+        let mut tt = TaskTrack::new();
+        // The completed step is `earlier`; the checkpoint is AT `draft` (the step an
+        // awaiting_user or awaiting_schedule resume re-runs, excluded from "used").
+        tt.add_step(TaskStep {
+            action_id: "earlier".to_owned(),
+            output_var: None,
+            content: "written under the old value".to_owned(),
+            sensitivity_severity: 2,
+            routing_tier_used: 1,
+            personal_flagged: false,
+            audit_unavailable: false,
+        });
+        run.task_track = Some(tt);
+        let mut ss = SharedStateTrack::new();
+        ss.write_disclosure_buffer(
+            "earlier",
+            buffer_fields
+                .iter()
+                .map(|n| ((*n).to_owned(), "approved".to_owned()))
+                .collect(),
+        );
+        run.shared_state = Some(ss);
+        run.write_checkpoint_for("draft", CheckpointPark::AwaitingUser, Utc::now())
+            .await
+            .unwrap();
+    }
+
+    async fn stale_rehydrate(
+        pool: &sqlx::SqlitePool,
+        run_id: &str,
+    ) -> Result<FocusRun, LifecycleError> {
+        rehydrate_focus_run(
+            BRIDGE_USER.to_owned(),
+            BRIDGE_PERSONA.to_owned(),
+            run_id.to_owned(),
+            pool.clone(),
+            Arc::new(ConductorScheduler::new()),
+            Some(RESUME_TEST_KEY_HEX.to_owned()),
+            std::collections::HashSet::new(),
+            None,
+        )
+        .await
+    }
+
+    async fn run_row(run_id: &str) -> (String, Option<String>, i64) {
+        let mut conn = open_outputs_db(BRIDGE_USER, BRIDGE_PERSONA, RESUME_TEST_KEY_HEX)
+            .await
+            .unwrap();
+        let r = sqlx::query(
+            "SELECT status, user_input,
+                    (SELECT COUNT(*) FROM focus_run_snapshots WHERE focus_run_id = ?) AS n
+             FROM focus_runs WHERE id = ?",
+        )
+        .bind(run_id)
+        .bind(run_id)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        (r.get("status"), r.get("user_input"), r.get("n"))
+    }
+
+    #[tokio::test]
+    async fn a_resume_with_an_unchanged_manifest_behaves_as_today() {
+        with_temp_data_root(async {
+            let (pool, run_id) = bridge_setup().await;
+            bridge_fact_row("job_title", "Cook", None, BRIDGE_PERSONA, false).await;
+            stale_check_checkpoint(&pool, &run_id, &["job_title"]).await;
+            let run = stale_rehydrate(&pool, &run_id).await.expect("resumes");
+            assert_eq!(run.task_track.as_ref().unwrap().steps().len(), 1);
+            assert_eq!(
+                run_row(&run_id).await.0,
+                "paused",
+                "rehydrate wrote nothing"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_resume_after_a_used_fact_changed_or_was_deleted_is_stale_and_writes_nothing() {
+        use crate::conductor::resume_staleness::StaleReason;
+        with_temp_data_root(async {
+            let (pool, run_id) = bridge_setup().await;
+            bridge_fact_row("job_title", "Cook", None, BRIDGE_PERSONA, false).await;
+            bridge_fact_row("employer", "Acme", None, BRIDGE_PERSONA, false).await;
+            stale_check_checkpoint(&pool, &run_id, &["job_title"]).await;
+
+            // employer changes: no completed step used it, so the run resumes.
+            delete_bridge_fact("employer").await;
+            bridge_fact_row("employer", "Globex", None, BRIDGE_PERSONA, false).await;
+            assert!(stale_rehydrate(&pool, &run_id).await.is_ok());
+
+            // job_title changes: a completed step used it.
+            delete_bridge_fact("job_title").await;
+            bridge_fact_row("job_title", "Chef", None, BRIDGE_PERSONA, false).await;
+            match stale_rehydrate(&pool, &run_id).await {
+                Err(LifecycleError::ResumeStale(StaleReason::FieldsChanged { count: 1 })) => {}
+                other => panic!("expected ResumeStale, got {:?}", other.map(|_| ())),
+            }
+            // rehydrate_focus_run changed nothing.
+            assert_eq!(
+                run_row(&run_id).await,
+                ("paused".into(), Some("input".into()), 1)
+            );
+
+            // And the same when the fact is deleted outright.
+            delete_bridge_fact("job_title").await;
+            assert!(matches!(
+                stale_rehydrate(&pool, &run_id).await,
+                Err(LifecycleError::ResumeStale(_))
+            ));
+        })
+        .await;
+    }
+
+    /// An approved field the step does not declare still counts (the quick-ask
+    /// `draft` step declares no field_requirements at all).
+    #[tokio::test]
+    async fn an_approved_but_undeclared_field_makes_the_resume_stale() {
+        with_temp_data_root(async {
+            let (pool, run_id) = bridge_setup().await;
+            bridge_fact_row("industry", "Food", None, BRIDGE_PERSONA, false).await;
+            stale_check_checkpoint(&pool, &run_id, &["industry"]).await;
+            delete_bridge_fact("industry").await;
+            bridge_fact_row("industry", "Retail", None, BRIDGE_PERSONA, false).await;
+            assert!(matches!(
+                stale_rehydrate(&pool, &run_id).await,
+                Err(LifecycleError::ResumeStale(_))
+            ));
+        })
+        .await;
+    }
+
+    /// The shared helper cancels only a run that is still parked.
+    #[tokio::test]
+    async fn the_stale_helper_cancels_a_parked_run_and_leaves_a_running_one_alone() {
+        use crate::conductor::resume_staleness::{
+            cancel_stale_resume, StaleReason, PERSONAL_CHANGED_WHILE_WAITING,
+        };
+        with_temp_data_root(async {
+            let (pool, run_id) = bridge_setup().await;
+            bridge_fact_row("job_title", "Cook", None, BRIDGE_PERSONA, false).await;
+            stale_check_checkpoint(&pool, &run_id, &["job_title"]).await;
+            let stale = LifecycleError::ResumeStale(StaleReason::FieldsChanged { count: 1 });
+
+            // Not a stale error: nothing happens.
+            let other = LifecycleError::NoKey;
+            assert!(
+                !cancel_stale_resume(
+                    &other,
+                    BRIDGE_USER,
+                    BRIDGE_PERSONA,
+                    RESUME_TEST_KEY_HEX,
+                    &run_id,
+                    None
+                )
+                .await
+            );
+            assert_eq!(run_row(&run_id).await.0, "paused");
+
+            // The run resumed meanwhile: left alone.
+            let mut conn = open_outputs_db(BRIDGE_USER, BRIDGE_PERSONA, RESUME_TEST_KEY_HEX)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE focus_runs SET status = 'running' WHERE id = ?")
+                .bind(&run_id)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            assert!(
+                !cancel_stale_resume(
+                    &stale,
+                    BRIDGE_USER,
+                    BRIDGE_PERSONA,
+                    RESUME_TEST_KEY_HEX,
+                    &run_id,
+                    None
+                )
+                .await
+            );
+            assert_eq!(
+                run_row(&run_id).await,
+                ("running".into(), Some("input".into()), 1)
+            );
+
+            // Parked again: cancelled with the plain message, nothing left behind.
+            sqlx::query("UPDATE focus_runs SET status = 'awaiting_user' WHERE id = ?")
+                .bind(&run_id)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            assert!(
+                cancel_stale_resume(
+                    &stale,
+                    BRIDGE_USER,
+                    BRIDGE_PERSONA,
+                    RESUME_TEST_KEY_HEX,
+                    &run_id,
+                    None
+                )
+                .await
+            );
+            assert_eq!(run_row(&run_id).await, ("cancelled".into(), None, 0));
+            let notes: String = sqlx::query_scalar("SELECT notes FROM focus_runs WHERE id = ?")
+                .bind(&run_id)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+            assert!(notes.contains(PERSONAL_CHANGED_WHILE_WAITING));
+        })
+        .await;
+    }
+
+    /// The scheduled sweep must cancel a stale run too (it would otherwise retry it
+    /// every tick), through the same helper.
+    #[tokio::test]
+    async fn the_scheduled_sweep_cancels_a_stale_run() {
+        with_temp_data_root(async {
+            let (pool, run_id) = bridge_setup().await;
+            bridge_fact_row("job_title", "Cook", None, BRIDGE_PERSONA, false).await;
+            stale_check_checkpoint(&pool, &run_id, &["job_title"]).await;
+            delete_bridge_fact("job_title").await;
+            // A parked-on-a-schedule run whose time has come.
+            let mut conn = open_outputs_db(BRIDGE_USER, BRIDGE_PERSONA, RESUME_TEST_KEY_HEX)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE focus_runs SET status = 'awaiting_schedule' WHERE id = ?")
+                .bind(&run_id)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO focus_run_steps
+                 (id, focus_run_id, action_id, attempt, sequence_index, status, scheduled_for,
+                  created_at, updated_at)
+                 VALUES ('s1', ?, 'draft', 1, 0, 'pending', '2020-01-01T00:00:00+00:00', ?, ?)",
+            )
+            .bind(&run_id)
+            .bind(now())
+            .bind(now())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            drop(conn);
+
+            let mut data_key = [0u8; crate::auth::kdf::MASTER_KEY_LEN];
+            for (i, b) in data_key.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&RESUME_TEST_KEY_HEX[i * 2..i * 2 + 2], 16).unwrap();
+            }
+            let registry = crate::auth::registry::KeyRegistry::default();
+            registry
+                .replace(crate::auth::registry::UnlockedKey {
+                    user_id: BRIDGE_USER.to_owned(),
+                    data_key,
+                    key_epoch: 1,
+                    sharing_private_key: [0u8; 32],
+                    unlocked_at: now(),
+                })
+                .await;
+            crate::conductor::scheduled_sweep::run_periodic_sweep(
+                &pool,
+                &registry,
+                &Arc::new(ConductorScheduler::new()),
+                None,
+            )
+            .await;
+            assert_eq!(run_row(&run_id).await, ("cancelled".into(), None, 0));
+        })
+        .await;
+    }
+
+    /// The three resume paths call the one helper (and nothing else cancels a stale run).
+    #[test]
+    fn every_resume_path_calls_the_one_stale_helper() {
+        let exec = include_str!("../commands/execution.rs");
+        assert_eq!(exec.matches("cancel_stale_resume(").count(), 2);
+        let sweep = include_str!("scheduled_sweep.rs");
+        assert_eq!(sweep.matches("cancel_stale_resume(").count(), 1);
+        let code = include_str!("lifecycle.rs")
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap();
+        assert!(
+            !code.contains("cancel_parked_run("),
+            "rehydrate_focus_run writes nothing"
+        );
+        assert_eq!(code.matches("resume_staleness::check(").count(), 1);
     }
 
     /// T2: only same-Persona (or confirmed cross-Persona, as not_permitted), catalogued,

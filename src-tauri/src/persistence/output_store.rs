@@ -1155,35 +1155,93 @@ pub async fn cancel_focus_run(
 pub enum ExpireOutcome {
     /// The run was cancelled and its snapshots, input and park reason removed.
     Expired,
-    /// The run's latest snapshot has not expired (or the run has no snapshot).
+    /// The run's latest snapshot has not expired (or, with no snapshot, the run
+    /// has not outlived its retention).
     NotExpired,
     /// The run is no longer in a parked status (it resumed, finished, or does
     /// not exist), so nothing was changed.
     NotParked,
 }
 
-/// items.id=681 (decisions.id=865): expire ONE parked run whose latest snapshot
-/// is past its retention. Everything happens in one BEGIN IMMEDIATE transaction,
-/// so it is atomic against a concurrent resume or re-park (the write lock is
-/// taken before the snapshot is read):
-///   1. read the run's latest snapshot and decide expiry (run_retention::
-///      snapshot_expired: its purge_after, else created_at + the awaiting_user
-///      period for a periodic one a crash left behind);
-///   2. UPDATE focus_runs SET status='cancelled', user_input and external_input
-///      NULL, the reason in notes WHERE id=? AND status IN (the parked set);
-///   3. only if exactly ONE row changed: delete the run's snapshots, its park
-///      reason and supersede a pending step review.
-///
-/// A run that resumed meanwhile is left alone (NotParked). This is a fourth site
-/// that clears focus_runs.user_input, beside the three writers: it is the purge
+/// items.id=681: the guarded cancel of a PARKED run, INSIDE a write transaction
+/// the caller holds. Shared by the expiry sweep and the stale-resume helper:
+///   UPDATE focus_runs SET status='cancelled', user_input and external_input NULL,
+///   the reason in notes WHERE id=? AND status IN (the parked set);
+/// only if exactly ONE row changed are the run's snapshots, its park reason and a
+/// pending step review removed. Returns whether it cancelled. A run that is not
+/// parked any more (it resumed, or finished) is left alone. This is a fourth site
+/// that clears focus_runs.user_input, beside the three writers: the purge
 /// items.id=894 named, because this cancel does not go through them.
+async fn cancel_parked_in_tx(
+    conn: &mut SqliteConnection,
+    run_id: &str,
+    reason: &str,
+) -> Result<bool, OutputStoreError> {
+    let sql = format!(
+        "UPDATE focus_runs SET status = 'cancelled', user_input = NULL, external_input = NULL,
+         notes = CASE WHEN json_valid(notes) THEN json_set(notes, '$.cancel_reason', ?)
+                      ELSE json_object('cancel_reason', ?) END
+         WHERE id = ? AND status IN ({})",
+        crate::conductor::run_retention::parked_status_list_sql()
+    );
+    let changed = sqlx::query(&sql)
+        .bind(reason)
+        .bind(reason)
+        .bind(run_id)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+    if changed != 1 {
+        return Ok(false);
+    }
+    sqlx::query("DELETE FROM focus_run_snapshots WHERE focus_run_id = ?")
+        .bind(run_id)
+        .execute(&mut *conn)
+        .await?;
+    clear_park_best_effort(conn, run_id).await;
+    crate::persistence::step_review_store::supersede_pending_for_run(conn, run_id)
+        .await
+        .map_err(|e| match e {
+            crate::persistence::step_review_store::StepReviewStoreError::Database(d) => {
+                OutputStoreError::from(d)
+            }
+            other => OutputStoreError::Validation(other.to_string()),
+        })?;
+    Ok(true)
+}
+
+/// items.id=681 stage 3: cancel one run with `reason` if it is still parked, in its
+/// own BEGIN IMMEDIATE transaction. Used when a resume found the run stale
+/// (conductor::resume_staleness). Returns whether it cancelled.
+pub async fn cancel_parked_run(
+    user_id: &str,
+    persona_id: &str,
+    key_hex: &str,
+    run_id: &str,
+    reason: &str,
+) -> Result<bool, OutputStoreError> {
+    let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
+    crate::persistence::session_store::begin_write(&mut conn).await?;
+    let result = cancel_parked_in_tx(&mut conn, run_id, reason).await;
+    crate::persistence::session_store::finish_write(&mut conn, result).await
+}
+
+/// items.id=681 (decisions.id=865): expire ONE parked run that is past its
+/// retention. Everything happens in one BEGIN IMMEDIATE transaction, so it is
+/// atomic against a concurrent resume or re-park (the write lock is taken before
+/// anything is read):
+///   1. decide expiry: the run's latest snapshot (run_retention::snapshot_expired:
+///      its purge_after, else created_at + the awaiting_user period for a periodic
+///      one a crash left behind), or, for a run with NO snapshot, started_at + the
+///      same period (run_expired_without_snapshot);
+///   2. the guarded cancel (cancel_parked_in_tx).
 pub async fn expire_parked_run(
     conn: &mut SqliteConnection,
     run_id: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<ExpireOutcome, OutputStoreError> {
     use crate::conductor::run_retention::{
-        parked_status_list_sql, snapshot_expired, EXPIRED_WHILE_WAITING,
+        run_expired_without_snapshot, snapshot_expired, EXPIRED_WHILE_WAITING,
     };
     crate::persistence::session_store::begin_write(conn).await?;
     let result: Result<ExpireOutcome, OutputStoreError> = async {
@@ -1194,45 +1252,29 @@ pub async fn expire_parked_run(
         .bind(run_id)
         .fetch_optional(&mut *conn)
         .await?;
-        let Some(latest) = latest else {
-            return Ok(ExpireOutcome::NotExpired);
+        let expired = match latest {
+            Some(latest) => {
+                let purge_after: Option<String> = latest.try_get("purge_after")?;
+                let created_at: String = latest.try_get("created_at")?;
+                snapshot_expired(purge_after.as_deref(), &created_at, now)
+            }
+            None => {
+                let started: Option<String> =
+                    sqlx::query_scalar("SELECT started_at FROM focus_runs WHERE id = ?")
+                        .bind(run_id)
+                        .fetch_optional(&mut *conn)
+                        .await?;
+                started.is_some_and(|s| run_expired_without_snapshot(&s, now))
+            }
         };
-        let purge_after: Option<String> = latest.try_get("purge_after")?;
-        let created_at: String = latest.try_get("created_at")?;
-        if !snapshot_expired(purge_after.as_deref(), &created_at, now) {
+        if !expired {
             return Ok(ExpireOutcome::NotExpired);
         }
-        let sql = format!(
-            "UPDATE focus_runs SET status = 'cancelled', user_input = NULL, external_input = NULL,
-             notes = CASE WHEN json_valid(notes) THEN json_set(notes, '$.cancel_reason', ?)
-                          ELSE json_object('cancel_reason', ?) END
-             WHERE id = ? AND status IN ({})",
-            parked_status_list_sql()
-        );
-        let changed = sqlx::query(&sql)
-            .bind(EXPIRED_WHILE_WAITING)
-            .bind(EXPIRED_WHILE_WAITING)
-            .bind(run_id)
-            .execute(&mut *conn)
-            .await?
-            .rows_affected();
-        if changed != 1 {
-            return Ok(ExpireOutcome::NotParked);
+        if cancel_parked_in_tx(conn, run_id, EXPIRED_WHILE_WAITING).await? {
+            Ok(ExpireOutcome::Expired)
+        } else {
+            Ok(ExpireOutcome::NotParked)
         }
-        sqlx::query("DELETE FROM focus_run_snapshots WHERE focus_run_id = ?")
-            .bind(run_id)
-            .execute(&mut *conn)
-            .await?;
-        clear_park_best_effort(conn, run_id).await;
-        crate::persistence::step_review_store::supersede_pending_for_run(conn, run_id)
-            .await
-            .map_err(|e| match e {
-                crate::persistence::step_review_store::StepReviewStoreError::Database(d) => {
-                    OutputStoreError::from(d)
-                }
-                other => OutputStoreError::Validation(other.to_string()),
-            })?;
-        Ok(ExpireOutcome::Expired)
     }
     .await;
     crate::persistence::session_store::finish_write(conn, result).await
@@ -1306,8 +1348,8 @@ pub async fn set_focus_run_status(
 /// The column holds the blended chat window a run was started with, kept only so
 /// a parked or interrupted run can resume (rehydrate_focus_run). A run in one of
 /// these statuses can no longer resume. A run parked and never finished keeps its
-/// copy until items.id=681 (retention sweep) and items.id=888 (archive hook)
-/// clear it: neither does yet.
+/// copy until items.id=681's retention sweep (expire_parked_run clears both input
+/// columns) or items.id=888's archive hook clears it.
 pub const USER_INPUT_CLEARED_STATUSES: &[&str] = &["complete", "cancelled", "failed"];
 
 /// Record a Gate 3 consent decision for a paused focus run (D6-352).

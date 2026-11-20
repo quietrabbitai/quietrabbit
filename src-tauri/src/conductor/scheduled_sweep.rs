@@ -143,6 +143,17 @@ pub async fn run_periodic_sweep(
                     log::warn!(
                         "scheduled_sweep: rehydrate_focus_run failed for run '{focus_run_id}': {e}"
                     );
+                    // items.id=681: a run found stale on resume is cancelled (the one
+                    // shared helper), so the sweep does not retry it every tick.
+                    crate::conductor::resume_staleness::cancel_stale_resume(
+                        &e,
+                        &user_id,
+                        &persona_id,
+                        &key_hex_str,
+                        &focus_run_id,
+                        app_handle.as_ref(),
+                    )
+                    .await;
                     continue;
                 }
             };

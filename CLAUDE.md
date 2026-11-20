@@ -1,5 +1,8 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: November 19, 2026 (items.id=932: new "Single-pass render substitution" section; the VALUE
+# Last updated: November 20, 2026 (items.id=681: new "Parked-run retention and resume staleness"
+# section; the PersonalTrack line under "Key Architectural Decisions" and the user_input bullet under
+# "Model blocks"; nothing else.).
+# Before that, November 19, 2026 (items.id=932: new "Single-pass render substitution" section; the VALUE
 # and NOT BUILT bullets under "Personal fact bridge", the Prompt Authoring Rule and the examples line under
 # "Calibration harness" (CI does build examples); nothing else.).
 # Before that, November 18, 2026 (items.id=931: new "Personal fact bridge" section; nothing else.
@@ -402,7 +405,9 @@ with no requirement still goes through select_model.
   chat history"; both are written together and cleared together). It
   is NULLed when the status becomes complete, cancelled or failed (output_store::
   USER_INPUT_CLEARED_STATUSES) and is not written for a latched one-time chat. A run
-  parked and never finished keeps it until items.id=681 and 888 clear it.
+  parked and never finished keeps it until the retention sweep expires it (items.id=681,
+  see "Parked-run retention and resume staleness": it clears both input columns) or
+  items.id=888 clears it.
 - Resuming a requires_user_handoff step re-parks it (pinned by a characterization
   test in lifecycle.rs). items.id=387 does NOT change this: the manual hand-off runs on
   chat passes and parks nothing (see "Manual hand-off"). rehydrate_focus_run restores
@@ -1169,6 +1174,62 @@ turn can carry persona-derived text from an earlier local run. The local render 
   prompt (items.id=922's carry, not this item), and the declared-inputs lint (user_input is declared as
   before).
 
+## Parked-run retention and resume staleness (items.id=681, decisions.id=865)
+A parked run's snapshot holds step outputs and disclosure buffers with the values approved for each
+step (raw at tier 1, abstracted from tier 2 up), encrypted at rest in the persona's outputs.db.
+Only runs parked in awaiting_user, awaiting_schedule or paused keep snapshots (complete, cancelled and
+failed delete them at once). This item bounds how long, and refuses a resume on changed data.
+- PURGE_AFTER (conductor/run_retention.rs, CheckpointPark). Written when a run parks, by
+  FocusRun::write_checkpoint_for (the one writer; write_checkpoint is the periodic one and stores NULL):
+  awaiting_user = checkpoint time + AWAITING_USER_RETENTION_DAYS (30; each new checkpoint is a new row, so
+  it refreshes), awaiting_schedule = the step's scheduled_for + AWAITING_SCHEDULE_RETENTION_DAYS (30). One
+  fixed text format (whole seconds, UTC, Z). A scan pins the four parking sites.
+- THE SWEEP. PARKED_STATUSES = awaiting_user, awaiting_schedule, paused. output_store::expire_parked_run
+  runs per run in ONE BEGIN IMMEDIATE transaction (decide, then cancel_parked_in_tx): the run's latest
+  snapshot is expired when its purge_after has passed; a snapshot with NO purge_after (the periodic one a
+  crash left, a run demote_interrupted_runs turned into paused) expires at created_at + 30 days; a parked run
+  with NO snapshot at all expires at started_at + 30 days (it cannot resume and still holds user_input); an
+  unparseable time is never expired. The cancel is UPDATE focus_runs SET status='cancelled', user_input and
+  external_input NULL, notes.cancel_reason WHERE id=? AND status IN (the parked set), and only if exactly one
+  row changed are the snapshots, the park reason and a pending step review removed: a run that resumed
+  meanwhile is left alone. This is the FOURTH site that clears focus_runs.user_input (beside the lifecycle
+  writer, set_focus_run_status and cancel_focus_run). The message is "expired while waiting"; focus_runs has
+  no message column, so it is in notes and in the event's step_display_name.
+- WHEN IT RUNS. Hourly supervised task parked_run_expiry (main.rs, pinned in writer_gate MAIN_TASKS) and one
+  pass per persona inside the login recovery task right after the demote. Only while the owner's key is
+  resident (decisions.id=847): the tick does nothing without one. Lease kind Sweep (short, not visible work: it
+  neither defers the demote nor counts as a run for a rotation to wait for; no FocusRun lease because it
+  cancels, never resumes). The injected clock is `now`; only the supervised tick reads Utc::now. The login pass
+  has no AppHandle and emits no event (the UI reads run state after login); the hourly tick emits
+  run-status-update.
+- RESUME STALENESS (conductor/resume_staleness.rs, pure `check`). rehydrate_focus_run reads the snapshot's
+  personal_context_manifest and compares field_hashes ONLY with the fresh PersonalTrack. A resume is STALE when a
+  field that a COMPLETED step used has changed or is gone. "Used" = a name in the disclosure buffer of a step in
+  the restored task track, whether or not the step still declares it; the step re-run at resume (awaiting_user
+  and awaiting_schedule resume AT the checkpointed step) is excluded. A field only in the fresh track (added) is
+  not stale. A NULL, blank or hash-less manifest means no check; an unparseable non-empty manifest (or one that is
+  not a JSON object) fails CLOSED. PersonalContextManifest::matches() is NOT used (it also compares
+  source_versions, which a .focus edit or app update would change) and has no caller outside its own tests.
+  Re-running Gate 1 is not the remedy: execute_once already runs Gate 1 on the fresh track before every step
+  attempt and rewrites that step's buffer, and Gate 1 needs no AppHandle. What goes stale is the OUTPUT text of
+  completed steps, which Gate 1 cannot change.
+- HANDLING. rehydrate_focus_run returns LifecycleError::ResumeStale and writes NOTHING (it runs before the run
+  is promoted: resume_execution writes `running`). The one helper resume_staleness::cancel_stale_resume is called
+  by resume_run, reenter_step (commands/execution.rs) and scheduled_sweep: it cancels with "personal information
+  changed while waiting" through the same guarded UPDATE (only if the run is still parked) and emits the event.
+  A scan test pins the three callers.
+- STATE PLAINLY (limits, accepted):
+  (a) A confirmed cross-Persona fact released raw to a local step makes a resume cancel that run: both
+      resume paths (execution.rs and scheduled_sweep) pass an empty confirmed-id set, so the fact is absent on
+      resume and reads as deleted.
+  (b) A policy tightened while a run is parked is NOT detected for completed output: the manifest holds no
+      policy. The executor still re-reads fact_disclosure_policy before each later hosted step (decisions.id=953).
+  (c) Entity (device), group and persona_context facts are NOT covered: only the four catalogued singleton
+      facts of items.id=931 are in the manifest.
+- NOT BUILT: a rewind-and-rerun of the affected steps (items.id=574's reenter_step could do it), a "continue
+  anyway" resume, the Library or clear_chat hooks (items.id=888), a banner for a stale cancel (the user sees
+  the cancelled run and its message).
+
 ## Collection consent (items.id=920 stage 1, decisions.id=944, decisions.id=509)
 A focus_level Focus (Tech Support) collects silently after ONE informed consent at
 setup. Stage 1 is the store and the gate, stage 2 the commands and the consent text
@@ -1488,7 +1549,11 @@ Design sessions must all complete before shared infrastructure build begins.
   focus_settings.max_permitted_tier is the hard ceiling.
   focus_settings.privacy_tier is user preference. Never conflate them.
   focus_settings row must exist before AUTHORIZE executes.
-- PersonalTrack NEVER serialized to focus_run_snapshots — re-fetched fresh on resume
+- PersonalTrack is never serialized: only a manifest of field names and hashes goes into a
+  snapshot, and it is re-fetched fresh on resume. This does NOT mean snapshots hold no
+  personal values: step outputs and disclosure buffers hold the values approved for each step
+  (raw at tier 1, abstracted from tier 2 up), encrypted at rest in the persona's outputs.db
+  (decisions.id=865). Parked runs' snapshots are swept (items.id=681).
 - Step 6: PG_GATE_1 writes approved/abstracted fields to step_disclosure_buffer
   Step 8: reads from step_disclosure_buffer for Tier 2+ (NEVER from PersonalTrack)
   Raw personal values never appear in external prompt strings.

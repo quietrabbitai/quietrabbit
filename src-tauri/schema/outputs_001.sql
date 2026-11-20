@@ -163,11 +163,19 @@ END;
 -- Focus run snapshots (checkpoints)
 -- PersonalTrack NEVER serialized — re-fetched fresh on resume.
 -- personal_context_manifest: field names + specialist versions at checkpoint time.
--- Resume compares manifest to current personal.db to detect changes.
--- purge_after: enforces retention policy on startup cleanup.
---   cancelled/complete: purge_after = created_at (immediate)
---   awaiting_feedback:  purge_after = Phase 5 completion time
---   paused/awaiting_user: no purge_after (preserve until resumed)
+-- Resume compares the manifest field_hashes to the fresh PersonalTrack (items.id=681).
+-- A snapshot still holds step outputs and disclosure buffers with the values approved
+-- for each step, encrypted at rest in the persona outputs.db (decisions.id=865).
+-- Retention (items.id=681, decisions.id=865):
+--   complete, cancelled, failed: the snapshot is deleted at once.
+--   awaiting_feedback: no snapshot.
+--   awaiting_user: purge_after = 30 days after the latest checkpoint.
+--   awaiting_schedule: purge_after = 30 days after the step scheduled_for time.
+--   a periodic checkpoint of a running run has no purge_after, so for a crashed run
+--   demoted to paused the sweep uses created_at + 30 days. A parked run with no
+--   snapshot expires at started_at + 30 days.
+-- Written when a run parks and swept hourly and at login, only while the owner key
+-- is resident (conductor/run_retention.rs).
 CREATE TABLE IF NOT EXISTS focus_run_snapshots (
     id                          TEXT PRIMARY KEY,
     focus_run_id                TEXT NOT NULL REFERENCES focus_runs(id)

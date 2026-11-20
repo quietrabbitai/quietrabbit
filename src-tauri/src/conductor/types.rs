@@ -9,11 +9,17 @@
 //   SharedStateTrack — content approved for cross-tier use via PG_GATE_3
 //
 // PersonalContextManifest — checkpoint metadata (field names + hashes only,
-//   never field values). Used by resume logic to detect personal.db drift.
+//   never field values). Used by the resume staleness check (items.id=681,
+//   conductor/resume_staleness.rs), which compares field_hashes only.
 //
 // INVARIANT: PersonalTrack is NEVER serialized to snapshots.
 //   Re-fetched fresh from personal.db on every resume.
 //   Only field names + content hashes + source versions go into manifest.
+//   This does NOT mean a snapshot holds no personal values: it holds step outputs
+//   and disclosure buffers, which carry the values approved for each step (raw at
+//   abstraction tier 1, abstracted from tier 2 up), encrypted at rest in the
+//   persona's outputs.db (decisions.id=865). Snapshots of parked runs are removed
+//   by the retention sweep (items.id=681, conductor/run_retention.rs).
 
 use std::collections::HashMap;
 
@@ -220,7 +226,8 @@ impl GroupFact {
 
 // NOT derived: Serialize, Deserialize — PersonalTrack is NEVER serialized.
 // INVARIANT: Re-fetched fresh from personal.db on every resume.
-// Only PersonalContextManifest (field names + hashes) goes into snapshots.
+// Only PersonalContextManifest (field names + hashes) goes into snapshots. The
+// snapshot still holds step outputs and disclosure buffers with approved values.
 /// Read-only view of personal fields for this focus run.
 /// Populated at Phase 3 INITIALIZE, then sealed before execution begins.
 /// NEVER serialized to snapshots. Re-fetched fresh on resume.
@@ -623,7 +630,11 @@ pub struct PromotedContentEntry {
 /// Holds content approved for cross-tier use via PG_GATE_3.
 ///
 /// step_disclosure_buffers: written by PG_GATE_1, read by Step 8 for Tier 2+.
-///   Contains abstracted field values only — raw personal values NEVER here.
+///   Contains the values approved for the step: the raw approved values at
+///   abstraction tier 1, abstracted from tier 2 up. Held in the run's snapshot and
+///   encrypted at rest in the persona's outputs.db (decisions.id=865). The names in
+///   a completed step's buffer are what the resume staleness check treats as used
+///   (items.id=681).
 ///
 /// promotions: append-only. PG_GATE_3 approved content entries.
 ///   Fields are private to enforce append-only and replacement semantics.
@@ -642,7 +653,8 @@ impl SharedStateTrack {
     }
 
     /// Write abstracted field values for a step.
-    /// Called by PG_GATE_1. Raw personal values must never be passed here.
+    /// Called by PG_GATE_1 with the values approved for the step (raw at tier 1,
+    /// abstracted from tier 2 up, never a value Gate 1 withheld).
     /// REPLACEMENT semantics — overwrites any prior entry for this action_id.
     /// Python oracle: write_disclosure_buffer()
     pub fn write_disclosure_buffer(

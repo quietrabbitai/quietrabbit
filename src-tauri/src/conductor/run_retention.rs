@@ -23,7 +23,8 @@
 // Expiry is enforced only while the owner's key is resident (decisions.id=847):
 // the tick takes the key from the registry and does nothing without one, and the
 // login pass runs inside the login recovery task. A run with no snapshot at all
-// is not touched.
+// expires at started_at + AWAITING_USER_RETENTION_DAYS (it cannot resume and still
+// holds user_input; an unparseable started_at is never expired).
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 
@@ -101,6 +102,16 @@ pub fn snapshot_expired(purge_after: Option<&str>, created_at: &str, now: DateTi
     }
 }
 
+/// A parked run with NO snapshot cannot resume and still holds user_input:
+/// it expires at started_at + AWAITING_USER_RETENTION_DAYS. An unparseable
+/// started_at is never expired.
+pub fn run_expired_without_snapshot(started_at: &str, now: DateTime<Utc>) -> bool {
+    match DateTime::parse_from_rfc3339(started_at) {
+        Ok(s) => now > s.with_timezone(&Utc) + Duration::days(AWAITING_USER_RETENTION_DAYS),
+        Err(_) => false,
+    }
+}
+
 /// One expiry tick. Does nothing with no key resident, and nothing while a
 /// rotation refuses the lease. `now` is the clock (injected by tests);
 /// `on_expired(persona_id, run_id)` is told of each expired run so the caller
@@ -158,13 +169,19 @@ pub async fn run_expiry_tick(
 }
 
 fn emit_expired(handle: &tauri::AppHandle<tauri::Wry>, run_id: &str) {
+    emit_cancelled(handle, run_id, EXPIRED_WHILE_WAITING);
+}
+
+/// Emit "run-status-update" for a run cancelled while parked, carrying the plain
+/// message in step_display_name (focus_runs has no message column).
+pub fn emit_cancelled(handle: &tauri::AppHandle<tauri::Wry>, run_id: &str, message: &str) {
     use tauri::Emitter;
     let payload = crate::conductor::lifecycle::RunStatusPayload {
         focus_run_id: run_id.to_owned(),
         status: "cancelled".to_owned(),
         current_step: 0,
         total_steps: 0,
-        step_display_name: Some(EXPIRED_WHILE_WAITING.to_owned()),
+        step_display_name: Some(message.to_owned()),
         step_content: None,
         crisis_resource_block: None,
         provenance_omissions: Vec::new(),
@@ -407,12 +424,12 @@ mod tests {
             assert!(row
                 .get::<String, _>("notes")
                 .contains(EXPIRED_WHILE_WAITING));
-            // A second pass changes nothing.
+            // A second pass changes nothing (the run is no longer parked).
             assert_eq!(
                 expire_parked_run(&mut c, "r", due + Duration::days(9))
                     .await
                     .unwrap(),
-                ExpireOutcome::NotExpired
+                ExpireOutcome::NotParked
             );
         });
     }
@@ -552,7 +569,7 @@ mod tests {
             );
             assert_eq!(state(&mut c, "reparked").await.2, 2);
             // A parked run with no snapshot at all is not touched.
-            add_run(&mut c, "bare", "awaiting_user", "2026-01-01T00:00:00+00:00").await;
+            add_run(&mut c, "bare", "awaiting_user", "2026-05-20T00:00:00+00:00").await;
             assert_eq!(
                 expire_parked_run(&mut c, "bare", now).await.unwrap(),
                 ExpireOutcome::NotExpired
@@ -616,15 +633,21 @@ mod tests {
     #[test]
     fn the_sweep_has_one_clock_one_set_and_a_guarded_update() {
         let store = include_str!("../persistence/output_store.rs");
-        let body = store
+        let cancel = store
+            .split("async fn cancel_parked_in_tx(")
+            .nth(1)
+            .and_then(|r| r.split("pub async fn cancel_parked_run(").next())
+            .unwrap();
+        assert!(cancel.contains("WHERE id = ? AND status IN ({})"));
+        assert!(cancel.contains("if changed != 1"));
+        let expire = store
             .split("pub async fn expire_parked_run(")
             .nth(1)
             .and_then(|r| r.split("pub async fn expire_parked_runs(").next())
             .unwrap();
-        assert!(body.contains("WHERE id = ? AND status IN ({})"));
-        assert!(body.contains("if changed != 1"));
-        assert!(body.contains("begin_write"));
-        assert!(!body.contains("Utc::now"), "the clock is injected");
+        assert!(expire.contains("begin_write"));
+        assert!(expire.contains("cancel_parked_in_tx("));
+        assert!(!expire.contains("Utc::now"), "the clock is injected");
         let me = include_str!("run_retention.rs");
         let live = me.split("#[cfg(test)]").next().unwrap();
         assert_eq!(
@@ -633,6 +656,71 @@ mod tests {
             "only the supervised tick reads the clock"
         );
         assert!(live.contains("Kind::Sweep"));
+    }
+
+    #[test]
+    fn a_run_with_no_snapshot_expires_at_started_at_plus_thirty_days() {
+        let started = "2026-11-01T12:00:00.5+00:00";
+        let due = t(2026, 12, 1);
+        assert!(!run_expired_without_snapshot(started, due));
+        assert!(run_expired_without_snapshot(
+            started,
+            due + Duration::seconds(1)
+        ));
+        // An unparseable started_at is never expired.
+        assert!(!run_expired_without_snapshot("junk", t(2099, 1, 1)));
+        assert!(!run_expired_without_snapshot("", t(2099, 1, 1)));
+    }
+
+    #[tokio::test]
+    async fn a_parked_run_with_no_snapshot_expires_by_started_at() {
+        with_root!({
+            let (u, p) = ("ret-u6", "ret-p6");
+            setup(u, p).await;
+            let mut c = conn(u, p).await;
+            let started = "2026-11-01T12:00:00+00:00";
+            for (id, status) in [
+                ("au", "awaiting_user"),
+                ("as", "awaiting_schedule"),
+                ("pa", "paused"),
+                ("rn", "running"),
+            ] {
+                add_run(&mut c, id, status, started).await;
+            }
+            add_run(&mut c, "bad", "awaiting_user", "not a time").await;
+            let due = t(2026, 12, 1);
+            for id in ["au", "as", "pa", "rn", "bad"] {
+                assert_eq!(
+                    expire_parked_run(&mut c, id, due - Duration::seconds(1))
+                        .await
+                        .unwrap(),
+                    ExpireOutcome::NotExpired,
+                    "{id} before"
+                );
+            }
+            let after = due + Duration::seconds(1);
+            for id in ["au", "as", "pa"] {
+                assert_eq!(
+                    expire_parked_run(&mut c, id, after).await.unwrap(),
+                    ExpireOutcome::Expired,
+                    "{id}"
+                );
+                assert_eq!(state(&mut c, id).await, ("cancelled".into(), None, 0));
+            }
+            // A running run is past its time but not parked: left alone.
+            assert_eq!(
+                expire_parked_run(&mut c, "rn", after).await.unwrap(),
+                ExpireOutcome::NotParked
+            );
+            assert_eq!(state(&mut c, "rn").await.1.as_deref(), Some("window text"));
+            // An unparseable started_at is never expired, however late.
+            assert_eq!(
+                expire_parked_run(&mut c, "bad", t(2099, 1, 1))
+                    .await
+                    .unwrap(),
+                ExpireOutcome::NotExpired
+            );
+        });
     }
 
     #[test]
