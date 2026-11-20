@@ -181,6 +181,10 @@ pub enum Code {
     StepReviewBlocked,
     /// The user refused to send the reviewed prompt. The run ends cancelled.
     StepReviewRefused,
+    /// The rendered prompt is longer than the review accepts
+    /// (privacy::MAX_REVIEW_BYTES, items.id=923), so it was refused before any
+    /// part of it was scanned. Nothing was sent.
+    StepReviewTooLong,
 
     // -- cost basis, price state, limit state, consent state ------------------
     CostBasisListPriceEstimate,
@@ -240,6 +244,7 @@ impl Code {
         Code::StepReviewPrivacyFilterUnavailable,
         Code::StepReviewBlocked,
         Code::StepReviewRefused,
+        Code::StepReviewTooLong,
         Code::CostBasisListPriceEstimate,
         Code::PriceStateKnown,
         Code::PriceStateUnknown,
@@ -297,6 +302,7 @@ impl Code {
             Code::StepReviewPrivacyFilterUnavailable => "step_review.privacy_filter_unavailable",
             Code::StepReviewBlocked => "step_review.blocked",
             Code::StepReviewRefused => "step_review.refused",
+            Code::StepReviewTooLong => "step_review.too_long",
             Code::CostBasisListPriceEstimate => "cost_basis.list_price_estimate",
             Code::PriceStateKnown => "price_state.known",
             Code::PriceStateUnknown => "price_state.unknown",
@@ -388,6 +394,7 @@ mod tests {
             "step_review.privacy_filter_unavailable",
             "step_review.blocked",
             "step_review.refused",
+            "step_review.too_long",
             "cost_basis.list_price_estimate",
             "price_state.known",
             "price_state.unknown",
@@ -416,9 +423,9 @@ mod tests {
     #[test]
     fn all_lists_every_variant() {
         // 17 warnings + 11 blocks + 6 API Chat stops + 2 resolver stops + 1 plan
-        // stop + 4 step review codes + 1 cost basis + 3 price states + 3 limit
+        // stop + 5 step review codes + 1 cost basis + 3 price states + 3 limit
         // states + 4 consent states.
-        assert_eq!(Code::ALL.len(), 52);
+        assert_eq!(Code::ALL.len(), 53);
     }
 
     #[test]

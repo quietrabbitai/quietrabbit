@@ -83,6 +83,7 @@ pub fn is_park_family(code: Code) -> bool {
             | Code::StepReviewPrivacyFilterUnavailable
             | Code::StepReviewBlocked
             | Code::StepReviewRefused
+            | Code::StepReviewTooLong
             | Code::BlockConsentRequired
             | Code::BlockReconsentRequired
             | Code::BlockPriceUnknown

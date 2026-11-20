@@ -29,6 +29,13 @@ use types::{Gate1Result, Gate2Result, Gate3Result, PersonalTrack};
 /// to disclosure_log (D6-362).
 pub const PF_TIMEOUT_SECS: u64 = 10;
 
+/// items.id=923: the longest text the Privacy Filter review accepts, in BYTES
+/// of the text (as PASTE_MAX_BYTES is). Longer text is refused, fail closed,
+/// before any part of it is classified. The filter's time follows characters,
+/// so non-ASCII text reaches this cap in fewer characters and runs faster.
+/// About 9 chunks of privacy_filter::CHUNK_TARGET_BYTES: roughly 13 s of review.
+pub const MAX_REVIEW_BYTES: usize = 128 * 1024;
+
 pub struct PrivacyGateway<L: DisclosureLogger> {
     pub logger: L,
 }

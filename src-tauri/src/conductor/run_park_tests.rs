@@ -102,6 +102,10 @@ fn each_family_leaves_a_park_with_its_registered_code() {
             park_result(&Park::FilterUnavailable, "draft", "f"),
             Code::StepReviewPrivacyFilterUnavailable,
         ),
+        (
+            park_result(&Park::TooLong, "draft", "f"),
+            Code::StepReviewTooLong,
+        ),
     ];
     for (failure, code) in cases {
         let park = from_failure(&failure).unwrap_or_else(|| panic!("{code:?} leaves a park"));

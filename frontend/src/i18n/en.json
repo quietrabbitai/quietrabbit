@@ -650,7 +650,8 @@
       "required": "Quiet Rabbit found something in this request that needs your decision before it can be sent. Nothing was sent.",
       "privacy_filter_unavailable": "The privacy check is not available, so this request was not sent.",
       "blocked": "The privacy check could not be completed, so this request was not sent.",
-      "refused": "You chose not to send this request, so it was stopped."
+      "refused": "You chose not to send this request, so it was stopped.",
+      "too_long": "This request is too long for the privacy check, so it was not sent. Shorten it and try again."
     }
   }
 }

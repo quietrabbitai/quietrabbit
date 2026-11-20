@@ -32,6 +32,7 @@
 //                                          ^^^^ build root, not lib/
 
 use std::borrow::Cow;
+use std::ops::Range;
 
 // ---------------------------------------------------------------------------
 // Shared types (always compiled — stub and live paths share the same API)
@@ -717,6 +718,185 @@ pub async fn run_classify_blocking(
 }
 
 // ---------------------------------------------------------------------------
+// Chunked classification (items.id=923, always compiled)
+// ---------------------------------------------------------------------------
+
+/// Target size of one classify call, in bytes. Measured 2026-11-20 with the
+/// real library and model (pf_enabled_chunk_timing): 16 KiB 1.4 s, 20 KiB 2.5 s,
+/// 24 KiB 2.8 s, 32 KiB 4.3 s, 48 KiB 7.2 s. Time grows faster than linearly
+/// and jumps between 16 and 20 KiB, so 16 KiB gives the shortest total review.
+pub(crate) const CHUNK_TARGET_BYTES: usize = 16 * 1024;
+/// Bytes each chunk shares with the previous one, so an entity that a cut
+/// splits is seen whole by the next chunk (names, emails, addresses and
+/// account numbers are far shorter).
+pub(crate) const CHUNK_OVERLAP_BYTES: usize = 1024;
+/// A cut is made after the last whitespace in this many bytes before the
+/// target, else at a character boundary.
+const CUT_WINDOW_BYTES: usize = 2048;
+
+/// The byte ranges `text` is classified in. Text of at most `target` bytes is
+/// one range, the whole text.
+// A one-element Vec of one Range is the intended answer for short text (one chunk).
+#[allow(clippy::single_range_in_vec_init)]
+pub(crate) fn chunk_plan(text: &str, target: usize, overlap: usize) -> Vec<Range<usize>> {
+    let len = text.len();
+    if len <= target {
+        return vec![0..len];
+    }
+    let floor = |mut i: usize| {
+        while !text.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    };
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0;
+    loop {
+        if len - start <= target {
+            out.push(start..len);
+            return out;
+        }
+        let hard = floor(start + target);
+        // After the last ASCII whitespace in the window (an ASCII byte is always a
+        // char boundary), else at the hard limit.
+        let lo = hard
+            .saturating_sub(CUT_WINDOW_BYTES)
+            .max(start + overlap + 1);
+        let end = bytes[lo..hard]
+            .iter()
+            .rposition(u8::is_ascii_whitespace)
+            .map(|i| lo + i + 1)
+            .unwrap_or(hard);
+        out.push(start..end);
+        // At least `overlap` bytes shared with this chunk, and always forward.
+        start = floor(end - overlap).max(start + 1);
+    }
+}
+
+/// Merge spans from different chunks of one text: spans that overlap become
+/// one span over their union (never less coverage), with the LOWEST score (a
+/// lower score raises the review tier) and the label of the member seen with
+/// the most context (farthest from a cut; ties go to the earlier chunk).
+/// `spans` are (chunk index, entity in whole-text offsets); `plan` the chunks.
+fn merge_chunk_spans(
+    text: &str,
+    plan: &[Range<usize>],
+    mut spans: Vec<(usize, PfEntityDecoded)>,
+) -> Vec<PfEntityDecoded> {
+    let last = plan.len() - 1;
+    let context = |chunk: usize, e: &PfEntityDecoded| {
+        let r = &plan[chunk];
+        let left = if chunk == 0 {
+            usize::MAX
+        } else {
+            e.start_byte - r.start
+        };
+        let right = if chunk == last {
+            usize::MAX
+        } else {
+            r.end - e.end_byte
+        };
+        left.min(right)
+    };
+    spans.sort_by_key(|(c, e)| (e.start_byte, e.end_byte, *c));
+    let mut out: Vec<PfEntityDecoded> = Vec::new();
+    // The context and chunk of the member that gave the current label.
+    let mut best: (usize, usize) = (0, 0);
+    for (chunk, e) in spans {
+        let ctx = context(chunk, &e);
+        match out.last_mut() {
+            Some(cur) if e.start_byte < cur.end_byte => {
+                cur.end_byte = cur.end_byte.max(e.end_byte);
+                cur.score = cur.score.min(e.score);
+                if ctx > best.0 || (ctx == best.0 && chunk < best.1) {
+                    cur.label = e.label;
+                    best = (ctx, chunk);
+                }
+            }
+            _ => {
+                best = (ctx, chunk);
+                out.push(e);
+            }
+        }
+    }
+    for e in &mut out {
+        e.span_text =
+            String::from_utf8_lossy(&text.as_bytes()[e.start_byte..e.end_byte]).into_owned();
+    }
+    out
+}
+
+/// How a chunked classification ended. Every outcome but `Entities` is a
+/// failure the caller must fail closed on; no partial result is ever returned.
+#[derive(Debug)]
+pub(crate) enum ChunkedOutcome {
+    /// Every chunk was classified. Offsets are into the whole text.
+    Entities(Vec<PfEntityDecoded>),
+    /// Longer than MAX_REVIEW_BYTES: nothing was classified.
+    TooLong,
+    /// A chunk exceeded the timeout. Later chunks were not classified.
+    TimedOut,
+    /// A chunk's task panicked or was cancelled.
+    Joined(tokio::task::JoinError),
+    /// A chunk's classifier call failed (classify_outcome's Failed).
+    Failed { reason: String },
+}
+
+/// Classify `text` in chunks, one after another (the filter holds one mutex),
+/// each under `timeout`. Stops at the first failure. `classify` is
+/// run_classify_blocking in production and a fake in tests.
+pub(crate) async fn classify_chunked<F, Fut>(
+    text: &str,
+    timeout: std::time::Duration,
+    mut classify: F,
+) -> ChunkedOutcome
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<
+        Output = Result<Result<Vec<PfEntityDecoded>, String>, tokio::task::JoinError>,
+    >,
+{
+    if text.len() > crate::conductor::privacy::MAX_REVIEW_BYTES {
+        return ChunkedOutcome::TooLong;
+    }
+    let plan = chunk_plan(text, CHUNK_TARGET_BYTES, CHUNK_OVERLAP_BYTES);
+    let mut found: Vec<(usize, PfEntityDecoded)> = Vec::new();
+    for (index, range) in plan.iter().enumerate() {
+        let chunk_len = range.end - range.start;
+        let entities =
+            match tokio::time::timeout(timeout, classify(text[range.clone()].to_owned())).await {
+                Err(_) => return ChunkedOutcome::TimedOut,
+                Ok(Err(join_err)) => return ChunkedOutcome::Joined(join_err),
+                Ok(joined) => match classify_outcome(joined) {
+                    PfOutcome::Entities(e) => e,
+                    PfOutcome::Failed { reason } => return ChunkedOutcome::Failed { reason },
+                },
+            };
+        for mut e in entities {
+            // validate_span already clamps a real classifier's spans to the
+            // chunk; anything else here is unusable, so the whole call fails.
+            if e.start_byte > e.end_byte || e.end_byte > chunk_len {
+                return ChunkedOutcome::Failed {
+                    reason: format!(
+                        "span outside its chunk (chunk {index}, start={}, end={}, len={chunk_len})",
+                        e.start_byte, e.end_byte
+                    ),
+                };
+            }
+            e.start_byte += range.start;
+            e.end_byte += range.start;
+            found.push((index, e));
+        }
+    }
+    if plan.len() == 1 {
+        // One call over the whole text: exactly what the classifier returned.
+        return ChunkedOutcome::Entities(found.into_iter().map(|(_, e)| e).collect());
+    }
+    ChunkedOutcome::Entities(merge_chunk_spans(text, &plan, found))
+}
+
+// ---------------------------------------------------------------------------
 // Status for the UI (always compiled, live or stub -- items.id=618)
 // ---------------------------------------------------------------------------
 
@@ -1266,6 +1446,447 @@ mod tests {
         let spans = run_classify_blocking_sync("My name is Alice Smith.", 0.0)
             .expect("classify after reinitialize");
         assert!(!spans.is_empty(), "expected at least one span");
+    }
+
+    /// Synthetic prose of exactly `bytes` bytes (ASCII), with a name, an email
+    /// and a phone number in every paragraph so the classifier has spans to find.
+    #[cfg(privacy_filter_available)]
+    fn timing_prose(bytes: usize) -> String {
+        let names = ["Alice Moreau", "Ravi Shankar", "Jonas Berg", "Mei Tanaka"];
+        let mut out = String::with_capacity(bytes + 512);
+        let mut i = 0usize;
+        while out.len() < bytes {
+            let n = names[i % names.len()];
+            out.push_str(&format!(
+                "Paragraph {i}. Yesterday {n} wrote to the office about the delayed shipment \
+                 and asked for a reply at case{i}@example.com or by phone on 555-01{:02}. \
+                 The order was placed in March and the invoice still shows the old address, \
+                 so the team agreed to check the records again before the end of the week. \n",
+                i % 100
+            ));
+            i += 1;
+        }
+        out.truncate(bytes);
+        out
+    }
+
+    // items.id=923: how long one classify call takes by size, with the real
+    // library and model. Run by hand (it is ignored and PF-enabled only):
+    //   cd src-tauri && TMPDIR=$HOME/.cache/qr-923-tmp \
+    //     CARGO_TARGET_DIR=$HOME/.cache/qr-618-target-pf \
+    //     PRIVACY_FILTER_LIB_DIR=$HOME/privacy-filter.cpp/build/release-portable \
+    //     QR_PRIVACY_FILTER_MODEL=$HOME/.local/share/quietrabbit/models/privacy-filter-q8.gguf \
+    //     cargo test --lib privacy_filter::tests::pf_enabled_chunk_timing -- --ignored --nocapture
+    #[cfg(privacy_filter_available)]
+    #[test]
+    #[ignore]
+    fn pf_enabled_chunk_timing() {
+        if !is_available() {
+            eprintln!("SKIPPED: the Privacy Filter model did not load");
+            return;
+        }
+        // Warm up (the first call pays one-time setup).
+        let _ = run_classify_blocking_sync(&timing_prose(2 * 1024), 0.0).expect("warm-up");
+        for kib in [4usize, 8, 12, 16, 20, 24, 32, 48] {
+            let text = timing_prose(kib * 1024);
+            let mut runs = Vec::new();
+            let mut spans = 0;
+            for _ in 0..2 {
+                let t = std::time::Instant::now();
+                let found = run_classify_blocking_sync(&text, 0.0).expect("classify");
+                runs.push(t.elapsed().as_secs_f64());
+                spans = found.len();
+            }
+            eprintln!(
+                "pf_timing: {kib:>3} KiB ({} chars) runs {:.2}s {:.2}s spans {spans}",
+                text.chars().count(),
+                runs[0],
+                runs[1]
+            );
+        }
+
+        // The whole review path at the cap: chunked, real classifier. Every
+        // seeded email must come back once, at whole-text offsets.
+        let text = timing_prose(crate::conductor::privacy::MAX_REVIEW_BYTES);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let t = std::time::Instant::now();
+        let out = rt.block_on(classify_chunked(
+            &text,
+            std::time::Duration::from_secs(crate::conductor::privacy::PF_TIMEOUT_SECS),
+            |chunk| run_classify_blocking(chunk, 0.0),
+        ));
+        let secs = t.elapsed().as_secs_f64();
+        let ChunkedOutcome::Entities(found) = out else {
+            panic!("chunked review at the cap failed: {out:?}");
+        };
+        let chunks = chunk_plan(&text, CHUNK_TARGET_BYTES, CHUNK_OVERLAP_BYTES).len();
+        let emails: Vec<usize> = text.match_indices("@example.com").map(|(i, _)| i).collect();
+        let mut hit = 0;
+        let mut twice = 0;
+        for at in &emails {
+            let n = found
+                .iter()
+                .filter(|e| e.start_byte <= *at && *at < e.end_byte)
+                .count();
+            hit += usize::from(n >= 1);
+            twice += usize::from(n > 1);
+        }
+        for e in &found {
+            assert_eq!(
+                text.get(e.start_byte..e.end_byte),
+                Some(e.span_text.as_str())
+            );
+        }
+        eprintln!(
+            "pf_timing: chunked {} KiB in {chunks} chunks: {secs:.2}s, spans {}, emails found {hit}/{}, \
+             covered twice {twice}",
+            text.len() / 1024,
+            found.len(),
+            emails.len()
+        );
+        assert_eq!(twice, 0, "no email is reported twice");
+    }
+
+    // -- chunked classification (items.id=923) ---------------------------------
+
+    mod chunked {
+        use super::super::*;
+        use crate::conductor::privacy::MAX_REVIEW_BYTES;
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        type Classified = Result<Result<Vec<PfEntityDecoded>, String>, tokio::task::JoinError>;
+
+        fn span(start: usize, end: usize, label: &str, score: f32, text: &str) -> PfEntityDecoded {
+            PfEntityDecoded {
+                start_byte: start,
+                end_byte: end,
+                score,
+                label: label.to_owned(),
+                span_text: text[start..end].to_owned(),
+            }
+        }
+
+        /// A classifier that finds every whole occurrence of `needle` in the
+        /// chunk it is given (chunk-local offsets), and counts its calls.
+        fn finder(
+            needle: &'static str,
+            calls: Rc<Cell<usize>>,
+        ) -> impl FnMut(String) -> std::future::Ready<Classified> {
+            move |chunk: String| {
+                calls.set(calls.get() + 1);
+                let found = chunk
+                    .match_indices(needle)
+                    .map(|(i, _)| span(i, i + needle.len(), "private_email", 0.9, &chunk))
+                    .collect();
+                std::future::ready(Ok(Ok(found)))
+            }
+        }
+
+        fn words(bytes: usize) -> String {
+            let mut s = String::new();
+            let mut i = 0;
+            while s.len() < bytes {
+                s.push_str(&format!("word{i} é日 "));
+                i += 1;
+            }
+            while !s.is_char_boundary(bytes) {
+                s.pop();
+            }
+            s.truncate(bytes);
+            s
+        }
+
+        #[test]
+        #[allow(clippy::single_range_in_vec_init)]
+        fn a_text_at_or_below_the_target_is_one_whole_chunk() {
+            assert_eq!(chunk_plan("", 16, 4), vec![0..0]);
+            let t = words(CHUNK_TARGET_BYTES);
+            assert_eq!(
+                chunk_plan(&t, CHUNK_TARGET_BYTES, CHUNK_OVERLAP_BYTES),
+                vec![0..t.len()]
+            );
+        }
+
+        #[test]
+        fn chunks_cover_the_text_overlap_and_sit_on_char_boundaries() {
+            let t = words(100 * 1024 + 7);
+            let plan = chunk_plan(&t, CHUNK_TARGET_BYTES, CHUNK_OVERLAP_BYTES);
+            assert!(plan.len() > 1);
+            assert_eq!(plan[0].start, 0);
+            assert_eq!(plan.last().unwrap().end, t.len());
+            for r in &plan {
+                assert!(r.end - r.start <= CHUNK_TARGET_BYTES, "{r:?}");
+                assert!(t.is_char_boundary(r.start) && t.is_char_boundary(r.end));
+            }
+            for w in plan.windows(2) {
+                assert!(w[1].start > w[0].start, "progress {w:?}");
+                assert!(
+                    w[0].end - w[1].start >= CHUNK_OVERLAP_BYTES,
+                    "overlap {w:?}"
+                );
+            }
+            // Cuts fall after whitespace when there is any near the target.
+            for r in &plan[..plan.len() - 1] {
+                assert_eq!(t.as_bytes()[r.end - 1], b' ', "cut at {r:?}");
+            }
+        }
+
+        #[test]
+        fn text_with_no_whitespace_is_cut_at_a_char_boundary() {
+            let t = "日".repeat(20_000);
+            let plan = chunk_plan(&t, CHUNK_TARGET_BYTES, CHUNK_OVERLAP_BYTES);
+            assert!(plan.len() > 1);
+            for r in &plan {
+                assert!(t.is_char_boundary(r.start) && t.is_char_boundary(r.end));
+                assert!(r.end - r.start <= CHUNK_TARGET_BYTES);
+            }
+            assert_eq!(plan.last().unwrap().end, t.len());
+        }
+
+        #[tokio::test]
+        async fn offsets_come_back_in_the_whole_text_once_each() {
+            let needle = "case7@example.com";
+            let mut t = words(60 * 1024);
+            // Place the needle every ~5 KiB, on a space so words stay whole.
+            let mut at = Vec::new();
+            let mut p = 1000;
+            while p + needle.len() < t.len() {
+                let q = t[p..].find(' ').map(|i| p + i + 1).unwrap();
+                t.insert_str(q, &format!("{needle} "));
+                at.push(q);
+                p = q + 5000;
+            }
+            let calls = Rc::new(Cell::new(0));
+            let out =
+                classify_chunked(&t, Duration::from_secs(5), finder(needle, calls.clone())).await;
+            let ChunkedOutcome::Entities(found) = out else {
+                panic!("expected entities, got {out:?}");
+            };
+            let starts: Vec<usize> = found.iter().map(|e| e.start_byte).collect();
+            assert_eq!(
+                starts, at,
+                "each needle exactly once, in whole-text offsets"
+            );
+            for e in &found {
+                assert_eq!(&t[e.start_byte..e.end_byte], needle);
+                assert_eq!(e.span_text, needle);
+            }
+            assert!(calls.get() > 1);
+        }
+
+        #[tokio::test]
+        async fn an_entity_across_a_cut_is_one_span_that_covers_it() {
+            let needle = "case7@example.com";
+            let mut t = "x".repeat(40 * 1024);
+            let cut = chunk_plan(&t, CHUNK_TARGET_BYTES, CHUNK_OVERLAP_BYTES)[0].end;
+            let pos = cut - 8;
+            t.replace_range(pos..pos + needle.len(), needle);
+            let plan = chunk_plan(&t, CHUNK_TARGET_BYTES, CHUNK_OVERLAP_BYTES);
+            assert!(
+                plan[0].end > pos && plan[0].end < pos + needle.len(),
+                "straddles"
+            );
+
+            // The chunk that ends inside the entity reports the fragment it sees,
+            // with another label and a higher score; the next sees it whole.
+            let classify = move |chunk: String| {
+                let mut found = Vec::new();
+                if let Some(i) = chunk.find(needle) {
+                    found.push(span(i, i + needle.len(), "private_email", 0.80, &chunk));
+                } else if let Some(i) = chunk.find("case7@") {
+                    found.push(span(i, chunk.len(), "private_url", 0.95, &chunk));
+                }
+                std::future::ready::<Classified>(Ok(Ok(found)))
+            };
+            let out = classify_chunked(&t, Duration::from_secs(5), classify).await;
+            let ChunkedOutcome::Entities(found) = out else {
+                panic!("expected entities, got {out:?}");
+            };
+            assert_eq!(found.len(), 1, "{found:?}");
+            let e = &found[0];
+            assert_eq!((e.start_byte, e.end_byte), (pos, pos + needle.len()));
+            assert_eq!(e.span_text, needle);
+            assert_eq!(e.score, 0.80, "the lower score");
+            assert_eq!(e.label, "private_email", "the label seen with more context");
+        }
+
+        /// The member seen with more context sorts FIRST here (the earlier chunk
+        /// sees the entity whole; the next starts inside it and sees a suffix).
+        #[tokio::test]
+        async fn the_label_comes_from_the_member_seen_with_most_context() {
+            let needle = "case7@example.com";
+            let mut t = "x".repeat(40 * 1024);
+            let next_start = chunk_plan(&t, CHUNK_TARGET_BYTES, CHUNK_OVERLAP_BYTES)[1].start;
+            let pos = next_start - 6;
+            t.replace_range(pos..pos + needle.len(), needle);
+            let plan = chunk_plan(&t, CHUNK_TARGET_BYTES, CHUNK_OVERLAP_BYTES);
+            assert!(
+                plan[1].start > pos && plan[1].start < pos + needle.len(),
+                "straddles"
+            );
+
+            let classify = move |chunk: String| {
+                let mut found = Vec::new();
+                if let Some(i) = chunk.find(needle) {
+                    found.push(span(i, i + needle.len(), "private_email", 0.80, &chunk));
+                } else if chunk.starts_with("example.com") {
+                    found.push(span(0, "example.com".len(), "private_url", 0.95, &chunk));
+                }
+                std::future::ready::<Classified>(Ok(Ok(found)))
+            };
+            let out = classify_chunked(&t, Duration::from_secs(5), classify).await;
+            let ChunkedOutcome::Entities(found) = out else {
+                panic!("expected entities, got {out:?}");
+            };
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(
+                (found[0].start_byte, found[0].end_byte),
+                (pos, pos + needle.len())
+            );
+            assert_eq!(found[0].label, "private_email");
+            assert_eq!(found[0].score, 0.80);
+        }
+
+        #[tokio::test]
+        async fn an_entity_inside_an_overlap_is_reported_once() {
+            let needle = "case7@example.com";
+            let mut t = "x".repeat(40 * 1024);
+            let cut = chunk_plan(&t, CHUNK_TARGET_BYTES, CHUNK_OVERLAP_BYTES)[0].end;
+            let pos = cut - 300;
+            t.replace_range(pos..pos + needle.len(), needle);
+            let plan = chunk_plan(&t, CHUNK_TARGET_BYTES, CHUNK_OVERLAP_BYTES);
+            assert!(
+                plan[1].start <= pos && pos + needle.len() <= plan[0].end,
+                "in both"
+            );
+            let calls = Rc::new(Cell::new(0));
+            let out = classify_chunked(&t, Duration::from_secs(5), finder(needle, calls)).await;
+            let ChunkedOutcome::Entities(found) = out else {
+                panic!("expected entities, got {out:?}");
+            };
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(
+                (found[0].start_byte, found[0].end_byte),
+                (pos, pos + needle.len())
+            );
+        }
+
+        #[tokio::test]
+        async fn one_chunk_returns_the_classifier_output_unchanged() {
+            let t = "Alice Smith wrote".to_owned();
+            let classify = |chunk: String| {
+                let found = vec![
+                    span(0, 11, "private_person", 0.9, &chunk),
+                    span(6, 11, "private_person", 0.5, &chunk),
+                ];
+                std::future::ready::<Classified>(Ok(Ok(found)))
+            };
+            let out = classify_chunked(&t, Duration::from_secs(5), classify).await;
+            let ChunkedOutcome::Entities(found) = out else {
+                panic!("expected entities, got {out:?}");
+            };
+            assert_eq!(found.len(), 2, "no merge inside one call");
+            assert_eq!((found[1].start_byte, found[1].score), (6, 0.5));
+        }
+
+        #[tokio::test]
+        async fn text_over_the_cap_is_refused_before_any_call() {
+            let calls = Rc::new(Cell::new(0));
+            let t = "a".repeat(MAX_REVIEW_BYTES + 1);
+            let out =
+                classify_chunked(&t, Duration::from_secs(5), finder("@", calls.clone())).await;
+            assert!(matches!(out, ChunkedOutcome::TooLong), "{out:?}");
+            assert_eq!(calls.get(), 0);
+
+            let t = "a".repeat(MAX_REVIEW_BYTES);
+            let out =
+                classify_chunked(&t, Duration::from_secs(5), finder("@", calls.clone())).await;
+            assert!(matches!(out, ChunkedOutcome::Entities(_)), "{out:?}");
+            assert!(calls.get() > 1);
+        }
+
+        /// A classifier whose `nth` call (1-based) misbehaves as `bad` says.
+        fn failing_at(
+            nth: usize,
+            calls: Rc<Cell<usize>>,
+            bad: &'static str,
+        ) -> impl FnMut(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Classified>>>
+        {
+            move |_chunk: String| {
+                calls.set(calls.get() + 1);
+                let n = calls.get();
+                Box::pin(async move {
+                    if n != nth {
+                        return Ok(Ok(vec![]));
+                    }
+                    match bad {
+                        "slow" => {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            Ok(Ok(vec![]))
+                        }
+                        "error" => Ok(Err("pf_classify failed (rc=1)".to_owned())),
+                        _ => Err(tokio::spawn(async { panic!("boom") }).await.unwrap_err()),
+                    }
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn a_failing_chunk_fails_the_whole_review_and_stops_there() {
+            let t = "a ".repeat(40 * 1024);
+            for (bad, want) in [
+                ("slow", "timeout"),
+                ("error", "failed"),
+                ("panic", "joined"),
+            ] {
+                let calls = Rc::new(Cell::new(0));
+                let out = classify_chunked(
+                    &t,
+                    Duration::from_millis(100),
+                    failing_at(2, calls.clone(), bad),
+                )
+                .await;
+                let got = match out {
+                    ChunkedOutcome::TimedOut => "timeout",
+                    ChunkedOutcome::Failed { .. } => "failed",
+                    ChunkedOutcome::Joined(_) => "joined",
+                    other => panic!("{bad}: {other:?}"),
+                };
+                assert_eq!(got, want, "{bad}");
+                assert_eq!(calls.get(), 2, "{bad}: no chunk after the failing one");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_span_outside_its_chunk_fails_closed() {
+            let t = "a ".repeat(20 * 1024);
+            let classify = |chunk: String| {
+                let bad = PfEntityDecoded {
+                    start_byte: 0,
+                    end_byte: chunk.len() + 1,
+                    score: 0.9,
+                    label: "secret".to_owned(),
+                    span_text: String::new(),
+                };
+                std::future::ready::<Classified>(Ok(Ok(vec![bad])))
+            };
+            let out = classify_chunked(&t, Duration::from_secs(5), classify).await;
+            assert!(matches!(out, ChunkedOutcome::Failed { .. }), "{out:?}");
+        }
+
+        #[test]
+        fn the_constants_leave_room_for_progress() {
+            const {
+                assert!(CHUNK_OVERLAP_BYTES * 4 <= CHUNK_TARGET_BYTES);
+                assert!(CUT_WINDOW_BYTES + CHUNK_OVERLAP_BYTES < CHUNK_TARGET_BYTES / 2);
+                assert!(MAX_REVIEW_BYTES > CHUNK_TARGET_BYTES);
+            }
+        }
     }
 
     fn ent() -> PfEntityDecoded {

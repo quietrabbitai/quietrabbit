@@ -19,7 +19,12 @@
 //       and target_tier >= 2, block with gate3_pf_unavailable_block. Debug and
 //       test builds skip this and keep 2b.
 //   2a. Privacy Filter path (compiled in + app_handle present):
-//       - spawn_blocking FFI call with 10s timeout (non-negotiable)
+//       - spawn_blocking FFI calls, one chunk of at most CHUNK_TARGET_BYTES at a
+//         time, each with the 10s timeout (non-negotiable); spans are mapped to
+//         whole-text offsets and merged across chunk overlaps (items.id=923)
+//       - Text over MAX_REVIEW_BYTES → gate3_pf_too_long + blocked, nothing classified
+//       - Any chunk timing out, panicking or failing ends the review at once
+//         through the arm below; later chunks are not classified
 //       - Timeout           → gate_timeout disclosure event + blocked result
 //       - spawn_blocking panic → same as timeout (conservative)
 //       - PF error          → gate3_pf_error_block disclosure event + blocked result
@@ -64,7 +69,7 @@ use super::{
     errors::DisclosureLogWriteError,
     fact_identity,
     logger::{DisclosureLogEntry, DisclosureLogger},
-    privacy_filter::{self, classify_outcome, join_error_reason, PfEntityDecoded, PfOutcome},
+    privacy_filter::{self, join_error_reason, ChunkedOutcome, PfEntityDecoded},
     types::{AutoResolvedSpan, ConsentRequestPayload, ConsentSpanItem, Gate3Result, ReviewTier},
     PF_TIMEOUT_SECS,
 };
@@ -329,6 +334,49 @@ async fn pf_error_block<L: DisclosureLogger>(
     })
 }
 
+/// items.id=923: the content is longer than MAX_REVIEW_BYTES, so it was not
+/// reviewed and does not pass. Nothing was classified. Takes no AppHandle and
+/// emits nothing, like pf_error_block. The outbound review refuses such a
+/// prompt itself, with its own code, before gate3 is called; this is the
+/// backstop for every other caller.
+///
+/// CHAT-BRAND REVIEW: placeholder plain_language, mirroring its neighbours.
+async fn pf_too_long_block<L: DisclosureLogger>(
+    logger: &L,
+    action_id: &str,
+    focus_run_id: &str,
+    execution_tier: u8,
+    content_key: &str,
+) -> Result<Gate3Result, DisclosureLogWriteError> {
+    log::warn!(
+        "gate3: content over {} bytes, blocked without review (fail closed)",
+        crate::conductor::privacy::MAX_REVIEW_BYTES
+    );
+    logger
+        .write(DisclosureLogEntry {
+            action_id: action_id.to_string(),
+            focus_run_id: focus_run_id.to_string(),
+            execution_tier,
+            abstraction_tier: None,
+            provider: None,
+            fields_shared: vec![],
+            fields_abstracted: IndexMap::new(),
+            fields_withheld: vec![content_key.to_string()],
+            override_declined: true,
+            event_type: "gate3_pf_too_long".to_string(),
+            category: None,
+            fact_key: None,
+        })
+        .await?;
+    Ok(Gate3Result {
+        blocked: true,
+        plain_language: Some(
+            "This content is too long for the privacy review. Content blocked.".to_string(),
+        ),
+        ..Gate3Result::default()
+    })
+}
+
 /// Release build, Privacy Filter unavailable, content bound for an external
 /// tier: nothing was reviewed, so nothing is promoted (items.id=618). Takes no
 /// AppHandle and emits nothing, like pf_error_block.
@@ -393,17 +441,23 @@ async fn gate3_with_pf<L: DisclosureLogger>(
     // rating when the caller knows its destination set, else target_tier
     // itself (today's exact behavior, unchanged).
     let destination_risk = destination_risk_rating.unwrap_or(target_tier);
-    let text = content_text.to_owned();
-
+    // items.id=923: the text is classified in chunks of CHUNK_TARGET_BYTES, one
+    // after another, each under PF_TIMEOUT_SECS, with the spans mapped back to
+    // whole-text offsets. The first chunk that times out or fails ends the
+    // review through the same arm a single call took; nothing partial is used.
+    // Text over MAX_REVIEW_BYTES is refused before any chunk is classified.
     // run_classify_blocking spawn_blocking's internally (items.id=479) —
     // FFI call is a synchronous C library and must not block the async executor.
-    let pf_task = privacy_filter::run_classify_blocking(text, 0.0);
-
-    let pf_outcome = tokio::time::timeout(Duration::from_secs(PF_TIMEOUT_SECS), pf_task).await;
+    let pf_outcome = privacy_filter::classify_chunked(
+        content_text,
+        Duration::from_secs(PF_TIMEOUT_SECS),
+        |chunk| privacy_filter::run_classify_blocking(chunk, 0.0),
+    )
+    .await;
 
     let entities: Vec<PfEntityDecoded> = match pf_outcome {
         // Timeout: write gate_timeout to disclosure_log (IPC flag — distinct event type).
-        Err(_elapsed) => {
+        ChunkedOutcome::TimedOut => {
             log::warn!("gate3: Privacy Filter timed out after {PF_TIMEOUT_SECS}s");
             logger
                 .write(DisclosureLogEntry {
@@ -436,7 +490,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
         }
 
         // spawn_blocking panicked: treat conservatively — same path as timeout.
-        Ok(Err(join_err)) => {
+        ChunkedOutcome::Joined(join_err) => {
             log::error!("gate3: {}", join_error_reason(&join_err));
             logger
                 .write(DisclosureLogEntry {
@@ -472,20 +526,26 @@ async fn gate3_with_pf<L: DisclosureLogger>(
         // bad span, rc != 0): fail closed (items.id=613). The panic arm above
         // is matched first, so the mapper only sees a non-panic result here.
         // Not a timeout: no gate_timeout event, timeout stays false.
-        Ok(joined) => match classify_outcome(joined) {
-            PfOutcome::Entities(entities) => entities,
-            PfOutcome::Failed { reason } => {
-                return pf_error_block(
-                    logger,
-                    action_id,
-                    focus_run_id,
-                    execution_tier,
-                    content_key,
-                    &reason,
-                )
+        // (classify_chunked maps each chunk's result through classify_outcome.)
+        ChunkedOutcome::Entities(entities) => entities,
+        ChunkedOutcome::Failed { reason } => {
+            return pf_error_block(
+                logger,
+                action_id,
+                focus_run_id,
+                execution_tier,
+                content_key,
+                &reason,
+            )
+            .await;
+        }
+
+        // items.id=923: over MAX_REVIEW_BYTES. Nothing was classified, so
+        // nothing passes. Not a timeout and not a classifier error.
+        ChunkedOutcome::TooLong => {
+            return pf_too_long_block(logger, action_id, focus_run_id, execution_tier, content_key)
                 .await;
-            }
-        },
+        }
     };
 
     // items.id=406 (decisions.id=756/757): partition entities into those
@@ -1041,7 +1101,7 @@ fn generalization_suggestion(category: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conductor::privacy::privacy_filter::PfEntityDecoded;
+    use crate::conductor::privacy::privacy_filter::{classify_outcome, PfEntityDecoded, PfOutcome};
 
     fn entity(score: f32, label: &str) -> PfEntityDecoded {
         PfEntityDecoded {

@@ -35,6 +35,14 @@
 // spend/codes.rs and the reason as data. A debug build without
 // PRIVACY_FILTER_LIB_DIR therefore parks every external step, by design.
 //
+// LONG PROMPTS (items.id=923). A prompt longer than privacy::MAX_REVIEW_BYTES
+// (128 KiB) is refused before the filter is consulted (Park::TooLong, code
+// step_review.too_long) and nothing is sent. A shorter one is classified by gate3
+// in chunks (privacy_filter::classify_chunked) whose spans come back in
+// whole-prompt offsets, so the hash, the stored descriptors, the held span text
+// and the rebuilt outbound text are the same as for a one-call review. The first
+// chunk that times out or fails parks the step as a single call would.
+//
 // PARK AND RESUME (decisions.id=875: attended or not, one rule). When the filter
 // flagged spans the user must decide on, a step_reviews row is written PENDING
 // (hash, offsets, categories: no text), gate3 has already emitted consent_request,
@@ -446,6 +454,9 @@ pub enum Park {
     },
     /// The Privacy Filter is not available.
     FilterUnavailable,
+    /// The prompt is longer than privacy::MAX_REVIEW_BYTES (items.id=923): refused
+    /// before any scan.
+    TooLong,
     Blocked(BlockReason),
 }
 
@@ -715,6 +726,38 @@ pub async fn review_prompt<S: ReviewScanner>(
     match store::supersede_pending_for_action(conn, input.run_id, input.action_id).await {
         Ok(ids) => ids.iter().for_each(|id| drop_held(id)),
         Err(_) => return block(conn, input, &sha, BlockReason::RecordUnavailable).await,
+    }
+
+    // items.id=923: a prompt longer than the review accepts is refused before
+    // any part of it is scanned. Nothing is sent; the row records the reason.
+    let prompt_bytes = input.prompt.len();
+    if prompt_bytes > crate::conductor::privacy::MAX_REVIEW_BYTES {
+        log::warn!(
+            "step_review_blocked: run={} action={} prompt_sha={} reason=prompt_too_long bytes={}",
+            input.run_id,
+            input.action_id,
+            short(&sha),
+            prompt_bytes
+        );
+        let spans = StoredSpans::default();
+        let _ = store::insert_review(
+            conn,
+            &NewReview {
+                focus_run_id: input.run_id,
+                action_id: input.action_id,
+                prompt_sha: &sha,
+                prompt_len: input.prompt.len(),
+                spans: &spans,
+                counts: Counts::default(),
+                outcome: ReviewOutcome::Blocked,
+                reason: Some("prompt_too_long"),
+                outbound_sha: None,
+                outbound_len: None,
+                provider_id: input.provider_id,
+            },
+        )
+        .await;
+        return ReviewDecision::Park(Park::TooLong);
     }
 
     if !scanner.filter_available() {
@@ -1059,6 +1102,12 @@ pub fn park_result(park: &Park, action_id: &str, focus_id: &str) -> FailureResul
             FailureAction::AwaitUser,
             FailureSeverity::Require,
             vec![("reason", "filter_unavailable".to_owned())],
+        ),
+        Park::TooLong => (
+            Code::StepReviewTooLong,
+            FailureAction::AwaitUser,
+            FailureSeverity::Require,
+            vec![("reason", "prompt_too_long".to_owned())],
         ),
         Park::Blocked(reason) => (
             Code::StepReviewBlocked,
@@ -1552,6 +1601,30 @@ mod tests {
         assert_eq!(r[0].reason.as_deref(), Some("filter_unavailable"));
     }
 
+    /// items.id=923: a prompt over the cap is refused before anything else
+    /// looks at it, with its own code, and nothing is scanned or sent.
+    #[tokio::test]
+    async fn a_prompt_over_the_cap_is_refused_before_any_scan() {
+        use crate::conductor::privacy::MAX_REVIEW_BYTES;
+        let mut c = conn().await;
+        let scanner = FakeScanner::clean();
+        let long = "a".repeat(MAX_REVIEW_BYTES + 1);
+        let p = parked(review_prompt(&mut c, &scanner, &input(&long)).await);
+        assert_eq!(p, Park::TooLong);
+        assert_eq!(scanner.calls(), 0, "no chunk is scanned");
+        let r = rows(&mut c).await;
+        assert_eq!(r[0].outcome, ReviewOutcome::Blocked);
+        assert_eq!(r[0].reason.as_deref(), Some("prompt_too_long"));
+        assert_eq!(r[0].outbound_sha, None, "nothing was released");
+
+        // At the cap it is reviewed as usual.
+        let mut c = conn().await;
+        let at_cap = "a".repeat(MAX_REVIEW_BYTES);
+        let d = review_prompt(&mut c, &scanner, &input(&at_cap)).await;
+        assert!(matches!(d, ReviewDecision::Send(_)), "{d:?}");
+        assert_eq!(scanner.calls(), 1);
+    }
+
     #[tokio::test]
     async fn no_app_handle_parks_the_step_and_calls_nothing() {
         let mut c = conn().await;
@@ -2003,6 +2076,15 @@ mod tests {
             "step_review.privacy_filter_unavailable"
         );
 
+        let too_long = park_result(&Park::TooLong, "act", "foc");
+        assert_eq!(too_long.action, FailureAction::AwaitUser);
+        assert_eq!(too_long.severity, FailureSeverity::Require);
+        assert!(too_long.is_recoverable);
+        let m = too_long.metadata.as_ref().unwrap();
+        assert_eq!(m["code"], "step_review.too_long");
+        assert_eq!(m["reason"], "prompt_too_long");
+        assert_eq!(too_long.plain_language, "step_review.too_long");
+
         for reason in [
             BlockReason::NoAppHandle,
             BlockReason::Timeout,
@@ -2023,6 +2105,24 @@ mod tests {
     }
 
     // -- the prompt type and the held text ----------------------------------------
+
+    /// Every step_review code has its placeholder copy under step_review.stop
+    /// (Chat-BRAND owns the wording).
+    #[test]
+    fn every_step_review_code_has_a_stop_key_in_en_json() {
+        let en: serde_json::Value =
+            serde_json::from_str(include_str!("../../../frontend/src/i18n/en.json")).unwrap();
+        for code in Code::ALL
+            .iter()
+            .filter(|c| c.as_str().starts_with("step_review."))
+        {
+            let leaf = code.as_str().trim_start_matches("step_review.");
+            assert!(
+                en["step_review"]["stop"][leaf].is_string(),
+                "en.json has no step_review.stop.{leaf}"
+            );
+        }
+    }
 
     #[test]
     fn a_reviewed_prompt_debug_shows_a_count_and_a_hash_never_the_text() {
