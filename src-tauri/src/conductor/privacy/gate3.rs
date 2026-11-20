@@ -34,7 +34,7 @@
 //       - severity >= 3 AND target_tier >= 2 → gate3_sensitivity_block + blocked
 //       - Otherwise → gate3_promotion_approved + approved
 //
-// D6-362: PG_GATE_3 fires unconditionally when sensitivity_ceiling > 0 AND
+// D6-362: PG_GATE_3 fires unconditionally when the just-completed step's own severity > 0 AND
 // content is about to cross a tier boundary. Fallback path preserves existing
 // golden-vector behavior for builds where Privacy Filter library is not compiled in.
 //

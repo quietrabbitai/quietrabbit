@@ -1,5 +1,9 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: November 20, 2026 (items.id=681: new "Parked-run retention and resume staleness"
+# Last updated: November 20, 2026 (items.id=922: new "Persona context, the output scan and external-step
+# scoring" section; the external-model-step gap note under "Manual hand-off", the persona_context and
+# scan_output item (2) under "Privacy treatment of a step attempt" (KNOWN BEHAVIOURS) and the Prompt
+# Authoring Rule; nothing else.).
+# Before that, November 20, 2026 (items.id=681: new "Parked-run retention and resume staleness"
 # section; the PersonalTrack line under "Key Architectural Decisions" and the user_input bullet under
 # "Model blocks"; nothing else.).
 # Before that, November 19, 2026 (items.id=932: new "Single-pass render substitution" section; the VALUE
@@ -684,11 +688,12 @@ selection and before Gate 1, through `derive_treatment(ctx, resolver_req, &selec
      stored_tier <= abstraction_tier). A resumed external step, resolved or ordinary, therefore
      parks on floor consent again until the user saves the preference. Existing behaviour,
      left alone; the hosted pick matches it.
-  2. Two other run-level reads still key off the Focus ceiling, not the pick: the persona_context
-     memory slice is assembled once per run at the Focus's max tier (lifecycle.rs
-     assemble_persona_context) and scan_output at output creation uses _focus_max_permitted_tier.
-     A local pick in an external-ceiling Focus therefore still gets the tier-limited memory slice.
-     Not part of items.id=921; its own item.
+  2. Two run-level reads did key off the Focus ceiling, not the pick (items.id=922 re-checked
+     both: neither leaks). scan_output at output creation now logs the highest tier a step used.
+     The persona_context memory slice is still assembled at the Focus's max tier (a LOWER tier
+     gets MORE scopes, so the ceiling slice is strict, and its only reader is the local render),
+     but only when a step names {persona_context}. See "Persona context, the output scan and
+     external-step scoring".
   3. A floor-consent "use local" answer cannot re-route a resolved step: the resolver never reads
      that preference. A hosted pick that parks on floor consent stays a hosted pick on resume
      unless readiness changes.
@@ -786,9 +791,9 @@ in a run, so nothing depends on resume. The legacy requires_user_handoff pause i
     user_input in a Focus that has a handoff_ingest row (handoff_render::store_backed_inputs);
     (3) any other declared name (the {user_input} token with no return row, a field name)
     contributes nothing. Items.id=884's rider; only declared inputs count. routing_tier_used
-    stays 1: the render itself calls nothing. (An EXTERNAL MODEL step's record still scores only
-    Gate 1 projected fields, so a store-backed input it names is not marked personal: items.id=922
-    closes this gap, not built, and it must land before items.id=913 turns hosted blocks on.)
+    stays 1: the render itself calls nothing. (An EXTERNAL MODEL step's record used to score only
+    Gate 1 projected fields, so a store-backed input it names was not marked personal: items.id=922
+    closed this gap, see "Persona context, the output scan and external-step scoring".)
   - handoff_pending (Session bound name, `h_` plus 12 lowercase hex of SHA-256 over run and
     row) is written by the render through the typed session store: latch-gated (a one-time
     chat still shows the starter and records nothing), NOT collection-consent gated (no user
@@ -1490,6 +1495,65 @@ values, in HashMap order) and then stripped every leftover {x} from the whole re
   unknown or malformed braces; nested {{a}}, unclosed braces, invalid shapes are identical). Mutations M1 to
   M5 (old loop, post-pass strip, per-path post-render replace, fixpoint, unresolved token left) each fail a test.
 
+## Persona context, the output scan and external-step scoring (items.id=922, decisions.id=947, 952, 953)
+Two reads that keyed off the run ceiling, and three gaps found with them, built in five stages.
+- DIRECTION CHECK (live source, neither leaks). (1) persona_context: the tier only picks visibility
+  scopes (domain_context_store::get_eligible_scopes, plan_state_store::eligible_scopes_for_tier) and a
+  HIGHER tier gets FEWER scopes, so the ceiling slice is a subset of a tier-1 slice; its only reader is
+  the local render (the external one inserts an empty string, items.id=882). The tier was left as the
+  ceiling on purpose (a tier-1 slice would widen what a local step sees, ruled out). (2) scan_output:
+  execution_tier reaches only the disclosure row; the block decision is the Privacy Filter result, or
+  without it the severity (output_scan.rs legacy path), never the tier. A test pins that.
+- TOKEN SHAPE AT LOAD (declared_inputs::lint_with, OutputVarNotTokenShaped, both loaders). Every
+  recorded variable (ordinary output_var, block handler, render row, store writer's published variable) must
+  be [a-z_][a-z0-9_]*. Before this the renderer resolved `{Draft}` (substitute_once looks up ANY
+  brace-free key) while find_tokens, which the declared-inputs rule and both taint closures read, did not
+  see it: an external step could take a local step's output undeclared. Shipped Focuses had no hits.
+  NOT SHAPE-CHECKED: the field_requirements names of a LOCAL step (an external step's are checked against
+  the catalogue by items.id=931); a local name with other characters is not looked up by find_tokens.
+- PERSONA CARRY REFUSED AT LOAD (declared_inputs::lint_persona_carry, PersonaContextCarriedToExternalStep).
+  An external step may not name or declare a variable derived from a LOCAL step that names
+  {persona_context}, nor read {previous_output} after such a row: taint_closure_of over ["persona_context"],
+  transitive, with the {previous_output} over-approximation (it can refuse a clean Focus, never admit a
+  carrying one). Refused, not tainted: persona_context is a system token, not a bound name, and tainting
+  would restrict it and drop steps from extraction. A local step may read such a variable. NO runtime
+  backstop for this carry. items.id=903's record names no step that carries it.
+- STORE-BACKED FLOOR ON EXTERNAL STEPS (executor.rs recorded_step, apply_store_backed_floor). A step that
+  went to a hosted destination (`treatment.hosted`) and DECLARES a store-backed input (a bound name, a
+  variable a tainted step produced, or user_input in a Focus that ingests a pasted reply:
+  StoreTokens::is_store_backed, pinned equal to handoff_render::store_backed_inputs) records severity at
+  least 2 and personal_flagged true. A floor only: it never lowers a severity and never sets
+  audit_unavailable; a local step is unchanged; undeclared names do not count. StoreTokens carries
+  user_input_backed beside restricted, both from seeding::store_state, set by every pass in execute(), so a
+  resumed run scores the same as a fresh one (a real rehydrate_focus_run is tested).
+  `personal_flagged` ON A FLOORED STEP MEANS "STORE-BACKED INPUT", NOT "GATE 2 FOUND A VALUE". Its only
+  consumer is the status payload field, which nothing renders yet; a screen must not read it as a Gate 2 hit.
+  An omitted bridged field (items.id=931 default) is not projected, so a hosted step that sent nothing still
+  records 1.
+- KNOWN GAP, SEVERITY LOST THROUGH A LOCAL STEP (characterized, not fixed). Gate 3 reads the record of the
+  step it JUST completed, never output_sensitivity() or the track's sensitivity_ceiling (a scan pins that
+  executor.rs never names the ceiling); output_sensitivity() is read only at output creation (the legacy
+  output scan and the output's label). For A (local, severity 3) -> C (local, reads A's variable) -> B
+  (external): no Gate 3 at A (next tier 1 is not above 1); at C Gate 3 runs on C's reply with C's own
+  severity, 1, because a step's severity comes from the PersonalTrack fields its template names, not from the
+  variables it consumed, so the legacy gate approves what it would block at severity 3; the outbound review
+  at B screens the prompt with a placeholder severity (REVIEW_SEVERITY 1, not authoritative), so a prompt with
+  no Privacy Filter span passes. The path is not ungated, but the severity-3 rule never sees A's label.
+  PRODUCER-SEVERITY INHERITANCE (rule 1 of handoff_render::inherit_from_inputs, for external model steps) is
+  DEFERRED: an inherited 3 or 4 would block at Gate 3 (legacy) or force High review (Privacy Filter), label
+  the output medical or financial and let the legacy output scan block export, so it needs its own decision.
+- SCAN TIER. output() passes lifecycle::highest_tier_used (the highest routing_tier_used over the track, 1
+  when no step ran, clamped to 1..3) as scan_output's execution_tier; it was the Focus ceiling.
+- PERSONA SLICE ONLY WHEN NAMED. assemble_persona_context (both call sites: run start and
+  rehydrate_focus_run) returns an empty string unless steps_name_persona_context finds {persona_context} in a
+  step's own template; no shipped Focus names it, so no shipped run reads the persona's memory stores for it.
+  domain_context_store::test_set_standing_summary is test-only.
+- UNCHANGED, stated: a one-time floor-consent "proceed" is still not read on resume, and a "use local"
+  answer still cannot re-route a resolved step (items.id=921's notes). Not verified: any hosted call end to
+  end (blocks stay off, items.id=913; the floor is tested through the pure function), the rehydrate call
+  site of the persona guard under a real resume, user-installed Focuses against the new LOAD refusals, and
+  Windows or macOS.
+
 ## Naming Architecture — term map
 
 Most legacy terms are retired; canonical terms are used in all new code.
@@ -1636,7 +1700,10 @@ render_template() (conductor/executor.rs) substitutes {token} in ONE pass
 (substitute_once, items.id=932) and strips unresolved {token} patterns of the
 TEMPLATE. Templates must not use {token_name} syntax for any string not intended
 as a Conductor token. A substituted value is never re-scanned: a value that
-holds {x} text appears literally.
+holds {x} text appears literally. A step's output_var must be token-shaped,
+[a-z_][a-z0-9_]*: LOAD refuses any other (items.id=922), because the renderer
+resolves any brace-free span but find_tokens, which every lint reads, sees only
+that shape.
 
 ## Rust/Tauri Architecture
 
