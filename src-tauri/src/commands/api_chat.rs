@@ -407,6 +407,7 @@ async fn review_new_turn<L: crate::conductor::privacy::logger::DisclosureLogger>
             persona_id,
             key_hex_str,
             crate::conductor::privacy::gate3::KeptPrivate::RemovesSpans,
+            &[],
         )
         .await
 }

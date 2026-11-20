@@ -202,6 +202,7 @@ pub trait ReviewScanner: Send + Sync {
         run_id: &str,
         action_id: &str,
         content: &str,
+        source_spans: &[crate::conductor::privacy::gate3::SourceSpan],
     ) -> Result<Gate3Result, DisclosureLogWriteError>;
 }
 
@@ -243,9 +244,11 @@ impl<L: DisclosureLogger> ReviewScanner for Gate3Scanner<'_, L> {
         run_id: &str,
         action_id: &str,
         content: &str,
+        source_spans: &[crate::conductor::privacy::gate3::SourceSpan],
     ) -> Result<Gate3Result, DisclosureLogWriteError> {
         #[cfg(test)]
         if let Some(forced) = forced::get() {
+            forced::record_sources(source_spans);
             return (forced.result)(content);
         }
         self.gateway
@@ -266,6 +269,7 @@ impl<L: DisclosureLogger> ReviewScanner for Gate3Scanner<'_, L> {
                 self.persona_id,
                 self.key_hex,
                 crate::conductor::privacy::gate3::KeptPrivate::RemovesSpans,
+                source_spans,
             )
             .await
     }
@@ -292,6 +296,19 @@ pub(crate) mod forced {
 
     thread_local! {
         static FORCED: RefCell<Option<Forced>> = const { RefCell::new(None) };
+        /// items.id=933: the source spans each forced scan was handed, in order.
+        static SOURCES: RefCell<Vec<Vec<crate::conductor::privacy::gate3::SourceSpan>>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    pub fn record_sources(spans: &[crate::conductor::privacy::gate3::SourceSpan]) {
+        SOURCES.with(|s| s.borrow_mut().push(spans.to_vec()));
+    }
+
+    /// The source spans every forced scan on this thread was handed since the
+    /// override was installed.
+    pub fn seen_sources() -> Vec<Vec<crate::conductor::privacy::gate3::SourceSpan>> {
+        SOURCES.with(|s| s.borrow().clone())
     }
 
     pub fn get() -> Option<Forced> {
@@ -303,12 +320,14 @@ pub(crate) mod forced {
 
     pub fn set(forced: Forced) -> Guard {
         FORCED.with(|f| *f.borrow_mut() = Some(forced));
+        SOURCES.with(|s| s.borrow_mut().clear());
         Guard
     }
 
     impl Drop for Guard {
         fn drop(&mut self) {
             FORCED.with(|f| *f.borrow_mut() = None);
+            SOURCES.with(|s| s.borrow_mut().clear());
         }
     }
 
@@ -482,6 +501,10 @@ pub struct ReviewInput<'a> {
     pub prompt: &'a str,
     /// The provider of the selected model, for the audit row.
     pub provider_id: Option<&'a str>,
+    /// items.id=933 (M2): spans raised by source (a bridged personal fact's value
+    /// carried into the prompt inside an earlier step's output), handed to gate3 to
+    /// merge before its partition. Offsets are into `prompt`.
+    pub source_spans: &'a [crate::conductor::privacy::gate3::SourceSpan],
 }
 
 // ---------------------------------------------------------------------------
@@ -821,7 +844,12 @@ pub async fn review_prompt<S: ReviewScanner>(
     }
 
     let result = match scanner
-        .scan(input.run_id, input.action_id, input.prompt)
+        .scan(
+            input.run_id,
+            input.action_id,
+            input.prompt,
+            input.source_spans,
+        )
         .await
     {
         Ok(r) => r,
@@ -1071,6 +1099,7 @@ async fn resume_existing(
 /// The one call execute_once makes for a hosted step. A bound API Chat run takes
 /// its already reviewed prompt. Any other hosted step is reviewed; a park comes
 /// back as the FailureResult the step returns.
+#[allow(clippy::too_many_arguments)] // Explicit architecture boundary; see D6-342/D6-346.
 pub async fn review_hosted_step<L: DisclosureLogger>(
     ctx: &StepContext,
     treatment: &StepTreatment,
@@ -1079,6 +1108,7 @@ pub async fn review_hosted_step<L: DisclosureLogger>(
     gateway: &PrivacyGateway<L>,
     app_handle: Option<&tauri::AppHandle<tauri::Wry>>,
     reuse: &ReviewReuse,
+    source_spans: &[crate::conductor::privacy::gate3::SourceSpan],
 ) -> Result<ReviewedPrompt, FailureResult> {
     if let Some(bound) = &ctx.bound {
         return Ok(ReviewedPrompt::for_bound_run(bound, prompt));
@@ -1098,6 +1128,7 @@ pub async fn review_hosted_step<L: DisclosureLogger>(
         action_id: &ctx.step.action_id,
         prompt,
         provider_id,
+        source_spans,
     };
     let mut conn =
         match output_store::open_outputs_db_retrying(&ctx.user_id, &ctx.persona_id, &ctx.key_hex)
@@ -1434,6 +1465,7 @@ pub(crate) mod fake {
             _run_id: &str,
             _action_id: &str,
             content: &str,
+            _source_spans: &[crate::conductor::privacy::gate3::SourceSpan],
         ) -> Result<Gate3Result, DisclosureLogWriteError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             (self.result)(content)
@@ -1501,6 +1533,7 @@ mod tests {
             action_id: ACTION,
             prompt,
             provider_id: Some("prov"),
+            source_spans: &[],
         }
     }
 

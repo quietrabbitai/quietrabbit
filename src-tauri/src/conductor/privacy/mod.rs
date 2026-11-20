@@ -118,6 +118,7 @@ impl<L: DisclosureLogger> PrivacyGateway<L> {
         persona_id: &str,
         key_hex: &str,
         kept_private: gate3::KeptPrivate,
+        source_spans: &[gate3::SourceSpan],
     ) -> Result<Gate3Result, DisclosureLogWriteError> {
         gate3::gate3(
             &self.logger,
@@ -137,6 +138,7 @@ impl<L: DisclosureLogger> PrivacyGateway<L> {
             persona_id,
             key_hex,
             kept_private,
+            source_spans,
         )
         .await
     }

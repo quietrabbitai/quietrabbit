@@ -318,6 +318,7 @@ mod tests {
             action_id: "draft",
             prompt: PROMPT,
             provider_id: Some("prov"),
+            source_spans: &[],
         };
         match review_prompt(
             &mut c,

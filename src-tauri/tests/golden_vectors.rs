@@ -1001,6 +1001,7 @@ async fn test_gate3() {
             "",
             "",
             quietrabbit_lib::conductor::privacy::gate3::KeptPrivate::StopsContent,
+            &[],
         )
         .await
         .unwrap_or_else(|e| panic!("{label}: gate3 returned Err: {e}"));

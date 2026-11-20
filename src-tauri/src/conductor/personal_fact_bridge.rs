@@ -29,7 +29,13 @@ pub const BRIDGE_SOURCE_ID: &str = "entity_fact_bridge";
 
 /// True for a field this module built.
 pub fn is_bridged(field: &PersonalField) -> bool {
-    field.source_id == BRIDGE_SOURCE_ID
+    is_bridged_source(&field.source_id)
+}
+
+/// The same test on a source id, for a reader holding the gate track's field (the carry
+/// scan, items.id=933), so the marker stays named in this file only.
+pub fn is_bridged_source(source_id: &str) -> bool {
+    source_id == BRIDGE_SOURCE_ID
 }
 
 /// How strict a policy word is. Higher is stricter. An unknown word is as strict as

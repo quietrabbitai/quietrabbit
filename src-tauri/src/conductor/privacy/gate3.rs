@@ -120,6 +120,50 @@ pub enum KeptPrivate {
     RemovesSpans,
 }
 
+/// items.id=933 (M2): the category of a span QuietRabbit raises by SOURCE, not
+/// because the Privacy Filter found it: a bridged personal fact's value carried into a
+/// hosted step's prompt inside an earlier step's output (executor.rs carry scan).
+pub const CARRIED_FIELD_CATEGORY: &str = "qr_personal_field";
+
+/// items.id=933 (M2): a span raised by source. Merged into the filter's spans BEFORE
+/// the partition, so a remembered answer, the step_reviews record, the consent
+/// request and the removal all take the ordinary path. `suggestion` is the field's
+/// abstraction at the step's tier (a summarize label), or None. Only the outbound
+/// review passes any (a scan pins it). Debug never prints the text.
+#[derive(Clone)]
+pub struct SourceSpan {
+    pub entity: PfEntityDecoded,
+    pub suggestion: Option<String>,
+}
+
+impl std::fmt::Debug for SourceSpan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceSpan")
+            .field("start_byte", &self.entity.start_byte)
+            .field("end_byte", &self.entity.end_byte)
+            .field("label", &self.entity.label)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The filter's spans with the source spans added: a filter span that overlaps any
+/// source span is dropped (the source span covers that text, and overlapping spans
+/// could not be applied), the rest are kept, ordered by start.
+fn merge_source_spans(
+    filter_spans: Vec<PfEntityDecoded>,
+    source_spans: &[SourceSpan],
+) -> Vec<PfEntityDecoded> {
+    let overlaps = |e: &PfEntityDecoded| {
+        source_spans
+            .iter()
+            .any(|s| e.start_byte < s.entity.end_byte && s.entity.start_byte < e.end_byte)
+    };
+    let mut out: Vec<PfEntityDecoded> = filter_spans.into_iter().filter(|e| !overlaps(e)).collect();
+    out.extend(source_spans.iter().map(|s| s.entity.clone()));
+    out.sort_by_key(|e| (e.start_byte, e.end_byte));
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -187,6 +231,10 @@ pub async fn gate3<L: DisclosureLogger>(
     // items.id=923 (F14): see KeptPrivate. Read only when every flagged span was
     // settled by an earlier keep_private decision.
     kept_private: KeptPrivate,
+    // items.id=933 (M2): spans raised by source (SourceSpan). Empty for every caller
+    // but the outbound review. Read only on the Privacy Filter path; any other path
+    // that would approve with one present blocks instead (Check 2c).
+    source_spans: &[SourceSpan],
 ) -> Result<Gate3Result, DisclosureLogWriteError> {
     // Check 1: external-access ceiling block — fires first, before any other
     // check. See this function's header comment for why this is a
@@ -264,9 +312,42 @@ pub async fn gate3<L: DisclosureLogger>(
                 persona_id,
                 key_hex,
                 kept_private,
+                source_spans,
             )
             .await;
         }
+    }
+
+    // Check 2c (items.id=933): a span raised by source is answered only on the
+    // Privacy Filter path above. Anywhere else it would be approved unseen, so the
+    // content is blocked. The outbound review never reaches here (it parks when the
+    // filter is unavailable); this is the backstop.
+    if !source_spans.is_empty() {
+        logger
+            .write(DisclosureLogEntry {
+                action_id: action_id.to_string(),
+                focus_run_id: focus_run_id.to_string(),
+                execution_tier,
+                abstraction_tier: None,
+                provider: None,
+                fields_shared: vec![],
+                fields_abstracted: IndexMap::new(),
+                fields_withheld: vec![content_key.to_string()],
+                override_declined: true,
+                event_type: "gate3_source_spans_unreviewed".to_string(),
+                category: None,
+                fact_key: None,
+            })
+            .await?;
+        return Ok(Gate3Result {
+            blocked: true,
+            plain_language: Some(
+                "This content holds personal details that could not be reviewed. \
+                 Content blocked."
+                    .to_string(),
+            ),
+            ..Gate3Result::default()
+        });
     }
 
     // Check 2b: Legacy sensitivity block fallback.
@@ -468,6 +549,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
     persona_id: &str,
     key_hex: &str,
     kept_private: KeptPrivate,
+    source_spans: &[SourceSpan],
 ) -> Result<Gate3Result, DisclosureLogWriteError> {
     // items.id=406: the value that actually feeds the High-forcing side of
     // assign_review_tier_for_span's OR-condition -- a live per-provider risk
@@ -581,6 +663,11 @@ async fn gate3_with_pf<L: DisclosureLogger>(
         }
     };
 
+    // items.id=933 (M2): the spans raised by source join the filter's spans here,
+    // before the partition, so they are settled, asked and removed exactly as the
+    // filter's are.
+    let entities = merge_source_spans(entities, source_spans);
+
     // items.id=406 (decisions.id=756/757): partition entities into those
     // with an already-made prior decision (silently reapplied, still
     // disclosure-logged) and those that genuinely need interactive review.
@@ -667,7 +754,12 @@ async fn gate3_with_pf<L: DisclosureLogger>(
     // severity_authoritative false, so they are never forced High on zero spans.
     // Write-before-surface invariant: log write must precede emit() — if the write
     // fails (fatal DisclosureLogWriteError), the frontend must not receive the event.
-    let spans = build_consent_spans(&entities, content_sensitivity_severity, destination_risk);
+    let spans = build_consent_spans(
+        &entities,
+        content_sensitivity_severity,
+        destination_risk,
+        source_spans,
+    );
     let no_spans_forced_high = spans.is_empty();
 
     // items.id=406: payload-level review_tier is now only meaningful for the
@@ -1112,7 +1204,19 @@ fn build_consent_spans(
     entities: &[(PfEntityDecoded, Option<String>)],
     content_sensitivity_severity: u8,
     destination_risk: u8,
+    source_spans: &[SourceSpan],
 ) -> Vec<ConsentSpanItem> {
+    // items.id=933: a span raised by source carries its own suggestion (the field's
+    // abstraction at the step's tier); a filter span keeps the category's.
+    let suggestion = |e: &PfEntityDecoded| -> Option<String> {
+        if e.label == CARRIED_FIELD_CATEGORY {
+            return source_spans
+                .iter()
+                .find(|s| s.entity.start_byte == e.start_byte && s.entity.end_byte == e.end_byte)
+                .and_then(|s| s.suggestion.clone());
+        }
+        generalization_suggestion(&e.label)
+    };
     entities
         .iter()
         .map(|(e, fact_key)| ConsentSpanItem {
@@ -1120,7 +1224,7 @@ fn build_consent_spans(
             category: e.label.clone(),
             user_label: taxonomy_label(&e.label),
             original_text: e.span_text.clone(),
-            suggestion: generalization_suggestion(&e.label),
+            suggestion: suggestion(e),
             start_byte: e.start_byte,
             end_byte: e.end_byte,
             score: e.score,
@@ -1233,6 +1337,8 @@ fn taxonomy_label(category: &str) -> String {
         "private_date" => "Personal date",
         "account_number" => "Account number",
         "secret" => "Sensitive value",
+        // items.id=933: placeholder wording, Chat-BRAND's.
+        CARRIED_FIELD_CATEGORY => "Personal detail",
         _ => "Sensitive information",
     }
     .to_owned()
@@ -1387,6 +1493,7 @@ mod tests {
             "",
             "",
             crate::conductor::privacy::gate3::KeptPrivate::StopsContent,
+            &[],
         )
         .await
         .unwrap()
@@ -2507,12 +2614,12 @@ mod tests {
             focus_run_id: "run".to_owned(),
             focus_name: "Focus".to_owned(),
             review_tier: ReviewTier::High,
-            spans: build_consent_spans(&[], 3, 1),
+            spans: build_consent_spans(&[], 3, 1, &[]),
         };
         assert!(empty.spans.is_empty());
         assert!(!emits_consent_request(&empty));
         let one = ConsentRequestPayload {
-            spans: build_consent_spans(&[(entity(0.9, "private_person"), None)], 3, 1),
+            spans: build_consent_spans(&[(entity(0.9, "private_person"), None)], 3, 1, &[]),
             ..empty
         };
         assert_eq!(one.spans.len(), 1);
@@ -2560,8 +2667,10 @@ mod tests {
             .nth(1)
             .and_then(|r| r.split("\n}\n").next())
             .unwrap();
-        assert!(gate3_body
-            .contains("                kept_private,\n            )\n            .await;"));
+        // items.id=933: the source spans travel with it, to the filter path only.
+        assert!(gate3_body.contains(
+            "                kept_private,\n                source_spans,\n            )\n            .await;"
+        ));
     }
 
     #[tokio::test]
@@ -2939,5 +3048,221 @@ mod tests {
         } else {
             std::env::remove_var("QR_DATA_ROOT");
         }
+    }
+
+    // -- items.id=933 (M2): spans raised by source -----------------------------------
+
+    fn source(start: usize, text: &str, suggestion: Option<&str>) -> SourceSpan {
+        SourceSpan {
+            entity: PfEntityDecoded {
+                start_byte: start,
+                end_byte: start + text.len(),
+                score: 1.0,
+                label: CARRIED_FIELD_CATEGORY.to_owned(),
+                span_text: text.to_owned(),
+            },
+            suggestion: suggestion.map(str::to_owned),
+        }
+    }
+
+    fn filter_span(start: usize, end: usize, label: &str) -> PfEntityDecoded {
+        PfEntityDecoded {
+            start_byte: start,
+            end_byte: end,
+            score: 0.9,
+            label: label.to_owned(),
+            span_text: "x".to_owned(),
+        }
+    }
+
+    /// A filter span overlapping a source span is dropped; the others are kept and the
+    /// result is ordered by start.
+    #[test]
+    fn source_spans_merge_before_the_partition_and_win_an_overlap() {
+        let merged = merge_source_spans(
+            vec![
+                filter_span(30, 40, "private_person"),
+                filter_span(3, 9, "private_address"),
+            ],
+            &[source(5, "Leeds", None)],
+        );
+        let got: Vec<(usize, &str)> = merged
+            .iter()
+            .map(|e| (e.start_byte, e.label.as_str()))
+            .collect();
+        assert_eq!(got, [(5, CARRIED_FIELD_CATEGORY), (30, "private_person")]);
+        assert_eq!(merge_source_spans(vec![], &[]).len(), 0);
+    }
+
+    /// A carried span is asked with its own label and suggestion (the field's
+    /// abstraction at the step's tier), a filter span keeps its category's.
+    #[test]
+    fn a_carried_span_is_asked_with_its_own_suggestion() {
+        let sources = [
+            source(0, "Leeds", Some("[a city]")),
+            source(10, "Acme", None),
+        ];
+        let entities: Vec<(PfEntityDecoded, Option<String>)> = vec![
+            (sources[0].entity.clone(), None),
+            (sources[1].entity.clone(), None),
+            (filter_span(20, 25, "private_email"), None),
+        ];
+        let spans = build_consent_spans(&entities, 1, 2, &sources);
+        assert_eq!(spans[0].category, CARRIED_FIELD_CATEGORY);
+        assert_eq!(spans[0].user_label, "Personal detail");
+        assert_eq!(spans[0].suggestion.as_deref(), Some("[a city]"));
+        assert_eq!(spans[1].suggestion, None);
+        assert_eq!(spans[2].suggestion.as_deref(), Some("[email address]"));
+    }
+
+    /// Check 2c: off the Privacy Filter path a source span is never approved unseen.
+    /// Target tier 1 so Check 1b does not fire first in a release build without the
+    /// filter; the same call with no source span is approved.
+    #[tokio::test]
+    async fn a_source_span_off_the_filter_path_blocks() {
+        use crate::conductor::privacy::logger::TestLogger;
+        async fn call(logger: &TestLogger, spans: &[SourceSpan]) -> Gate3Result {
+            gate3(
+                logger,
+                "step-1",
+                "run-1",
+                "Test Focus",
+                "msg-1",
+                "in Leeds",
+                1,
+                1,
+                ExternalAccess::Unrestricted,
+                2,
+                None,
+                None,
+                false,
+                "",
+                "",
+                "",
+                KeptPrivate::RemovesSpans,
+                spans,
+            )
+            .await
+            .unwrap()
+        }
+        let logger = TestLogger::new();
+        let r = call(&logger, &[source(3, "Leeds", None)]).await;
+        assert!(r.blocked && !r.approved && !r.pending_consent);
+        assert_eq!(
+            logger.entries()[0].event_type,
+            "gate3_source_spans_unreviewed"
+        );
+        let logger = TestLogger::new();
+        let r = call(&logger, &[]).await;
+        assert!(r.approved && !r.blocked);
+    }
+
+    /// A remembered answer applies to a carried span: the span's text equals the
+    /// stored bridged fact, Layer 3 resolves it to that fact, and a standing
+    /// generalize keyed on the fact settles it (not forced High). Another case of the
+    /// same text does not match Layer 3 (exact text) and is asked: errs toward asking.
+    #[tokio::test]
+    async fn a_remembered_answer_settles_a_carried_span() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let _root = fresh_root();
+        f_seed_run().await;
+        let fact_id = crate::persistence::personal_store::create_entity_fact_with_provenance(
+            F_USER,
+            F_PERSONA,
+            TEST_KEY_HEX,
+            None,
+            "location_city",
+            "Leeds",
+            "personal",
+            "user",
+            F_PERSONA,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("fact");
+        crate::persistence::personal_store::write_standing_preference(
+            F_USER,
+            F_PERSONA,
+            TEST_KEY_HEX,
+            &format!("entity_facts:{fact_id}"),
+            CARRIED_FIELD_CATEGORY,
+            "generalize",
+            Some("[a city]"),
+            None,
+        )
+        .await
+        .expect("standing preference");
+        let run = |text: &'static str| async move {
+            partition_with_rule(
+                &TestLogger::new(),
+                F_USER,
+                F_PERSONA,
+                TEST_KEY_HEX,
+                F_ACTION,
+                F_RUN,
+                2,
+                vec![entity_with(CARRIED_FIELD_CATEGORY, text)],
+                false,
+                KeptPrivate::RemovesSpans,
+            )
+            .await
+            .expect("partition")
+        };
+        let o = run("Leeds").await;
+        let early = o.early_result.expect("settled by the remembered answer");
+        assert!(early.approved);
+        assert_eq!(early.auto_resolved.len(), 1);
+        assert_eq!(early.auto_resolved[0].decision, "generalize");
+        let o = run("LEEDS").await;
+        assert!(unsettled(&o), "a different case is asked again");
+    }
+
+    /// Scan: only the outbound review's scanner passes source spans; every other gate3
+    /// call passes none.
+    #[test]
+    fn only_the_outbound_review_passes_source_spans() {
+        fn production(src: &str) -> String {
+            src.split("#[cfg(test)]\nmod tests {")
+                .next()
+                .unwrap()
+                .to_owned()
+        }
+        for (name, src) in [
+            ("executor.rs", production(include_str!("../executor.rs"))),
+            (
+                "consent.rs",
+                production(include_str!("../../commands/consent.rs")),
+            ),
+            (
+                "api_chat.rs",
+                production(include_str!("../../commands/api_chat.rs")),
+            ),
+        ] {
+            let calls: Vec<&str> = src.split(".gate3(").skip(1).collect();
+            assert!(!calls.is_empty(), "{name}");
+            for c in calls {
+                let args = c.split(".await").next().unwrap();
+                assert!(args.contains("&[],"), "{name}: {args}");
+                assert!(!args.contains("source_spans"), "{name}");
+            }
+        }
+        let review = production(include_str!("../step_review.rs"));
+        let scanner = review
+            .split("impl<L: DisclosureLogger> ReviewScanner for Gate3Scanner")
+            .nth(1)
+            .unwrap();
+        let args = scanner
+            .split(".gate3(")
+            .nth(1)
+            .unwrap()
+            .split(".await")
+            .next()
+            .unwrap();
+        assert!(
+            args.contains("RemovesSpans,\n                source_spans,"),
+            "{args}"
+        );
     }
 }

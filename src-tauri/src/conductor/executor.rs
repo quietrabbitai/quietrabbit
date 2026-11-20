@@ -745,6 +745,51 @@ impl StepExecutor {
         // spend gate, so what is measured and sent is the released text. A park
         // (the user must answer, the filter is unavailable, anything fail-closed)
         // is returned as the step's result and never retried.
+        // -- items.id=933 (M2) — the carry scan of a hosted step --
+        // A bridged personal value an earlier step's output carried into this prompt
+        // (a local step receives its fields raw since items.id=933) is raised as a span
+        // in the outbound review, or, when its policy at this tier is not_permitted,
+        // removed before the review with a disclosure row and never shown. A bound API
+        // Chat run has no carried output. See conductor/carry_scan.rs.
+        let (prompt, carry_spans) = if treatment.hosted && ctx.bound.is_none() {
+            let carried = carried_values(ctx, &output_vars, &previous_output);
+            let hits = crate::conductor::carry_scan::classify(
+                &carried,
+                &gate_track,
+                &g1.fields_shared,
+                treatment.abstraction_tier,
+            );
+            let prompt = if hits.remove.is_empty() {
+                prompt
+            } else {
+                privacy_gateway
+                    .logger
+                    .write(DisclosureLogEntry {
+                        action_id: ctx.step.action_id.clone(),
+                        focus_run_id: ctx.focus_run_id.clone(),
+                        execution_tier: treatment.execution_tier,
+                        abstraction_tier: Some(treatment.abstraction_tier),
+                        provider: selected_model.provider_id.clone(),
+                        fields_shared: vec![],
+                        fields_abstracted: IndexMap::new(),
+                        fields_withheld: hits.remove.iter().map(|h| h.field_name.clone()).collect(),
+                        override_declined: false,
+                        event_type: CARRY_REMOVED_EVENT.to_owned(),
+                        category: None,
+                        fact_key: None,
+                    })
+                    .await
+                    .map_err(|e| ConductorError::DisclosureLogWrite {
+                        plain_language: e.plain_language.clone(),
+                    })?;
+                crate::conductor::carry_scan::remove_values(&prompt, &hits.remove)
+            };
+            let spans = crate::conductor::carry_scan::source_spans(&prompt, &hits.ask);
+            (prompt, spans)
+        } else {
+            (prompt, Vec::new())
+        };
+
         let reviewed: Option<ReviewedPrompt> = if treatment.hosted {
             match step_review::review_hosted_step(
                 ctx,
@@ -754,6 +799,7 @@ impl StepExecutor {
                 privacy_gateway,
                 app_handle,
                 review_reuse,
+                &carry_spans,
             )
             .await
             {
@@ -1124,6 +1170,7 @@ impl StepExecutor {
                         &ctx.persona_id,
                         &ctx.key_hex,
                         crate::conductor::privacy::gate3::KeptPrivate::StopsContent,
+                        &[],
                     )
                     .await
                     .map_err(|e| ConductorError::DisclosureLogWrite {
@@ -1277,6 +1324,30 @@ pub(crate) fn render_template(
         );
     }
     result.trim().to_owned()
+}
+
+/// items.id=933 (M2): the disclosure-log event of a carried not_permitted value removed
+/// before the outbound review. Names the fields, never a value.
+pub(crate) const CARRY_REMOVED_EVENT: &str = "carry_not_permitted_removed";
+
+/// items.id=933 (M2): the CARRIED values a template names: an earlier step's output
+/// variable or {previous_output}. Never {user_input}, a projected field or a seed
+/// (a name shared with an output_var is included anyway: over-inclusive, which only
+/// matters if the value also appears in the prompt).
+fn carried_values<'a>(
+    ctx: &StepContext,
+    output_vars: &'a HashMap<String, String>,
+    previous_output: &'a str,
+) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    for token in find_tokens(&ctx.step.prompt_template) {
+        if token == "previous_output" {
+            out.push(previous_output);
+        } else if let Some(v) = output_vars.get(&token) {
+            out.push(v.as_str());
+        }
+    }
+    out
 }
 
 /// The step's projected personal fields (its disclosure buffer) over the output
@@ -4836,6 +4907,7 @@ mod tests {
                 "persona-1",
                 "",
                 crate::conductor::privacy::gate3::KeptPrivate::StopsContent,
+                &[],
             )
             .await
             .unwrap()
@@ -8161,6 +8233,7 @@ mod tests {
                         "persona-1",
                         "",
                         crate::conductor::privacy::gate3::KeptPrivate::StopsContent,
+                        &[],
                     )
                     .await
                     .unwrap()
@@ -11506,6 +11579,7 @@ mod tests {
                 action_id: &ctx.step.action_id,
                 prompt,
                 provider_id: Some("fixture-host-a"),
+                source_spans: &[],
             };
             assert!(matches!(
                 review_prompt(
@@ -12628,5 +12702,337 @@ mod tests {
             .and_then(|r| r.split("\n}\n").next())
             .expect("insert_projected_fields");
         assert!(helper.contains("personal_fact_bridge::clean_braces(v)"));
+    }
+
+    // -- items.id=933 unit 2 (M2): the carry scan of a hosted step -------------------
+
+    /// A bridged track built the production way with `word` as the user's tier-2 policy
+    /// for every fact (None: no row, the default omit). `stored` is the fact's stored
+    /// sensitivity.
+    fn bridged_track_with(
+        facts: &[(&str, &str)],
+        word: Option<&str>,
+        stored: &str,
+    ) -> PersonalTrack {
+        use crate::conductor::personal_fact_fields::registry;
+        use crate::persistence::fact_policy_store::{FactPolicyRow, UserPolicies};
+        let rows: Vec<FactPolicyRow> = word
+            .map(|w| {
+                facts
+                    .iter()
+                    .map(|(n, _)| FactPolicyRow {
+                        field_name: (*n).to_owned(),
+                        tier2: Some(w.to_owned()),
+                        tier3: None,
+                        set_at: String::new(),
+                        set_by: "user".to_owned(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let efs: Vec<_> = facts
+            .iter()
+            .map(|(n, v)| {
+                let mut f = bridge_fact(n, v);
+                f.sensitivity = stored.to_owned();
+                f
+            })
+            .collect();
+        let mut pt = PersonalTrack::new();
+        for f in crate::conductor::personal_fact_bridge::bridge_fields(
+            efs.iter(),
+            "persona-1",
+            registry().map_err(|_| ()),
+            &UserPolicies::Rows(rows),
+        ) {
+            pt.add_field(f).unwrap();
+        }
+        pt
+    }
+
+    /// The tier-2 step of research-and-buy's shape: it reads the local step's
+    /// {requirements} and the user's own text, and declares location_city itself.
+    /// `word` is written to personal.db as the user's tier-2 policy (the executor
+    /// re-reads it before a hosted step holding a bridged field).
+    async fn carried_hosted_ctx(pool: &sqlx::SqlitePool, word: Option<&str>) -> StepContext {
+        use crate::conductor::personal_fact_fields::Tier;
+        let key_hex = hosted_pick_rig(pool).await;
+        let mut ctx = hosted_ctx(RunAttendance::Attended, &key_hex);
+        ctx.step.action_id = "research".to_owned();
+        ctx.step.prompt_template =
+            "Requirements: {requirements}\nUser: {user_input}\nRegion: {location_city}".to_owned();
+        declare_field(&mut ctx, "location_city");
+        ctx.floor_consent_preference = Some(FLOOR_CONSENT_MODIFIED.to_owned());
+        if let Some(w) = word {
+            let mut conn = crate::persistence::personal_store::open_personal_db(
+                &ctx.user_id,
+                &ctx.persona_id,
+                &ctx.key_hex,
+            )
+            .await
+            .expect("personal.db opens in the fixture");
+            crate::persistence::fact_policy_store::set_fact_policy(
+                &mut conn,
+                "location_city",
+                Tier::Two,
+                w,
+                "user",
+            )
+            .await
+            .unwrap();
+        }
+        ctx
+    }
+
+    /// A finished local step whose output variable `requirements` holds `content`.
+    fn track_with_requirements(content: &str) -> TaskTrack {
+        let mut track = TaskTrack::new();
+        track.add_step(TaskStep {
+            action_id: "requirements_capture".to_owned(),
+            output_var: Some("requirements".to_owned()),
+            content: content.to_owned(),
+            sensitivity_severity: 2,
+            routing_tier_used: 1,
+            personal_flagged: false,
+            audit_unavailable: false,
+        });
+        track
+    }
+
+    struct HostedSeen {
+        prompts: Vec<String>,
+        sources: Vec<crate::conductor::privacy::gate3::SourceSpan>,
+        gateway: PrivacyGateway<TestLogger>,
+    }
+
+    /// Run the hosted step once after `track`, with a scanner that approves and records
+    /// the prompt and the source spans the review handed it.
+    async fn run_hosted_after(
+        ctx: &StepContext,
+        pool: &sqlx::SqlitePool,
+        pt: &PersonalTrack,
+        mut track: TaskTrack,
+    ) -> HostedSeen {
+        let (forced, seen) = capturing_scanner();
+        let _g = step_review::forced::arm(ctx, forced).await;
+        let gateway = PrivacyGateway::new(TestLogger::new());
+        let _ = StepExecutor::new()
+            .execute_once(
+                ctx,
+                0,
+                pt,
+                &mut track,
+                &mut SharedStateTrack::new(),
+                &FailureHandler::new(ctx.effective_access),
+                &gateway,
+                &Arc::new(ConductorScheduler::new()),
+                None,
+                pool,
+                &step_review::ReviewReuse::default(),
+            )
+            .await;
+        let sources = step_review::forced::seen_sources()
+            .into_iter()
+            .flatten()
+            .collect();
+        let prompts = seen.borrow().clone();
+        HostedSeen {
+            prompts,
+            sources,
+            gateway,
+        }
+    }
+
+    fn span_texts(s: &HostedSeen) -> Vec<&str> {
+        s.sources
+            .iter()
+            .map(|x| x.entity.span_text.as_str())
+            .collect()
+    }
+
+    /// Chat-PM's required test. A summarize-policy field is released at tier 2 as its
+    /// label, so Gate 1 lists it as ABSTRACTED, not shared (g1.fields_shared holds only
+    /// raw-released fields), and the carry scan does not skip it: its raw value carried
+    /// in {requirements} is raised in the outbound review, with the label as the
+    /// suggestion, and so is the user's own typed occurrence.
+    #[tokio::test]
+    async fn a_summarize_field_whose_raw_value_is_carried_is_raised_in_the_review() {
+        use crate::conductor::privacy::gate3::CARRIED_FIELD_CATEGORY;
+        with_temp_shared_db(|pool| async move {
+            let ctx = {
+                let mut c = carried_hosted_ctx(&pool, Some("summarize")).await;
+                c.external_input = "I commute in leeds".to_owned();
+                c
+            };
+            let pt =
+                bridged_track_with(&[("location_city", "Leeds")], Some("summarize"), "personal");
+            let seen = run_hosted_after(
+                &ctx,
+                &pool,
+                &pt,
+                track_with_requirements("A road bike for LEEDS hills."),
+            )
+            .await;
+            assert_eq!(seen.prompts.len(), 1, "the review saw one prompt");
+            assert_eq!(
+                seen.prompts[0],
+                "Requirements: A road bike for LEEDS hills.\nUser: I commute in leeds\n\
+                 Region: personal location city information"
+            );
+            let g1 = gate1_entries(&seen.gateway)
+                .into_iter()
+                .find(|e| e.event_type == "gate1_pass")
+                .unwrap();
+            assert!(g1.fields_shared.is_empty(), "{:?}", g1.fields_shared);
+            assert!(g1.fields_abstracted.contains_key("location_city"));
+            assert_eq!(span_texts(&seen), ["LEEDS", "leeds"]);
+            for s in &seen.sources {
+                assert_eq!(s.entity.label, CARRIED_FIELD_CATEGORY);
+                assert_eq!(
+                    &seen.prompts[0][s.entity.start_byte..s.entity.end_byte],
+                    s.entity.span_text
+                );
+                assert_eq!(
+                    s.suggestion.as_deref(),
+                    Some("personal location city information")
+                );
+            }
+        })
+        .await;
+    }
+
+    /// A field this step released raw (pass, declared) is in fields_shared, so a carried
+    /// copy of it is not raised; with the default omit and nothing carried, nothing is
+    /// raised either.
+    #[tokio::test]
+    async fn a_field_the_step_released_raw_or_nothing_carried_raises_nothing() {
+        with_temp_shared_db(|pool| async move {
+            let ctx = carried_hosted_ctx(&pool, Some("pass")).await;
+            let pt = bridged_track_with(&[("location_city", "Leeds")], Some("pass"), "personal");
+            let seen = run_hosted_after(
+                &ctx,
+                &pool,
+                &pt,
+                track_with_requirements("A road bike for Leeds hills."),
+            )
+            .await;
+            assert_eq!(seen.prompts.len(), 1);
+            assert!(
+                seen.prompts[0].ends_with("Region: Leeds"),
+                "{}",
+                seen.prompts[0]
+            );
+            assert!(seen.sources.is_empty());
+        })
+        .await;
+        with_temp_shared_db(|pool| async move {
+            let ctx = carried_hosted_ctx(&pool, None).await;
+            let pt = bridged_track_with(&[("location_city", "Leeds")], None, "personal");
+            let seen =
+                run_hosted_after(&ctx, &pool, &pt, track_with_requirements("A road bike.")).await;
+            assert_eq!(seen.prompts.len(), 1);
+            assert!(seen.sources.is_empty());
+        })
+        .await;
+    }
+
+    /// A not_permitted value (a fact stored as medical is not_permitted at every tier
+    /// whatever the user says) is removed before the review, every occurrence, the
+    /// user's own text included, with a disclosure row naming the field and no value;
+    /// it is never raised as a span, so no answer can release it.
+    #[tokio::test]
+    async fn a_not_permitted_carried_value_is_removed_and_never_shown() {
+        with_temp_shared_db(|pool| async move {
+            let mut ctx = carried_hosted_ctx(&pool, None).await;
+            ctx.external_input = "near Leeds General".to_owned();
+            let pt = bridged_track_with(&[("location_city", "Leeds General")], None, "medical");
+            let seen = run_hosted_after(
+                &ctx,
+                &pool,
+                &pt,
+                track_with_requirements("Clinic visits at LEEDS GENERAL weekly."),
+            )
+            .await;
+            assert_eq!(seen.prompts.len(), 1);
+            let p = &seen.prompts[0];
+            assert!(!p.to_lowercase().contains("leeds general"), "{p}");
+            assert_eq!(p.matches("[removed]").count(), 2, "{p}");
+            assert!(seen.sources.is_empty());
+            let rows: Vec<_> = seen
+                .gateway
+                .logger
+                .entries()
+                .into_iter()
+                .filter(|e| e.event_type == CARRY_REMOVED_EVENT)
+                .collect();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].fields_withheld, ["location_city"]);
+            let all = format!("{:?}", seen.gateway.logger.entries());
+            assert!(!all.to_lowercase().contains("leeds"), "{all}");
+        })
+        .await;
+    }
+
+    /// Plan item 4, the crossing. A LOCAL step that declares location_city now renders
+    /// it, and its reply carries the value. Gate 3 at that step reviews the reply for the
+    /// tier-2 step that follows (severity 2: approved, the step completes). The next,
+    /// hosted step receives the reply through {requirements}; with the default policy
+    /// (omit) the carried value is raised in its outbound review.
+    #[tokio::test]
+    async fn a_value_a_local_step_carries_still_meets_gate_3_and_the_outbound_review() {
+        with_temp_shared_db(|pool| async move {
+            install_local_models(&pool).await;
+            crate::ollama_sidecar::force_trust_for_test(true);
+            let server = LoopbackServer::start(vec![Canned::json(
+                200,
+                r#"{"response":"Needs: a road bike for Leeds hills.","done":true,"model":"stub"}"#,
+            )]);
+            let port: u16 = server.base().rsplit(':').next().unwrap().parse().unwrap();
+            let pt = bridged_track_with(&[("location_city", "Leeds")], None, "personal");
+            let mut local = local_field_ctx("Location: {location_city}", &["location_city"]);
+            local.step.action_id = "requirements_capture".to_owned();
+            local.step.output_var = Some("requirements".to_owned());
+            local.next_execution_tier = Some(2);
+            // The shipped shape: the Focus may go to tier 2, this step is tier 1.
+            local.focus_external_access = ExternalAccess::AnonymousRequired;
+            let mut track = TaskTrack::new();
+            let gateway = PrivacyGateway::new(TestLogger::new());
+            {
+                let _port = crate::ollama_sidecar::ForcedPortGuard::set(port);
+                let out = StepExecutor::new()
+                    .execute_once(
+                        &local,
+                        0,
+                        &pt,
+                        &mut track,
+                        &mut SharedStateTrack::new(),
+                        &FailureHandler::new(local.effective_access),
+                        &gateway,
+                        &Arc::new(ConductorScheduler::new()),
+                        None,
+                        &pool,
+                        &step_review::ReviewReuse::default(),
+                    )
+                    .await;
+                let out = out.unwrap();
+                assert!(out.is_none(), "the local step completed: {out:?}");
+            }
+            crate::ollama_sidecar::force_trust_for_test(false);
+            assert_eq!(server.captured()[0].json()["prompt"], "Location: Leeds");
+            assert_eq!(gate3_events(&gateway), ["gate3_promotion_approved"]);
+            assert_eq!(track.steps()[0].sensitivity_severity, 2);
+            assert!(track.steps()[0].content.contains("Leeds"));
+
+            let hosted = carried_hosted_ctx(&pool, None).await;
+            let seen = run_hosted_after(&hosted, &pool, &pt, track).await;
+            assert_eq!(seen.prompts.len(), 1);
+            assert!(seen.prompts[0].contains("a road bike for Leeds hills."));
+            assert_eq!(span_texts(&seen), ["Leeds"]);
+            assert!(
+                seen.sources[0].suggestion.is_none(),
+                "omit offers no suggestion"
+            );
+        })
+        .await;
     }
 }
