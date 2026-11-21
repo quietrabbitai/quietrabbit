@@ -140,6 +140,7 @@ pub(crate) fn expand(
             template: lines.join("\n"),
             params: t.params.draft,
             length,
+            required: vec![spec.brief_var.clone()],
         },
     )
 }

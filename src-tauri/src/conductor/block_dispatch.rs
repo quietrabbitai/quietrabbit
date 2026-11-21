@@ -23,15 +23,42 @@
 //
 // A block step is NOT an LLM step. Its handler is a pure function over the
 // run's TaskTrack: it makes no provider call, touches no PersonalTrack and no
-// disclosure buffer, and reads only a named output variable. Every block step
+// disclosure buffer, and reads only a named output variable. items.id=903
+// (decisions.id=963 ruling 3, amending decisions.id=942's pure-block contract): a
+// handler may also READ the stored values its row DECLARES (BlockHandler::
+// declared_inputs, put in the row's declared_inputs at LOAD and so checked by the
+// declared-inputs lint and seeded at pass start). It receives them read-only in
+// BlockInputs, filtered to exactly those names by execute_block_step; it still has
+// no provider, no store handle and no write. Every block step
 // is authored LocalOnly (load_focus_definition_from_db sets routing_tier
 // LocalOnly and no external_access_override), so it never reaches F2 /
 // OfferTier2 or any external-step path.
 
 use serde::Deserialize;
 
+use std::collections::HashMap;
+
+use crate::conductor::check_block::{self, DraftCheckConfig, Emit};
 use crate::conductor::quality::{CriterionKind, QualityAssessor, QualityCriterion};
 use crate::conductor::types::TaskTrack;
+
+/// items.id=903: what a handler reads. Read-only: the track, and the seeded values
+/// of the names its row declares (nothing else is in `seeds`).
+pub struct BlockInputs<'a> {
+    pub track: &'a TaskTrack,
+    pub seeds: &'a HashMap<String, String>,
+}
+
+impl BlockInputs<'_> {
+    /// A declared name's value: a seeded bound name, else the track's output of that
+    /// name. None when neither has it.
+    pub fn value(&self, name: &str) -> Option<String> {
+        self.seeds
+            .get(name)
+            .cloned()
+            .or_else(|| self.track.get_output(name).map(str::to_owned))
+    }
+}
 
 /// What a handler produced. execute_step() records it with
 /// TaskTrack::add_step; a handler never mutates the track itself.
@@ -51,7 +78,11 @@ pub struct BlockHandler {
     pub validate: fn(&serde_json::Value) -> Result<(), String>,
     /// Run the block over the track. Err only for a customization that did not
     /// validate (LOAD guarantees it did) -- never for a quality verdict.
-    pub run: fn(&serde_json::Value, &TaskTrack) -> Result<BlockOutput, String>,
+    pub run: fn(&serde_json::Value, &BlockInputs) -> Result<BlockOutput, String>,
+    /// items.id=903: the names a row with this customization reads besides the
+    /// track's input variable (the row's declared_inputs). Empty for a row that
+    /// reads only the track.
+    pub declared_inputs: fn(&serde_json::Value) -> Vec<String>,
     /// The variable name a row with this customization records when it runs
     /// (the BlockOutput.output_var it will produce). items.id=878: the LOAD
     /// guard analysis needs it, because ActionDefinition.output_var is None for
@@ -129,8 +160,17 @@ static CB06: BlockHandler = BlockHandler {
     validate: cb06_validate,
     run: cb06_run,
     output_var: cb06_output_var,
+    declared_inputs: cb06_declared_inputs,
     example: cb06_example,
 };
+
+fn cb06_declared_inputs(customization: &serde_json::Value) -> Vec<String> {
+    parse_cb06(customization, false)
+        .ok()
+        .and_then(|c| c.draft_check)
+        .map(|d| d.declared())
+        .unwrap_or_default()
+}
 
 fn cb06_example() -> serde_json::Value {
     serde_json::json!({
@@ -145,7 +185,7 @@ fn cb06_example() -> serde_json::Value {
 }
 
 fn cb06_output_var(customization: &serde_json::Value) -> Option<String> {
-    parse_cb06(customization).ok().map(|c| c.output_var)
+    parse_cb06(customization, false).ok().map(|c| c.output_var)
 }
 
 /// The only on_fail value cb-06 accepts. The block reports a verdict and never
@@ -163,6 +203,11 @@ struct Cb06Config {
     output_var: String,
     criteria: Vec<Cb06Criterion>,
     on_fail: String,
+    /// items.id=903: the draft check (conductor::check_block). With it, input_var
+    /// is the draft and output_var records the verdict literal (emit verdict, and
+    /// then criteria must be empty) or the content-free report (emit report).
+    #[serde(default)]
+    draft_check: Option<DraftCheckConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,7 +229,9 @@ enum Cb06Kind {
     MinLength,
 }
 
-fn parse_cb06(customization: &serde_json::Value) -> Result<Cb06Config, String> {
+/// `authored`: the row as written (LOAD), which may not carry the run-start fields
+/// of a draft check.
+fn parse_cb06(customization: &serde_json::Value, authored: bool) -> Result<Cb06Config, String> {
     let cfg: Cb06Config =
         serde_json::from_value(customization.clone()).map_err(|e| format!("cb-06 config: {e}"))?;
 
@@ -216,8 +263,29 @@ fn parse_cb06(customization: &serde_json::Value) -> Result<Cb06Config, String> {
             cfg.on_fail
         ));
     }
-    if cfg.criteria.is_empty() {
-        return Err("cb-06 config: criteria is empty".to_owned());
+    match &cfg.draft_check {
+        None if cfg.criteria.is_empty() => {
+            return Err("cb-06 config: criteria is empty".to_owned());
+        }
+        Some(d) => {
+            d.validate(authored)
+                .map_err(|e| format!("cb-06 config: {e}"))?;
+            if d.emit == Emit::Verdict && !cfg.criteria.is_empty() {
+                return Err(
+                    "cb-06 config: a draft check that emits a verdict takes no criteria (its \
+                     variable holds the verdict literal only)"
+                        .to_owned(),
+                );
+            }
+            if d.declared().contains(&cfg.input_var) || d.declared().contains(&cfg.output_var) {
+                return Err(
+                    "cb-06 config: a draft check source may be neither the draft (input_var) \
+                     nor the row's own output_var"
+                        .to_owned(),
+                );
+            }
+        }
+        None => {}
     }
     for c in &cfg.criteria {
         if c.name.trim().is_empty() {
@@ -251,7 +319,7 @@ fn parse_cb06(customization: &serde_json::Value) -> Result<Cb06Config, String> {
 }
 
 fn cb06_validate(customization: &serde_json::Value) -> Result<(), String> {
-    parse_cb06(customization).map(|_| ())
+    parse_cb06(customization, true).map(|_| ())
 }
 
 /// Pure over (customization, task_track.get_output(input_var)). Advisory only:
@@ -263,10 +331,40 @@ fn cb06_validate(customization: &serde_json::Value) -> Result<(), String> {
 /// guaranteed to stay content-free.
 fn cb06_run(
     customization: &serde_json::Value,
-    task_track: &TaskTrack,
+    inputs: &BlockInputs,
 ) -> Result<BlockOutput, String> {
-    let cfg = parse_cb06(customization)?;
+    let cfg = parse_cb06(customization, false)?;
+    let task_track = inputs.track;
 
+    // items.id=903: the draft check. Its sources are read through BlockInputs (the
+    // declared names only); the draft is the track's input variable.
+    if let Some(check) = &cfg.draft_check {
+        let draft = task_track.get_output(&cfg.input_var);
+        let outcome = check_block::evaluate(check, draft, &|n: &str| inputs.value(n))?;
+        let content = match check.emit {
+            Emit::Verdict => outcome.verdict_literal().to_owned(),
+            Emit::Report => {
+                let mut text = outcome.report_text();
+                if !cfg.criteria.is_empty() {
+                    text.push(' ');
+                    text.push_str(&criteria_text(&cfg, draft));
+                }
+                text
+            }
+        };
+        return Ok(BlockOutput {
+            content,
+            output_var: cfg.output_var,
+        });
+    }
+    Ok(BlockOutput {
+        content: criteria_text(&cfg, task_track.get_output(&cfg.input_var)),
+        output_var: cfg.output_var,
+    })
+}
+
+/// The advisory criteria verdict (the pre-903 cb-06 text).
+fn criteria_text(cfg: &Cb06Config, input: Option<&str>) -> String {
     let criteria: Vec<QualityCriterion> = cfg
         .criteria
         .iter()
@@ -281,7 +379,6 @@ fn cb06_run(
         .collect();
     let total = criteria.len();
 
-    let input = task_track.get_output(&cfg.input_var);
     let verdict = QualityAssessor::new(criteria).assess_content(input.unwrap_or(""));
 
     let unmet = verdict.gaps.len();
@@ -309,11 +406,7 @@ fn cb06_run(
     if unmet > 0 {
         text.push_str(&format!(" Unmet: {names}."));
     }
-
-    Ok(BlockOutput {
-        content: text,
-        output_var: cfg.output_var,
-    })
+    text
 }
 
 #[cfg(test)]
@@ -346,7 +439,15 @@ mod tests {
     }
 
     fn run(c: &serde_json::Value, t: &TaskTrack) -> BlockOutput {
-        (block_handler("cb-06").unwrap().run)(c, t).expect("cb-06 must not raise")
+        let seeds = HashMap::new();
+        (block_handler("cb-06").unwrap().run)(
+            c,
+            &BlockInputs {
+                track: t,
+                seeds: &seeds,
+            },
+        )
+        .expect("cb-06 must not raise")
     }
 
     #[test]

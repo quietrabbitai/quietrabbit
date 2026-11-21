@@ -115,7 +115,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use quietrabbit_lib::conductor::draft_check::{check, CheckInput, CheckReport, Point};
+use quietrabbit_lib::conductor::draft_check::{
+    check, CheckInput, CheckReport, CitationMarkers, Point,
+};
 use quietrabbit_lib::ollama_sidecar::OllamaSidecar;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -899,6 +901,8 @@ fn load_drafts(
                     &CheckInput {
                         allowed_text: &allowed,
                         points: &vb.points,
+                        // items.id=903: the calibration keeps the pre-903 scan.
+                        citations: CitationMarkers::None,
                     },
                 );
                 out.push(Draft {

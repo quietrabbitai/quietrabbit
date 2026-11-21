@@ -330,9 +330,36 @@ pub(crate) fn lint_with(
             if !store_names_external_allowed {
                 lint_store_names(step, &taint, bound, &bound_like).map_err(|e| e.to_string())?;
             }
+        } else {
+            // items.id=903 (decisions.id=963 ruling 3): a pure block row may declare the
+            // stored values its handler reads (cb-06's draft check). Each must be real,
+            // by rule (3), exactly as a template step's declaration.
+            lint_declared_known(step, &earlier, bound).map_err(|e| e.to_string())?;
         }
         if let Some(v) = var {
             earlier.insert(v);
+        }
+    }
+    Ok(())
+}
+
+/// (3) every declared name must be real, external or not: an earlier row's variable,
+/// a system token, the step's own field_requirements name or a bound name.
+fn lint_declared_known(
+    step: &ActionDefinition,
+    earlier: &HashSet<&str>,
+    bound: &[&str],
+) -> Result<(), DeclaredInputsError> {
+    for name in &step.declared_inputs {
+        let known = earlier.contains(name.as_str())
+            || is_system_token(name)
+            || step.field_requirements.contains_key(name)
+            || bound.contains(&name.as_str());
+        if !known {
+            return Err(DeclaredInputsError::UnknownDeclared {
+                action_id: step.action_id.clone(),
+                name: name.clone(),
+            });
         }
     }
     Ok(())
@@ -534,19 +561,7 @@ fn lint_step(
     bound: &[&str],
     bound_like: &HashSet<&str>,
 ) -> Result<(), DeclaredInputsError> {
-    // (3) every declared name must be real, external or not.
-    for name in &step.declared_inputs {
-        let known = earlier.contains(name.as_str())
-            || is_system_token(name)
-            || step.field_requirements.contains_key(name)
-            || bound.contains(&name.as_str());
-        if !known {
-            return Err(DeclaredInputsError::UnknownDeclared {
-                action_id: step.action_id.clone(),
-                name: name.clone(),
-            });
-        }
-    }
+    lint_declared_known(step, earlier, bound)?;
 
     if !step.is_external_for_lint() {
         return Ok(());

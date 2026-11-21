@@ -303,6 +303,9 @@ fn check_with(points: &[PointData], allowed_text: &str, text: &str) -> CheckRepo
         &CheckInput {
             allowed_text,
             points: &pts,
+            // items.id=903: the harness keeps the pre-903 scan, so its measurements stay
+            // comparable with items.id=893/894.
+            citations: quietrabbit_lib::conductor::draft_check::CitationMarkers::None,
         },
     )
 }

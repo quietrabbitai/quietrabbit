@@ -40,6 +40,21 @@
       "points_label": "Points and facts to cover:"
     }
   },
+  "check": {
+    "suppress_phrases": [
+      "i hope this finds you well",
+      "i hope this email finds you well",
+      "i am writing to express",
+      "in today's fast-paced world",
+      "it is important to note that",
+      "needless to say",
+      "at the end of the day",
+      "i wanted to reach out",
+      "please do not hesitate to",
+      "thank you for your time and consideration"
+    ],
+    "sentence_words": { "brisk": 18, "measured": 26, "unhurried": 34 }
+  },
   "scales": {
     "voice": {
       "directness": [
@@ -149,6 +164,7 @@
       "sender": [],
       "context_fields": [],
       "flag_unsupplied_references": true,
+      "citation_markers": "numeric",
       "based_on": null
     },
     {

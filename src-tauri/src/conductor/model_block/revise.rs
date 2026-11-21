@@ -84,6 +84,7 @@ pub(crate) fn expand(
             template: lines.join("\n"),
             params: t.params.revise,
             length,
+            required: vec![spec.draft_var.clone(), spec.change_var.clone()],
         },
     )
 }

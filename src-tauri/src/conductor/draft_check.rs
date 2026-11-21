@@ -39,6 +39,18 @@
 // as [1] is read as an unsupported number, [2a] as a placeholder, and a short line
 // of capitalised words is read as a name.
 //
+// CITATIONS (items.id=903, decisions.id=963 ruling 2, option A). The citation quirk
+// stays the DEFAULT (CheckInput::citations = CitationMarkers::None), so the
+// calibration harness and the items.id=893/894 measurements are unchanged. A
+// document type with citation_markers numeric (essay_section) passes Numeric: every
+// citation marker ([1], [1, 3], [2-4], [2a]) is taken out of the text BEFORE the
+// placeholder and unsupported-specific scans, and a marker whose reference the
+// allowed text does not supply is listed in unsupplied_references. That finding is
+// not one of has_findings(): decide() MARKS a draft that has only it and never
+// regenerates for it (decisions.id=548, flag_unsupplied_references). A reference is
+// SUPPLIED when the allowed text carries the same marker id itself (a brief lists its
+// sources as "[1] ..." lines). A range [2-4] stands for each id in it.
+//
 // No model or provider id appears here (a source scan in the tests pins that), and
 // the module reads no file, database or network.
 
@@ -46,6 +58,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::conductor::model_block::document_type::CitationMarkers;
 use crate::conductor::model_block::document_type::{CheckPolicy, Latitude};
 
 /// One point of a brief with the keyword groups that show a draft covers it:
@@ -67,6 +80,8 @@ pub struct CheckInput<'a> {
     /// Points for the coverage measure. Empty means coverage is not measured
     /// (points_total is 0).
     pub points: &'a [Point<'a>],
+    /// items.id=903: how citation markers are read. None keeps the pre-903 scan.
+    pub citations: CitationMarkers,
 }
 
 /// The measures of one draft. Findings are the first four fields after coverage.
@@ -81,6 +96,11 @@ pub struct CheckReport {
     pub placeholders: Vec<String>,
     pub opening_chatter: Option<String>,
     pub closing_chatter: Option<String>,
+    /// items.id=903: citation marker ids the allowed text does not supply (Numeric
+    /// citations only). Marks a draft, never regenerates it. Not serialized when
+    /// empty, so the pre-903 fixture is unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsupplied_references: Vec<String>,
 }
 
 /// Lower-cases and folds typographic quotes, dashes and no-break spaces, so the
@@ -395,7 +415,90 @@ fn unsupported_specifics(text: &str, allowed: &HashSet<String>) -> Vec<String> {
 }
 
 /// Runs every measure on one draft.
+/// Longest id list one range marker may stand for ([1-40] is 40 ids). A longer
+/// range is not read as a citation.
+const MAX_RANGE: u32 = 40;
+
+/// One marker id: 1 to 3 digits and an optional lower-case letter ("2a").
+fn citation_id(s: &str) -> Option<String> {
+    let digits = s.trim_end_matches(|c: char| c.is_ascii_lowercase());
+    let suffix = &s[digits.len()..];
+    let ok = (1..=3).contains(&digits.len())
+        && digits.chars().all(|c| c.is_ascii_digit())
+        && suffix.len() <= 1;
+    ok.then(|| s.to_owned())
+}
+
+/// The ids of one bracket's inner text when it is a citation marker
+/// ("1", "1, 3", "2-4", "2a; 5"), else None.
+fn marker_ids(inner: &str) -> Option<Vec<String>> {
+    let mut ids: Vec<String> = Vec::new();
+    for item in inner.split([',', ';']) {
+        let item = item.trim();
+        if let Some((a, b)) = item.split_once(['-', '\u{2013}']) {
+            let (a, b) = (a.trim(), b.trim());
+            let (lo, hi) = (a.parse::<u32>().ok()?, b.parse::<u32>().ok()?);
+            if a.len() > 3 || b.len() > 3 || lo == 0 || hi < lo || hi - lo >= MAX_RANGE {
+                return None;
+            }
+            ids.extend((lo..=hi).map(|n| n.to_string()));
+        } else {
+            ids.push(citation_id(item)?);
+        }
+    }
+    (!ids.is_empty()).then_some(ids)
+}
+
+/// Takes every citation marker out of `text`: the ids in first-seen order (no
+/// repeats) and the text with each marker replaced by a space.
+fn split_citations(text: &str) -> (Vec<String>, String) {
+    let mut ids: Vec<String> = Vec::new();
+    let mut rest = String::with_capacity(text.len());
+    let mut i = 0;
+    while let Some(off) = text[i..].find('[') {
+        let open = i + off;
+        rest.push_str(&text[i..open]);
+        let marker = text[open + 1..]
+            .find(']')
+            .filter(|&e| e <= 40)
+            .and_then(|e| marker_ids(&text[open + 1..open + 1 + e]).map(|m| (e, m)));
+        match marker {
+            Some((e, m)) => {
+                for id in m {
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+                rest.push(' ');
+                i = open + e + 2;
+            }
+            None => {
+                rest.push('[');
+                i = open + 1;
+            }
+        }
+    }
+    rest.push_str(&text[i..]);
+    (ids, rest)
+}
+
+/// Runs every measure on one draft.
 pub fn check(text: &str, input: &CheckInput) -> CheckReport {
+    // items.id=903: with Numeric citations the markers are cut out first, so the
+    // placeholder and unsupported-specific scans never see them.
+    let (unsupplied_references, scanned) = match input.citations {
+        CitationMarkers::None => (Vec::new(), text.to_owned()),
+        CitationMarkers::Numeric => {
+            let (ids, rest) = split_citations(text);
+            let supplied = split_citations(input.allowed_text).0;
+            let missing = ids
+                .into_iter()
+                .filter(|id| !supplied.contains(id))
+                .collect();
+            (missing, rest)
+        }
+    };
+    let text = scanned.as_str();
     let hay = norm(text);
     let missing: Vec<String> = input
         .points
@@ -411,6 +514,7 @@ pub fn check(text: &str, input: &CheckInput) -> CheckReport {
         placeholders: split_placeholders(text).0,
         opening_chatter: opening_chatter(text),
         closing_chatter: closing_chatter(text),
+        unsupplied_references,
     }
 }
 
@@ -441,9 +545,13 @@ pub enum Verdict {
 /// Applies the latitude's policy to a report. `attempt` is 0 for the first draft
 /// and 1 for the draft after a regeneration; a strict draft is regenerated at most
 /// once, so any attempt after the first is marked.
+///
+/// items.id=903: an unsupplied reference alone MARKS the draft (never Regenerate),
+/// under a strict or a framed latitude; free is Skipped as before.
 pub fn decide(report: &CheckReport, latitude: Latitude, attempt: u32) -> Verdict {
     match CheckPolicy::for_latitude(latitude) {
         CheckPolicy::Off => Verdict::Skipped,
+        _ if !report.has_findings() && !report.unsupplied_references.is_empty() => Verdict::Mark,
         _ if !report.has_findings() => Verdict::Accept,
         CheckPolicy::MarkOnly => Verdict::Mark,
         CheckPolicy::RegenerateOnceThenMark if attempt == 0 => Verdict::Regenerate,
@@ -613,6 +721,7 @@ mod tests {
             &CheckInput {
                 allowed_text: &c.allowed,
                 points: &points,
+                citations: CitationMarkers::None,
             },
         )
     }
@@ -720,6 +829,95 @@ mod tests {
         }
         // Every shipped type is covered above (a new type forces a decision here).
         assert_eq!(reg.types.len(), 6);
+    }
+
+    // -- items.id=903: numeric citations (decisions.id=963 ruling 2, option A) -----
+
+    fn essay(text: &str, allowed: &str) -> CheckReport {
+        check(
+            text,
+            &CheckInput {
+                allowed_text: allowed,
+                points: &[],
+                citations: CitationMarkers::Numeric,
+            },
+        )
+    }
+
+    #[test]
+    fn citation_markers_are_read_in_every_listed_shape() {
+        let (ids, rest) = split_citations("A [1], B [1, 3], C [2-4], D [2a; 7] and [Name].");
+        assert_eq!(ids, ["1", "3", "2", "4", "2a", "7"]);
+        assert!(
+            rest.contains("[Name]"),
+            "a placeholder is not a citation: {rest}"
+        );
+        assert!(!rest.contains("[1]") && !rest.contains("[2a"));
+        // Not citations: a long range, a zero, letters, four digits, an empty pair.
+        for s in ["[1-99]", "[0-2]", "[ab]", "[1234]", "[]", "[1a2]", "[2aa]"] {
+            assert!(split_citations(s).0.is_empty(), "{s}");
+        }
+    }
+
+    #[test]
+    fn numeric_citations_leave_the_scans_and_only_unsupplied_ones_are_listed() {
+        let allowed = "Kim 2019 found a rise.\n[1] Kim, 2019\n[2] Ode, 2021";
+        let r = essay(
+            "Kim found a rise in 2019 [1] and again [2], then [2a].",
+            allowed,
+        );
+        assert!(r.unsupported.is_empty(), "{:?}", r.unsupported);
+        assert!(r.placeholders.is_empty(), "{:?}", r.placeholders);
+        assert_eq!(r.unsupplied_references, ["2a"]);
+        assert!(!r.has_findings());
+        // The same draft with the default keeps the pinned quirk.
+        let r = check(
+            "Kim found a rise in 2019 [1] and again [2], then [2a].",
+            &CheckInput {
+                allowed_text: allowed,
+                points: &[],
+                citations: CitationMarkers::None,
+            },
+        );
+        assert_eq!(r.placeholders, ["[2a]"]);
+        assert!(r.unsupplied_references.is_empty());
+    }
+
+    #[test]
+    fn an_unsupplied_reference_marks_and_never_regenerates() {
+        let refs = CheckReport {
+            unsupplied_references: vec!["3".to_owned()],
+            ..CheckReport::default()
+        };
+        assert_eq!(decide(&refs, Latitude::Strict, 0), Verdict::Mark);
+        assert_eq!(decide(&refs, Latitude::Strict, 1), Verdict::Mark);
+        assert_eq!(decide(&refs, Latitude::Framed, 0), Verdict::Mark);
+        assert_eq!(decide(&refs, Latitude::Free, 0), Verdict::Skipped);
+        // With another finding the usual policy applies.
+        let both = CheckReport {
+            placeholders: vec!["[Name]".to_owned()],
+            ..refs
+        };
+        assert_eq!(decide(&both, Latitude::Strict, 0), Verdict::Regenerate);
+    }
+
+    #[test]
+    fn only_essay_section_ships_numeric_citations() {
+        let reg = registry().expect("registry");
+        for t in &reg.types {
+            let want = if t.id == "essay_section" {
+                CitationMarkers::Numeric
+            } else {
+                CitationMarkers::None
+            };
+            assert_eq!(t.citation_markers, want, "{}", t.id);
+        }
+    }
+
+    #[test]
+    fn the_pre_903_fixture_serializes_without_the_new_field() {
+        let v = serde_json::to_value(CheckReport::default()).unwrap();
+        assert!(v.get("unsupplied_references").is_none());
     }
 
     // -- Scans ------------------------------------------------------------------

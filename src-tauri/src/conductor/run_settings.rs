@@ -227,10 +227,67 @@ pub fn reexpand(def: &mut FocusDefinition, resolved: &Resolved) -> Result<(), Re
             });
         };
         let mut new = new;
+        // items.id=903: the slot's list is already the MERGED one (the block's own
+        // required-input clauses, then the row's), so it is kept whole. The fresh
+        // expansion's clauses depend only on the spec's variable names, which a
+        // re-expansion never changes; a mismatch would be a bug, so it is refused.
+        if new
+            .and_guards
+            .iter()
+            .any(|g| !slot.and_guards.contains(g) && slot.guard.as_ref() != Some(g))
+        {
+            return Err(ResolveError::Expand {
+                step: origin.action_id.clone(),
+                message: "the re-expanded block emits a required-input guard the loaded row \
+                          does not carry"
+                    .to_owned(),
+            });
+        }
         new.guard = slot.guard.take();
         new.and_guards = std::mem::take(&mut slot.and_guards);
         new.schedule_trigger = slot.schedule_trigger.take();
         *slot = new;
+    }
+    inject_check_settings(def, resolved)
+}
+
+/// items.id=903 (decisions.id=942 point 3): every cb-06 row with a draft check gets
+/// the run's selected document type, latitude and pacing, from the SAME resolution
+/// the model blocks were just re-expanded with, so the check and the draft agree. A
+/// Focus with no document_type question (no selected type or settings) is left with
+/// the row's own document type and its shipped defaults.
+fn inject_check_settings(
+    def: &mut FocusDefinition,
+    resolved: &Resolved,
+) -> Result<(), ResolveError> {
+    let (Some(document_type), Some(settings)) = (
+        resolved.resolution.document_type.as_ref(),
+        resolved.resolution.settings.as_ref(),
+    ) else {
+        return Ok(());
+    };
+    for step in def.steps.iter_mut() {
+        if step.block_stable_id.as_deref() != Some("cb-06") {
+            continue;
+        }
+        let Some(custom) = step.block_customization.as_ref() else {
+            continue;
+        };
+        let run = crate::conductor::check_block::RunCheckSettings {
+            document_type: document_type.clone(),
+            latitude: settings.latitude,
+            pacing: settings.pacing.clone(),
+        };
+        let filled =
+            crate::conductor::check_block::with_run_settings(custom, run).map_err(|message| {
+                ResolveError::Expand {
+                    step: step.action_id.clone(),
+                    message,
+                }
+            })?;
+        if let Some(filled) = filled {
+            step.block_customization = Some(filled);
+        }
     }
     Ok(())
 }

@@ -979,10 +979,13 @@ pub(crate) async fn load_focus_definition_from_db(
                             requires_user_handoff: false,
                             revisitable: false,
                             block_stable_id: Some(stable_id.clone()),
+                            // items.id=903 (decisions.id=963 ruling 3): the stored
+                            // values the handler may read, declared so the
+                            // declared-inputs lint checks them and seeding reads them.
+                            declared_inputs: (handler.declared_inputs)(&block_customization),
                             block_customization: Some(block_customization),
                             schedule_trigger: None,
                             guard: None,
-                            declared_inputs: Vec::new(),
                             store_op: None,
                             and_guards: Vec::new(),
                             requirement: None,
@@ -1050,8 +1053,23 @@ pub(crate) async fn load_focus_definition_from_db(
             }
         };
         step.schedule_trigger = schedule_trigger;
+        // items.id=903 (constraint 1, decisions.id=963 ruling 1): a model block's
+        // expansion carries its own required-input clauses (empty for every other
+        // row). They are MERGED ahead of the row's clauses, never overwritten, and
+        // the merged set is capped like a row's own list.
+        let block_clauses = std::mem::take(&mut step.and_guards);
+        step.and_guards = crate::conductor::model_block::merge_block_clauses(
+            &block_clauses,
+            guard.as_ref(),
+            and_guards,
+        )
+        .map_err(|e| {
+            LifecycleError::ValidationFailed(format!(
+                "Focus '{focus_id}' step '{}': with the block's own required-input guard: {e}",
+                step.action_id
+            ))
+        })?;
         step.guard = guard;
-        step.and_guards = and_guards;
         steps.push(step);
     }
 
@@ -3761,7 +3779,14 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             ))
         })?;
 
-        let out = (handler.run)(customization, task_track).map_err(|e| {
+        // items.id=903 (decisions.id=963 ruling 3): the handler sees the seeds of the
+        // names its row DECLARES and nothing else, read-only.
+        let seeds = declared_seeds(step, &self.store_tokens.seeds);
+        let inputs = crate::conductor::block_dispatch::BlockInputs {
+            track: task_track,
+            seeds: &seeds,
+        };
+        let out = (handler.run)(customization, &inputs).map_err(|e| {
             LifecycleError::ValidationFailed(format!(
                 "step '{}': block '{block_id}': {e}",
                 step.action_id
@@ -5663,6 +5688,25 @@ fn deserialize_shared_state_track(json: &str) -> Result<SharedStateTrack, Lifecy
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// items.id=903 (decisions.id=963 ruling 3): the seeds a pure block handler may read:
+/// exactly the names its row declares, copied (the handler cannot write back).
+pub(crate) fn declared_seeds(
+    step: &ActionDefinition,
+    seeds: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    seeds
+        .iter()
+        .filter(|(k, _)| step.declared_inputs.contains(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// items.id=903 unit A: the model block's own required-input guard, its merge with the
+/// row's guards, the run-start re-expansion and cb-06's declared reads, on the DB loader.
+#[cfg(test)]
+#[path = "block_guard_load_tests.rs"]
+mod block_guard_load_tests;
 
 /// items.id=901 stage 7: tests of the run's park reason against a real outputs.db.
 #[cfg(test)]

@@ -28,7 +28,7 @@
 // and they are not settings: a SettingsPatch has no field for them and
 // deny_unknown_fields rejects a patch that names one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
@@ -487,6 +487,20 @@ pub struct TypeParams {
     pub revise: StepParams,
 }
 
+/// items.id=903: how the draft check reads bracketed citation markers
+/// (DocumentType::citation_markers).
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CitationMarkers {
+    /// Markers are scanned like any other text (the pre-903 behaviour).
+    #[default]
+    None,
+    /// Numeric markers are citations: see DocumentType::citation_markers.
+    Numeric,
+}
+
 /// One document type. The shipped ones are rows of block_data/document_types.json
 /// (shared by every Focus that uses the draft block). A custom type is the same
 /// shape, stored per persona in the encrypted store (a later build) and validated
@@ -514,6 +528,15 @@ pub struct DocumentType {
     /// A scholarly type flags references the user did not supply
     /// (decisions.id=548) whatever its latitude. Tighten-only against `based_on`.
     pub flag_unsupplied_references: bool,
+    /// items.id=903 (decisions.id=963 ruling 2, option A): how the draft check reads
+    /// bracketed citation markers ([1], [1, 3], [2-4], [2a]). `none`: as today, a
+    /// marker is an unsupported number or a placeholder. `numeric`: markers are taken
+    /// out before the number and placeholder scans, and a marker whose reference the
+    /// brief does not supply is its own finding, which marks the draft and never
+    /// regenerates it. numeric requires flag_unsupplied_references (it is how that
+    /// flag is checked) and is tighten-only against `based_on` like the flag.
+    #[serde(default)]
+    pub citation_markers: CitationMarkers,
     /// Custom types only: the shipped type this one was made from.
     pub based_on: Option<String>,
 }
@@ -610,6 +633,14 @@ pub fn validate_document_type(
     }
     match (&t.based_on, base) {
         (Some(b), Some(base)) => {
+            if base.citation_markers == CitationMarkers::Numeric
+                && t.citation_markers != CitationMarkers::Numeric
+            {
+                return Err(format!(
+                    "document type '{id}': citation_markers cannot be switched off against its \
+                     base '{b}'"
+                ));
+            }
             if &base.id != b {
                 return Err(format!(
                     "document type '{id}': based_on '{b}' does not match the base given"
@@ -634,6 +665,12 @@ pub fn validate_document_type(
         }
         (None, None) => {}
     }
+    if t.citation_markers == CitationMarkers::Numeric && !t.flag_unsupplied_references {
+        return Err(format!(
+            "document type '{id}': citation_markers numeric needs flag_unsupplied_references \
+             (the citation check is how that flag is applied)"
+        ));
+    }
     Ok(())
 }
 
@@ -647,7 +684,69 @@ pub fn validate_document_type(
 pub struct Registry {
     pub phrases: Phrases,
     pub scales: Scales,
+    /// items.id=903: the data of cb-06's deterministic voice check.
+    pub check: CheckData,
     pub types: Vec<DocumentType>,
+}
+
+/// items.id=903 (decisions.id=942 point 3): the data of cb-06's voice-coherence
+/// check (conductor::check_block). Data, so tuning it is a data edit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckData {
+    /// Lower-case phrases a voice-applied draft should not contain (stock filler).
+    /// A draft that contains one is marked, never regenerated.
+    pub suppress_phrases: Vec<String>,
+    /// For each step of the pacing scale, the longest average sentence, in words,
+    /// that the pacing allows. A longer average marks the draft.
+    pub sentence_words: BTreeMap<String, u32>,
+}
+
+/// Most suppress phrases the data may list, and the longest one.
+pub const MAX_SUPPRESS_PHRASES: usize = 60;
+pub const MAX_SUPPRESS_PHRASE_CHARS: usize = 80;
+
+impl CheckData {
+    pub fn validate(&self, scales: &Scales) -> Result<(), String> {
+        if self.suppress_phrases.len() > MAX_SUPPRESS_PHRASES {
+            return Err(format!(
+                "check: more than {MAX_SUPPRESS_PHRASES} suppress phrases"
+            ));
+        }
+        for (i, p) in self.suppress_phrases.iter().enumerate() {
+            check_text(&format!("check.suppress_phrases[{i}]"), p, &[])?;
+            if p.chars().count() > MAX_SUPPRESS_PHRASE_CHARS
+                || p.trim() != p
+                || p.to_lowercase() != *p
+            {
+                return Err(format!(
+                    "check.suppress_phrases[{i}]: a phrase is lower case, trimmed and at most \
+                     {MAX_SUPPRESS_PHRASE_CHARS} characters"
+                ));
+            }
+            if self.suppress_phrases[..i].contains(p) {
+                return Err(format!("check.suppress_phrases[{i}]: listed twice"));
+            }
+        }
+        let pacing: BTreeSet<&str> = scales.voice.pacing.iter().map(|s| s.id.as_str()).collect();
+        let keyed: BTreeSet<&str> = self.sentence_words.keys().map(String::as_str).collect();
+        if pacing != keyed {
+            return Err(
+                "check.sentence_words: needs exactly one entry per step of the pacing scale"
+                    .to_owned(),
+            );
+        }
+        if let Some((k, _)) = self
+            .sentence_words
+            .iter()
+            .find(|(_, &n)| !(5..=80).contains(&n))
+        {
+            return Err(format!(
+                "check.sentence_words.{k}: must be between 5 and 80 words"
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Registry {
@@ -660,6 +759,7 @@ impl Registry {
     pub fn validate(&self) -> Result<(), String> {
         self.scales.validate()?;
         self.phrases.validate()?;
+        self.check.validate(&self.scales)?;
         if self.types.is_empty() {
             return Err("registry: no document types".to_owned());
         }

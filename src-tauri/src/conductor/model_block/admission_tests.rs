@@ -69,6 +69,7 @@ const PINNED_KEYS: &[&str] = &[
     "based_on",
     "brief_var",
     "change_var",
+    "citation_markers",
     "class_preference",
     "common",
     "context_fields",
@@ -727,7 +728,14 @@ async fn every_example_loads_through_the_real_loader_as_the_right_kind_of_step()
                 Some(ExternalAccess::LocalOnly)
             );
             assert!(!step.requires_user_handoff);
-            assert!(step.store_op.is_none() && !step.is_guarded());
+            // items.id=903: the only clauses are the block's own required-input ones.
+            assert!(step.store_op.is_none() && step.guard.is_none());
+            assert!(step.and_guards.iter().all(|g| {
+                g.condition == crate::conductor::guard::Condition::Present
+                    && crate::conductor::bound_spec::spec(&g.var).is_some_and(|s| {
+                        s.presence == crate::conductor::bound_spec::Presence::Optional
+                    })
+            }));
             assert_eq!(
                 step.output_var.as_deref(),
                 output_var_of(id, &ex).as_deref()
@@ -937,7 +945,12 @@ fn a_pure_block_does_not_change_the_track_and_leaks_no_input_text() {
             audit_unavailable: false,
         });
         let before = track.steps().len();
-        let out = (h.run)(&ex, &track).unwrap();
+        let seeds = std::collections::HashMap::new();
+        let inputs = crate::conductor::block_dispatch::BlockInputs {
+            track: &track,
+            seeds: &seeds,
+        };
+        let out = (h.run)(&ex, &inputs).unwrap();
         assert_eq!(
             track.steps().len(),
             before,

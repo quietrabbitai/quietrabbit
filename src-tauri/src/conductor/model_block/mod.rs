@@ -65,6 +65,7 @@ use std::collections::{BTreeSet, HashMap};
 use serde_json::Value;
 
 use crate::conductor::executor::find_tokens;
+use crate::conductor::guard::{Condition, Guard};
 use crate::conductor::tokens::{ActionDefinition, ExternalAccess, StepType};
 
 use self::config::{tighten, CommonConfig, Destination, EnvelopeOverride, ModelRequirement};
@@ -227,6 +228,55 @@ pub(crate) struct Built {
     pub template: String,
     pub params: StepParams,
     pub length: WordRange,
+    /// items.id=903 (constraint 1, decisions.id=963 ruling 1): the variables the
+    /// block cannot run without (cb-12 brief_var, cb-13 apply input_var, cb-14
+    /// draft_var and change_var). finish() turns each that is an Optional bound
+    /// name into a `present` clause on the expanded step (required_input_clauses).
+    pub required: Vec<String>,
+}
+
+/// items.id=903 (constraint 1, decisions.id=963 ruling 1): the guard clauses a
+/// model block emits for itself. An Optional bound name (an artifact such as
+/// content_brief, a hand-off name, run_change) is ABSENT until something writes
+/// it, and an absent name renders as nothing, so a draft from an absent brief
+/// would run on an empty input. Each required variable that is an Optional bound
+/// name gets a `present` clause, in the order given, without duplicates. The loader
+/// (and the run-start re-expansion, which keeps the merged list) puts these AHEAD of
+/// the row's own clauses (merge_block_clauses), so no Focus row can drop them. A
+/// variable that is an earlier row's output, or an Always bound name, gets none.
+pub fn required_input_clauses(required: &[String]) -> Vec<Guard> {
+    let mut out: Vec<Guard> = Vec::new();
+    for var in required {
+        let optional = crate::conductor::bound_spec::spec(var)
+            .is_some_and(|s| s.presence == crate::conductor::bound_spec::Presence::Optional);
+        if optional && !out.iter().any(|g| &g.var == var) {
+            out.push(Guard {
+                var: var.clone(),
+                condition: Condition::Present,
+            });
+        }
+    }
+    out
+}
+
+/// items.id=903: the clause list of a model-block row: the block's own clauses
+/// first, then the row's. A block clause the row already states (as its single
+/// guard or in its list) is not repeated, so a row that writes the guard itself
+/// still loads. The whole set is then capped by guard::check_clause_total exactly
+/// as a row's own list is, so a block clause counts toward MAX_GUARD_CLAUSES.
+pub fn merge_block_clauses(
+    block: &[Guard],
+    row_single: Option<&Guard>,
+    row_clauses: Vec<Guard>,
+) -> Result<Vec<Guard>, crate::conductor::guard::GuardError> {
+    let mut merged: Vec<Guard> = block
+        .iter()
+        .filter(|g| row_single != Some(*g) && !row_clauses.contains(g))
+        .cloned()
+        .collect();
+    merged.extend(row_clauses);
+    crate::conductor::guard::check_clause_total(row_single, &merged)?;
+    Ok(merged)
 }
 
 /// A temperature or top_p as the JSON number a user would have typed, not an
@@ -344,7 +394,9 @@ pub(crate) fn finish(
         block_customization: None,
         schedule_trigger: None,
         guard: None,
-        and_guards: Vec::new(),
+        // items.id=903: the block's own required-input clauses. The loader merges
+        // the row's clauses after them (merge_block_clauses).
+        and_guards: required_input_clauses(&built.required),
         declared_inputs: common.declared_inputs.clone(),
         store_op: None,
         requirement: Some(ModelRequirement {

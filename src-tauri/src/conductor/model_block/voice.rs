@@ -137,6 +137,7 @@ pub(crate) fn expand(
             template: lines.join("\n"),
             params: t.params.voice,
             length,
+            required: spec.input_var.iter().cloned().collect(),
         },
     )
 }
