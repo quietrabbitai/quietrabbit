@@ -126,18 +126,25 @@ pub enum KeptPrivate {
 /// hosted step's prompt inside an earlier step's output (executor.rs carry scan).
 pub const CARRIED_FIELD_CATEGORY: &str = "qr_personal_field";
 
+/// items.id=924: the category of a Focus-owned device value raised by source (an ask
+/// value the pass seeded, found anywhere in a hosted step's prompt: carry_scan).
+pub const DEVICE_FIELD_CATEGORY: &str = "qr_device_field";
+
 /// items.id=933 (M2): a span raised by source. Merged into the filter's spans BEFORE
 /// the partition, so a remembered answer, the step_reviews record, the consent
 /// request and the removal all take the ordinary path. `suggestion` is the field's
 /// abstraction at the step's tier (a summarize label), or None. Only the outbound
 /// review passes any (a scan pins it). Debug never prints the text.
 /// items.id=924: `allowed` is the answers the span allows (allowed_answers.rs); the
-/// partition and the outbound review's application both apply it.
+/// partition and the outbound review's application both apply it. `fact_key`, when
+/// the source gives one (a device value: device_fact:...), is the span's identity in
+/// place of the Layer 1 to 3 cascade.
 #[derive(Clone)]
 pub struct SourceSpan {
     pub entity: PfEntityDecoded,
     pub suggestion: Option<String>,
     pub allowed: AllowedAnswers,
+    pub fact_key: Option<String>,
 }
 
 /// items.id=924: the source span that raised `e` (same offsets and label), if any.
@@ -1026,8 +1033,12 @@ async fn partition_with_rule<L: DisclosureLogger>(
     let mut auto_resolved: Vec<AutoResolvedSpan> = Vec::new();
 
     for entity in entities {
-        let fact_key =
-            resolve_fact_key(user_id, persona_id, key_hex, &entity, &prior_mentions).await;
+        // items.id=924: a source span that carries its own identity (a device value)
+        // uses it; every other span takes the cascade.
+        let fact_key = match source_of(&entity, source_spans).and_then(|s| s.fact_key.clone()) {
+            Some(fk) => Some(fk),
+            None => resolve_fact_key(user_id, persona_id, key_hex, &entity, &prior_mentions).await,
+        };
 
         let prior_decision = match &fact_key {
             None => None,
@@ -1399,6 +1410,8 @@ fn taxonomy_label(category: &str) -> String {
         "secret" => "Sensitive value",
         // items.id=933: placeholder wording, Chat-BRAND's.
         CARRIED_FIELD_CATEGORY => "Personal detail",
+        // items.id=924: placeholder wording, Chat-BRAND's.
+        DEVICE_FIELD_CATEGORY => "Device detail",
         _ => "Sensitive information",
     }
     .to_owned()
@@ -2567,6 +2580,7 @@ mod tests {
             entity: entity_with("private_email", F_EMAIL),
             suggestion: Some("[email address]".to_owned()),
             allowed,
+            fact_key: None,
         }
     }
 
@@ -2720,6 +2734,91 @@ mod tests {
         }
     }
 
+    /// items.id=924 D3: a device span carries its own key (device_fact:...), which
+    /// replaces the cascade. A standing release under it is asked again (a field with
+    /// the access-credential flag allows a live release only); a standing
+    /// generalization under it applies; a preference under any other key is not its.
+    #[tokio::test]
+    async fn a_device_span_is_remembered_by_its_own_key() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let serial = "C02XK1ZZJGH5";
+        let key =
+            crate::conductor::device_seeding::device_fact_key("ent-1", "serial_number", serial);
+        let src = SourceSpan {
+            entity: entity_with(DEVICE_FIELD_CATEGORY, serial),
+            suggestion: Some("[serial number]".to_owned()),
+            allowed: AllowedAnswers::NO_STANDING_RELEASE,
+            fact_key: Some(key.clone()),
+        };
+        let part = || async {
+            partition_with_rule(
+                &TestLogger::new(),
+                F_USER,
+                F_PERSONA,
+                TEST_KEY_HEX,
+                F_ACTION,
+                F_RUN,
+                1,
+                vec![src.entity.clone()],
+                false,
+                KeptPrivate::RemovesSpans,
+                std::slice::from_ref(&src),
+            )
+            .await
+            .expect("partition")
+        };
+        let standing = |fk: String, decision: &'static str, sugg: Option<&'static str>| async move {
+            crate::persistence::personal_store::write_standing_preference(
+                F_USER,
+                F_PERSONA,
+                TEST_KEY_HEX,
+                &fk,
+                DEVICE_FIELD_CATEGORY,
+                decision,
+                sugg,
+                None,
+            )
+            .await
+            .unwrap();
+        };
+        // Nothing remembered: asked, under the device key.
+        {
+            let _root = fresh_root();
+            f_seed_run().await;
+            let o = part().await;
+            assert!(unsettled(&o));
+            assert_eq!(o.needs_review[0].1.as_deref(), Some(key.as_str()));
+        }
+        // A standing release under the key: asked again.
+        {
+            let _root = fresh_root();
+            f_seed_run().await;
+            standing(key.clone(), "release_original", None).await;
+            assert!(unsettled(&part().await));
+        }
+        // A standing generalization under the key: applied.
+        {
+            let _root = fresh_root();
+            f_seed_run().await;
+            standing(key.clone(), "generalize", Some("[serial number]")).await;
+            let r = part().await.early_result.expect("settled");
+            assert_eq!(r.auto_resolved[0].decision, "generalize");
+            assert_eq!(
+                r.auto_resolved[0].allowed,
+                AllowedAnswers::NO_STANDING_RELEASE
+            );
+        }
+        // A preference under another key (the same text of another device) is not its.
+        {
+            let _root = fresh_root();
+            f_seed_run().await;
+            let other =
+                crate::conductor::device_seeding::device_fact_key("ent-2", "serial_number", serial);
+            standing(other, "generalize", Some("[serial number]")).await;
+            assert!(unsettled(&part().await));
+        }
+    }
+
     #[tokio::test]
     async fn a_span_that_allows_every_answer_is_settled_as_before() {
         let _lock = crate::test_support::ENV_MUTEX.lock().await;
@@ -2752,6 +2851,7 @@ mod tests {
             entity: entity_with("private_phone", F_EMAIL),
             suggestion: None,
             allowed: AllowedAnswers::NO_RELEASE,
+            fact_key: None,
         };
         assert!(build_consent_spans(&[(e, None)], 1, 3, &[other])[0]
             .allowed
@@ -3327,6 +3427,7 @@ mod tests {
             },
             suggestion: suggestion.map(str::to_owned),
             allowed: Default::default(),
+            fact_key: None,
         }
     }
 

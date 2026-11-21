@@ -26,6 +26,18 @@
 // handle that resolves among its replies); one that cannot be verified refuses the
 // resume (decisions ruling 9 of the items.id=888 plan, fail closed).
 //
+// THE DEVICE SEED (items.id=924). Derived names have no version, but the device values
+// a pass seeded drive the carry scan of its hosted steps (carry_scan::classify_devices),
+// so a checkpoint whose pass seeded any records `device_seed`: the DeviceSeed's
+// fingerprint, a SHA-256 of every seeded (entity, field, value, disclosure) and the
+// brief's device count, never a value. On resume the device names the steps read are
+// seeded again and the fingerprint compared: a device edited, renamed, added, purged or
+// re-disclosed between the park and the resume, or a read that fails, refuses the resume
+// (ResumeStoreChanged). A pass that seeded no device writes no entry, and a snapshot
+// without one (every row from before items.id=924) resumes as before. A pass whose own
+// writer changes a seeded device fact before it parks cannot resume either (the pin is
+// the pass's seed, not the store at checkpoint time: completed steps saw the seed).
+//
 // A snapshot with no extra_metadata (the default '{}', every row from before this item)
 // has nothing pinned and is not checked. Metadata that does not parse is refused.
 
@@ -45,6 +57,7 @@ pub struct PinError;
 pub const SEED_VERSIONS_KEY: &str = "seed_versions";
 pub const SEED_VERSIONS_UNREADABLE_KEY: &str = "seed_versions_unreadable";
 pub const PUBLISHED_KEY: &str = "published";
+pub const DEVICE_SEED_KEY: &str = "device_seed";
 
 /// The plain message of a run stopped because the chat's saved state changed.
 pub const SAVED_STATE_CHANGED: &str = "saved chat state changed while waiting";
@@ -109,16 +122,22 @@ pub struct Pinned {
     pub versions: Option<BTreeMap<String, i64>>,
     pub unreadable: bool,
     pub published: BTreeMap<String, String>,
+    /// items.id=924: the pass's DeviceSeed fingerprint, when it seeded any device.
+    pub device_seed: Option<String>,
 }
 
-/// The snapshot's extra_metadata JSON for these versions and published ids. `versions`
-/// is None when the steps read no versioned name, Some(Err) when the store could not be
-/// read.
+/// The snapshot's extra_metadata JSON for these versions, published ids and device-seed
+/// fingerprint. `versions` is None when the steps read no versioned name, Some(Err) when
+/// the store could not be read; `device_seed` is None when the pass seeded no device.
 pub fn checkpoint_metadata(
     versions: Option<Result<BTreeMap<String, i64>, PinError>>,
     published: &HashMap<String, String>,
+    device_seed: Option<String>,
 ) -> String {
     let mut obj = serde_json::Map::new();
+    if let Some(fp) = device_seed {
+        obj.insert(DEVICE_SEED_KEY.to_owned(), serde_json::Value::String(fp));
+    }
     match versions {
         None => {}
         Some(Ok(v)) => {
@@ -165,6 +184,9 @@ pub fn parse(extra: Option<&str>) -> Result<Pinned, PinError> {
     if let Some(v) = obj.get(SEED_VERSIONS_UNREADABLE_KEY) {
         pinned.unreadable = v.as_bool().ok_or(PinError)?;
     }
+    if let Some(v) = obj.get(DEVICE_SEED_KEY) {
+        pinned.device_seed = Some(v.as_str().ok_or(PinError)?.to_owned());
+    }
     if let Some(v) = obj.get(PUBLISHED_KEY) {
         let map = v.as_object().ok_or(PinError)?;
         for (var, id) in map {
@@ -174,6 +196,35 @@ pub fn parse(extra: Option<&str>) -> Result<Pinned, PinError> {
         }
     }
     Ok(pinned)
+}
+
+/// items.id=924: the fingerprint of the device names these steps read, seeded now as a
+/// pass would seed them. None when the steps read no device name or nothing is seeded;
+/// Err on any read failure (the caller fails closed).
+pub async fn current_device_seed(
+    outputs: &mut SqliteConnection,
+    personal: &mut SqliteConnection,
+    context_key: Option<&str>,
+    focus_id: &str,
+    steps: &[ActionDefinition],
+) -> Result<Option<String>, PinError> {
+    let names: Vec<&'static str> = crate::conductor::seeding::required_names(steps)
+        .into_iter()
+        .filter(|n| crate::conductor::device_seeding::is_device_seed(n))
+        .collect();
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let (_, seed) = crate::conductor::device_seeding::read_device_seeds(
+        outputs,
+        personal,
+        context_key,
+        focus_id,
+        &names,
+    )
+    .await
+    .map_err(|_| PinError)?;
+    Ok(seed.fingerprint())
 }
 
 /// Re-verify every published id against its own store, scoped to `focus_id`. The kind of

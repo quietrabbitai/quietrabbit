@@ -4217,7 +4217,13 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
                     .await,
                 )
             };
-            crate::conductor::resume_pin::checkpoint_metadata(versions, &self.store_vars)
+            // items.id=924: the fingerprint of the device values this pass seeded (a
+            // hash only; none when it seeded no device).
+            crate::conductor::resume_pin::checkpoint_metadata(
+                versions,
+                &self.store_vars,
+                self.store_tokens.device_seed.fingerprint(),
+            )
         };
 
         // items.id=888 (F7): the id is returned so reenter_step can carry it as its
@@ -4924,11 +4930,38 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             return Err(changed());
         }
         let needs_versions = pinned.versions.as_ref().is_some_and(|v| !v.is_empty());
-        if !needs_versions && pinned.published.is_empty() {
+        if !needs_versions && pinned.published.is_empty() && pinned.device_seed.is_none() {
             return Ok(());
         }
         let key_hex = self.key_hex.as_deref().ok_or(LifecycleError::NoKey)?;
         let mut conn = open_outputs_db(&self.user_id, &self.persona_id, key_hex).await?;
+        // items.id=924: the device values the pass seeded must be what a pass seeds now.
+        if let Some(pinned_seed) = pinned.device_seed.as_deref() {
+            let steps = &self
+                .focus_def
+                .as_ref()
+                .expect("check_resume_pin() requires load()")
+                .steps;
+            let mut personal = crate::persistence::personal_store::open_personal_db(
+                &self.user_id,
+                &self.persona_id,
+                key_hex,
+            )
+            .await
+            .map_err(|_| changed())?;
+            let now = resume_pin::current_device_seed(
+                &mut conn,
+                &mut personal,
+                self.context_key.as_deref(),
+                &self.focus_id,
+                steps,
+            )
+            .await
+            .map_err(|_| changed())?;
+            if now.as_deref() != Some(pinned_seed) {
+                return Err(changed());
+            }
+        }
         if let Some(pinned_versions) = pinned.versions.as_ref().filter(|v| !v.is_empty()) {
             let chat = self.context_key.as_deref().ok_or_else(changed)?;
             let names: Vec<&str> = pinned_versions.keys().map(String::as_str).collect();
@@ -16981,6 +17014,196 @@ steps:
             let err = changed.check_resume_pin(Some(&extra)).await.unwrap_err();
             assert!(matches!(err, LifecycleError::ResumeStoreChanged), "{err:?}");
             assert!(changed.store_vars.is_empty());
+        })
+        .await;
+    }
+
+    // -- items.id=924: the device-seed pin ---------------------------------------
+
+    /// A run of chat PIN_CHAT whose one step reads {device_library_brief}.
+    fn device_pin_run() -> FocusRun<crate::conductor::privacy::logger::TestLogger> {
+        let mut reads = single_tier3_step_focus_def().steps[0].clone();
+        reads.action_id = "reads".to_owned();
+        reads.routing_tier = ExternalAccess::LocalOnly;
+        reads.external_access_override = None;
+        reads.requires_user_handoff = false;
+        reads.prompt_template = "Devices: {device_library_brief}".to_owned();
+        writer_run(vec![reads], Some(PIN_CHAT), &[])
+    }
+
+    async fn personal(
+        run: &FocusRun<crate::conductor::privacy::logger::TestLogger>,
+    ) -> sqlx::SqliteConnection {
+        crate::persistence::personal_store::open_personal_db(
+            &run.user_id,
+            &run.persona_id,
+            CRISIS_TEST_KEY_HEX,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn add_device(
+        run: &FocusRun<crate::conductor::privacy::logger::TestLogger>,
+        name: &str,
+        serial: &str,
+    ) -> String {
+        let mut conn = personal(run).await;
+        let id = crate::persistence::owned_entity_store::create_subject(
+            &mut conn,
+            &run.focus_id,
+            &run.persona_id,
+            name,
+            None,
+            &format!("k:{name}"),
+        )
+        .await
+        .unwrap();
+        crate::persistence::owned_entity_store::put_owned_fact(
+            &mut conn,
+            &run.focus_id,
+            &run.persona_id,
+            &id,
+            "serial_number",
+            serial,
+        )
+        .await
+        .unwrap();
+        id
+    }
+
+    /// Seed a pass of `run` as execute() does, checkpoint it, and return the metadata.
+    async fn device_checkpoint(
+        run: &mut FocusRun<crate::conductor::privacy::logger::TestLogger>,
+    ) -> String {
+        run.seed_store_tokens().await.unwrap();
+        pinned_checkpoint(run).await
+    }
+
+    /// items.id=924: a checkpoint whose pass seeded a device pins its fingerprint (a
+    /// hash, never a value). A resume on the same devices passes; a serial edited, a
+    /// device renamed, or a device added while the run waited refuses it
+    /// (ResumeStoreChanged).
+    #[tokio::test]
+    async fn a_resume_is_refused_when_a_seeded_device_changed_while_parked() {
+        with_temp_data_root(async {
+            let mut run = device_pin_run();
+            let laptop = add_device(&run, "Study laptop", "PF2ABC3D").await;
+            let extra = device_checkpoint(&mut run).await;
+            assert!(
+                !extra.contains("PF2ABC3D") && !extra.contains("Study"),
+                "{extra}"
+            );
+            let pinned = crate::conductor::resume_pin::parse(Some(&extra)).unwrap();
+            assert_eq!(
+                pinned.device_seed,
+                run.store_tokens.device_seed.fingerprint(),
+                "the pass's own seed"
+            );
+            assert!(pinned.device_seed.is_some());
+
+            // Unchanged: resumes.
+            device_pin_run()
+                .check_resume_pin(Some(&extra))
+                .await
+                .expect("unchanged devices resume");
+
+            // Edited: refused.
+            let mut conn = personal(&run).await;
+            crate::persistence::owned_entity_store::put_owned_fact(
+                &mut conn,
+                &run.focus_id,
+                &run.persona_id,
+                &laptop,
+                "serial_number",
+                "PF2ZZZ9Z",
+            )
+            .await
+            .unwrap();
+            let err = device_pin_run()
+                .check_resume_pin(Some(&extra))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, LifecycleError::ResumeStoreChanged), "{err:?}");
+
+            // Renamed (the serial put back): refused.
+            crate::persistence::owned_entity_store::put_owned_fact(
+                &mut conn,
+                &run.focus_id,
+                &run.persona_id,
+                &laptop,
+                "serial_number",
+                "PF2ABC3D",
+            )
+            .await
+            .unwrap();
+            device_pin_run()
+                .check_resume_pin(Some(&extra))
+                .await
+                .expect("the serial put back resumes");
+            crate::persistence::owned_entity_store::rename_owned(
+                &mut conn,
+                &run.focus_id,
+                &laptop,
+                "Old laptop",
+            )
+            .await
+            .unwrap();
+            drop(conn);
+            let err = device_pin_run()
+                .check_resume_pin(Some(&extra))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, LifecycleError::ResumeStoreChanged), "{err:?}");
+        })
+        .await;
+        with_temp_data_root(async {
+            let mut run = device_pin_run();
+            add_device(&run, "Study laptop", "PF2ABC3D").await;
+            let extra = device_checkpoint(&mut run).await;
+            add_device(&run, "Router", "4XF1234567890").await;
+            let err = device_pin_run()
+                .check_resume_pin(Some(&extra))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, LifecycleError::ResumeStoreChanged),
+                "added: {err:?}"
+            );
+        })
+        .await;
+    }
+
+    /// items.id=924: a pass that seeded no device (its Focus has none, or no step names a
+    /// device name) writes no device_seed entry and resumes unchanged; so does a snapshot
+    /// from before items.id=924, which has none.
+    #[tokio::test]
+    async fn a_pass_that_seeded_no_device_pins_none_and_resumes_unchanged() {
+        with_temp_data_root(async {
+            let mut run = device_pin_run();
+            let extra = device_checkpoint(&mut run).await;
+            assert!(!extra.contains("device_seed"), "{extra}");
+            assert_eq!(
+                crate::conductor::resume_pin::parse(Some(&extra))
+                    .unwrap()
+                    .device_seed,
+                None
+            );
+            // A device added after that checkpoint does not refuse it: nothing was pinned.
+            add_device(&run, "Study laptop", "PF2ABC3D").await;
+            device_pin_run()
+                .check_resume_pin(Some(&extra))
+                .await
+                .expect("no entry, no device check");
+
+            let mut plain = pin_run();
+            put_intent(&plain, "billing").await;
+            let extra = device_checkpoint(&mut plain).await;
+            assert!(!extra.contains("device_seed"), "{extra}");
+            pin_run()
+                .check_resume_pin(Some(&extra))
+                .await
+                .expect("a Focus with no device name");
         })
         .await;
     }

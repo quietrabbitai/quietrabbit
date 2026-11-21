@@ -594,7 +594,18 @@ impl StepExecutor {
         } else {
             None
         };
-        let gate_track = to_gate_track_with(personal_track, fresh_policies.as_ref());
+        // items.id=924 (D7): an ask field is released raw only to a hosted step that
+        // gets the outbound review, whose carry scan then raises it.
+        let (gate_track, asked_by_tier) = to_gate_track_asks(
+            personal_track,
+            fresh_policies.as_ref(),
+            treatment.hosted && ctx.bound.is_none(),
+        );
+        let asked_fields: &[String] = if treatment.abstraction_tier >= 3 {
+            &asked_by_tier[1]
+        } else {
+            &asked_by_tier[0]
+        };
         // items.id=931 report_scope: Gate 1 reports (log row, shared, withheld, floor
         // clamp) over the step's DECLARED field names only. approved_fields stays
         // unfiltered: the declared-field filter below is still the live control.
@@ -751,14 +762,25 @@ impl StepExecutor {
         // in the outbound review, or, when its policy at this tier is not_permitted,
         // removed before the review with a disclosure row and never shown. A bound API
         // Chat run has no carried output. See conductor/carry_scan.rs.
+        // items.id=924: the same scan raises (ask) or removes (never) every occurrence
+        // of a device value this pass seeded, wherever it is in the prompt.
         let (prompt, carry_spans) = if treatment.hosted && ctx.bound.is_none() {
             let carried = carried_values(ctx, &output_vars, &previous_output);
-            let hits = crate::conductor::carry_scan::classify(
+            let mut hits = crate::conductor::carry_scan::classify(
                 &carried,
                 &gate_track,
                 &g1.fields_shared,
                 treatment.abstraction_tier,
             );
+            hits.extend(crate::conductor::carry_scan::classify_asked(
+                &prompt,
+                &gate_track,
+                asked_fields,
+            ));
+            hits.extend(crate::conductor::carry_scan::classify_devices(
+                &prompt,
+                &ctx.store_tokens.device_seed,
+            ));
             let prompt = if hits.remove.is_empty() {
                 prompt
             } else {
@@ -3297,6 +3319,12 @@ fn to_gate_track(ct: &PersonalTrack) -> GateTrack {
     to_gate_track_with(ct, None)
 }
 
+/// to_gate_track_asks for a step that releases no ask field (ask is omit).
+#[cfg(test)]
+fn to_gate_track_with(ct: &PersonalTrack, fresh: Option<&UserPolicies>) -> GateTrack {
+    to_gate_track_asks(ct, fresh, false).0
+}
+
 /// The user's fact policies, read again for one step (items.id=931). Any failure to
 /// open or read personal.db is UserPolicies::Unreadable, which answers "omit" for
 /// every field and tier (decisions.id=953 ruling 10). Logs no value.
@@ -3328,10 +3356,21 @@ async fn reload_fact_policies(ctx: &StepContext) -> UserPolicies {
 /// the stricter of the INITIALIZE snapshot and the fresh policy. An unknown policy word
 /// maps to AbstractionPolicy::Unknown, which Gate 1 omits. Any other field maps as it
 /// always did (an unknown sensitivity is general: items.id=930 and earlier).
-fn to_gate_track_with(ct: &PersonalTrack, fresh: Option<&UserPolicies>) -> GateTrack {
+///
+/// items.id=924 (D7): a bridged field whose word is `ask` is released RAW (Pass) only when
+/// `ask_releases` (a hosted step that gets the outbound review: never a bound API Chat
+/// run) and its value has at least carry_scan::MIN_VALUE_CHARS characters (so the scan can
+/// find it); otherwise it is omit. The names released that way, per tier [2, 3], are
+/// returned for the carry scan, which raises every occurrence in the review.
+fn to_gate_track_asks(
+    ct: &PersonalTrack,
+    fresh: Option<&UserPolicies>,
+    ask_releases: bool,
+) -> (GateTrack, [Vec<String>; 2]) {
     use crate::conductor::personal_fact_bridge::{is_bridged, resolve_word, stricter};
     use crate::conductor::personal_fact_fields::{registry, Origin, Tier};
     let mut gt = GateTrack::new();
+    let mut asked: [Vec<String>; 2] = [Vec::new(), Vec::new()];
     for (_, field) in ct.fields() {
         let bridged = is_bridged(field);
         let sensitivity = match field.sensitivity.as_str() {
@@ -3377,6 +3416,20 @@ fn to_gate_track_with(ct: &PersonalTrack, fresh: Option<&UserPolicies>) -> GateT
                 field.abstraction_tier3.clone(),
             )
         };
+        let scannable =
+            field.field_value.chars().count() >= crate::conductor::carry_scan::MIN_VALUE_CHARS;
+        let mut resolve_ask = |word: String, slot: usize| -> String {
+            if bridged && word == "ask" {
+                if ask_releases && scannable {
+                    asked[slot].push(field.field_name.clone());
+                    return "pass".to_owned();
+                }
+                return "omit".to_owned();
+            }
+            word
+        };
+        let tier2 = resolve_ask(tier2, 0);
+        let tier3 = resolve_ask(tier3, 1);
         let _ = gt.add_field(GateField {
             field_name: field.field_name.clone(),
             field_value: field.field_value.clone(),
@@ -3388,7 +3441,7 @@ fn to_gate_track_with(ct: &PersonalTrack, fresh: Option<&UserPolicies>) -> GateT
         });
     }
     gt.seal();
-    gt
+    (gt, asked)
 }
 
 // ---------------------------------------------------------------------------
@@ -4685,6 +4738,7 @@ mod tests {
             seeds: Default::default(),
             restricted,
             user_input_backed,
+            device_seed: Default::default(),
         }
     }
 
@@ -12972,6 +13026,198 @@ mod tests {
             assert!(!all.to_lowercase().contains("leeds"), "{all}");
         })
         .await;
+    }
+
+    /// items.id=924: the pass seeded a device (a serial and a name, ask; a warranty
+    /// contact made never in this fixture; the make, pass). A local step's reply carries
+    /// them into the hosted step through {requirements} and the user typed the serial in
+    /// another case. Every ask occurrence is raised as a device span (suggestion, device
+    /// key, the serial allowing a live release only); the never value is removed before
+    /// the review, logged by field name with no value, and never raised; the pass value
+    /// is sent.
+    #[tokio::test]
+    async fn a_device_value_in_a_hosted_prompt_is_raised_or_removed_by_its_disclosure() {
+        use crate::conductor::device_fields::Disclosure;
+        use crate::conductor::device_seeding::{device_fact_key, DeviceSeed, SeededValue};
+        use crate::conductor::privacy::allowed_answers::AllowedAnswers;
+        use crate::conductor::privacy::gate3::DEVICE_FIELD_CATEGORY;
+        let v = |field: &str, value: &str, d: Disclosure, sugg: Option<&str>| SeededValue {
+            entity_id: "ent-1".to_owned(),
+            field: field.to_owned(),
+            value: value.to_owned(),
+            disclosure: d,
+            access_credential: field == "serial_number",
+            suggestion: sugg.map(str::to_owned),
+        };
+        with_temp_shared_db(|pool| async move {
+            let mut ctx = carried_hosted_ctx(&pool, None).await;
+            ctx.external_input = "the serial is pf2abc3d".to_owned();
+            ctx.store_tokens.device_seed = DeviceSeed::for_test(
+                vec![
+                    v(
+                        "device_name",
+                        "Study laptop",
+                        Disclosure::Ask,
+                        Some("[device]"),
+                    ),
+                    v(
+                        "serial_number",
+                        "PF2ABC3D",
+                        Disclosure::Ask,
+                        Some("[serial number]"),
+                    ),
+                    v(
+                        "warranty_contact",
+                        "help@warranty.example",
+                        Disclosure::Never,
+                        None,
+                    ),
+                    v("make", "Lenovo", Disclosure::Pass, None),
+                ],
+                None,
+            );
+            let seen = run_hosted_after(
+                &ctx,
+                &pool,
+                &PersonalTrack::new(),
+                track_with_requirements(
+                    "Study laptop, Lenovo, S/N PF2ABC3D, contact help@warranty.example",
+                ),
+            )
+            .await;
+            assert_eq!(seen.prompts.len(), 1);
+            let p = &seen.prompts[0];
+            assert!(!p.contains("help@warranty.example"), "{p}");
+            assert_eq!(p.matches("[removed]").count(), 1, "{p}");
+            assert!(p.contains("Lenovo"), "{p}");
+            assert_eq!(span_texts(&seen), ["Study laptop", "PF2ABC3D", "pf2abc3d"]);
+            let serial_key = device_fact_key("ent-1", "serial_number", "PF2ABC3D");
+            for s in &seen.sources {
+                assert_eq!(s.entity.label, DEVICE_FIELD_CATEGORY);
+                assert_eq!(
+                    &p[s.entity.start_byte..s.entity.end_byte],
+                    s.entity.span_text
+                );
+            }
+            assert_eq!(seen.sources[0].allowed, AllowedAnswers::ALL);
+            assert_eq!(seen.sources[0].suggestion.as_deref(), Some("[device]"));
+            for s in &seen.sources[1..] {
+                assert_eq!(s.allowed, AllowedAnswers::NO_STANDING_RELEASE);
+                assert_eq!(s.suggestion.as_deref(), Some("[serial number]"));
+                assert_eq!(s.fact_key.as_deref(), Some(serial_key.as_str()));
+            }
+            let rows: Vec<_> = seen
+                .gateway
+                .logger
+                .entries()
+                .into_iter()
+                .filter(|e| e.event_type == CARRY_REMOVED_EVENT)
+                .collect();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].fields_withheld, ["warranty_contact"]);
+            let all = format!("{:?}", seen.gateway.logger.entries());
+            assert!(
+                !all.contains("warranty.example") && !all.contains("PF2ABC3D"),
+                "{all}"
+            );
+        })
+        .await;
+    }
+
+    /// items.id=924: a hosted step whose pass seeded no device raises nothing for the
+    /// same text (the scan only knows what the pass seeded).
+    #[tokio::test]
+    async fn a_hosted_step_whose_pass_seeded_no_device_raises_no_device_span() {
+        with_temp_shared_db(|pool| async move {
+            let ctx = carried_hosted_ctx(&pool, None).await;
+            let seen = run_hosted_after(
+                &ctx,
+                &pool,
+                &PersonalTrack::new(),
+                track_with_requirements("Study laptop, S/N PF2ABC3D"),
+            )
+            .await;
+            assert_eq!(seen.prompts.len(), 1);
+            assert!(seen.sources.is_empty());
+        })
+        .await;
+    }
+
+    /// items.id=924 (D7): a personal field the user set to ask is released raw to the
+    /// hosted step that declares it, and every occurrence in the final prompt (the
+    /// projected field, the carried copy, the user's own words) is raised in the
+    /// outbound review with every answer. Gate 1 lists it as shared.
+    #[tokio::test]
+    async fn an_ask_field_is_released_raw_and_every_occurrence_is_raised() {
+        use crate::conductor::privacy::allowed_answers::AllowedAnswers;
+        use crate::conductor::privacy::gate3::CARRIED_FIELD_CATEGORY;
+        with_temp_shared_db(|pool| async move {
+            let mut ctx = carried_hosted_ctx(&pool, Some("ask")).await;
+            ctx.external_input = "I commute in leeds".to_owned();
+            let pt = bridged_track_with(&[("location_city", "Leeds")], Some("ask"), "personal");
+            let seen = run_hosted_after(
+                &ctx,
+                &pool,
+                &pt,
+                track_with_requirements("A road bike for LEEDS hills."),
+            )
+            .await;
+            assert_eq!(seen.prompts.len(), 1);
+            assert_eq!(
+                seen.prompts[0],
+                "Requirements: A road bike for LEEDS hills.\nUser: I commute in leeds\n\
+                 Region: Leeds"
+            );
+            let g1 = gate1_entries(&seen.gateway)
+                .into_iter()
+                .find(|e| e.event_type == "gate1_pass")
+                .unwrap();
+            assert_eq!(g1.fields_shared, ["location_city"]);
+            assert_eq!(span_texts(&seen), ["LEEDS", "leeds", "Leeds"]);
+            for s in &seen.sources {
+                assert_eq!(s.entity.label, CARRIED_FIELD_CATEGORY);
+                assert_eq!(s.allowed, AllowedAnswers::ALL);
+                assert_eq!(s.fact_key, None, "the review resolves its identity");
+            }
+        })
+        .await;
+    }
+
+    /// items.id=924 (D7): an ask value under 4 characters cannot be found by the scan, so
+    /// it is omit: not rendered, not raised.
+    #[tokio::test]
+    async fn an_ask_value_too_short_to_scan_is_omitted() {
+        with_temp_shared_db(|pool| async move {
+            let ctx = carried_hosted_ctx(&pool, Some("ask")).await;
+            let pt = bridged_track_with(&[("location_city", "Ely")], Some("ask"), "personal");
+            let seen =
+                run_hosted_after(&ctx, &pool, &pt, track_with_requirements("A road bike.")).await;
+            assert_eq!(seen.prompts.len(), 1);
+            assert!(seen.prompts[0].ends_with("Region:"), "{}", seen.prompts[0]);
+            assert!(seen.sources.is_empty());
+        })
+        .await;
+    }
+
+    /// items.id=924 (D7): only a hosted step that gets the review releases an ask field;
+    /// for any other caller ask is omit, at tier 3 too (the resolver already turned an
+    /// ask at tier 3 into omit for a field that is not tier3_selectable).
+    #[test]
+    fn ask_is_released_only_where_the_review_raises_it() {
+        let pt = bridged_track_with(&[("location_city", "Leeds")], Some("ask"), "personal");
+        let field = |gt: &GateTrack| gt.fields().get("location_city").unwrap().clone();
+        let (gt, asked) = to_gate_track_asks(&pt, None, true);
+        assert_eq!(field(&gt).abstraction_tier2, AbstractionPolicy::Pass);
+        assert_eq!(asked[0], ["location_city"]);
+        assert_eq!(field(&gt).abstraction_tier3, AbstractionPolicy::Omit);
+        assert!(asked[1].is_empty());
+        let (gt, asked) = to_gate_track_asks(&pt, None, false);
+        assert_eq!(field(&gt).abstraction_tier2, AbstractionPolicy::Omit);
+        assert!(asked[0].is_empty());
+        assert_eq!(
+            field(&to_gate_track(&pt)).abstraction_tier2,
+            AbstractionPolicy::Omit
+        );
     }
 
     /// Plan item 4, the crossing. A LOCAL step that declares location_city now renders

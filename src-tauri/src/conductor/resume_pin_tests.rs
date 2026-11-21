@@ -171,7 +171,7 @@ async fn versions_are_read_per_chat_and_focus_with_zero_for_no_row() {
 fn the_metadata_round_trips_and_never_holds_a_value() {
     let versions: BTreeMap<String, i64> = [("locked_intent".to_owned(), 3)].into();
     let published: HashMap<String, String> = [("new_case".to_owned(), "case-1".to_owned())].into();
-    let text = checkpoint_metadata(Some(Ok(versions.clone())), &published);
+    let text = checkpoint_metadata(Some(Ok(versions.clone())), &published, None);
     assert!(!text.contains("billing"));
     let pinned = parse(Some(&text)).unwrap();
     assert_eq!(pinned.versions, Some(versions));
@@ -181,6 +181,7 @@ fn the_metadata_round_trips_and_never_holds_a_value() {
     let unreadable = parse(Some(&checkpoint_metadata(
         Some(Err(PinError)),
         &HashMap::new(),
+        None,
     )))
     .unwrap();
     assert!(unreadable.unreadable);
@@ -188,7 +189,7 @@ fn the_metadata_round_trips_and_never_holds_a_value() {
 
     // Nothing pinned: no versioned name, no published id, or no metadata at all.
     for empty in [
-        checkpoint_metadata(None, &HashMap::new()),
+        checkpoint_metadata(None, &HashMap::new(), None),
         "{}".to_owned(),
         String::new(),
     ] {

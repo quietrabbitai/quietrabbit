@@ -39,37 +39,43 @@ pub fn is_bridged_source(source_id: &str) -> bool {
 }
 
 /// How strict a policy word is. Higher is stricter. An unknown word is as strict as
-/// omit (fail closed), `ask` behaves as omit until items.id=924.
+/// omit (fail closed). items.id=924: ask sends the raw value only on the user's answer
+/// in the review, summarize sends its label unreviewed, so ask ranks between pass and
+/// summarize.
 fn strictness(word: &str) -> u8 {
     match word {
         "pass" => 0,
-        "summarize" => 1,
-        "not_permitted" => 3,
-        // omit, ask and anything unknown
-        _ => 2,
+        "ask" => 1,
+        "summarize" => 2,
+        "not_permitted" => 4,
+        // omit and anything unknown
+        _ => 3,
     }
 }
 
 /// The STRICTER of two policy words (decisions.id=953 ruling 7): not_permitted over
-/// omit (ask and unknown count as omit) over summarize over pass. Equal strictness
+/// omit (unknown counts as omit) over summarize over ask over pass. Equal strictness
 /// keeps `a`, so pass against pass stays pass (an explicit pass survives a re-read
-/// that still says pass, and keeps no floor clamp). Returns a word Gate 1 understands.
+/// that still says pass, and keeps no floor clamp). Returns a word Gate 1 understands,
+/// or "ask", which executor::to_gate_track_asks resolves for the step.
 pub fn stricter(a: &str, b: &str) -> &'static str {
     let s = strictness(a).max(strictness(b));
     match s {
         0 => "pass",
-        1 => "summarize",
-        3 => "not_permitted",
+        1 => "ask",
+        2 => "summarize",
+        4 => "not_permitted",
         _ => "omit",
     }
 }
 
-/// The word stored on the field for a resolved policy (ask is written as omit).
+/// The word stored on the field for a resolved policy.
 fn policy_word(p: Policy) -> &'static str {
     match p {
         Policy::Pass => "pass",
         Policy::Summarize => "summarize",
-        Policy::Omit | Policy::Ask => "omit",
+        Policy::Omit => "omit",
+        Policy::Ask => "ask",
         Policy::NotPermitted => "not_permitted",
     }
 }
@@ -226,8 +232,12 @@ mod tests {
         assert_eq!(stricter("omit", "pass"), "omit");
         assert_eq!(stricter("not_permitted", "pass"), "not_permitted");
         assert_eq!(stricter("pass", "pass"), "pass");
-        // ask and garbage count as omit
-        assert_eq!(stricter("pass", "ask"), "omit");
+        // items.id=924: ask is between pass and summarize; garbage counts as omit
+        assert_eq!(stricter("pass", "ask"), "ask");
+        assert_eq!(stricter("ask", "pass"), "ask");
+        assert_eq!(stricter("ask", "summarize"), "summarize");
+        assert_eq!(stricter("omit", "ask"), "omit");
+        assert_eq!(stricter("ask", "ask"), "ask");
         assert_eq!(stricter("pass", "???"), "omit");
         assert_eq!(stricter("summarize", "???"), "omit");
     }

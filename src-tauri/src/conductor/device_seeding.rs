@@ -54,15 +54,26 @@
 //                     bounded by bound_spec::DERIVED_TEXT_MAX_BYTES (seeding::cap).
 //
 // READS ONLY. Nothing here writes to either store.
+//
+// THE DEVICE SEED (items.id=924). Beside the two texts, a pass keeps in memory every
+// catalogued value it seeded (and each seeded device's name) with the value's
+// disclosure (device_fields::Disclosure): a DeviceSeed on the pass's StoreTokens, never
+// persisted, serialized or logged (Debug prints counts only), rebuilt by every pass and
+// so on resume. The carry scan of a hosted step (carry_scan::classify_devices) raises or
+// removes every occurrence of an ask or never value of it. Its fingerprint (a SHA-256 of
+// the entity ids, fields, values and disclosures, never a value) is what a checkpoint
+// pins (resume_pin DEVICE_SEED_KEY): a device edited, renamed, added or re-disclosed
+// between a park and its resume refuses the resume.
 
 use std::collections::HashMap;
 
+use sha2::{Digest, Sha256};
 use sqlx::SqliteConnection;
 
 use crate::conductor::bound_spec::{
     self as spec, ACTIVE_CASE_ID, DEVICE_LIBRARY_BRIEF, SUBJECT_CONTEXT,
 };
-use crate::conductor::device_fields::{self, Catalogue, SUBJECT_CLASS_FIELD};
+use crate::conductor::device_fields::{self, Catalogue, Disclosure, SUBJECT_CLASS_FIELD};
 use crate::conductor::seeding::{cap, clean, SeedError};
 use crate::persistence::case_store;
 use crate::persistence::handles;
@@ -80,6 +91,148 @@ pub const SUBJECT_VALUE_MAX_BYTES: usize = 200;
 /// Longest subject_context, in bytes (whole lines are dropped to fit).
 pub const SUBJECT_CONTEXT_MAX_BYTES: usize = 1800;
 
+/// items.id=924: the field name a device's NAME is scanned and logged under (it is not
+/// a catalogue fact: entities.display_name).
+pub const DEVICE_NAME_FIELD: &str = "device_name";
+
+/// items.id=924: one value a pass seeded, with its disclosure. Debug never prints it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SeededValue {
+    pub entity_id: String,
+    /// A catalogue field name, or DEVICE_NAME_FIELD.
+    pub field: String,
+    /// The stored value (trimmed), before the brace cleaning of a rendering.
+    pub value: String,
+    pub disclosure: Disclosure,
+    pub access_credential: bool,
+    pub suggestion: Option<String>,
+}
+
+/// items.id=924: what a pass seeded of the Focus's devices (see the header). Empty
+/// when the pass named neither device name or the Focus has no device.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct DeviceSeed {
+    values: Vec<SeededValue>,
+    /// How many active devices the brief counted (its "and n more"), when read.
+    brief_total: Option<usize>,
+}
+
+impl std::fmt::Debug for DeviceSeed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceSeed")
+            .field("values", &self.values.len())
+            .field("brief_total", &self.brief_total)
+            .finish()
+    }
+}
+
+impl DeviceSeed {
+    pub fn values(&self) -> &[SeededValue] {
+        &self.values
+    }
+
+    /// No device was seeded (a brief that found none included): no pin entry.
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Add a device's name and catalogued facts, once per (entity, field).
+    fn add_device(
+        &mut self,
+        catalogue: &Catalogue,
+        entity_id: &str,
+        name: &str,
+        facts: &[ActiveFact],
+    ) {
+        let mut push =
+            |field: &str, value: &str, d: Disclosure, cred: bool, sugg: &Option<String>| {
+                let value = value.trim();
+                if value.is_empty()
+                    || self
+                        .values
+                        .iter()
+                        .any(|v| v.entity_id == entity_id && v.field == field)
+                {
+                    return;
+                }
+                self.values.push(SeededValue {
+                    entity_id: entity_id.to_owned(),
+                    field: field.to_owned(),
+                    value: value.to_owned(),
+                    disclosure: d,
+                    access_credential: cred,
+                    suggestion: sugg.clone(),
+                });
+            };
+        push(
+            DEVICE_NAME_FIELD,
+            name,
+            catalogue.device_name_disclosure,
+            false,
+            &catalogue.device_name_suggestion,
+        );
+        for f in facts {
+            if let Some(def) = catalogue.field(&f.field_name) {
+                push(
+                    &def.name,
+                    &f.value,
+                    def.disclosure,
+                    def.access_credential_flag,
+                    &def.suggestion,
+                );
+            }
+        }
+    }
+
+    /// A seed of these values (tests outside this module).
+    #[cfg(test)]
+    pub(crate) fn for_test(values: Vec<SeededValue>, brief_total: Option<usize>) -> DeviceSeed {
+        DeviceSeed {
+            values,
+            brief_total,
+        }
+    }
+
+    /// The pin of this seed: None when nothing was seeded (no entry is written), else
+    /// a SHA-256 over every (entity, field, value, disclosure), sorted, and the brief's
+    /// device count. Never a value.
+    pub fn fingerprint(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut rows: Vec<String> = self
+            .values
+            .iter()
+            .map(|v| {
+                format!(
+                    "{}\0{}\0{}\0{}",
+                    v.entity_id,
+                    v.field,
+                    v.value,
+                    v.disclosure.as_str()
+                )
+            })
+            .collect();
+        rows.sort();
+        let mut h = Sha256::new();
+        for r in &rows {
+            h.update(r.as_bytes());
+            h.update(b"\n");
+        }
+        h.update(format!("brief_total:{:?}", self.brief_total).as_bytes());
+        Some(format!("{:x}", h.finalize()))
+    }
+}
+
+/// items.id=924: the fact key of a device value in the review (remembered answers):
+/// `device_fact:` and a SHA-256 of the entity, the field and the value, so a changed
+/// value is asked again.
+pub fn device_fact_key(entity_id: &str, field: &str, value: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(format!("{entity_id}\0{field}\0{}", value.trim()).as_bytes());
+    format!("device_fact:{:x}", h.finalize())
+}
+
 /// True for the two names this module reads.
 pub fn is_device_seed(name: &str) -> bool {
     name == SUBJECT_CONTEXT || name == DEVICE_LIBRARY_BRIEF
@@ -90,13 +243,13 @@ pub fn is_device_seed(name: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// One device as the brief shows it: its handle, name, class and every active
-/// catalogued fact (label, value, tier-2 policy), in catalogue order.
+/// catalogued fact (label, value, disclosure word), in catalogue order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BriefDevice {
     pub handle: String,
     pub name: String,
     pub class: Option<String>,
-    /// (label, value, abstraction_tier2), catalogue order, subject_class excluded.
+    /// (label, value, disclosure word), catalogue order, subject_class excluded.
     pub facts: Vec<(String, String, String)>,
 }
 
@@ -174,7 +327,7 @@ pub fn render_device_brief(devices: &[BriefDevice], total: usize) -> String {
             for (label, value, _) in d
                 .facts
                 .iter()
-                .filter(|(_, _, tier2)| tier2 == "pass")
+                .filter(|(_, _, disclosure)| disclosure == "pass")
                 .take(HEADLINE_FACTS)
             {
                 let value = clean(value);
@@ -207,7 +360,7 @@ fn store_err(name: &'static str, e: impl std::fmt::Display) -> SeedError {
     }
 }
 
-/// The catalogued facts of a device as (label, value, tier-2 policy) in catalogue
+/// The catalogued facts of a device as (label, value, disclosure word) in catalogue
 /// order, the subject class apart.
 fn split_facts(
     catalogue: &Catalogue,
@@ -221,29 +374,43 @@ fn split_facts(
             continue;
         }
         if let Some(def) = catalogue.field(&f.field_name) {
-            rest.push((def.label.clone(), f.value, def.abstraction_tier2.clone()));
+            rest.push((
+                def.label.clone(),
+                f.value,
+                def.disclosure.as_str().to_owned(),
+            ));
         }
     }
     (class, rest)
 }
 
 /// Read the device seeds named in `names` (a subset of subject_context and
-/// device_library_brief). Every value must satisfy its own spec, and any store
-/// read error fails the pass closed, like every other derived name.
+/// device_library_brief), and the DeviceSeed of what they hold (items.id=924). Every
+/// value must satisfy its own spec, and any store read error fails the pass closed,
+/// like every other derived name.
 pub async fn read_device_seeds(
     outputs: &mut SqliteConnection,
     personal: &mut SqliteConnection,
     context_key: Option<&str>,
     focus_id: &str,
     names: &[&'static str],
-) -> Result<HashMap<String, String>, SeedError> {
+) -> Result<(HashMap<String, String>, DeviceSeed), SeedError> {
     let catalogue = device_fields::registry().map_err(|e| store_err(SUBJECT_CONTEXT, e))?;
     let mut out: HashMap<String, String> = HashMap::new();
+    let mut seed = DeviceSeed::default();
 
     if names.contains(&SUBJECT_CONTEXT) {
         out.insert(
             SUBJECT_CONTEXT.to_owned(),
-            subject_context(outputs, personal, catalogue, context_key, focus_id).await?,
+            subject_context(
+                outputs,
+                personal,
+                catalogue,
+                context_key,
+                focus_id,
+                &mut seed,
+            )
+            .await?,
         );
     }
 
@@ -256,6 +423,7 @@ pub async fn read_device_seeds(
             let facts = owned::list_active_facts(personal, focus_id, &d.id)
                 .await
                 .map_err(|e| store_err(DEVICE_LIBRARY_BRIEF, e))?;
+            seed.add_device(catalogue, &d.id, &d.display_name, &facts);
             let (class, facts) = split_facts(catalogue, facts);
             shown.push(BriefDevice {
                 handle: handles::entity_handle(focus_id, &d.id),
@@ -264,6 +432,7 @@ pub async fn read_device_seeds(
                 facts,
             });
         }
+        seed.brief_total = Some(devices.len());
         out.insert(
             DEVICE_LIBRARY_BRIEF.to_owned(),
             render_device_brief(&shown, devices.len()),
@@ -279,7 +448,7 @@ pub async fn read_device_seeds(
             _ => return Err(SeedError::InvalidValue(name)),
         }
     }
-    Ok(out)
+    Ok((out, seed))
 }
 
 async fn subject_context(
@@ -288,6 +457,7 @@ async fn subject_context(
     catalogue: &Catalogue,
     context_key: Option<&str>,
     focus_id: &str,
+    seed: &mut DeviceSeed,
 ) -> Result<String, SeedError> {
     // No chat means no active case.
     let Some(key) = context_key else {
@@ -321,6 +491,7 @@ async fn subject_context(
     let facts = owned::list_active_facts(personal, focus_id, &entity_id)
         .await
         .map_err(|e| store_err(SUBJECT_CONTEXT, e))?;
+    seed.add_device(catalogue, &entity_id, &entity.display_name, &facts);
     let (class, facts) = split_facts(catalogue, facts);
     let facts: Vec<(String, String)> = facts.into_iter().map(|(l, v, _)| (l, v)).collect();
     Ok(render_subject_context(
@@ -640,6 +811,7 @@ mod tests {
         read_device_seeds(&mut db.outputs, &mut db.personal, key, FOCUS, names)
             .await
             .unwrap()
+            .0
     }
 
     #[tokio::test]
@@ -745,7 +917,8 @@ mod tests {
             &[SUBJECT_CONTEXT, DEVICE_LIBRARY_BRIEF],
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
         assert_eq!(seeds[SUBJECT_CONTEXT], "", "OTHER does not own the router");
         assert_eq!(seeds[DEVICE_LIBRARY_BRIEF], "", "and lists none of it");
     }
@@ -1042,5 +1215,146 @@ mod tests {
         .await
         .unwrap();
         assert!(t.seeds.is_empty());
+    }
+
+    // -- items.id=924: the device seed -------------------------------------------
+
+    fn sv(entity: &str, field: &str, value: &str, d: Disclosure) -> SeededValue {
+        SeededValue {
+            entity_id: entity.to_owned(),
+            field: field.to_owned(),
+            value: value.to_owned(),
+            disclosure: d,
+            access_credential: field == "serial_number",
+            suggestion: None,
+        }
+    }
+
+    /// The fingerprint: none for an empty seed (no pin entry), stable for the same
+    /// values in any order, and different when a value, its disclosure, a device or the
+    /// brief's count changes. Debug and the fingerprint never hold a value.
+    #[test]
+    fn the_fingerprint_changes_with_every_seeded_part_and_holds_no_value() {
+        assert_eq!(DeviceSeed::default().fingerprint(), None);
+        let base = vec![
+            sv("e1", DEVICE_NAME_FIELD, "Study laptop", Disclosure::Ask),
+            sv("e1", "serial_number", "SECRET-SN-1", Disclosure::Ask),
+            sv("e1", "make", "Lenovo", Disclosure::Pass),
+        ];
+        let fp = DeviceSeed::for_test(base.clone(), Some(1))
+            .fingerprint()
+            .unwrap();
+        let mut rev = base.clone();
+        rev.reverse();
+        assert_eq!(
+            DeviceSeed::for_test(rev, Some(1)).fingerprint().unwrap(),
+            fp
+        );
+        let mut edited = base.clone();
+        edited[1].value = "SECRET-SN-2".to_owned();
+        let mut redisclosed = base.clone();
+        redisclosed[2].disclosure = Disclosure::Ask;
+        let mut added = base.clone();
+        added.push(sv("e2", DEVICE_NAME_FIELD, "Router", Disclosure::Ask));
+        let mut renamed = base.clone();
+        renamed[0].value = "Old laptop".to_owned();
+        for (what, seed) in [
+            ("edited", DeviceSeed::for_test(edited, Some(1))),
+            ("re-disclosed", DeviceSeed::for_test(redisclosed, Some(1))),
+            ("added", DeviceSeed::for_test(added, Some(2))),
+            ("renamed", DeviceSeed::for_test(renamed, Some(1))),
+            ("count", DeviceSeed::for_test(base.clone(), Some(9))),
+        ] {
+            assert_ne!(seed.fingerprint().unwrap(), fp, "{what}");
+        }
+        assert!(!fp.contains("SECRET"));
+        let d = format!("{:?}", DeviceSeed::for_test(base, Some(1)));
+        assert!(!d.contains("SECRET") && !d.contains("Study"), "{d}");
+        // A brief that found no device seeded nothing: no pin entry.
+        assert_eq!(DeviceSeed::for_test(vec![], Some(0)).fingerprint(), None);
+    }
+
+    #[test]
+    fn the_device_fact_key_names_the_entity_field_and_value() {
+        let k = device_fact_key("e1", "serial_number", "SN-1");
+        assert!(k.starts_with("device_fact:") && !k.contains("SN-1"));
+        assert_eq!(k, device_fact_key("e1", "serial_number", " SN-1 "));
+        assert_ne!(k, device_fact_key("e1", "serial_number", "SN-2"));
+        assert_ne!(k, device_fact_key("e2", "serial_number", "SN-1"));
+        assert_ne!(k, device_fact_key("e1", "retailer", "SN-1"));
+    }
+
+    /// A pass seeds the name and every catalogued fact of each device it reads, with the
+    /// catalogue's disclosure, the flag and the suggestion; the subject class is a fact
+    /// like any other here.
+    #[tokio::test]
+    async fn a_pass_seeds_each_read_devices_values_with_their_disclosure() {
+        let _root = TestRoot::new().await;
+        let mut db = dbs().await;
+        let laptop = device(&mut db, FOCUS, "Study laptop", "l:1").await;
+        put(&mut db, &laptop, "make", "Lenovo").await;
+        put(&mut db, &laptop, "serial_number", "PF2ABC3D").await;
+        activate(&mut db, "c1", FOCUS, &laptop).await;
+        let (_, seed) = read_device_seeds(
+            &mut db.outputs,
+            &mut db.personal,
+            Some(CHAT),
+            FOCUS,
+            &[SUBJECT_CONTEXT, DEVICE_LIBRARY_BRIEF],
+        )
+        .await
+        .unwrap();
+        let mut got: Vec<(&str, &str, Disclosure, bool, Option<&str>)> = seed
+            .values()
+            .iter()
+            .map(|v| {
+                assert_eq!(v.entity_id, laptop);
+                (
+                    v.field.as_str(),
+                    v.value.as_str(),
+                    v.disclosure,
+                    v.access_credential,
+                    v.suggestion.as_deref(),
+                )
+            })
+            .collect();
+        got.sort_by_key(|g| g.0);
+        assert_eq!(
+            got,
+            [
+                (
+                    DEVICE_NAME_FIELD,
+                    "Study laptop",
+                    Disclosure::Ask,
+                    false,
+                    Some("[device]")
+                ),
+                ("make", "Lenovo", Disclosure::Pass, false, None),
+                (
+                    "serial_number",
+                    "PF2ABC3D",
+                    Disclosure::Ask,
+                    true,
+                    Some("[serial number]")
+                ),
+            ]
+        );
+        // Read twice, nothing changed: the same pin.
+        let (_, again) = read_device_seeds(
+            &mut db.outputs,
+            &mut db.personal,
+            Some(CHAT),
+            FOCUS,
+            &[SUBJECT_CONTEXT, DEVICE_LIBRARY_BRIEF],
+        )
+        .await
+        .unwrap();
+        assert_eq!(seed.fingerprint(), again.fingerprint());
+        // A pass naming no device name seeds nothing.
+        let (_, none) =
+            read_device_seeds(&mut db.outputs, &mut db.personal, Some(CHAT), FOCUS, &[])
+                .await
+                .unwrap();
+        assert!(none.is_empty());
     }
 }

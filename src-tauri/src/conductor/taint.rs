@@ -165,6 +165,10 @@ pub struct StoreTokens {
     /// handoff_ingest row, so the chat window carries a pasted reply). Set by
     /// seeding::seed_pass from the same closure as `restricted`; false otherwise.
     pub user_input_backed: bool,
+    /// items.id=924: the device values this pass seeded, with their disclosure, for the
+    /// carry scan of a hosted step and the resume pin. In memory only; empty unless a
+    /// step of the pass names a device name.
+    pub device_seed: crate::conductor::device_seeding::DeviceSeed,
 }
 
 impl StoreTokens {
@@ -411,6 +415,7 @@ mod tests {
             seeds: toks(seeds),
             restricted: restricted.iter().map(|s| (*s).to_owned()).collect(),
             user_input_backed: false,
+            device_seed: Default::default(),
         }
     }
 

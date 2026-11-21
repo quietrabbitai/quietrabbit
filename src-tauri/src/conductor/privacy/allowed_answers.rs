@@ -329,10 +329,10 @@ mod tests {
         );
     }
 
-    /// Unit 1 builds the rule and the plumbing only: no production code outside this
-    /// file names a restricted set yet (items.id=924 unit 2 adds the device source).
+    /// Only the carry scan's device source (items.id=924 unit 2) names a restricted set
+    /// in production; every other span allows every answer.
     #[test]
-    fn no_production_code_restricts_a_span_yet() {
+    fn only_the_carry_scan_restricts_a_span() {
         fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
             for e in std::fs::read_dir(dir).unwrap() {
                 let p = e.unwrap().path();
@@ -351,6 +351,7 @@ mod tests {
             &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
             &mut files,
         );
+        let mut restricting = Vec::new();
         for (path, src) in files {
             if path.ends_with("allowed_answers.rs") {
                 continue;
@@ -370,8 +371,20 @@ mod tests {
                 "release: false",
                 "standing_release: false",
             ] {
-                assert!(!prod.contains(name), "{path} names {name}");
+                if prod.contains(name) {
+                    restricting.push((path.clone(), name));
+                }
             }
+        }
+        // items.id=924: the device values of carry_scan (a never value's removed hit
+        // and an access-credential field's spans) are the only restriction.
+        assert!(!restricting.is_empty());
+        for (path, name) in &restricting {
+            assert!(
+                path.ends_with("conductor/carry_scan.rs")
+                    && ["NO_RELEASE", "NO_STANDING_RELEASE"].contains(name),
+                "{path} names {name}"
+            );
         }
     }
 

@@ -34,7 +34,8 @@
 // catalogue_unavailable, fact_policy_unavailable. The last is any store failure and
 // carries no detail. The wording is placeholder (Chat-BRAND). The user-facing words
 // share, describe and withhold are placeholder keys fact_policy.policy.<word> for the
-// stored words pass, summarize and omit (and ask, reserved until items.id=924).
+// stored words pass, summarize and omit (and ask, items.id=924: released only behind the
+// outbound review; it has no key yet, no screen offers it).
 
 use serde::Serialize;
 use specta::Type;

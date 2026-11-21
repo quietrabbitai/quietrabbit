@@ -20,10 +20,27 @@
 //
 // WHAT A FIELD CARRIES: its category (decisions.id=507's categories, a closed list
 // here), a label (the wording a derived text uses, never a {token}), the
-// sensitivity and the two abstraction policies the fact is written with (the
-// existing entity_facts writer defaulted both to pass, which is wrong for a serial
-// number or an address), a byte cap, and for the serial number the
-// access_credential_flag of decisions.id=475.
+// sensitivity, its DISCLOSURE (items.id=924: never, ask or pass, what may reach a
+// hosted step) with the generalization a review suggests for an ask field, a byte
+// cap, and for the serial number the access_credential_flag of decisions.id=475.
+//
+// DISCLOSURE (items.id=924, decisions.id=507 credentials invariant kept). never: the
+// value is removed from a hosted prompt before the outbound review and never shown;
+// ask: every occurrence in a hosted prompt is raised in the outbound review
+// (carry_scan); pass: sent as it is. The shipped default is CONSERVATIVE: every field
+// that was not pass before is ask (nothing loosens without the user's answer), and the
+// choice is per field, so a later data edit can move one field either way. No shipped
+// field is never (the catalogue holds no credential; a never field is a data edit). A
+// field with the access-credential flag may not be pass, and a remembered release of
+// it is not applied (carry_scan restricts its spans to a live release). The device's NAME
+// is not a fact: its disclosure is the top-level device_name_disclosure.
+//
+// THE STORED COLUMNS. entity_facts.abstraction_tier2/3 of an owned fact are written
+// with a conservative mapping of the disclosure (Disclosure::stored_policy: never ->
+// not_permitted, ask -> omit, pass -> pass) and NOTHING READS THEM (owned facts are
+// excluded from every PersonalTrack loader; a scan pins that the owned-fact and
+// device-seed readers never select them). Rows written before items.id=924 keep their
+// stricter not_permitted. No migration.
 //
 // The configuration/workflow history category of decisions.id=507 is NOT here: it
 // is a pointer to the configuration deltas, which live in outputs.db
@@ -72,7 +89,34 @@ const CREDENTIAL_WORDS: [&str; 12] = [
 ];
 
 const SENSITIVITIES: [&str; 4] = ["general", "personal", "medical", "financial"];
-const POLICIES: [&str; 5] = ["pass", "omit", "summarize", "range_only", "not_permitted"];
+
+/// items.id=924: what of a device value may reach a hosted step (see the header).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Disclosure {
+    Never,
+    Ask,
+    Pass,
+}
+
+impl Disclosure {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Disclosure::Never => "never",
+            Disclosure::Ask => "ask",
+            Disclosure::Pass => "pass",
+        }
+    }
+
+    /// The abstraction policy written to entity_facts for an owned fact (never read).
+    pub fn stored_policy(self) -> &'static str {
+        match self {
+            Disclosure::Never => "not_permitted",
+            Disclosure::Ask => "omit",
+            Disclosure::Pass => "pass",
+        }
+    }
+}
 
 /// Largest byte cap a field may declare.
 pub const FIELD_MAX_BYTES_CEILING: usize = 400;
@@ -95,8 +139,11 @@ pub struct FieldDef {
     pub category: String,
     pub label: String,
     pub sensitivity: String,
-    pub abstraction_tier2: String,
-    pub abstraction_tier3: String,
+    /// items.id=924: what may reach a hosted step.
+    pub disclosure: Disclosure,
+    /// items.id=924: the generalization a review suggests (an ask field only).
+    #[serde(default)]
+    pub suggestion: Option<String>,
     pub max_bytes: usize,
     /// decisions.id=475: a serial number can serve as access-credential metadata.
     #[serde(default)]
@@ -107,6 +154,11 @@ pub struct FieldDef {
 #[serde(deny_unknown_fields)]
 pub struct Catalogue {
     pub catalogue_version: i64,
+    /// items.id=924: the disclosure of a device's NAME (entities.display_name).
+    pub device_name_disclosure: Disclosure,
+    /// items.id=924: the generalization a review suggests for the name.
+    #[serde(default)]
+    pub device_name_suggestion: Option<String>,
     pub categories: Vec<Category>,
     pub fields: Vec<FieldDef>,
 }
@@ -179,33 +231,27 @@ impl Catalogue {
             if !SENSITIVITIES.contains(&f.sensitivity.as_str()) {
                 return Err(format!("field '{}': unknown sensitivity", f.name));
             }
-            for (which, p) in [("2", &f.abstraction_tier2), ("3", &f.abstraction_tier3)] {
-                if !POLICIES.contains(&p.as_str()) {
-                    return Err(format!(
-                        "field '{}': unknown abstraction policy for tier {which}",
-                        f.name
-                    ));
-                }
-            }
+            check_suggestion(&f.name, f.disclosure, f.suggestion.as_deref())?;
             if f.max_bytes == 0 || f.max_bytes > FIELD_MAX_BYTES_CEILING {
                 return Err(format!(
                     "field '{}': max_bytes must be 1 to {FIELD_MAX_BYTES_CEILING}",
                     f.name
                 ));
             }
-            // A field that can identify the device or reach it is never passed
-            // upward unreviewed: the flagged serial number and anything marked
-            // not_permitted keep both tiers closed.
-            if f.access_credential_flag
-                && !(f.abstraction_tier2 == "not_permitted"
-                    && f.abstraction_tier3 == "not_permitted")
-            {
+            // items.id=924: a field that can serve as access-credential metadata is
+            // never passed to a hosted step unreviewed.
+            if f.access_credential_flag && f.disclosure == Disclosure::Pass {
                 return Err(format!(
-                    "field '{}' carries the access-credential flag, so both tiers must be not_permitted",
+                    "field '{}' carries the access-credential flag, so it must be ask or never",
                     f.name
                 ));
             }
         }
+        check_suggestion(
+            "device name",
+            self.device_name_disclosure,
+            self.device_name_suggestion.as_deref(),
+        )?;
         if !self.fields.iter().any(|f| f.name == SUBJECT_CLASS_FIELD) {
             return Err(format!("the catalogue must define '{SUBJECT_CLASS_FIELD}'"));
         }
@@ -219,6 +265,18 @@ impl Catalogue {
     /// The position of a field in the catalogue, for ordering a rendering.
     pub fn position(&self, name: &str) -> Option<usize> {
         self.fields.iter().position(|f| f.name == name)
+    }
+}
+
+/// items.id=924: an ask field needs a suggestion (the review's generalization, prompt
+/// text, so the label rules apply); a pass or never field has none (never is never
+/// shown, pass is never asked).
+fn check_suggestion(id: &str, d: Disclosure, suggestion: Option<&str>) -> Result<(), String> {
+    match (d, suggestion) {
+        (Disclosure::Ask, Some(s)) => check_label("suggestion", id, s),
+        (Disclosure::Ask, None) => Err(format!("'{id}' is ask, so it needs a suggestion")),
+        (_, Some(_)) => Err(format!("'{id}' is not ask, so it takes no suggestion")),
+        (_, None) => Ok(()),
     }
 }
 
@@ -306,7 +364,7 @@ mod tests {
     #[test]
     fn the_bundled_catalogue_validates_and_is_pinned() {
         let c = registry().expect("the bundled catalogue must validate");
-        assert_eq!(c.catalogue_version, 1);
+        assert_eq!(c.catalogue_version, 2);
         // The consent text and the seed list categories that match exactly what
         // is saved, so a new field is a deliberate act: change these with the data.
         let names: Vec<&str> = c.fields.iter().map(|f| f.name.as_str()).collect();
@@ -351,14 +409,58 @@ mod tests {
         }
         let serial = c.field("serial_number").unwrap();
         assert!(serial.access_credential_flag);
-        assert_eq!(serial.abstraction_tier2, "not_permitted");
-        assert_eq!(serial.abstraction_tier3, "not_permitted");
-        // Anything that reaches the device is closed upward as well.
-        for name in ["access_location", "warranty_contact"] {
-            let f = c.field(name).unwrap();
-            assert_eq!(f.abstraction_tier2, "not_permitted", "{name}");
-            assert_eq!(f.abstraction_tier3, "not_permitted", "{name}");
+        assert_eq!(serial.disclosure, Disclosure::Ask);
+        assert_eq!(serial.suggestion.as_deref(), Some("[serial number]"));
+        assert_eq!(c.device_name_disclosure, Disclosure::Ask);
+        assert_eq!(c.device_name_suggestion.as_deref(), Some("[device]"));
+    }
+
+    /// items.id=924 D2: the conservative default. Every field that was pass before is
+    /// pass, every other one is ask (none is never), each ask field has a suggestion,
+    /// and the stored columns get the conservative mapping.
+    #[test]
+    fn the_shipped_disclosures_are_the_conservative_default() {
+        let c = registry().unwrap();
+        let ask: Vec<&str> = c
+            .fields
+            .iter()
+            .filter(|f| f.disclosure == Disclosure::Ask)
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(
+            ask,
+            [
+                "ip_range",
+                "isp_context",
+                "purchase_date",
+                "retailer",
+                "serial_number",
+                "warranty_expiry",
+                "warranty_provider",
+                "warranty_contact",
+                "access_method",
+                "access_location",
+            ]
+        );
+        assert!(c.fields.iter().all(|f| f.disclosure != Disclosure::Never));
+        assert_eq!(
+            c.fields
+                .iter()
+                .filter(|f| f.disclosure == Disclosure::Pass)
+                .count(),
+            10
+        );
+        for f in &c.fields {
+            assert_eq!(
+                f.suggestion.is_some(),
+                f.disclosure == Disclosure::Ask,
+                "{}",
+                f.name
+            );
         }
+        assert_eq!(Disclosure::Never.stored_policy(), "not_permitted");
+        assert_eq!(Disclosure::Ask.stored_policy(), "omit");
+        assert_eq!(Disclosure::Pass.stored_policy(), "pass");
     }
 
     #[test]
@@ -409,8 +511,23 @@ mod tests {
         push("unknown sensitivity", &|c| {
             c.fields[1].sensitivity = "x".to_owned()
         });
-        push("unknown policy", &|c| {
-            c.fields[1].abstraction_tier2 = "x".to_owned()
+        push("ask without a suggestion", &|c| {
+            let i = c.fields.iter().position(|f| f.name == "retailer").unwrap();
+            c.fields[i].suggestion = None;
+        });
+        push("pass with a suggestion", &|c| {
+            c.fields[1].suggestion = Some("[make]".to_owned())
+        });
+        push("never with a suggestion", &|c| {
+            c.fields[1].disclosure = Disclosure::Never;
+            c.fields[1].suggestion = Some("[make]".to_owned());
+        });
+        push("brace in a suggestion", &|c| {
+            let i = c.fields.iter().position(|f| f.name == "retailer").unwrap();
+            c.fields[i].suggestion = Some("{user_input}".to_owned());
+        });
+        push("device name ask without a suggestion", &|c| {
+            c.device_name_suggestion = None
         });
         push("zero cap", &|c| c.fields[1].max_bytes = 0);
         push("cap over the ceiling", &|c| c.fields[1].max_bytes = 401);
@@ -425,7 +542,8 @@ mod tests {
                 .iter()
                 .position(|f| f.name == "serial_number")
                 .unwrap();
-            c.fields[i].abstraction_tier2 = "pass".to_owned();
+            c.fields[i].disclosure = Disclosure::Pass;
+            c.fields[i].suggestion = None;
         });
         push("no subject_class", &|c| {
             c.fields.retain(|f| f.name != SUBJECT_CLASS_FIELD)
@@ -434,6 +552,19 @@ mod tests {
             assert!(c.validate().is_err(), "{what} must be refused");
         }
         assert!(bundled().validate().is_ok());
+        // A never field, and the flagged field as never, validate.
+        let mut c = bundled();
+        let i = c
+            .fields
+            .iter()
+            .position(|f| f.name == "serial_number")
+            .unwrap();
+        c.fields[i].disclosure = Disclosure::Never;
+        c.fields[i].suggestion = None;
+        assert!(c.validate().is_ok());
+        // An unknown disclosure word does not parse.
+        let bad = BUNDLED.replacen("\"disclosure\": \"pass\"", "\"disclosure\": \"maybe\"", 1);
+        assert!(serde_json::from_str::<Catalogue>(&bad).is_err());
     }
 
     #[test]
@@ -517,6 +648,23 @@ mod tests {
         }
         for cat in &c.categories {
             assert!(!cat.label.contains('{') && !cat.label.contains('}'));
+        }
+    }
+
+    /// items.id=924: the stored abstraction columns of an owned fact are written (the
+    /// conservative mapping) and never read: the owned-fact store and the device seed,
+    /// the only readers of owned facts that reach a prompt, never name them.
+    #[test]
+    fn the_stored_abstraction_columns_of_an_owned_fact_are_never_read() {
+        for (path, src) in [
+            (
+                "owned_entity_store.rs",
+                include_str!("../persistence/owned_entity_store.rs"),
+            ),
+            ("device_seeding.rs", include_str!("device_seeding.rs")),
+        ] {
+            let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap();
+            assert!(!prod.contains("abstraction_tier"), "{path}");
         }
     }
 }

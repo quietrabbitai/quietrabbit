@@ -352,8 +352,10 @@ async fn write_fact(
         &def.name,
         value,
         &def.sensitivity,
-        &def.abstraction_tier2,
-        &def.abstraction_tier3,
+        // items.id=924: the conservative mapping of the field's disclosure. Nothing
+        // reads these columns for an owned fact (device_fields.rs header).
+        def.disclosure.stored_policy(),
+        def.disclosure.stored_policy(),
         focus,
         persona_id,
         false,
@@ -734,8 +736,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(row.get::<String, _>("sensitivity"), "personal");
-        assert_eq!(row.get::<String, _>("abstraction_tier2"), "not_permitted");
-        assert_eq!(row.get::<String, _>("abstraction_tier3"), "not_permitted");
+        // items.id=924: the serial is ask, written as omit (never read).
+        assert_eq!(row.get::<String, _>("abstraction_tier2"), "omit");
+        assert_eq!(row.get::<String, _>("abstraction_tier3"), "omit");
         assert_eq!(row.get::<String, _>("source"), FOCUS);
         assert_eq!(row.get::<String, _>("source_persona_id"), PERSONA);
         assert_eq!(row.get::<i64, _>("cross_persona_export"), 0);

@@ -185,6 +185,7 @@ pub async fn seed_pass(
             seeds: HashMap::new(),
             restricted,
             user_input_backed,
+            device_seed: Default::default(),
         });
     }
     // items.id=897: the launch names are seeded from the run's launch resolution,
@@ -221,11 +222,13 @@ pub async fn seed_pass(
             seeds,
             restricted,
             user_input_backed,
+            device_seed: Default::default(),
         });
     }
     let mut conn = crate::persistence::output_store::open_outputs_db(user_id, persona_id, key_hex)
         .await
         .map_err(|e| SeedError::Open(e.to_string()))?;
+    let mut device_seed = Default::default();
     if !store_names.is_empty() {
         seeds.extend(read_seeds(&mut conn, context_key, focus_id, &store_names, Utc::now()).await?);
     }
@@ -234,21 +237,22 @@ pub async fn seed_pass(
             crate::persistence::personal_store::open_personal_db(user_id, persona_id, key_hex)
                 .await
                 .map_err(|e| SeedError::Open(e.to_string()))?;
-        seeds.extend(
-            crate::conductor::device_seeding::read_device_seeds(
-                &mut conn,
-                &mut personal,
-                context_key,
-                focus_id,
-                &device_names,
-            )
-            .await?,
-        );
+        let (texts, seed) = crate::conductor::device_seeding::read_device_seeds(
+            &mut conn,
+            &mut personal,
+            context_key,
+            focus_id,
+            &device_names,
+        )
+        .await?;
+        seeds.extend(texts);
+        device_seed = seed;
     }
     Ok(StoreTokens {
         seeds,
         restricted,
         user_input_backed,
+        device_seed,
     })
 }
 
@@ -724,6 +728,7 @@ mod tests {
                 seeds: HashMap::new(),
                 restricted,
                 user_input_backed,
+                device_seed: Default::default(),
             };
             let render_rows = crate::conductor::handoff_render::store_backed_inputs(&focus, &vars);
             for name in [

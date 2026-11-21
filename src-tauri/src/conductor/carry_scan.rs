@@ -29,14 +29,37 @@
 // - LIMITS (stated plainly): a text match misses a paraphrase ("the Leeds area" is caught,
 //   "West Yorkshire" is not); a value under 4 characters is not scanned and so not caught;
 //   a substring inside a longer word is caught; case folding is per character.
-// - Device facts, group facts and persona_context are out of scope (items.id=924).
+// - Group facts and persona_context are out of scope.
+//
+// DEVICE VALUES (items.id=924, the same mechanism widened, not a second one). A pass
+// that seeds a device name keeps a DeviceSeed (device_seeding.rs). classify_devices
+// raises every value of it whose disclosure is not pass:
+// - TRIGGER: ANY occurrence in the final prompt (the derived name itself, a carried
+//   variable, {previous_output}, the user's own text), case-insensitive, at least 4
+//   characters, of the stored value or its brace-cleaned form. Device text has no Gate 1
+//   projection and no raw-release record, so nothing is skipped.
+// - ACTION by its disclosure: never -> removed before the review, logged by field name,
+//   never shown; ask -> a span of category qr_device_field ("Device detail", placeholder
+//   wording) with the field's suggestion, its fact key device_fact:<hash of entity, field,
+//   value> (so a remembered answer applies to the same value only), and the answers it
+//   allows: every answer, except a field with the access-credential flag, whose
+//   remembered release is not applied (NO_STANDING_RELEASE: a release in this run still
+//   counts).
+// - LIMITS, beside the ones above: a value seeded in an EARLIER pass that a session
+//   variable or artifact carries into this pass is not scanned unless this pass seeds
+//   the device again; a value reformatted (a serial with spaces or dashes added, a
+//   zero-padded address) is missed; a device name made of common words over-asks. A
+//   serial the user types in a format the Privacy Filter misses (a Lenovo "S/N
+//   PF2ABC3D") is caught only when that device is seeded in the pass.
 
 use crate::api_chat::redact::REMOVED_PLACEHOLDER;
+use crate::conductor::device_fields::Disclosure;
+use crate::conductor::device_seeding::{device_fact_key, DeviceSeed};
 use crate::conductor::personal_fact_bridge::is_bridged_source;
 use crate::conductor::privacy::abstraction::{apply_abstraction, AbstractionLevel};
 use crate::conductor::privacy::allowed_answers::AllowedAnswers;
 use crate::conductor::privacy::gate2::scan_matches;
-use crate::conductor::privacy::gate3::{SourceSpan, CARRIED_FIELD_CATEGORY};
+use crate::conductor::privacy::gate3::{SourceSpan, CARRIED_FIELD_CATEGORY, DEVICE_FIELD_CATEGORY};
 use crate::conductor::privacy::privacy_filter::PfEntityDecoded;
 use crate::conductor::privacy::types::{AbstractionPolicy, PersonalTrack as GateTrack};
 
@@ -44,20 +67,30 @@ use crate::conductor::privacy::types::{AbstractionPolicy, PersonalTrack as GateT
 /// that scan_matches ignores a 3-character value and matches a 4-character one).
 pub const MIN_VALUE_CHARS: usize = 4;
 
-/// One bridged field whose value an earlier step's output carried into this prompt.
-/// Debug never prints the value.
+/// One value a source flags in this prompt: a bridged field an earlier step's output
+/// carried, or a device value the pass seeded (items.id=924). Debug never prints the
+/// value.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CarryHit {
     pub field_name: String,
     pub value: String,
     pub suggestion: Option<String>,
+    /// The span's category (CARRIED_FIELD_CATEGORY or DEVICE_FIELD_CATEGORY).
+    pub category: &'static str,
+    /// The answers the span allows (items.id=924).
+    pub allowed: AllowedAnswers,
+    /// The span's fact key when the source gives one (a device value); else gate3
+    /// resolves it as for any span.
+    pub fact_key: Option<String>,
 }
 
 impl std::fmt::Debug for CarryHit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CarryHit")
             .field("field_name", &self.field_name)
+            .field("category", &self.category)
             .field("has_suggestion", &self.suggestion.is_some())
+            .field("allowed", &self.allowed)
             .finish_non_exhaustive()
     }
 }
@@ -73,6 +106,12 @@ pub struct CarryHits {
 impl CarryHits {
     pub fn is_empty(&self) -> bool {
         self.ask.is_empty() && self.remove.is_empty()
+    }
+
+    /// Both sources' hits together (items.id=924).
+    pub fn extend(&mut self, other: CarryHits) {
+        self.ask.extend(other.ask);
+        self.remove.extend(other.remove);
     }
 }
 
@@ -111,6 +150,11 @@ pub fn classify(
             field_name: name,
             value: field.field_value.clone(),
             suggestion,
+            category: CARRIED_FIELD_CATEGORY,
+            // A bridged field that is asked allows every answer (its not_permitted
+            // values never reach the review: they are removed).
+            allowed: AllowedAnswers::ALL,
+            fact_key: None,
         };
         if *policy == AbstractionPolicy::NotPermitted {
             hits.remove.push(CarryHit {
@@ -119,6 +163,76 @@ pub fn classify(
             });
         } else {
             hits.ask.push(hit);
+        }
+    }
+    hits
+}
+
+/// items.id=924 (D7): the bridged fields whose policy is ask, released raw to this step
+/// (executor::to_gate_track_asks): every occurrence of each value in `prompt` is raised,
+/// with every answer, wherever it came from (the projected field, a carried output, the
+/// user's text). A value under MIN_VALUE_CHARS is never released as ask, so never here.
+pub fn classify_asked(prompt: &str, gate_track: &GateTrack, asked: &[String]) -> CarryHits {
+    let mut hits = CarryHits::default();
+    for name in asked {
+        let Some(field) = gate_track.fields().get(name) else {
+            continue;
+        };
+        if !is_bridged_source(&field.source_id)
+            || occurrences(prompt, &field.field_value).is_empty()
+        {
+            continue;
+        }
+        hits.ask.push(CarryHit {
+            field_name: name.clone(),
+            value: field.field_value.clone(),
+            suggestion: None,
+            category: CARRIED_FIELD_CATEGORY,
+            allowed: AllowedAnswers::ALL,
+            fact_key: None,
+        });
+    }
+    hits
+}
+
+/// items.id=924: the device values `seed` holds that occur anywhere in `prompt` and are
+/// not pass (see the header). The stored value and its brace-cleaned form (what a
+/// rendering shows) are both looked for.
+pub fn classify_devices(prompt: &str, seed: &DeviceSeed) -> CarryHits {
+    let mut hits = CarryHits::default();
+    for v in seed.values() {
+        if v.disclosure == Disclosure::Pass {
+            continue;
+        }
+        let cleaned = crate::conductor::seeding::clean(&v.value);
+        let mut forms = vec![v.value.clone()];
+        if cleaned != v.value {
+            forms.push(cleaned);
+        }
+        for form in forms {
+            if occurrences(prompt, &form).is_empty() {
+                continue;
+            }
+            let hit = CarryHit {
+                field_name: v.field.clone(),
+                value: form,
+                suggestion: v.suggestion.clone(),
+                category: DEVICE_FIELD_CATEGORY,
+                allowed: if v.access_credential {
+                    AllowedAnswers::NO_STANDING_RELEASE
+                } else {
+                    AllowedAnswers::ALL
+                },
+                fact_key: Some(device_fact_key(&v.entity_id, &v.field, &v.value)),
+            };
+            match v.disclosure {
+                Disclosure::Never => hits.remove.push(CarryHit {
+                    suggestion: None,
+                    allowed: AllowedAnswers::NO_RELEASE,
+                    ..hit
+                }),
+                _ => hits.ask.push(hit),
+            }
         }
     }
     hits
@@ -184,13 +298,12 @@ pub fn source_spans(prompt: &str, ask: &[CarryHit]) -> Vec<SourceSpan> {
                 start_byte: s,
                 end_byte: e,
                 score: 1.0,
-                label: CARRIED_FIELD_CATEGORY.to_owned(),
+                label: ask[i].category.to_owned(),
                 span_text: prompt[s..e].to_owned(),
             },
             suggestion: ask[i].suggestion.clone(),
-            // items.id=924: a bridged field that is asked allows every answer (its
-            // not_permitted values never reach the review: they are removed).
-            allowed: AllowedAnswers::ALL,
+            allowed: ask[i].allowed,
+            fact_key: ask[i].fact_key.clone(),
         })
         .collect()
 }
@@ -331,6 +444,9 @@ mod tests {
             field_name: n.to_owned(),
             value: v.to_owned(),
             suggestion: None,
+            category: CARRIED_FIELD_CATEGORY,
+            allowed: AllowedAnswers::ALL,
+            fact_key: None,
         };
         let ask = [hit("location_city", "Leeds"), hit("employer", "Leeds Bank")];
         let p = "At Leeds Bank in Leeds.";
@@ -351,11 +467,175 @@ mod tests {
             field_name: "location_city".to_owned(),
             value: "SECRET-CITY".to_owned(),
             suggestion: Some("SECRET-LABEL".to_owned()),
+            category: CARRIED_FIELD_CATEGORY,
+            allowed: AllowedAnswers::ALL,
+            fact_key: None,
         };
         let d = format!("{h:?}");
         assert!(!d.contains("SECRET"), "{d}");
         let s = source_spans("in SECRET-CITY", &[h]);
         let d = format!("{s:?}");
         assert!(!d.contains("SECRET"), "{d}");
+    }
+
+    // -- items.id=924: device values ---------------------------------------------
+
+    use crate::conductor::device_seeding::{SeededValue, DEVICE_NAME_FIELD};
+
+    fn dv(field: &str, value: &str, d: Disclosure, cred: bool, sugg: Option<&str>) -> SeededValue {
+        SeededValue {
+            entity_id: "ent-1".to_owned(),
+            field: field.to_owned(),
+            value: value.to_owned(),
+            disclosure: d,
+            access_credential: cred,
+            suggestion: sugg.map(str::to_owned),
+        }
+    }
+
+    fn rma_seed() -> DeviceSeed {
+        DeviceSeed::for_test(
+            vec![
+                dv(
+                    DEVICE_NAME_FIELD,
+                    "Study laptop",
+                    Disclosure::Ask,
+                    false,
+                    Some("[device]"),
+                ),
+                dv(
+                    "serial_number",
+                    "PF2ABC3D",
+                    Disclosure::Ask,
+                    true,
+                    Some("[serial number]"),
+                ),
+                dv("make", "Lenovo", Disclosure::Pass, false, None),
+                dv(
+                    "warranty_contact",
+                    "help@warranty.example",
+                    Disclosure::Never,
+                    false,
+                    None,
+                ),
+                dv(
+                    "retailer",
+                    "Box",
+                    Disclosure::Ask,
+                    false,
+                    Some("[retailer]"),
+                ),
+            ],
+            None,
+        )
+    }
+
+    /// An ask value is raised wherever it is (a derived text, a carried output, the
+    /// user's own words), with its suggestion, its device key and its allowed answers:
+    /// a live release only for the flagged serial, every answer for the name. A never
+    /// value is removed and never raised; a pass value and a value under 4 characters
+    /// are not looked at.
+    #[test]
+    fn device_values_are_raised_by_disclosure_wherever_they_occur() {
+        let prompt = "RMA for my study LAPTOP? No: Study laptop, S/N PF2ABC3D (pf2abc3d typed), \
+                      Lenovo, bought at Box, contact help@warranty.example";
+        let hits = classify_devices(prompt, &rma_seed());
+        let ask: Vec<(&str, &str)> = hits
+            .ask
+            .iter()
+            .map(|h| (h.field_name.as_str(), h.value.as_str()))
+            .collect();
+        assert_eq!(
+            ask,
+            [
+                (DEVICE_NAME_FIELD, "Study laptop"),
+                ("serial_number", "PF2ABC3D")
+            ]
+        );
+        assert_eq!(hits.remove.len(), 1);
+        assert_eq!(hits.remove[0].field_name, "warranty_contact");
+        assert_eq!(hits.remove[0].allowed, AllowedAnswers::NO_RELEASE);
+
+        let cleaned = remove_values(prompt, &hits.remove);
+        assert!(!cleaned.contains("help@warranty.example"));
+        let spans = source_spans(&cleaned, &hits.ask);
+        let got: Vec<(&str, Option<&str>, AllowedAnswers)> = spans
+            .iter()
+            .map(|s| {
+                (
+                    s.entity.span_text.as_str(),
+                    s.suggestion.as_deref(),
+                    s.allowed,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("study LAPTOP", Some("[device]"), AllowedAnswers::ALL),
+                ("Study laptop", Some("[device]"), AllowedAnswers::ALL),
+                (
+                    "PF2ABC3D",
+                    Some("[serial number]"),
+                    AllowedAnswers::NO_STANDING_RELEASE
+                ),
+                (
+                    "pf2abc3d",
+                    Some("[serial number]"),
+                    AllowedAnswers::NO_STANDING_RELEASE
+                ),
+            ]
+        );
+        for s in &spans {
+            assert_eq!(s.entity.label, DEVICE_FIELD_CATEGORY);
+            assert_eq!(
+                &cleaned[s.entity.start_byte..s.entity.end_byte],
+                s.entity.span_text
+            );
+        }
+        assert_eq!(
+            spans[2].fact_key,
+            Some(device_fact_key("ent-1", "serial_number", "PF2ABC3D"))
+        );
+        assert_eq!(
+            spans[2].fact_key, spans[3].fact_key,
+            "one fact, both occurrences"
+        );
+        assert_eq!(
+            spans[0].fact_key, spans[1].fact_key,
+            "the name in either case"
+        );
+        // Nothing seeded, nothing raised.
+        assert!(classify_devices(prompt, &DeviceSeed::default()).is_empty());
+    }
+
+    /// The forms a rendering shows: a stored value with braces renders cleaned
+    /// (parentheses), and both forms are looked for. A reformatted value is missed (a
+    /// stated limit).
+    #[test]
+    fn a_device_value_is_found_stored_or_cleaned_and_missed_when_reformatted() {
+        let seed = DeviceSeed::for_test(
+            vec![dv(
+                "serial_number",
+                "AB{12}CD",
+                Disclosure::Ask,
+                true,
+                Some("[serial number]"),
+            )],
+            None,
+        );
+        let a = classify_devices("Serial number: AB(12)CD", &seed);
+        assert_eq!(a.ask.len(), 1);
+        assert_eq!(a.ask[0].value, "AB(12)CD");
+        let b = classify_devices("model said AB{12}CD", &seed);
+        assert_eq!(b.ask[0].value, "AB{12}CD");
+        assert_eq!(
+            a.ask[0].fact_key, b.ask[0].fact_key,
+            "keyed by the stored value"
+        );
+        assert!(
+            classify_devices("AB 12 CD", &seed).is_empty(),
+            "reformatted: missed"
+        );
     }
 }

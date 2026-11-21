@@ -19,9 +19,12 @@
 //   3. a cross-Persona fact: NotPermitted (v1)
 //   4. the user's row for the tier, if present and parseable (pass, summarize, omit,
 //      ask). Anything else, including not_permitted (system-only), is Omit. A user
-//      pass at tier 3 counts only for a tier3_selectable field, else Omit.
+//      pass or ask at tier 3 counts only for a tier3_selectable field, else Omit.
 //   5. the catalogue default (Omit at both tiers for every v1 field).
-// Ask is reserved (items.id=924): it behaves as Omit and discloses nothing.
+// Ask (items.id=924, D7): the raw value goes only to a hosted step whose outbound review
+// raises every occurrence of it with every answer (executor::to_gate_track_asks,
+// carry_scan::classify_asked); anywhere else, and for a value under 4 characters, it is
+// Omit. A remembered answer applies through the review's fact identity as for any span.
 //
 // User-facing words (placeholder, Chat-BRAND): share = pass, describe = summarize,
 // withhold = omit. The store and the resolver speak the policy words.
@@ -95,7 +98,10 @@ pub enum Policy {
     Pass,
     Summarize,
     Omit,
-    /// Reserved (items.id=924): behaves as Omit.
+    /// items.id=924 (D7): released raw only to a hosted step whose outbound review
+    /// raises every occurrence of the value (carry_scan), with every answer; omit
+    /// anywhere else (executor::to_gate_track_asks). Not at tier 3 unless the field is
+    /// tier3_selectable, like pass.
     Ask,
     /// System-only: never a user choice.
     NotPermitted,
@@ -197,7 +203,11 @@ pub fn effective_policy(catalogue: Result<&Catalogue, ()>, input: &PolicyInput<'
     }
     if let Some(raw) = input.user_policy {
         return match Policy::parse_user(raw) {
-            Some(Policy::Pass) if input.tier == Tier::Three && !def.tier3_selectable => {
+            // items.id=924: ask releases the raw value (behind the review), so it
+            // follows pass's tier-3 rule.
+            Some(Policy::Pass | Policy::Ask)
+                if input.tier == Tier::Three && !def.tier3_selectable =>
+            {
                 Policy::Omit
             }
             Some(p) => p,
@@ -211,7 +221,9 @@ pub fn effective_policy(catalogue: Result<&Catalogue, ()>, input: &PolicyInput<'
     match Policy::parse_default(default) {
         // A default pass is validated away for tier 3 unless selectable, but never
         // trust that here: the resolver re-applies the rule.
-        Some(Policy::Pass) if input.tier == Tier::Three && !def.tier3_selectable => Policy::Omit,
+        Some(Policy::Pass | Policy::Ask) if input.tier == Tier::Three && !def.tier3_selectable => {
+            Policy::Omit
+        }
         Some(p) => p,
         None => Policy::Omit,
     }
@@ -472,7 +484,8 @@ mod tests {
                             (Some("pass"), Tier::Two) => Policy::Pass,
                             (Some("pass"), Tier::Three) => Policy::Omit, // not tier3_selectable
                             (Some("summarize"), _) => Policy::Summarize,
-                            (Some("ask"), _) => Policy::Ask,
+                            (Some("ask"), Tier::Two) => Policy::Ask,
+                            (Some("ask"), Tier::Three) => Policy::Omit, // as pass
                             _ => Policy::Omit, // none, omit, garbage, not_permitted, empty
                         }
                     };
