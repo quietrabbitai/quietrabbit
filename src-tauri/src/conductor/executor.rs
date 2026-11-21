@@ -1465,10 +1465,12 @@ fn render_prompt_with_disclosure(
     // items.id=886: as in render_prompt. (Since items.id=884 flipped
     // STORE_NAMES_EXTERNAL_ALLOWED an external step may name a bound name it declares:
     // its seed is put in here, and the text then goes through the outbound review
-    // (step_review). The device names are never in an external template: the lint
-    // refuses them, DEVICE_NAMES_NEVER_EXTERNAL.)
+    // (step_review).) items.id=924 unit 3: the two device names render for the
+    // destination (never facts dropped, decisions.id=513 applied at the Boundary), and
+    // the carry scan then raises every ask value in the review.
     ctx.store_tokens
         .apply(&ctx.step.prompt_template, &mut tokens);
+    ctx.store_tokens.apply_external_devices(&mut tokens);
     render_template(
         &ctx.step.prompt_template,
         &tokens,
@@ -13122,6 +13124,248 @@ mod tests {
             );
         })
         .await;
+    }
+
+    /// items.id=924 unit 3: the RMA fixture. An ordinary external step (routing tier 2,
+    /// not a model block) declares {subject_context}; the pass seeded the fixture laptop
+    /// with the warranty contact made never. Returns what the review saw.
+    async fn rma_run(
+        pool: &sqlx::SqlitePool,
+        template: &str,
+        redact: bool,
+        carried: &str,
+        typed: &str,
+    ) -> HostedSeen {
+        use crate::conductor::device_seeding::{
+            catalogue_with_never_for_test, entity_for_test, rma_facts_for_test, DeviceSeed,
+        };
+        let mut ctx = carried_hosted_ctx(pool, None).await;
+        ctx.step.action_id = "rma_letter".to_owned();
+        ctx.step.prompt_template = template.to_owned();
+        ctx.step.declared_inputs = vec![
+            "subject_context".to_owned(),
+            "requirements".to_owned(),
+            "user_input".to_owned(),
+        ];
+        ctx.external_input = typed.to_owned();
+        let mut seed = DeviceSeed::default();
+        let local = seed.add_for_test(
+            &catalogue_with_never_for_test("warranty_contact"),
+            &entity_for_test("ent-1", "Study laptop", redact, false),
+            &rma_facts_for_test(),
+            true,
+        );
+        ctx.store_tokens
+            .seeds
+            .insert("subject_context".to_owned(), local);
+        ctx.store_tokens
+            .restricted
+            .insert("subject_context".to_owned());
+        ctx.store_tokens.device_seed = seed;
+        run_hosted_after(
+            &ctx,
+            pool,
+            &PersonalTrack::new(),
+            track_with_requirements(carried),
+        )
+        .await
+    }
+
+    /// items.id=924 unit 3, the RMA use case. The hosted step receives the EXTERNAL
+    /// subject_context (the never warranty contact dropped), and for this one device the
+    /// review raises THREE spans: the device name, the purchase date and the serial, each
+    /// with its suggestion and device key, the serial allowing a live release only.
+    #[tokio::test]
+    async fn the_rma_letter_receives_the_external_device_text_and_raises_three_spans() {
+        use crate::conductor::device_seeding::device_fact_key;
+        use crate::conductor::privacy::allowed_answers::AllowedAnswers;
+        use crate::conductor::privacy::gate3::DEVICE_FIELD_CATEGORY;
+        with_temp_shared_db(|pool| async move {
+            let seen = rma_run(
+                &pool,
+                "Write an RMA letter for:\n{subject_context}",
+                false,
+                "",
+                "",
+            )
+            .await;
+            assert_eq!(seen.prompts.len(), 1);
+            assert_eq!(
+                seen.prompts[0],
+                "Write an RMA letter for:\nDevice: Study laptop (device:endpoint:laptop)\n\
+                 Make: Lenovo\nModel: ThinkPad X1\nBought on: 2025-03-14\nSerial number: PF2ABC3D"
+            );
+            let got: Vec<(&str, Option<&str>, AllowedAnswers)> = seen
+                .sources
+                .iter()
+                .map(|s| {
+                    (
+                        s.entity.span_text.as_str(),
+                        s.suggestion.as_deref(),
+                        s.allowed,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                got,
+                [
+                    ("Study laptop", Some("[device]"), AllowedAnswers::ALL),
+                    ("2025-03-14", Some("[purchase date]"), AllowedAnswers::ALL),
+                    (
+                        "PF2ABC3D",
+                        Some("[serial number]"),
+                        AllowedAnswers::NO_STANDING_RELEASE
+                    ),
+                ]
+            );
+            for s in &seen.sources {
+                assert_eq!(s.entity.label, DEVICE_FIELD_CATEGORY);
+            }
+            assert_eq!(
+                seen.sources[2].fact_key,
+                Some(device_fact_key("ent-1", "serial_number", "PF2ABC3D"))
+            );
+            assert!(seen
+                .gateway
+                .logger
+                .entries()
+                .iter()
+                .all(|e| e.event_type != CARRY_REMOVED_EVENT));
+        })
+        .await;
+    }
+
+    /// items.id=924 unit 3: the never value a LOCAL step's output carries into the RMA
+    /// step is removed and logged by field name, with no value; the serial the local step
+    /// carried and the one the user typed are raised with the rendered one.
+    #[tokio::test]
+    async fn the_rma_letter_removes_a_carried_never_value_and_raises_every_serial() {
+        with_temp_shared_db(|pool| async move {
+            let seen = rma_run(
+                &pool,
+                "{subject_context}\nDraft: {requirements}\nNote: {user_input}",
+                false,
+                "Contact help@warranty.example about PF2ABC3D",
+                "my serial is pf2abc3d",
+            )
+            .await;
+            let p = &seen.prompts[0];
+            assert!(!p.contains("help@warranty.example"), "{p}");
+            assert_eq!(p.matches("[removed]").count(), 1, "{p}");
+            assert_eq!(
+                span_texts(&seen),
+                [
+                    "Study laptop",
+                    "2025-03-14",
+                    "PF2ABC3D",
+                    "PF2ABC3D",
+                    "pf2abc3d"
+                ]
+            );
+            let rows: Vec<_> = seen
+                .gateway
+                .logger
+                .entries()
+                .into_iter()
+                .filter(|e| e.event_type == CARRY_REMOVED_EVENT)
+                .collect();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].fields_withheld, ["warranty_contact"]);
+            let all = format!("{:?}", seen.gateway.logger.entries());
+            assert!(
+                !all.contains("warranty.example") && !all.contains("PF2ABC3D"),
+                "{all}"
+            );
+        })
+        .await;
+    }
+
+    /// items.id=924 unit 3: a device decisions.id=513 redacts. The RMA step sees
+    /// "[device]" and the pass facts only, nothing is asked, and the name and serial a
+    /// local step carried in are removed (never), not raised.
+    #[tokio::test]
+    async fn the_rma_letter_of_a_redacted_device_hides_its_name_and_asks_nothing() {
+        with_temp_shared_db(|pool| async move {
+            let seen = rma_run(
+                &pool,
+                "{subject_context}\nDraft: {requirements}",
+                true,
+                "Study laptop, S/N PF2ABC3D",
+                "",
+            )
+            .await;
+            let p = &seen.prompts[0];
+            assert_eq!(
+                p,
+                "Device: [device] (device:endpoint:laptop)\nMake: Lenovo\nModel: ThinkPad X1\n\
+                 Draft: [removed], S/N [removed]"
+            );
+            assert!(seen.sources.is_empty());
+        })
+        .await;
+    }
+
+    /// items.id=924 unit 3: a hosted step naming {device_library_brief} receives the
+    /// external brief: the redacted device appears as "[device]", the visible one by
+    /// name, which the review raises.
+    #[tokio::test]
+    async fn a_hosted_step_receives_the_external_device_brief() {
+        use crate::conductor::device_seeding::{entity_for_test, rma_facts_for_test, DeviceSeed};
+        with_temp_shared_db(|pool| async move {
+            let mut ctx = carried_hosted_ctx(&pool, None).await;
+            ctx.step.prompt_template = "Devices:\n{device_library_brief}".to_owned();
+            ctx.step.declared_inputs = vec!["device_library_brief".to_owned()];
+            let cat = crate::conductor::device_fields::registry().unwrap();
+            let mut seed = DeviceSeed::default();
+            for (id, name, redact) in [("a", "Study laptop", false), ("b", "Kitchen tablet", true)] {
+                seed.add_for_test(cat, &entity_for_test(id, name, redact, false), &rma_facts_for_test(), false);
+            }
+            ctx.store_tokens.seeds.insert(
+                "device_library_brief".to_owned(),
+                "- E-a: Study laptop\n- E-b: Kitchen tablet".to_owned(),
+            );
+            ctx.store_tokens
+                .restricted
+                .insert("device_library_brief".to_owned());
+            ctx.store_tokens.device_seed = seed;
+            let seen = run_hosted_after(&ctx, &pool, &PersonalTrack::new(), TaskTrack::new()).await;
+            assert_eq!(
+                seen.prompts[0],
+                "Devices:\n- E-a: Study laptop (device:endpoint:laptop) | Make: Lenovo | Model: ThinkPad X1\n\
+                 - E-b: [device] (device:endpoint:laptop) | Make: Lenovo | Model: ThinkPad X1"
+            );
+            assert_eq!(span_texts(&seen), ["Study laptop"]);
+        })
+        .await;
+    }
+
+    /// items.id=924 unit 3: the external rendering of the device names is applied by
+    /// the external render only, after the seeds; the local render keeps the local text.
+    #[test]
+    fn only_the_external_render_applies_the_external_device_text() {
+        let src = include_str!("executor.rs");
+        let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert_eq!(prod.matches("apply_external_devices(").count(), 1);
+        let ext = prod
+            .split("fn render_prompt_with_disclosure(")
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let seeds_at = ext
+            .find(".apply(&ctx.step.prompt_template, &mut tokens)")
+            .unwrap();
+        let device_at = ext.find("apply_external_devices(&mut tokens)").unwrap();
+        assert!(seeds_at < device_at);
+        let local = prod
+            .split("pub(crate) fn render_prompt(")
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(!local.contains("apply_external_devices"));
     }
 
     /// items.id=924: a hosted step whose pass seeded no device raises nothing for the

@@ -2079,6 +2079,37 @@ mod tests {
         assert_eq!(out, PROMPT);
     }
 
+    /// items.id=924 unit 3, the RMA use case at the outbound review: the serial span
+    /// (a live release only) is sent on the user's live release, removed on keep
+    /// private, and replaced on a generalization; the rest of the letter is untouched.
+    #[tokio::test]
+    async fn the_rma_serial_is_sent_on_a_live_release_and_removed_on_keep_private() {
+        const RMA: &str = "Please process an RMA. Serial number: PF2ABC3D. Thank you.";
+        for (decision, modified, want) in [
+            ("release_original", None, RMA.to_owned()),
+            ("keep_private", None, RMA.replace("PF2ABC3D", "[removed]")),
+            (
+                "generalize",
+                Some("[serial number]"),
+                RMA.replace("PF2ABC3D", "[serial number]"),
+            ),
+        ] {
+            let mut c = conn().await;
+            let r = ReviewReuse::default();
+            let scanner = FakeScanner::pending(vec![ConsentSpanItem {
+                allowed: AllowedAnswers::NO_STANDING_RELEASE,
+                ..asked_span("s-sn", RMA, "PF2ABC3D")
+            }]);
+            match parked(review_prompt(&mut c, &scanner, &r, &input(RMA)).await) {
+                Park::Pending { .. } => {}
+                other => panic!("expected pending, got {other:?}"),
+            }
+            record(&mut c, &[answer("s-sn", decision, modified)]).await;
+            let out = sent(review_prompt(&mut c, &scanner, &r, &input(RMA)).await);
+            assert_eq!(out, want, "{decision}");
+        }
+    }
+
     #[test]
     fn a_span_that_allows_every_answer_is_stored_as_before() {
         let asked = AskedSpan {

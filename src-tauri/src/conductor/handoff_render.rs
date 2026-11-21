@@ -31,7 +31,8 @@
 //     Items.id=884 flipped that flag, so a starter may now carry content_brief, and a
 //     Focus that also has a handoff_ingest row may name {user_input} (the pasted
 //     reply is in it: conductor::taint). The two DEVICE names are the exception
-//     the flag never relaxes (declared_inputs::DEVICE_NAMES_NEVER_EXTERNAL). What a
+//     the flag never relaxes (declared_inputs::DEVICE_NAMES_NEVER_IN_STARTER: a starter
+//     has no device scan or outbound review, items.id=924). What a
 //     starter built from a store-backed input means for its RECORD is the rule of
 //     inherit_from_inputs below.
 // It does NOT flip EXTERNAL_MODEL_BLOCKS_ALLOWED: that flag is about model calls

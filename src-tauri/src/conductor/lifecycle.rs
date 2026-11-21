@@ -12109,7 +12109,7 @@ mod tests {
     // LOAD (database path): the interim invariant, collisions, guards.
 
     #[tokio::test]
-    async fn store_names_db_an_external_step_may_declare_a_store_name_but_never_a_device_name() {
+    async fn store_names_db_an_external_step_may_declare_a_store_name_and_a_device_name() {
         with_temp_data_root(async {
             // A declared store name loads (items.id=884 flipped the flag).
             declared_load(
@@ -12147,25 +12147,28 @@ mod tests {
             .await
             .unwrap();
 
-            // A DEVICE name, declared: refused with the explicit message, for each.
+            // items.id=924: a DEVICE name, declared, loads in an external model step, for
+            // each (it receives the external rendering and the carry scan); undeclared,
+            // the declaration rule refuses it.
             for name in ["subject_context", "device_library_brief"] {
-                let m = declared_load(
+                declared_load(
                     &format!("sn-device-{name}"),
                     vec![dstep("e", 2, &format!("{{{name}}}"), &[name], &[], None)],
                 )
                 .await
+                .unwrap();
+                let m = declared_load(
+                    &format!("sn-device-undeclared-{name}"),
+                    vec![dstep("e", 2, &format!("{{{name}}}"), &[], &[], None)],
+                )
+                .await
                 .unwrap_err();
-                assert!(m.contains(&format!("Focus 'sn-device-{name}'")), "{m}");
-                assert!(
-                    m.contains("step 'e'")
-                        && m.contains(&format!("'{name}'"))
-                        && m.contains("device's catalogued facts"),
-                    "{m}"
-                );
+                assert!(m.contains("step 'e'") && m.contains(name), "{m}");
+                assert!(!m.contains("device's catalogued facts"), "{m}");
             }
 
-            // Transitive through a local step that read a device name.
-            let m = declared_load(
+            // Transitive through a local step that read a device name: loads.
+            declared_load(
                 "sn-device-transitive",
                 vec![
                     dstep("a", 1, "{subject_context}", &[], &[], Some("echo1")),
@@ -12174,9 +12177,7 @@ mod tests {
                 ],
             )
             .await
-            .unwrap_err();
-            assert!(m.contains("step 'e'") && m.contains("'echo2'"), "{m}");
-            assert!(m.contains("device's catalogued facts"), "{m}");
+            .unwrap();
         })
         .await;
     }
@@ -12262,10 +12263,10 @@ mod tests {
     }
 
     /// The YAML loader runs the same lint. Items.id=884 flipped the store-name flag, so
-    /// a declared store name loads in an external step; a DEVICE name still cannot
-    /// reach one, whatever the flag says, and neither can a variable derived from it.
+    /// a declared store name loads in an external step; since items.id=924 so does a
+    /// declared variable derived from a DEVICE name.
     #[test]
-    fn store_names_yaml_an_external_step_cannot_name_a_device_name() {
+    fn store_names_yaml_an_external_step_may_take_a_device_derived_variable() {
         let text = |name: &str| {
             format!(
                 r#"
@@ -12287,16 +12288,10 @@ steps:
         // A store name that is not a device name: the declared variable loads.
         let def = parse_focus_text(&text("case_context")).unwrap();
         lint_declared_inputs(&def.focus_id, &def.steps).unwrap();
-        // A device name: refused, for each of the two, with the explicit message.
+        // A device name: loads, for each of the two (items.id=924).
         for name in ["subject_context", "device_library_brief"] {
             let def = parse_focus_text(&text(name)).unwrap();
-            let LifecycleError::ValidationFailed(m) =
-                lint_declared_inputs(&def.focus_id, &def.steps).unwrap_err()
-            else {
-                panic!("expected ValidationFailed");
-            };
-            assert!(m.contains("step 'second'") && m.contains("'v'"), "{m}");
-            assert!(m.contains("device's catalogued facts"), "{m}");
+            lint_declared_inputs(&def.focus_id, &def.steps).unwrap();
         }
     }
 

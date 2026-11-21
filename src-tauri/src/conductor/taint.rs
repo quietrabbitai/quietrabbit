@@ -180,6 +180,20 @@ impl StoreTokens {
         self.restricted.contains(name) || (self.user_input_backed && name == "user_input")
     }
 
+    /// items.id=924 unit 3: a HOSTED step's device names, replaced by their external
+    /// rendering from the pass's DeviceSeed (only where apply() put a seed in, so only
+    /// for a step whose template names it). A seed with no device behind it renders
+    /// empty (fail closed).
+    pub fn apply_external_devices(&self, tokens: &mut HashMap<String, String>) {
+        use crate::conductor::bound_spec::{DEVICE_LIBRARY_BRIEF, SUBJECT_CONTEXT};
+        if let Some(v) = tokens.get_mut(SUBJECT_CONTEXT) {
+            *v = self.device_seed.external_subject_context();
+        }
+        if let Some(v) = tokens.get_mut(DEVICE_LIBRARY_BRIEF) {
+            *v = self.device_seed.external_device_brief();
+        }
+    }
+
     /// Adjust one step's token map (see the module header).
     pub fn apply(&self, template: &str, tokens: &mut HashMap<String, String>) {
         if self.restricted.is_empty() && self.seeds.is_empty() {

@@ -5,11 +5,13 @@
 // device_library_brief (bound_spec.rs: Source::Derived, Presence::Always, text).
 // Like case_context and the other derived names they are READ at pass start
 // (seeding::seed_pass), never written, never a TaskStep, and never in the
-// extraction input: every row that names one is tainted (conductor::taint), and an
-// external step may not name or declare either, whatever STORE_NAMES_EXTERNAL_ALLOWED
-// says (items.id=884 flipped that flag to true and kept these two out by a closed
-// list, declared_inputs::DEVICE_NAMES_NEVER_EXTERNAL, with an explicit LOAD refusal).
-// Both are LOCAL prompt text.
+// extraction input: every row that names one is tainted (conductor::taint). The text
+// below is the LOCAL rendering. Since items.id=924 an external model step may name and
+// declare either (a hand-off starter still may not:
+// declared_inputs::DEVICE_NAMES_NEVER_IN_STARTER) and receives the EXTERNAL rendering
+// of the pass's DeviceSeed instead (never facts dropped, a withheld name shown as
+// "[device]", a device decisions.id=513 suppresses left out), whose ask values the
+// carry scan raises in the outbound review.
 //
 // WHAT EACH IS
 //   subject_context      the device the ACTIVE CASE is about, and what is recorded
@@ -75,7 +77,9 @@ use crate::conductor::bound_spec::{
 };
 use crate::conductor::device_fields::{self, Catalogue, Disclosure, SUBJECT_CLASS_FIELD};
 use crate::conductor::seeding::{cap, clean, SeedError};
+use crate::conductor::visibility::{evaluate_object_visibility, SurfaceClass, VisibilityDecision};
 use crate::persistence::case_store;
+use crate::persistence::entity_store::Entity;
 use crate::persistence::handles;
 use crate::persistence::owned_entity_store::{self as owned, ActiveFact, OwnedEntityError};
 use crate::persistence::session_store;
@@ -108,6 +112,33 @@ pub struct SeededValue {
     pub suggestion: Option<String>,
 }
 
+/// items.id=924 unit 3: what an EXTERNAL rendering of the device names shows for a
+/// device whose name is never or that decisions.id=513 redacts at the Boundary.
+pub const WITHHELD_DEVICE_NAME: &str = "[device]";
+
+/// items.id=924 unit 3: one device as a pass read it, with every fact's EFFECTIVE
+/// disclosure word (see effective()), for the external rendering.
+#[derive(Clone, PartialEq, Eq)]
+struct SeededDevice {
+    device: BriefDevice,
+    /// The effective disclosure of the name.
+    name_disclosure: Disclosure,
+    /// decisions.id=513's answer at the Boundary surface.
+    visibility: VisibilityDecision,
+}
+
+/// items.id=924 unit 3: a value's disclosure once decisions.id=513 has spoken. A
+/// device that is not Visible at the Boundary (redacted, suppressed, or anything else)
+/// keeps its pass facts and turns its name and every other fact into never: Boundary
+/// behaviour is invariant, so no answer in a review may release them.
+fn effective(d: Disclosure, visibility: VisibilityDecision) -> Disclosure {
+    if visibility == VisibilityDecision::Visible || d == Disclosure::Pass {
+        d
+    } else {
+        Disclosure::Never
+    }
+}
+
 /// items.id=924: what a pass seeded of the Focus's devices (see the header). Empty
 /// when the pass named neither device name or the Focus has no device.
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -115,6 +146,10 @@ pub struct DeviceSeed {
     values: Vec<SeededValue>,
     /// How many active devices the brief counted (its "and n more"), when read.
     brief_total: Option<usize>,
+    /// The active case's device, when subject_context was read and has one.
+    subject: Option<SeededDevice>,
+    /// The devices the brief listed, when it was read.
+    brief: Vec<SeededDevice>,
 }
 
 impl std::fmt::Debug for DeviceSeed {
@@ -136,14 +171,18 @@ impl DeviceSeed {
         self.values.is_empty()
     }
 
-    /// Add a device's name and catalogued facts, once per (entity, field).
+    /// Add a device's name and catalogued facts, once per (entity, field), at their
+    /// effective disclosure, and return it for the external rendering.
     fn add_device(
         &mut self,
         catalogue: &Catalogue,
-        entity_id: &str,
-        name: &str,
+        entity: &Entity,
+        handle: String,
         facts: &[ActiveFact],
-    ) {
+    ) -> SeededDevice {
+        let visibility = evaluate_object_visibility(entity, "entity", SurfaceClass::Boundary, None);
+        let entity_id = entity.id.as_str();
+        let name_disclosure = effective(catalogue.device_name_disclosure, visibility);
         let mut push =
             |field: &str, value: &str, d: Disclosure, cred: bool, sugg: &Option<String>| {
                 let value = value.trim();
@@ -166,8 +205,8 @@ impl DeviceSeed {
             };
         push(
             DEVICE_NAME_FIELD,
-            name,
-            catalogue.device_name_disclosure,
+            &entity.display_name,
+            name_disclosure,
             false,
             &catalogue.device_name_suggestion,
         );
@@ -176,12 +215,90 @@ impl DeviceSeed {
                 push(
                     &def.name,
                     &f.value,
-                    def.disclosure,
+                    effective(def.disclosure, visibility),
                     def.access_credential_flag,
                     &def.suggestion,
                 );
             }
         }
+        let (class, facts) = split_facts(catalogue, facts.to_vec());
+        let facts = facts
+            .into_iter()
+            .map(|(label, value, word)| {
+                // split_facts carries the catalogue's word; an unknown one is never.
+                let d = match word.as_str() {
+                    "pass" => Disclosure::Pass,
+                    "ask" => Disclosure::Ask,
+                    _ => Disclosure::Never,
+                };
+                (label, value, effective(d, visibility).as_str().to_owned())
+            })
+            .collect();
+        SeededDevice {
+            device: BriefDevice {
+                handle,
+                name: entity.display_name.clone(),
+                class,
+                facts,
+            },
+            name_disclosure,
+            visibility,
+        }
+    }
+
+    /// The name an external rendering shows: the device's own, or WITHHELD_DEVICE_NAME
+    /// when its effective disclosure is never.
+    fn external_device(d: &SeededDevice) -> BriefDevice {
+        BriefDevice {
+            name: if d.name_disclosure == Disclosure::Never {
+                WITHHELD_DEVICE_NAME.to_owned()
+            } else {
+                d.device.name.clone()
+            },
+            facts: d
+                .device
+                .facts
+                .iter()
+                .filter(|(_, _, word)| word != Disclosure::Never.as_str())
+                .cloned()
+                .collect(),
+            ..d.device.clone()
+        }
+    }
+
+    fn shown_outside(d: &SeededDevice) -> bool {
+        matches!(
+            d.visibility,
+            VisibilityDecision::Visible | VisibilityDecision::Redacted
+        )
+    }
+
+    /// items.id=924 unit 3: subject_context as a HOSTED step receives it: the same
+    /// skeleton, never facts dropped, a withheld name shown as WITHHELD_DEVICE_NAME, and
+    /// nothing for a device decisions.id=513 suppresses (or when no device was seeded).
+    pub fn external_subject_context(&self) -> String {
+        match &self.subject {
+            Some(d) if Self::shown_outside(d) => {
+                let e = Self::external_device(d);
+                let facts: Vec<(String, String)> =
+                    e.facts.into_iter().map(|(l, v, _)| (l, v)).collect();
+                render_subject_context(&e.name, e.class.as_deref(), &facts)
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// items.id=924 unit 3: device_library_brief as a HOSTED step receives it: a
+    /// suppressed device left out, a withheld name shown as WITHHELD_DEVICE_NAME (the
+    /// brief shows pass facts only, as locally).
+    pub fn external_device_brief(&self) -> String {
+        let shown: Vec<BriefDevice> = self
+            .brief
+            .iter()
+            .filter(|d| Self::shown_outside(d))
+            .map(Self::external_device)
+            .collect();
+        render_device_brief(&shown, self.brief_total.unwrap_or(shown.len()))
     }
 
     /// A seed of these values (tests outside this module).
@@ -190,7 +307,31 @@ impl DeviceSeed {
         DeviceSeed {
             values,
             brief_total,
+            ..Default::default()
         }
+    }
+
+    /// Tests outside this module: a device in memory, added as the active case's
+    /// device (`as_subject`) or as a brief line, exactly as a pass adds one. Returns
+    /// the LOCAL subject_context text a pass would seed for it.
+    #[cfg(test)]
+    pub(crate) fn add_for_test(
+        &mut self,
+        catalogue: &Catalogue,
+        entity: &Entity,
+        facts: &[ActiveFact],
+        as_subject: bool,
+    ) -> String {
+        let seeded = self.add_device(catalogue, entity, format!("E-{}", entity.id), facts);
+        if as_subject {
+            self.subject = Some(seeded);
+        } else {
+            self.brief.push(seeded);
+            self.brief_total = Some(self.brief.len());
+        }
+        let (class, f) = split_facts(catalogue, facts.to_vec());
+        let f: Vec<(String, String)> = f.into_iter().map(|(l, v, _)| (l, v)).collect();
+        render_subject_context(&entity.display_name, class.as_deref(), &f)
     }
 
     /// The pin of this seed: None when nothing was seeded (no entry is written), else
@@ -423,7 +564,13 @@ pub async fn read_device_seeds(
             let facts = owned::list_active_facts(personal, focus_id, &d.id)
                 .await
                 .map_err(|e| store_err(DEVICE_LIBRARY_BRIEF, e))?;
-            seed.add_device(catalogue, &d.id, &d.display_name, &facts);
+            let seeded = seed.add_device(
+                catalogue,
+                d,
+                handles::entity_handle(focus_id, &d.id),
+                &facts,
+            );
+            seed.brief.push(seeded);
             let (class, facts) = split_facts(catalogue, facts);
             shown.push(BriefDevice {
                 handle: handles::entity_handle(focus_id, &d.id),
@@ -491,7 +638,7 @@ async fn subject_context(
     let facts = owned::list_active_facts(personal, focus_id, &entity_id)
         .await
         .map_err(|e| store_err(SUBJECT_CONTEXT, e))?;
-    seed.add_device(catalogue, &entity_id, &entity.display_name, &facts);
+    seed.subject = Some(seed.add_device(catalogue, &entity, String::new(), &facts));
     let (class, facts) = split_facts(catalogue, facts);
     let facts: Vec<(String, String)> = facts.into_iter().map(|(l, v, _)| (l, v)).collect();
     Ok(render_subject_context(
@@ -499,6 +646,63 @@ async fn subject_context(
         class.as_deref(),
         &facts,
     ))
+}
+
+/// Tests: an entity in memory with decisions.id=513's two flags.
+#[cfg(test)]
+pub(crate) fn entity_for_test(id: &str, name: &str, redact: bool, hide: bool) -> Entity {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "entity_type": "subject",
+        "display_name": name,
+        "aliases": [],
+        "parent_entity_id": null,
+        "status": "active",
+        "modification_state": "user_created",
+        "source_registry_id": null,
+        "source_url": null,
+        "created_at": "t",
+        "extra_metadata": {},
+        "redact_identification": redact,
+        "hide_from_shared_surfaces": hide,
+    }))
+    .expect("an entity")
+}
+
+/// Tests: the RMA fixture device (synthetic values): a laptop with two pass facts, the
+/// serial and the purchase date (ask), and a warranty contact.
+#[cfg(test)]
+pub(crate) fn rma_facts_for_test() -> Vec<ActiveFact> {
+    [
+        ("subject_class", "device:endpoint:laptop"),
+        ("make", "Lenovo"),
+        ("model", "ThinkPad X1"),
+        ("purchase_date", "2025-03-14"),
+        ("serial_number", "PF2ABC3D"),
+        ("warranty_contact", "help@warranty.example"),
+    ]
+    .iter()
+    .map(|(f, v)| ActiveFact {
+        field_name: (*f).to_owned(),
+        value: (*v).to_owned(),
+        created_at: "t".to_owned(),
+    })
+    .collect()
+}
+
+/// Tests: the shipped catalogue with `field` made never (no shipped field is never).
+#[cfg(test)]
+pub(crate) fn catalogue_with_never_for_test(field: &str) -> Catalogue {
+    let mut c = device_fields::registry().expect("catalogue").clone();
+    let f = c
+        .fields
+        .iter_mut()
+        .find(|f| f.name == field)
+        .expect("a field");
+    f.disclosure = Disclosure::Never;
+    f.suggestion = None;
+    c.validate().expect("still valid");
+    c
 }
 
 #[cfg(test)]
@@ -1356,5 +1560,122 @@ mod tests {
                 .await
                 .unwrap();
         assert!(none.is_empty());
+    }
+
+    // -- items.id=924 unit 3: the external rendering ------------------------------
+
+    /// THE WORDING of the RMA fixture, local and external, pinned. The external text
+    /// keeps the skeleton and every pass and ask fact, and drops the never fact (the
+    /// fixture makes the warranty contact never); the local text is unchanged.
+    #[test]
+    fn the_external_subject_context_drops_never_facts_and_keeps_the_rest() {
+        let cat = catalogue_with_never_for_test("warranty_contact");
+        let mut seed = DeviceSeed::default();
+        let local = seed.add_for_test(
+            &cat,
+            &entity_for_test("ent-1", "Study laptop", false, false),
+            &rma_facts_for_test(),
+            true,
+        );
+        assert_eq!(
+            local,
+            "Device: Study laptop (device:endpoint:laptop)\n\
+             Make: Lenovo\n\
+             Model: ThinkPad X1\n\
+             Bought on: 2025-03-14\n\
+             Serial number: PF2ABC3D\n\
+             Warranty contact: help@warranty.example"
+        );
+        assert_eq!(
+            seed.external_subject_context(),
+            "Device: Study laptop (device:endpoint:laptop)\n\
+             Make: Lenovo\n\
+             Model: ThinkPad X1\n\
+             Bought on: 2025-03-14\n\
+             Serial number: PF2ABC3D"
+        );
+        // With the shipped catalogue (warranty contact ask) it is rendered too.
+        let mut shipped = DeviceSeed::default();
+        let local = shipped.add_for_test(
+            device_fields::registry().unwrap(),
+            &entity_for_test("ent-1", "Study laptop", false, false),
+            &rma_facts_for_test(),
+            true,
+        );
+        assert_eq!(shipped.external_subject_context(), local);
+        // No device: empty, like the local text.
+        assert_eq!(DeviceSeed::default().external_subject_context(), "");
+        assert_eq!(DeviceSeed::default().external_device_brief(), "");
+    }
+
+    /// decisions.id=513 at the Boundary: a REDACTED device shows "[device]" and its pass
+    /// facts only, and its name and ask values become never (removed by the carry scan,
+    /// never asked); a SUPPRESSED device renders nothing and the same values are never.
+    #[test]
+    fn a_redacted_or_suppressed_device_is_withheld_outside_and_its_values_are_never() {
+        let cat = device_fields::registry().unwrap();
+        let mut redacted = DeviceSeed::default();
+        redacted.add_for_test(
+            cat,
+            &entity_for_test("ent-1", "Study laptop", true, false),
+            &rma_facts_for_test(),
+            true,
+        );
+        assert_eq!(
+            redacted.external_subject_context(),
+            "Device: [device] (device:endpoint:laptop)\nMake: Lenovo\nModel: ThinkPad X1"
+        );
+        let mut suppressed = DeviceSeed::default();
+        suppressed.add_for_test(
+            cat,
+            &entity_for_test("ent-1", "Study laptop", false, true),
+            &rma_facts_for_test(),
+            true,
+        );
+        assert_eq!(suppressed.external_subject_context(), "");
+        for seed in [&redacted, &suppressed] {
+            for v in seed.values() {
+                let want = if ["make", "model", "subject_class"].contains(&v.field.as_str()) {
+                    Disclosure::Pass
+                } else {
+                    Disclosure::Never
+                };
+                assert_eq!(v.disclosure, want, "{}", v.field);
+            }
+        }
+        // A flag change changes the pin.
+        let mut visible = DeviceSeed::default();
+        visible.add_for_test(
+            cat,
+            &entity_for_test("ent-1", "Study laptop", false, false),
+            &rma_facts_for_test(),
+            true,
+        );
+        assert_ne!(visible.fingerprint(), redacted.fingerprint());
+    }
+
+    /// The external brief: a suppressed device left out, a redacted one named
+    /// "[device]", a visible one as locally (pass facts only).
+    #[test]
+    fn the_external_brief_withholds_by_visibility() {
+        let cat = device_fields::registry().unwrap();
+        let mut seed = DeviceSeed::default();
+        for (id, name, redact, hide) in [
+            ("a", "Study laptop", false, false),
+            ("b", "Kitchen tablet", true, false),
+            ("c", "Hidden router", false, true),
+        ] {
+            seed.add_for_test(
+                cat,
+                &entity_for_test(id, name, redact, hide),
+                &rma_facts_for_test(),
+                false,
+            );
+        }
+        assert_eq!(
+            seed.external_device_brief(),
+            "- E-a: Study laptop (device:endpoint:laptop) | Make: Lenovo | Model: ThinkPad X1\n\
+             - E-b: [device] (device:endpoint:laptop) | Make: Lenovo | Model: ThinkPad X1"
+        );
     }
 }

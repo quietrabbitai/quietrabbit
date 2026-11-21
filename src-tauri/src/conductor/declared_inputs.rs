@@ -38,10 +38,11 @@
 //     may not be tainted at all. items.id=884 flipped it to true: an external step
 //     may now name a store-backed name it DECLARES, and the outbound review
 //     (conductor::step_review) is what stands between that text and the provider.
-//   * ONE EXCEPTION THE FLAG NEVER RELAXES (items.id=884, decided by Jason after the
-//     flip stage report): the two DEVICE names, DEVICE_NAMES_NEVER_EXTERNAL. An
-//     external step may not name or declare either, nor a variable derived from
-//     one, whatever the flag says. See that constant for why.
+//   * ONE EXCEPTION THE FLAG NEVER RELAXES, narrowed by items.id=924: the two DEVICE
+//     names may not reach a cb-15 hand-off STARTER (DEVICE_NAMES_NEVER_IN_STARTER),
+//     nor may a variable derived from one. An external MODEL step may name and
+//     declare them (items.id=884's closed list is gone): it receives their external
+//     rendering and its carry scan raises every ask value. See that constant.
 //
 // A LOCAL step needs no declaration. If a local step has one anyway its names
 // are still checked by (3), so a typo cannot hide until a step's tier is
@@ -76,34 +77,30 @@ pub fn bound_names() -> &'static [&'static str] {
 /// only line that changed here. It lets an external step NAME store-backed names
 /// (lint_with); it does not allow hosted model blocks (EXTERNAL_MODEL_BLOCKS_ALLOWED,
 /// items.id=913 behind the run plan), and it does not relax
-/// DEVICE_NAMES_NEVER_EXTERNAL below.
+/// DEVICE_NAMES_NEVER_IN_STARTER below.
 pub const STORE_NAMES_EXTERNAL_ALLOWED: bool = true;
 
-/// The store-backed names that NO external step may name or declare, whatever
-/// STORE_NAMES_EXTERNAL_ALLOWED says (items.id=884 stage 3, items.id=891). A CLOSED
-/// list: the two derived DEVICE names (bound_spec: SUBJECT_CONTEXT,
-/// DEVICE_LIBRARY_BRIEF), a pin test holds it equal to them.
+/// The store-backed names a cb-15 hand-off STARTER may not name or declare, whatever
+/// STORE_NAMES_EXTERNAL_ALLOWED says: the two derived DEVICE names (bound_spec:
+/// SUBJECT_CONTEXT, DEVICE_LIBRARY_BRIEF), a pin test holds it equal to them.
 ///
-/// WHY. `subject_context` renders EVERY catalogued fact of a device as local text,
-/// serial number (credential-flagged), warranty contact and access location included:
-/// facts block_data/device_fields.json marks `not_permitted` at tiers 2 and 3, which
-/// means never, not even with consent, and omit or range_only for the rest.
-/// `device_library_brief` carries only tier-2 `pass` facts but also the user's own
-/// device NAMES, and two free-text fields (hardware_specs, known_issues) pass with
-/// no secret detector. The outbound review detects personal spans and asks; it is
-/// not the catalogue's policy. Letting it stand alone for these names would turn
-/// "never" into "one click". decisions.id=513's redaction (a Boundary-surface rule
-/// of the visibility function and its flags) is not built in R1 (decisions.id=945),
-/// and Tech Support steps are local by default in R1 (decisions.id=937 point 6,
-/// 940 ruling 8), so nothing needs these names outside the device today. Opening
-/// them later is a deliberate design: a tier-aware render of the catalogue's
-/// policies, not a flag.
+/// HISTORY. items.id=884 and 891 refused both names in EVERY external step: the local
+/// text renders every catalogued fact, and the outbound review detects and asks, it
+/// does not enforce the catalogue. items.id=924 built what that refusal waited for: a
+/// per-field disclosure (never, ask, pass) in the catalogue, an external rendering of
+/// both names (never dropped, decisions.id=513 applied at the Boundary:
+/// DeviceSeed::external_subject_context), and the carry scan that raises every ask
+/// value in a hosted step's review with its allowed answers. So an external MODEL step
+/// may now name and declare them like any store-backed name (declared, tainting, the
+/// items.id=922 personal floor).
 ///
-/// The refusal covers a step that names or declares one of them, and a step that
-/// names a variable derived from one (a local step that read it and produced an
-/// output; see taint::taint_closure_of). It is checked on every Focus, before the
-/// declaration rules and whatever the flag says.
-pub const DEVICE_NAMES_NEVER_EXTERNAL: &[&str] = &[
+/// WHY A STARTER STAYS REFUSED. A starter makes no model call: it is rendered from
+/// its declared inputs with no external rendering, no carry scan and no outbound
+/// review, only the copy-time review, whose Privacy Filter misses serials, device
+/// names and bare addresses (the items.id=924 probe). Opening the names to a starter
+/// is its own design. The refusal covers a starter that names or declares one, a
+/// variable derived from one, and a starter that follows one by {previous_output}.
+pub const DEVICE_NAMES_NEVER_IN_STARTER: &[&str] = &[
     crate::conductor::bound_spec::SUBJECT_CONTEXT,
     crate::conductor::bound_spec::DEVICE_LIBRARY_BRIEF,
 ];
@@ -134,9 +131,9 @@ pub enum DeclaredInputsError {
     /// An external step names or declares a store-backed name while
     /// STORE_NAMES_EXTERNAL_ALLOWED is false (items.id=886, items.id=884).
     StoreNameInExternalStep { action_id: String, name: String },
-    /// An external step names or declares a DEVICE name, or a variable derived from
-    /// one (DEVICE_NAMES_NEVER_EXTERNAL). Whatever STORE_NAMES_EXTERNAL_ALLOWED says.
-    DeviceNameInExternalStep { action_id: String, name: String },
+    /// A cb-15 starter names or declares a DEVICE name, or a variable derived from one
+    /// (DEVICE_NAMES_NEVER_IN_STARTER). Whatever STORE_NAMES_EXTERNAL_ALLOWED says.
+    DeviceNameInStarter { action_id: String, name: String },
     /// An external step names or declares {persona_context} (items.id=882,
     /// decisions.id=937 point 2). It renders EMPTY at an external destination, so a
     /// template that names it, or a declaration of it, is refused rather than left as
@@ -220,13 +217,12 @@ impl std::fmt::Display for DeclaredInputsError {
                  carries session or case content, until the outbound review of external \
                  prompts exists (items.id=884)"
             ),
-            Self::DeviceNameInExternalStep { action_id, name } => write!(
+            Self::DeviceNameInStarter { action_id, name } => write!(
                 f,
-                "step '{action_id}': an external step cannot name or declare '{name}', which \
+                "step '{action_id}': a hand-off starter cannot name or declare '{name}', which \
                  carries a device's catalogued facts (serial number, access location and \
-                 warranty contact included). A device name stays on the device, whatever the \
-                 outbound review would show the user: the catalogue's tier policies are not \
-                 the review's to waive (items.id=884, items.id=891, decisions.id=507)"
+                 warranty contact included). A starter has no outbound review and no device \
+                 scan, only the copy-time review (items.id=924, items.id=891, decisions.id=507)"
             ),
             Self::FieldRequirementInvalid {
                 action_id,
@@ -290,7 +286,7 @@ pub(crate) fn lint_with(
     // as a bound name for rule (1) below, so an external step cannot name it
     // undeclared any more than it can name the bound name itself.
     let taint = taint_closure(steps, row_vars, bound);
-    let device_taint = taint_closure_of(steps, row_vars, DEVICE_NAMES_NEVER_EXTERNAL, false);
+    let device_taint = taint_closure_of(steps, row_vars, DEVICE_NAMES_NEVER_IN_STARTER, false);
     // items.id=922: the closure of {persona_context}, a system token the store closure
     // leaves untainted. Used only by lint_persona_carry; it changes no extraction.
     let persona_taint = taint_closure_of(steps, row_vars, &[PERSONA_CONTEXT], false);
@@ -321,7 +317,7 @@ pub(crate) fn lint_with(
         // A pure or model block row has no template and no declaration; it only
         // produces. A render block row (items.id=387) has both, and is external.
         if step.reads_template() {
-            // The device names never reach an external step, whatever the flag says,
+            // The device names never reach a hand-off starter, whatever the flag says,
             // and this is checked FIRST so the refusal is always the explicit one.
             lint_device_names(step, &device_taint).map_err(|e| e.to_string())?;
             // {persona_context} is refused in an external step, declared or not, and
@@ -407,17 +403,17 @@ fn lint_persona_carry(
     }
 }
 
-/// DEVICE_NAMES_NEVER_EXTERNAL: an external step may not name or declare a device
-/// name, nor a variable derived from one, nor be a step that read one. Independent
-/// of STORE_NAMES_EXTERNAL_ALLOWED.
+/// DEVICE_NAMES_NEVER_IN_STARTER: a cb-15 starter may not name or declare a device
+/// name, nor a variable derived from one, nor follow one by {previous_output}.
+/// Independent of STORE_NAMES_EXTERNAL_ALLOWED. Any other step passes (items.id=924).
 fn lint_device_names(
     step: &ActionDefinition,
     device_taint: &Taint,
 ) -> Result<(), DeclaredInputsError> {
-    if !step.is_external_for_lint() {
+    if !step.is_render_block() {
         return Ok(());
     }
-    let is_device = |n: &str| DEVICE_NAMES_NEVER_EXTERNAL.contains(&n);
+    let is_device = |n: &str| DEVICE_NAMES_NEVER_IN_STARTER.contains(&n);
     let derived = |n: &str| device_taint.vars.contains(n);
     let offending = step
         .declared_inputs
@@ -435,11 +431,11 @@ fn lint_device_names(
             device_taint
                 .actions
                 .contains(&step.action_id)
-                .then(|| tainting_name(step, device_taint, DEVICE_NAMES_NEVER_EXTERNAL))
+                .then(|| tainting_name(step, device_taint, DEVICE_NAMES_NEVER_IN_STARTER))
                 .flatten()
         });
     match offending {
-        Some(name) => Err(DeclaredInputsError::DeviceNameInExternalStep {
+        Some(name) => Err(DeclaredInputsError::DeviceNameInStarter {
             action_id: step.action_id.clone(),
             name,
         }),
@@ -657,25 +653,25 @@ mod tests {
 
     /// items.id=884: the flag was flipped, the one line that changed in
     /// declared_inputs.rs's rules. Pinned both ways: the constant is true, and the
-    /// closed list of device names does NOT depend on it. Changing either needs a
+    /// starter's device list (items.id=924 narrowed it to starters) does NOT depend on it. Changing either needs a
     /// decision (decisions.id=943 point 7 for the flag; this item's stage 3 ruling for
     /// the list).
     #[test]
-    fn the_store_name_flag_ships_true_and_the_device_list_does_not_depend_on_it() {
+    fn the_store_name_flag_ships_true_and_the_starter_device_list_does_not_depend_on_it() {
         const { assert!(STORE_NAMES_EXTERNAL_ALLOWED) };
         // The list is exactly the two device names, which are registered bound names.
         assert_eq!(
-            DEVICE_NAMES_NEVER_EXTERNAL,
+            DEVICE_NAMES_NEVER_IN_STARTER,
             [
                 crate::conductor::bound_spec::SUBJECT_CONTEXT,
                 crate::conductor::bound_spec::DEVICE_LIBRARY_BRIEF
             ]
         );
         assert_eq!(
-            DEVICE_NAMES_NEVER_EXTERNAL,
+            DEVICE_NAMES_NEVER_IN_STARTER,
             ["subject_context", "device_library_brief"]
         );
-        for n in DEVICE_NAMES_NEVER_EXTERNAL {
+        for n in DEVICE_NAMES_NEVER_IN_STARTER {
             assert!(bound_names().contains(n), "{n} is a registered bound name");
         }
         // The refusal runs before, and apart from, the flag: lint_with_bound reads the
@@ -1327,61 +1323,41 @@ mod tests {
         assert!(run(&rows(&["draft_quality_verdict"]), &[]).is_ok());
     }
 
-    /// items.id=891 and items.id=884: the two DEVICE names are refused for an external
-    /// step whatever STORE_NAMES_EXTERNAL_ALLOWED says, with a refusal of their own
-    /// (DeviceNameInExternalStep), explicit about why. Run with the flag as it ships
-    /// (true), with it closed, and open, so no setting relaxes it.
+    /// items.id=924: the two DEVICE names. An external MODEL step may name and declare
+    /// them as the flag ships (they are store-backed: declared, and the declaration rule
+    /// still refuses one it names undeclared), a variable derived from one too, and a
+    /// step that follows one by {previous_output}. A cb-15 STARTER is refused whatever
+    /// the flag says, with its own explicit refusal (DeviceNameInStarter), for the name,
+    /// a derived variable and {previous_output}.
     #[test]
-    fn an_external_step_cannot_name_or_declare_a_device_name_whatever_the_flag_says() {
+    fn a_device_name_opens_to_an_external_model_step_and_stays_closed_to_a_starter() {
         let bound = bound_names();
+        let starter = |template: &str, decl: &[&str]| {
+            let mut s = step("e", EXT, template, decl, &[]);
+            s.block_stable_id = Some("cb-15".to_owned());
+            assert!(s.is_render_block());
+            s
+        };
         type Runner = fn(&[(ActionDefinition, Option<&str>)], &[&str]) -> Result<(), String>;
         let settings: [(&str, Runner); 3] =
             [("shipped", run), ("closed", run_closed), ("open", run_open)];
-        for (setting, runner) in settings {
-            for name in DEVICE_NAMES_NEVER_EXTERNAL {
-                assert!(bound.contains(name), "{name} is a registered bound name");
-                let template = format!("{{{name}}}");
-                let explicit = |e: &str| {
-                    e.contains("step 'e'")
-                        && e.contains(&format!("'{name}'"))
-                        && e.contains("device's catalogued facts")
-                        && e.contains("serial number")
-                        && e.contains("items.id=884")
-                };
-                // Named and declared.
-                let e =
-                    runner(&[(step("e", EXT, &template, &[name], &[]), None)], bound).unwrap_err();
-                assert!(explicit(&e), "{setting}: {e}");
-                // Declared without being named.
-                let e = runner(&[(step("e", EXT, "no tokens", &[name], &[]), None)], bound)
-                    .unwrap_err();
-                assert!(explicit(&e), "{setting}: {e}");
-                // Named without being declared: the explicit refusal is the first one.
+        for name in DEVICE_NAMES_NEVER_IN_STARTER {
+            assert!(bound.contains(name), "{name} is a registered bound name");
+            let template = format!("{{{name}}}");
+            // An external model step, as the flag ships and open.
+            for runner in [run as Runner, run_open] {
+                assert!(runner(&[(step("e", EXT, &template, &[name], &[]), None)], bound).is_ok());
                 let e = runner(&[(step("e", EXT, &template, &[], &[]), None)], bound).unwrap_err();
-                assert!(explicit(&e), "{setting}: {e}");
-                // A LOCAL step may name it freely.
                 assert!(
-                    runner(&[(step("a", LOCAL, &template, &[], &[]), Some("v"))], bound).is_ok(),
-                    "{setting}"
+                    e.contains("does not declare") || e.contains("declared_inputs"),
+                    "{e}"
                 );
-                // And the name cannot be a row's output variable.
-                let e =
-                    runner(&[(step("a", LOCAL, "x", &[], &[]), Some(name))], bound).unwrap_err();
-                assert!(
-                    e.contains(&format!("output_var '{name}'")),
-                    "{setting}: {e}"
-                );
-                // A variable DERIVED from it is refused in an external step too, by the
-                // device refusal, and so is a step that follows it by {previous_output}.
+                assert!(!e.contains("hand-off starter"), "{e}");
                 let chain = [
                     (step("a", LOCAL, &template, &[], &[]), Some("v1")),
                     (step("e", EXT, "{v1}", &["v1"], &[]), None),
                 ];
-                let e = runner(&chain, bound).unwrap_err();
-                assert!(
-                    e.contains("device's catalogued facts") && e.contains("'v1'"),
-                    "{setting}: {e}"
-                );
+                assert!(runner(&chain, bound).is_ok(), "derived: {name}");
                 let via_previous = [
                     (step("a", LOCAL, &template, &[], &[]), Some("v1")),
                     (
@@ -1389,8 +1365,45 @@ mod tests {
                         None,
                     ),
                 ];
-                let e = runner(&via_previous, bound).unwrap_err();
-                assert!(e.contains("device's catalogued facts"), "{setting}: {e}");
+                assert!(
+                    runner(&via_previous, bound).is_ok(),
+                    "previous_output: {name}"
+                );
+            }
+            // With the store-name invariant closed the store rule refuses it, as for any
+            // store-backed name.
+            assert!(run_closed(&[(step("e", EXT, &template, &[name], &[]), None)], bound).is_err());
+            // A starter: refused whatever the flag says.
+            for (setting, runner) in settings {
+                let explicit = |e: &str| {
+                    e.contains("step 'e'")
+                        && e.contains("hand-off starter")
+                        && e.contains("device's catalogued facts")
+                        && e.contains("items.id=924")
+                };
+                let e = runner(&[(starter(&template, &[name]), None)], bound).unwrap_err();
+                assert!(
+                    explicit(&e) && e.contains(&format!("'{name}'")),
+                    "{setting}: {e}"
+                );
+                let e = runner(&[(starter("no tokens", &[name]), None)], bound).unwrap_err();
+                assert!(explicit(&e), "{setting}: {e}");
+                let chain = [
+                    (step("a", LOCAL, &template, &[], &[]), Some("v1")),
+                    (starter("{v1}", &["v1"]), None),
+                ];
+                let e = runner(&chain, bound).unwrap_err();
+                assert!(explicit(&e) && e.contains("'v1'"), "{setting}: {e}");
+                // A LOCAL step may name it freely, and it is never a row's output.
+                assert!(
+                    runner(&[(step("a", LOCAL, &template, &[], &[]), Some("v"))], bound).is_ok()
+                );
+                let e =
+                    runner(&[(step("a", LOCAL, "x", &[], &[]), Some(name))], bound).unwrap_err();
+                assert!(
+                    e.contains(&format!("output_var '{name}'")),
+                    "{setting}: {e}"
+                );
             }
         }
     }
@@ -1412,7 +1425,7 @@ mod tests {
         ];
         let defs: Vec<ActionDefinition> = rows.iter().map(|(s, _)| s.clone()).collect();
         let vars: Vec<Option<String>> = vec![None, None];
-        let taint = taint_closure_of(&defs, &vars, DEVICE_NAMES_NEVER_EXTERNAL, false);
+        let taint = taint_closure_of(&defs, &vars, DEVICE_NAMES_NEVER_IN_STARTER, false);
         assert!(!taint.user_input && taint.actions.is_empty() && taint.vars.is_empty());
         assert!(lint_device_names(&defs[1], &taint).is_ok());
     }
@@ -1502,7 +1515,7 @@ mod tests {
         for name in crate::conductor::bound_spec::LAUNCH_NAMES {
             assert!(bound.contains(&name), "{name} is a registered bound name");
             assert!(
-                !DEVICE_NAMES_NEVER_EXTERNAL.contains(&name),
+                !DEVICE_NAMES_NEVER_IN_STARTER.contains(&name),
                 "{name} must not be on the closed device list"
             );
             let template = format!("{{{name}}}");
@@ -1531,7 +1544,7 @@ mod tests {
         // a launch name does not reach it by derivation: a variable a LOCAL step
         // derives from a launch name is not a device taint.
         assert_eq!(
-            DEVICE_NAMES_NEVER_EXTERNAL,
+            DEVICE_NAMES_NEVER_IN_STARTER,
             &["subject_context", "device_library_brief"]
         );
         let chain = [
