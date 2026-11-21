@@ -44,4 +44,5 @@ src-tauri/target/
 src-tauri/resources/ggml-backends/
 
 # Local Claude Code tooling state (not project source)
-.claude/
+.claude/*
+!.claude/rules/
