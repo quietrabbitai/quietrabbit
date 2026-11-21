@@ -329,6 +329,8 @@ export interface ModalSpan {
   score: number
   review_tier: 'low' | 'medium' | 'high'
   fact_key: string | null
+  /** items.id=924: the answers the server allows (the modal disables the rest). */
+  allowed: { release: boolean; standing_release: boolean }
 }
 
 function modalSpan(s: PendingStepReviewSpan): ModalSpan {
@@ -343,6 +345,7 @@ function modalSpan(s: PendingStepReviewSpan): ModalSpan {
     score: s.score ?? 0,
     review_tier: s.review_tier,
     fact_key: s.fact_key,
+    allowed: s.allowed,
   }
 }
 

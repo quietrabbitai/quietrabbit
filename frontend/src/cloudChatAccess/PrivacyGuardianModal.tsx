@@ -73,6 +73,13 @@ import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { isAllKeptPrivate, type ElementDecision, type ElementDecisionKind } from './consentDecisions'
 import { groupSpansByTier, REVIEW_TIER_ORDER, type ReviewTier } from './reviewSections'
+import {
+  editCarriesOriginal,
+  releaseAvailable,
+  rememberReleaseAvailable,
+  saveForPersonaFor,
+  type SpanAllowedAnswers,
+} from './spanAnswers'
 import './PrivacyGuardianModal.css'
 
 export type { ReviewTier } from './reviewSections'
@@ -93,6 +100,10 @@ export interface ConsentSpanItem {
    *  (or null if none of the three deterministic layers resolved it).
    *  Echoed back unchanged in the matching ElementDecision. */
   fact_key: string | null
+  /** items.id=924: the answers the server allows for this span (display only; the
+   *  server applies the rule whatever is sent). Absent = every answer (the copy
+   *  review's payload). A cell it does not allow is shown disabled. */
+  allowed?: SpanAllowedAnswers
 }
 
 export interface ConsentRequestPayload {
@@ -175,8 +186,11 @@ function effectiveSuggestionText(span: ConsentSpanItem, row: RowState): string {
 
 function isRowValid(span: ConsentSpanItem, row: RowState): boolean {
   if (row.decision === null) return false
+  // items.id=924: an answer the span does not allow is not a decision.
+  if (row.decision === 'release_original') return releaseAvailable(span)
   if (row.decision === 'generalize') {
-    return effectiveSuggestionText(span, row).trim().length > 0
+    const text = effectiveSuggestionText(span, row)
+    return text.trim().length > 0 && !editCarriesOriginal(span, text)
   }
   return true
 }
@@ -312,7 +326,8 @@ export function PrivacyGuardianModal({
         user_modified_text: row.editedText,
         category: span.category,
         fact_key: span.fact_key,
-        save_for_persona: span.fact_key !== null && row.saveForPersona,
+        // items.id=924: never for a release the span may not remember.
+        save_for_persona: saveForPersonaFor(span, row.decision ?? 'keep_private', row.saveForPersona),
       }
     })
   }
@@ -630,12 +645,23 @@ function PgRow({
       {/* items.id=406 (decisions.id=756): "remember this for [Persona]" --
           only shown when gate3 resolved a stable fact_key for this span;
           a plain checkbox for now, visual placement is a Chat-BRAND pass. */}
-      {span.fact_key !== null && row.decision !== null && (
-        <label className="pg-modal__remember-for-persona">
-          <input type="checkbox" checked={row.saveForPersona} onChange={onToggleSaveForPersona} />
-          {t('privacyGuardianModal.rememberForPersona')}
-        </label>
-      )}
+      {span.fact_key !== null &&
+        row.decision !== null &&
+        (row.decision === 'release_original' && !rememberReleaseAvailable(span) ? (
+          // items.id=924: a remembered release of this span is never applied (D3).
+          <label className="pg-modal__remember-for-persona" data-disabled="">
+            <input type="checkbox" checked={false} disabled />
+            {t('privacyGuardianModal.rememberForPersona')}
+            <span className="pg-modal__answer-note">
+              {t('privacyGuardianModal.rememberReleaseNotAvailable')}
+            </span>
+          </label>
+        ) : (
+          <label className="pg-modal__remember-for-persona">
+            <input type="checkbox" checked={row.saveForPersona} onChange={onToggleSaveForPersona} />
+            {t('privacyGuardianModal.rememberForPersona')}
+          </label>
+        ))}
     </li>
   )
 }
@@ -664,6 +690,8 @@ function PgCell({
   t,
 }: PgCellProps) {
   const selected = row.decision === kind
+  // items.id=924: a release the span does not allow is shown, disabled.
+  const disabled = kind === 'release_original' && !releaseAvailable(span)
   const label =
     kind === 'generalize'
       ? t('privacyGuardianModal.cellGeneralize')
@@ -684,15 +712,19 @@ function PgCell({
   // while already selected are harmless no-ops -- no stopPropagation
   // wrapper needed for those.
   const selectCell = () => {
-    if (!selected) onSelect(kind)
+    if (!selected && !disabled) onSelect(kind)
   }
+  const carriesOriginal =
+    kind === 'generalize' && selected && editCarriesOriginal(span, suggestionText)
 
   return (
     <div
       className={`pg-modal__cell pg-modal__cell--${kind}${isDefault ? ' pg-modal__cell--default' : ' pg-modal__cell--override'}`}
       data-selected={selected ? '' : undefined}
+      data-disabled={disabled ? '' : undefined}
+      aria-disabled={disabled || undefined}
       role="button"
-      tabIndex={0}
+      tabIndex={disabled ? -1 : 0}
       onClick={selectCell}
       onKeyDown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') {
@@ -702,6 +734,16 @@ function PgCell({
       }}
     >
       <span className="pg-modal__cell-label">{label}</span>
+      {disabled && (
+        <span className="pg-modal__answer-note">
+          {t('privacyGuardianModal.releaseNotAvailable')}
+        </span>
+      )}
+      {carriesOriginal && !row.editing && (
+        <span className="pg-modal__answer-note" role="alert">
+          {t('privacyGuardianModal.editContainsOriginal')}
+        </span>
+      )}
       {kind === 'generalize' &&
         (row.editing ? (
           <span className="pg-modal__cell-edit-field">

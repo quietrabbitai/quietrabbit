@@ -274,6 +274,12 @@ assert.deepEqual(reduce(INITIAL_STATE, { type: 'run_status', runId: 'api-chat-se
   const nan = modalPayload({ ...review('r1'), spans: [{ ...span('a'), score: null }] }, 'x')
   assert.equal(nan.spans[0].score, 0)
   assert.equal(modalPayload({ ...review('r1'), spans: [] }, 'x').review_tier, 'high')
+  // items.id=924: the allowed answers reach the modal unchanged.
+  const serial = modalPayload(
+    { ...review('r1'), spans: [{ ...span('a'), allowed: { release: true, standing_release: false } }] },
+    'x',
+  )
+  assert.deepEqual(serial.spans[0].allowed, { release: true, standing_release: false })
 }
 
 // -- the command's error codes ----------------------------------------------------

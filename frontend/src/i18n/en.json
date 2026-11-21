@@ -538,7 +538,10 @@
       "medium": "Medium risk",
       "high": "High risk"
     },
-    "rememberForPersona": "Remember this decision"
+    "rememberForPersona": "Remember this decision",
+    "releaseNotAvailable": "Not available for this detail",
+    "rememberReleaseNotAvailable": "A release of this detail is asked for each time",
+    "editContainsOriginal": "This still contains the original, so it will be removed"
   },
   "cloudChatSelector": {
     "railLabel": "Cloud Chat providers",

@@ -352,3 +352,19 @@
   opacity: 0.4;
   cursor: not-allowed;
 }
+
+/* items.id=924: an answer the span does not allow (placeholder treatment, Chat-BRAND). */
+.pg-modal__cell[data-disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.pg-modal__remember-for-persona[data-disabled] {
+  opacity: 0.6;
+}
+
+.pg-modal__answer-note {
+  display: block;
+  font-size: 0.8em;
+  opacity: 0.8;
+}

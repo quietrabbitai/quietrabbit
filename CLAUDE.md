@@ -1,5 +1,13 @@
 # Quiet Rabbit — Claude Code Context
-# Last updated: November 20, 2026 (items.id=933: new "Local render of personal fields and the carry
+# Last updated: November 20, 2026 (items.id=924: new "Device facts in external steps and allowed
+# answers" section; and the older lines it made false: under "Per-pass artifact store" the flag pin
+# test's name; under "Manual hand-off" the device-name sentence of the render row; under "Launch
+# questions" the closed-list name; under "Parked-run retention" limit (c); under "Resume state"
+# limit (f); under "Focus-owned entities" the Facts bullet's policy words and the derived-names
+# bullet's brief, LOCAL-text and CLOSED LIST sentences; under "Personal fact bridge" the POLICY,
+# RE-READ and NOT BUILT bullets; under "Local render of personal fields" the carry scan's TRIGGER and
+# out-of-scope lines; under "Key Architectural Decisions" the raw-values line; nothing else.).
+# Before that, November 20, 2026 (items.id=933: new "Local render of personal fields and the carry
 # scan" section; under "Key Architectural Decisions" the Step 8 line and the "raw values never appear"
 # line; under "Personal fact bridge" the VALUE bullet's tier-1 sentence; under "Single-pass render
 # substitution" the KEPT AS DEFENCE IN DEPTH list; under "Persona context, the output scan and
@@ -756,7 +764,7 @@ outputs_015 with the other outputs files.
   store-backed like every bound name: restricted to the step whose own template names them,
   tainting a step that names one (so it stays out of extraction), and, since items.id=884
   flipped STORE_NAMES_EXTERNAL_ALLOWED to true (declared_inputs.rs, pin test
-  the_store_name_flag_ships_true_and_the_device_list_does_not_depend_on_it), allowed in an
+  the_store_name_flag_ships_true_and_the_starter_device_list_does_not_depend_on_it), allowed in an
   external step that DECLARES it (the declaration rule decides, and the outbound review sees
   the text). A stored text that fails its validator fails the pass closed.
 - TWO BEHAVIOURS LATER BUILDS MUST RESPECT (items.id=903 and 907 carry the same note):
@@ -803,9 +811,11 @@ in a run, so nothing depends on resume. The legacy requires_user_handoff pause i
     only {user_input} among the system tokens, no field_requirements. STORE_NAMES_EXTERNAL_ALLOWED
     is true (items.id=884 flipped it), so a starter may declare a store-backed name, content_brief
     included, and {user_input} even in a Focus that also has a handoff_ingest row (taint below).
-    It may NOT name or declare the two device names (subject_context, device_library_brief): the
-    closed list DEVICE_NAMES_NEVER_EXTERNAL refuses them whatever the flag says (see "Focus-owned
-    entities"). The real starter naming content_brief is therefore no longer blocked by the flag;
+    It may NOT name or declare the two device names (subject_context, device_library_brief), nor a
+    variable derived from one: DEVICE_NAMES_NEVER_IN_STARTER refuses them whatever the flag says
+    (items.id=924 lifted the refusal for external MODEL steps and kept it for starters, which have no
+    external rendering, carry scan or outbound review; see "Device facts in external steps and allowed
+    answers"). The real starter naming content_brief is therefore no longer blocked by the flag;
     it is built with the Writing Assistant (still not built).
   - Its record (handoff_render::inherit_from_inputs), over each DECLARED input: (1) takes the
     highest sensitivity_severity and ORs personal_flagged and audit_unavailable of the step that
@@ -938,7 +948,7 @@ mechanism is exercised by fixture Focuses in tests.
   is a registered store-backed name for an external step (it must declare one it names, a step that
   names one is tainted and so is its variable and every step downstream, so it stays out of
   extraction, and a cb-15 starter that declares one counts as personal); none is in
-  DEVICE_NAMES_NEVER_EXTERNAL. DOCUMENT_TYPE_NAME (model_resolver_input.rs) equals DOCUMENT_TYPE.
+  DEVICE_NAMES_NEVER_IN_STARTER. DOCUMENT_TYPE_NAME (model_resolver_input.rs) equals DOCUMENT_TYPE.
 - LOAD LINT (launch_config::lint, both load paths): a step that names a slot needs a question on it, a
   guard literal on a slot is one of that question's options, and a step with a `requirement` needs a
   document_type question (asked or fixed). run_change needs no question. On the DB path
@@ -1262,8 +1272,9 @@ in the same tick and login pass, settles them (same section).
       resume and reads as deleted.
   (b) A policy tightened while a run is parked is NOT detected for completed output: the manifest holds no
       policy. The executor still re-reads fact_disclosure_policy before each later hosted step (decisions.id=953).
-  (c) Entity (device), group and persona_context facts are NOT covered: only the four catalogued singleton
-      facts of items.id=931 are in the manifest.
+  (c) Entity (device), group and persona_context facts are NOT covered by this check: only the four
+      catalogued singleton facts of items.id=931 are in the manifest. Device values a pass seeded are pinned
+      by the resume pin's device_seed fingerprint instead (items.id=924, "Device facts in external steps").
 - NOT BUILT: a rewind-and-rerun of the affected steps (items.id=574's reenter_step could do it; deferred
   as option B on items.id=888), a "continue anyway" resume, a Library hook, a banner for a stale cancel (the
   user sees the cancelled run and its message). The archive hook is built (items.id=888).
@@ -1376,7 +1387,8 @@ is deferred. The byte cap on the chat history window is not built and stays defe
   (d) A crashed run whose own store writer ran after its last checkpoint has a pin that no longer matches:
       it is cancelled on resume, not resumed.
   (e) A transient read failure at checkpoint time makes that snapshot unresumable.
-  (f) Derived names (case and delta texts, the device names) have no version and are not pinned.
+  (f) Derived names (case and delta texts) have no version and are not pinned. The device names have none
+      either, but a pass that seeded a device pins its DeviceSeed fingerprint (items.id=924).
   (g) A run parked before stage 5 has no pin and resumes unchecked.
   (h) The cancel messages are "a one-time chat cannot be resumed" and "saved chat state changed while
       waiting"; wording is Chat-BRAND's.
@@ -1477,7 +1489,8 @@ Focus and items.id=916 flips it; the hard purge ships before that.
   list_pending_cross_persona_exports exclude an owned entity and its facts. create_owned_entity_conn is
   the only writer of owner_focus. Entity serializes WITHOUT owner_focus (payload hashes unchanged).
 - Facts (conductor/device_fields.rs, block_data/device_fields.json): a CLOSED catalogue, 7 categories
-  and 20 fields, each with label, sensitivity, tier-2/3 abstraction policy, byte cap, and the
+  and 20 fields, each with label, sensitivity, a disclosure (never, ask or pass) and for ask a
+  suggestion (items.id=924, replacing the tier-2/3 abstraction policies), byte cap, and the
   access_credential_flag on serial_number. validate() refuses a field NAME containing a credential
   word (password, pin, token, secret, login...). known_issues (400 bytes) and hardware_specs (300) are
   free text in practice: nothing in code stops a typed secret, so the exclusion that covers them is
@@ -1511,20 +1524,15 @@ Focus and items.id=916 flips it; the hard purge ships before that.
   running Focus and active, else ""; "Device: name (class)" then one "Label: value" line per
   catalogued fact in catalogue order, 200 bytes a value, 1800 total, whole lines dropped) and
   device_library_brief ("- E-XXXXXXXX: name (class) | Label: value ..." up to 8 devices newest first,
-  up to 3 headline facts that the catalogue marks pass at tier 2, 60 bytes a value, "- and N more").
-  subject_context renders EVERY catalogued fact, serial number and address included, as LOCAL text.
-  CLOSED LIST (items.id=884, declared_inputs.rs DEVICE_NAMES_NEVER_EXTERNAL = subject_context and
-  device_library_brief, pinned equal to the two bound_spec names): LOAD refuses an external step that
-  names or declares either name, a variable derived from one, or a step that follows one through
-  {previous_output}, with its own error (DeviceNameInExternalStep), checked first on every Focus and
-  NOT relaxed by STORE_NAMES_EXTERNAL_ALLOWED (true since items.id=884). Why: the catalogue marks
-  serial number, warranty contact and access location not_permitted at tiers 2 and 3 (never, even
-  with consent), the brief carries the user's device names and two free-text fields with no secret
-  detector, the outbound review detects and asks (it does not enforce the catalogue), and
-  decisions.id=513's redaction needs flags decisions.id=945 defers. The closed-list refusal is
-  TEMPORARY: items.id=924 (a design, not built) replaces it with a per-field policy (never, ask,
-  pass) and a tier-aware render of the catalogue's policies, and removes the refusal for the fields
-  it allows. Opening the names is that design, not a flag. They stay tainted like every store
+  up to 3 headline facts whose disclosure is pass, 60 bytes a value, "- and N more").
+  subject_context's LOCAL text renders EVERY catalogued fact, serial number and address included. A
+  hosted step receives the EXTERNAL rendering instead (items.id=924, "Device facts in external steps and
+  allowed answers"). THE OLD CLOSED LIST WAS TEMPORARY FOR EXTERNAL MODEL STEPS AND IS LIFTED: items.id=884
+  refused both names in every external step (DEVICE_NAMES_NEVER_EXTERNAL, DeviceNameInExternalStep) until
+  a per-field policy and a tier-aware render existed; items.id=924 built both, so an external model step
+  may name and declare them like any store-backed name. A NARROWER LIST STAYS FOR cb-15 STARTERS
+  (DEVICE_NAMES_NEVER_IN_STARTER, DeviceNameInStarter: a starter, a variable derived from a device name,
+  or {previous_output} after one) until its own design. They stay tainted like every store
   name. Seeds are read once per pass, so a device's facts appear one pass
   late. The wording is provisional (Chat-PM reviewed; items.id=914 owns the other three texts and
   edits seeding.rs/bound_spec.rs after this item).
@@ -1587,10 +1595,12 @@ default OMIT at tiers 2 and 3) reaches Gate 1 at the user's disclosure policy.
   abstraction columns (EntityFact does not carry them, the loader does not select them, a scan pins both).
   The default is omit, only an explicit user pass releases the raw value and only at tier 2 (tier 3 pass is
   not selectable for any v1 field), medical and financial (and an unknown sensitivity) are not_permitted
-  whatever the user says. ask behaves as omit until items.id=924.
+  whatever the user says. ask (items.id=924, D7) releases the raw value only to a hosted step that gets the
+  outbound review and only for a value of 4 or more characters, and the carry scan raises every occurrence
+  with every answer; anywhere else it is omit, and at tier 3 it follows pass's rule.
 - RE-READ. A run uses the INITIALIZE snapshot and execute_once reads fact_disclosure_policy AGAIN before
   Gate 1 for a hosted step that holds a bridged field, taking the STRICTER word of the two (not_permitted >
-  omit, with ask and unknown as omit > summarize > pass; equal words keep the snapshot, so an explicit pass
+  omit, with unknown as omit > summarize > ask > pass, items.id=924; equal words keep the snapshot, so an explicit pass
   survives a new value of the same field). An unreadable table or database is omit for every bridged field.
   A resumed run builds its track again, so a policy tightened while it was parked is honoured (T9).
 - GATE 1 report_scope. gate1 takes an optional set of declared names (execute_once passes the step's
@@ -1618,7 +1628,8 @@ default OMIT at tiers 2 and 3) reaches Gate 1 at the user's disclosure policy.
   attribute (local) or halt an external step, Gate 2 can flag a reply echoing a value (flag only), step and
   output sensitivity rise to personal, and checkpoint manifests carry name:value hashes. Local steps are
   otherwise unchanged.
-- NOT BUILT: UI and copy, group facts and entity-scoped (device) facts (items.id=924), releasing medical,
+- NOT BUILT: UI and copy, group facts, bridging entity-scoped (device) facts into PersonalTrack (device
+  values reach a hosted step through their own path since items.id=924), releasing medical,
   financial or cross-Persona facts, an end-to-end hosted call (the
   loopback client is not HTTPS). Hand checks for the live app are listed in the items.id=931 handoff.
   items.id=633 absorbs personal_012.sql (items.id=930).
@@ -1824,6 +1835,8 @@ lets a local step's output carry a raw value into a hosted step, the hosted step
   - TRIGGER: gate2::scan_matches (Gate 2's rule: case-insensitive substring, at least 4 characters) over each
     CARRIED value the template names (an output variable or {previous_output}; never {user_input}, the
     projected fields or the seeds). Only bridged fields count (personal_fact_bridge::is_bridged_source).
+    items.id=924 adds two triggers on the same path: a bridged field at ask (any occurrence) and a device
+    value the pass seeded (any occurrence); see "Device facts in external steps and allowed answers".
     A field this step released RAW is skipped: g1.fields_shared holds only approved values equal to the raw
     value, so a summarize label is NOT in it and its raw value carried in is raised (tested). A pass field
     the step did not declare is raised (over-asking).
@@ -1848,9 +1861,8 @@ lets a local step's output carry a raw value into a hosted step, the hosted step
     applies. Another case ("LEEDS" for "Leeds") is asked again (errs toward asking).
   - LIMITS, stated plainly: a text match MISSES A PARAPHRASE ("the Leeds area" is caught, "West Yorkshire" is
     not); a value UNDER 4 CHARACTERS is not scanned and so not caught; a SUBSTRING inside a longer word is
-    caught; case folding is per character. Out of scope: device and group facts and their derived names
-    (items.id=924 builds source-flagged spans in general), persona_context, a cb-15 starter (copy-time review
-    only), the severity label (the A -> C -> B gap above).
+    caught; case folding is per character. Out of scope: group facts, persona_context, a cb-15 starter
+    (copy-time review only), the severity label (the A -> C -> B gap above). Device values: items.id=924.
 - TESTS: a_local_step_renders_its_declared_personal_field (red "Location:", green "Location: Leeds"), the
   undeclared twin, both renders' precedence, a_summarize_field_whose_raw_value_is_carried_is_raised_in_the_review,
   a_field_the_step_released_raw_or_nothing_carried_raises_nothing, a_not_permitted_carried_value_is_removed_and_never_shown,
@@ -1860,6 +1872,99 @@ lets a local step's output carry a raw value into a hosted step, the hosted step
 - NOT VERIFIED: the merge inside gate3_with_pf against the real filter (it needs an app handle: tested
   through its pure parts and the forced scanner), the live app hand check (research-and-buy with a stored
   city, role-assessment with a stored employer, industry and job title), Windows and macOS.
+
+## Device facts in external steps and allowed answers (items.id=924, decisions.id=507, 513, 945, 953)
+A device's serial number can now go into an RMA letter written by a hosted step, behind the outbound review,
+while what must never leave cannot be released by any answer. Built on items.id=933's carry scan, not beside
+it. Units: allowed answers (U1), catalogue and device spans (U2), external rendering and the lint (U3),
+frontend and docs (U4).
+- ALLOWED ANSWERS (conductor/privacy/allowed_answers.rs, pure). Every review span carries AllowedAnswers
+  {release, standing_release} (ALL, NO_STANDING_RELEASE, NO_RELEASE). The one rule: keep private is always
+  allowed; release needs `release`, and a REMEMBERED Persona-wide release also needs `standing_release`;
+  where release is not allowed, a generalization whose replacement contains the original (case-insensitive)
+  counts as keep private. gate3's partition admits every remembered decision through admit_remembered (a
+  refused one is applied as keep private on a no-release span, asked again on a live-only span); an in-run
+  consent row the user did not write (auto-reapplied) counts as standing. The outbound review applies the
+  same rule to live answers (step_review::applied_decisions: a refused answer is removed, and the counts
+  follow what is sent). AskedSpan and SettledSpan store `allowed` (absent = ALL, so old rows read as
+  before). Only carry_scan restricts a span (scan only_the_carry_scan_restricts_a_span).
+- THE CATALOGUE (block_data/device_fields.json, version 2). Each field has a disclosure: never (removed
+  before the review, never shown), ask (every occurrence in a hosted prompt is raised) or pass (sent); an
+  ask field has a suggestion (a fixed label such as "[serial number]", placeholder wording, Chat-BRAND's).
+  The device NAME (entities.display_name, not a fact) has device_name_disclosure ask, "[device]". THE
+  SHIPPED DEFAULT IS CONSERVATIVE AND PER-FIELD REVERSIBLE: the ten fields that were pass stay pass, the
+  other ten (serial number, warranty contact and address included) are ask, none is never; any field can
+  move either way by a data edit. validate(): an access-credential field (the serial) may not be pass, an
+  ask field needs a suggestion, a pass or never field takes none, the credential-word refusal stays. The
+  owned-fact writer stores never/ask/pass as not_permitted/omit/pass in entity_facts.abstraction_tier2/3;
+  NOTHING READS THOSE COLUMNS for an owned fact (scan), and rows written before keep not_permitted. No
+  migration.
+- THE DEVICE SEED (conductor/device_seeding.rs). A pass that names a device name keeps a DeviceSeed on
+  StoreTokens: every seeded device's name and catalogued facts at their EFFECTIVE disclosure, the flag and
+  the suggestion, and what the external rendering needs. In memory only (Debug prints counts), rebuilt each
+  pass. decisions.id=513 is evaluated per device at seeding (evaluate_object_visibility, Boundary): a device
+  that is not Visible keeps its pass facts and its name and every other fact become never (Boundary is
+  invariant: no answer may release them).
+- THE EXTERNAL RENDERING (StoreTokens::apply_external_devices, called only by render_prompt_with_disclosure,
+  after the seeds; scan). A hosted step that names subject_context or device_library_brief receives the
+  same skeleton with never facts dropped, a never name shown as "[device]", and a suppressed device left
+  out. The local render is unchanged.
+- THE CARRY SCAN, WIDENED (carry_scan::classify_devices and classify_asked, executor execute_once on every
+  step with treatment.hosted and no bound API Chat run). A device value the pass seeded that is not pass is
+  raised or removed at EVERY occurrence in the final prompt (the derived text, a carried output,
+  {previous_output}, the user's own words), stored or brace-cleaned form: never -> "[removed]" before the
+  review and a carry_not_permitted_removed row naming the field (no value); ask -> a qr_device_field span
+  ("Device detail", placeholder) with its suggestion, its own fact key `device_fact:` + SHA-256 of
+  (entity, field, value), which gate3 uses in place of the Layer 1 to 3 cascade, and its allowed answers:
+  ALL, except the access-credential field, NO_STANDING_RELEASE (D3: a standing release is asked again, a
+  release in this run counts).
+- PERSONAL ask (D7). A bridged personal field the user set to ask (set_fact_policy accepts it; no screen)
+  is released RAW only to a hosted step that gets the outbound review and only when its value has 4 or more
+  characters (executor::to_gate_track_asks); classify_asked then raises every occurrence with every answer.
+  Anywhere else ask is omit; at tier 3 it follows pass's rule. Re-read order: not_permitted > omit >
+  summarize > ask > pass.
+- THE RESUME PIN. A checkpoint whose pass seeded a device records device_seed, the DeviceSeed fingerprint
+  (entity, field, value and effective disclosure of every seeded value, and the brief's device count; a hash
+  only). A resume seeds the steps' device names again and refuses on a mismatch or a read failure
+  (ResumeStoreChanged, "saved chat state changed while waiting"): A DEVICE EDITED, RENAMED, ADDED,
+  RE-DISCLOSED OR RE-FLAGGED BETWEEN THE PARK AND THE RESUME REFUSES THE RESUME. No entry when the pass
+  seeded no device; a snapshot without one resumes as before.
+- THE LINT. The old closed list was temporary for external MODEL steps and is lifted: they may name and
+  declare both device names like any store-backed name (declared, tainting, the items.id=922 personal
+  floor), and a derived variable or {previous_output}. A narrower refusal stays for cb-15 hand-off STARTERS
+  (DEVICE_NAMES_NEVER_IN_STARTER, DeviceNameInStarter) until its own design: a starter makes no model call,
+  so it gets no external rendering, carry scan or outbound review, only the copy-time review.
+- FRONTEND (cloudChatAccess/spanAnswers.ts, PrivacyGuardianModal.tsx, stepReview.ts). DISPLAY ONLY (the
+  server applies the rule whatever is sent): a release the span does not allow is shown disabled with
+  privacyGuardianModal.releaseNotAvailable; "Remember this decision" for a release of a live-only span is
+  disabled with privacyGuardianModal.rememberReleaseNotAvailable and save_for_persona is not sent; a
+  generalization carrying the original where no release is allowed is flagged with
+  privacyGuardianModal.editContainsOriginal and does not count as a decision. The three keys are placeholder
+  wording, Chat-BRAND's (in use, so not orphans). A span without `allowed` (the copy review) allows all.
+- ACCEPTED LIMITS:
+  (a) TEXT MATCH. A paraphrase is missed, a value under 4 characters is not scanned, a reformatted value
+      (a serial with spaces or dashes added, a zero-padded address) is missed, a substring inside a longer
+      word is caught, a device name made of common words over-asks. Aliases are not scanned.
+  (b) THE GENERALIZE CHECK IS A TEXT MATCH: a replacement that carries the original reformatted (a serial
+      with spaces or dashes) passes as a generalization.
+  (c) A SERIAL THE USER TYPES in a format the Privacy Filter misses (a Lenovo "S/N PF2ABC3D") is caught
+      only when that device is seeded in the pass.
+  (d) Device values are scanned only in a pass that seeds the device: a value an earlier pass left in a
+      session variable or artifact is missed in a pass that does not seed it again.
+  (e) THE PIN IS THE PASS'S OWN SEED (fail closed): a pass whose own writer (entity_fact_put) changes a
+      seeded device fact before it parks cannot resume. Hashing the store at checkpoint time would not fix
+      it (completed steps saw the old values); the fix is keeping the seeded values in the checkpoint, a
+      later design for the Tech Support build (items.id=915, 916).
+  (f) decisions.id=513's flags have no setter (decisions.id=945): redaction and suppression are tested with
+      entities built in memory and do nothing in R1.
+  (g) THE MODAL DOES NOT GROUP spans that share a fact_key: every occurrence (the serial in the device text
+      and in the user's note) is its own row with its own answer and its own "remember" box.
+  (h) The RMA use case is a fixture (an ordinary tier-2 step declaring subject_context). The Writing
+      Assistant cannot read Tech Support's devices: decisions.id=945 ruling 1 keeps owned entities out of
+      every cross-Focus loader, and narrowing it is a separate decision. Tech Support is not built.
+  (i) No shipped field is never; a never field is tested on a fixture catalogue.
+  (j) Not verified: the live app, an end-to-end hosted call (the loopback client is not HTTPS; hosted model
+      blocks stay off, items.id=913), Windows and macOS.
 
 ## Naming Architecture — term map
 
@@ -1929,7 +2034,9 @@ Design sessions must all complete before shared infrastructure build begins.
   Step 8: BOTH renders read the step's step_disclosure_buffer (NEVER PersonalTrack): raw at
   abstraction tier 1 for a local step, abstracted from tier 2 up (items.id=933; before it the local
   render did not read the buffer and a declared field rendered empty).
-  Raw personal values never reach an external prompt through the buffer above tier 1. A bridged value
+  Above tier 1 a raw personal value reaches an external prompt through the buffer only for a bridged
+  field the user set to pass, or to ask (items.id=924), whose every occurrence the outbound review then
+  raises. A bridged value
   an earlier step's output carries into a hosted prompt is caught by the carry scan, within its limits
   (items.id=933, "Local render of personal fields and the carry scan").
 - Tier 3 is a terminal boundary — execution loop breaks, status=awaiting_user.
