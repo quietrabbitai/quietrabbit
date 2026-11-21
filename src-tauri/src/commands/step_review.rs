@@ -386,6 +386,7 @@ mod tests {
                     end_byte: 18,
                     category: "private_person".into(),
                     review_tier: "high".into(),
+                    allowed: Default::default(),
                 }],
                 settled: vec![],
             };
@@ -495,6 +496,7 @@ mod tests {
                 end_byte: 18,
                 category: "private_person".into(),
                 review_tier: "high".into(),
+                allowed: Default::default(),
             }],
             settled: vec![],
         };

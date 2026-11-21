@@ -1,6 +1,7 @@
 // src-tauri/src/conductor/privacy/mod.rs
 
 pub mod abstraction;
+pub mod allowed_answers;
 pub mod coref;
 pub mod errors;
 pub mod fact_identity;

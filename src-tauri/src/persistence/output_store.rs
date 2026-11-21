@@ -1862,6 +1862,10 @@ pub struct PriorFactDecision {
     pub decision: String,
     pub suggestion_text: Option<String>,
     pub user_modified_text: Option<String>,
+    /// items.id=924: the user wrote this row (save_preference set, original_text
+    /// NULL), as opposed to an auto-reapplied one. A row the user did not write is
+    /// treated as a standing decision by allowed_answers.
+    pub user_written: bool,
 }
 
 /// Conversation-scoped prior-decision query (decisions.id=756's default,
@@ -1883,7 +1887,8 @@ pub async fn find_consent_decision_for_fact(
     let mut conn = open_outputs_db(user_id, persona_id, key_hex).await?;
 
     let row = sqlx::query(
-        "SELECT decision, suggestion_text, user_modified_text
+        "SELECT decision, suggestion_text, user_modified_text,
+                (save_preference IS NOT NULL AND original_text IS NULL) AS user_written
          FROM consent_decisions
          WHERE focus_run_id = ? AND fact_key = ? AND decision_type = 'element_consent'
          ORDER BY created_at DESC LIMIT 1",
@@ -1899,6 +1904,7 @@ pub async fn find_consent_decision_for_fact(
             decision: r.try_get("decision")?,
             suggestion_text: r.try_get("suggestion_text")?,
             user_modified_text: r.try_get("user_modified_text")?,
+            user_written: r.try_get::<i64, _>("user_written")? != 0,
         })),
     }
 }
@@ -1987,6 +1993,7 @@ pub async fn find_review_answer_for_fact(
             decision: r.try_get("decision")?,
             suggestion_text: r.try_get("suggestion_text")?,
             user_modified_text: r.try_get("user_modified_text")?,
+            user_written: true,
         }));
     }
     Ok(None)

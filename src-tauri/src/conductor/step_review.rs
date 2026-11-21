@@ -87,6 +87,7 @@ use crate::api_chat::redact::{apply, Decision, SpanDecision};
 use crate::api_chat::BoundDestination;
 use crate::conductor::executor::StepContext;
 use crate::conductor::failure::{FailureAction, FailureResult, FailureSeverity};
+use crate::conductor::privacy::allowed_answers::enforce;
 use crate::conductor::privacy::errors::DisclosureLogWriteError;
 use crate::conductor::privacy::logger::DisclosureLogger;
 use crate::conductor::privacy::privacy_filter;
@@ -533,6 +534,7 @@ fn auto_to_settled(a: &AutoResolvedSpan) -> SettledSpan {
         .to_owned(),
         suggestion_text: a.suggestion_text.clone(),
         user_modified_text: a.user_modified_text.clone(),
+        allowed: a.allowed,
     }
 }
 
@@ -543,8 +545,52 @@ fn answer_for<'a>(
     answers.iter().find(|a| a.span_id == span_id)
 }
 
-/// The text that leaves: the settled spans as they were settled, every asked span
-/// as the user answered it, and an unanswered asked span REMOVED. None when the
+/// items.id=924: the span's text in the prompt, for the allowed-answers rule.
+/// Offsets that do not fit give "" (apply then refuses the spans anyway).
+fn span_text(prompt: &str, start: usize, end: usize) -> &str {
+    prompt.get(start..end).unwrap_or("")
+}
+
+/// Every span with the decision that is applied to it: the settled spans as they
+/// were settled, every asked span as the user answered it, an unanswered asked span
+/// REMOVED, and (items.id=924) any decision the span's allowed answers do not permit
+/// REMOVED (allowed_answers::enforce), for settled and asked spans alike.
+fn applied_decisions(
+    prompt: &str,
+    spans: &StoredSpans,
+    answers: &[RecordedSpanDecision],
+) -> Vec<SpanDecision> {
+    let mut all: Vec<SpanDecision> = spans
+        .settled
+        .iter()
+        .map(|s| {
+            enforce(
+                s.allowed,
+                span_text(prompt, s.start_byte, s.end_byte),
+                settled_to_decision(s),
+            )
+        })
+        .collect();
+    for s in &spans.asked {
+        all.push(match answer_for(answers, &s.span_id) {
+            Some(a) => enforce(
+                s.allowed,
+                span_text(prompt, s.start_byte, s.end_byte),
+                SpanDecision {
+                    start_byte: s.start_byte,
+                    end_byte: s.end_byte,
+                    decision: Decision::parse(&a.decision),
+                    suggestion_text: a.suggestion_text.clone(),
+                    user_modified_text: a.user_modified_text.clone(),
+                },
+            ),
+            None => SpanDecision::unresolved(s.start_byte, s.end_byte),
+        });
+    }
+    all
+}
+
+/// The text that leaves: every span as applied_decisions decides it. None when the
 /// spans cannot be applied safely, and the caller must not send. The original is
 /// never the fallback.
 pub fn outbound_for(
@@ -552,20 +598,7 @@ pub fn outbound_for(
     spans: &StoredSpans,
     answers: &[RecordedSpanDecision],
 ) -> Option<String> {
-    let mut all: Vec<SpanDecision> = spans.settled.iter().map(settled_to_decision).collect();
-    for s in &spans.asked {
-        all.push(match answer_for(answers, &s.span_id) {
-            Some(a) => SpanDecision {
-                start_byte: s.start_byte,
-                end_byte: s.end_byte,
-                decision: Decision::parse(&a.decision),
-                suggestion_text: a.suggestion_text.clone(),
-                user_modified_text: a.user_modified_text.clone(),
-            },
-            None => SpanDecision::unresolved(s.start_byte, s.end_byte),
-        });
-    }
-    apply(prompt, all)
+    apply(prompt, applied_decisions(prompt, spans, answers))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -598,7 +631,10 @@ fn classify(decision: Decision, suggestion: Option<&str>, user_modified: Option<
 
 /// The outcome and the counts of a review whose asked spans have been answered
 /// (or not). `edited` wins over `redacted`, and the counts keep the detail.
+/// items.id=924: counted from applied_decisions, so a decision the span's allowed
+/// answers refuse counts as removed, exactly as outbound_for applies it.
 pub fn derive_outcome(
+    prompt: &str,
     spans: &StoredSpans,
     answers: &[RecordedSpanDecision],
 ) -> (ReviewOutcome, Counts) {
@@ -613,24 +649,22 @@ pub fn derive_outcome(
         Kind::Removed => counts.removed += 1,
     };
 
-    for s in &spans.settled {
-        bump(classify(
-            Decision::parse(&s.decision),
-            s.suggestion_text.as_deref(),
-            s.user_modified_text.as_deref(),
-        ));
+    let applied = applied_decisions(prompt, spans, answers);
+    let (settled, asked) = applied.split_at(spans.settled.len());
+    let kind_of = |d: &SpanDecision| {
+        classify(
+            d.decision,
+            d.suggestion_text.as_deref(),
+            d.user_modified_text.as_deref(),
+        )
+    };
+    for d in settled {
+        bump(kind_of(d));
     }
     let mut edited = false;
     let mut asked_removed = false;
-    for s in &spans.asked {
-        let kind = match answer_for(answers, &s.span_id) {
-            Some(a) => classify(
-                Decision::parse(&a.decision),
-                a.suggestion_text.as_deref(),
-                a.user_modified_text.as_deref(),
-            ),
-            None => Kind::Removed,
-        };
+    for d in asked {
+        let kind = kind_of(d);
         edited |= matches!(kind, Kind::Generalized { edited: true });
         asked_removed |= kind == Kind::Removed;
         bump(kind);
@@ -670,6 +704,7 @@ fn asked_from(spans: &[ConsentSpanItem]) -> Vec<AskedSpan> {
             end_byte: s.end_byte,
             category: s.category.clone(),
             review_tier: tier_str(&s.review_tier).to_owned(),
+            allowed: s.allowed,
         })
         .collect()
 }
@@ -884,7 +919,7 @@ pub async fn review_prompt<S: ReviewScanner>(
         if outbound_for(input.prompt, &stored, &[]).is_none() {
             return block(conn, input, &sha, BlockReason::Unappliable).await;
         }
-        let (_, counts) = derive_outcome(&stored, &[]);
+        let (_, counts) = derive_outcome(input.prompt, &stored, &[]);
         let id = match store::insert_review(
             conn,
             &NewReview {
@@ -934,7 +969,7 @@ pub async fn review_prompt<S: ReviewScanner>(
     let Some(outbound) = outbound_for(input.prompt, &stored, &[]) else {
         return block(conn, input, &sha, BlockReason::Unappliable).await;
     };
-    let (outcome, counts) = derive_outcome(&stored, &[]);
+    let (outcome, counts) = derive_outcome(input.prompt, &stored, &[]);
     let out_sha = sha256_hex(&outbound);
     let inserted = store::insert_review(
         conn,
@@ -1051,7 +1086,7 @@ async fn resume_existing(
             BlockReason::Unappliable,
         )));
     };
-    let (outcome, counts) = derive_outcome(&row.spans, &answers);
+    let (outcome, counts) = derive_outcome(input.prompt, &row.spans, &answers);
     let out_sha = sha256_hex(&outbound);
     match store::finalize_review(
         conn,
@@ -1222,6 +1257,9 @@ pub struct PendingStepReviewSpan {
     pub score: f32,
     pub review_tier: crate::conductor::privacy::types::ReviewTier,
     pub fact_key: Option<String>,
+    /// items.id=924: the answers this span allows (display: the server applies the
+    /// rule whatever the frontend sends).
+    pub allowed: crate::conductor::privacy::allowed_answers::AllowedAnswers,
 }
 
 impl PendingStepReviewSpan {
@@ -1237,6 +1275,7 @@ impl PendingStepReviewSpan {
             score: s.score,
             review_tier: s.review_tier.clone(),
             fact_key: s.fact_key.clone(),
+            allowed: s.allowed,
         }
     }
 }
@@ -1486,6 +1525,7 @@ pub(crate) mod fake {
             score: 0.95,
             review_tier: ReviewTier::High,
             fact_key: None,
+            allowed: Default::default(),
         }
     }
 
@@ -1503,6 +1543,7 @@ pub(crate) mod fake {
             decision: decision.to_owned(),
             suggestion_text: replacement.map(str::to_owned),
             user_modified_text: None,
+            allowed: Default::default(),
         }
     }
 }
@@ -1938,6 +1979,132 @@ mod tests {
         assert_eq!(rows(&mut c).await.len(), 1);
     }
 
+    // -- items.id=924: the answers a span allows ---------------------------------
+
+    use crate::conductor::privacy::allowed_answers::AllowedAnswers;
+
+    const ADDRESS: &str = "12 Oak Road";
+
+    fn restricted(span_id: &str, text: &str, allowed: AllowedAnswers) -> ConsentSpanItem {
+        ConsentSpanItem {
+            allowed,
+            ..asked_span(span_id, PROMPT, text)
+        }
+    }
+
+    fn carries_address(text: &str) -> bool {
+        text.to_lowercase().contains(&ADDRESS.to_lowercase())
+    }
+
+    /// A span that allows no release (a `never` field, D1) is sent without its text
+    /// whatever the user answers, and the record keeps the allowed answers for the
+    /// resume. A generalization that does not carry the text stands.
+    #[tokio::test]
+    async fn a_span_that_allows_no_release_is_never_sent_whatever_the_live_answer() {
+        // (An unknown decision word cannot be stored: consent_decisions CHECKs it.
+        // allowed_answers' own tests cover it.)
+        let cases: [(&str, Option<&str>, bool); 5] = [
+            ("release_original", None, false),
+            ("generalize", Some("12 OAK ROAD"), false),
+            ("generalize", Some("near 12 oak road, the blue door"), false),
+            ("keep_private", None, false),
+            ("generalize", Some("a street address"), true),
+        ];
+        for (decision, modified, generalized) in cases {
+            let mut c = conn().await;
+            let r = ReviewReuse::default();
+            let scanner =
+                FakeScanner::pending(vec![restricted("s-b", ADDRESS, AllowedAnswers::NO_RELEASE)]);
+            park_one(&mut c, &scanner).await;
+            assert_eq!(
+                rows(&mut c).await[0].spans.asked[0].allowed,
+                AllowedAnswers::NO_RELEASE,
+                "the record keeps the allowed answers"
+            );
+            record(&mut c, &[answer("s-b", decision, modified)]).await;
+            let out = sent(review_prompt(&mut c, &scanner, &r, &input(PROMPT)).await);
+            assert!(!carries_address(&out), "{decision} {modified:?} sent {out}");
+            let row = &rows(&mut c).await[0];
+            assert_eq!(row.counts.released, 0, "{decision}");
+            if generalized {
+                assert!(out.contains("a street address"), "{out}");
+                assert_eq!(row.counts.generalized, 1);
+            } else {
+                assert!(
+                    out.contains("[removed]"),
+                    "{decision} {modified:?} sent {out}"
+                );
+                assert_eq!(row.counts.removed, 1, "{decision}");
+                assert_eq!(row.outcome, ReviewOutcome::Redacted, "{decision}");
+            }
+            // The retry loop rebuilds the same text from the record.
+            let again = sent(review_prompt(&mut c, &scanner, &r, &input(PROMPT)).await);
+            assert_eq!(out, again);
+            assert_eq!(scanner.calls(), 1);
+        }
+    }
+
+    /// A span settled as a release (a remembered decision that reached the record)
+    /// is removed when the span allows no release: the application checks again.
+    #[tokio::test]
+    async fn a_settled_release_of_a_span_that_allows_no_release_is_removed() {
+        let mut c = conn().await;
+        let mut settled = settled_span(PROMPT, ADDRESS, "release_original", None);
+        settled.allowed = AllowedAnswers::NO_RELEASE;
+        let scanner = FakeScanner::standing(vec![settled]);
+        let out =
+            sent(review_prompt(&mut c, &scanner, &ReviewReuse::default(), &input(PROMPT)).await);
+        assert!(!carries_address(&out), "{out}");
+        assert!(out.contains("[removed]"));
+        let row = &rows(&mut c).await[0];
+        assert_eq!(row.counts.removed, 1);
+        assert_eq!(row.counts.released, 0);
+        assert_eq!(row.spans.settled[0].allowed, AllowedAnswers::NO_RELEASE);
+    }
+
+    /// Where only a live release is allowed (the access-credential flag, D3), the
+    /// user's live release is sent as answered.
+    #[tokio::test]
+    async fn a_live_release_is_sent_where_only_a_remembered_one_is_refused() {
+        let mut c = conn().await;
+        let r = ReviewReuse::default();
+        let scanner = FakeScanner::pending(vec![restricted(
+            "s-b",
+            ADDRESS,
+            AllowedAnswers::NO_STANDING_RELEASE,
+        )]);
+        park_one(&mut c, &scanner).await;
+        record(&mut c, &[answer("s-b", "release_original", None)]).await;
+        let out = sent(review_prompt(&mut c, &scanner, &r, &input(PROMPT)).await);
+        assert_eq!(out, PROMPT);
+    }
+
+    #[test]
+    fn a_span_that_allows_every_answer_is_stored_as_before() {
+        let asked = AskedSpan {
+            span_id: "s".into(),
+            start_byte: 0,
+            end_byte: 1,
+            category: "private_person".into(),
+            review_tier: "high".into(),
+            allowed: AllowedAnswers::ALL,
+        };
+        let json = serde_json::to_string(&asked).unwrap();
+        assert!(!json.contains("allowed"), "{json}");
+        let restricted = AskedSpan {
+            allowed: AllowedAnswers::NO_RELEASE,
+            ..asked.clone()
+        };
+        let json = serde_json::to_string(&restricted).unwrap();
+        let back: AskedSpan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, restricted);
+        let old: AskedSpan = serde_json::from_str(
+            r#"{"span_id":"s","start_byte":0,"end_byte":1,"category":"c","review_tier":"low"}"#,
+        )
+        .unwrap();
+        assert!(old.allowed.is_all());
+    }
+
     /// items.id=923 (F13): a final review is reused only by the retry loop that
     /// produced it. After a park (a new loop) the step is reviewed again, so a
     /// standing decision the user tightened while the run was parked applies.
@@ -2066,6 +2233,7 @@ mod tests {
                     end_byte: i * 2 + 1,
                     category: "c".into(),
                     review_tier: "high".into(),
+                    allowed: Default::default(),
                 })
                 .collect(),
             settled,
@@ -2077,6 +2245,7 @@ mod tests {
         let s = spans(&["a", "b", "c"], vec![]);
         // Everything released or generalised as suggested.
         let (o, c) = derive_outcome(
+            "",
             &s,
             &[
                 answer("a", "release_original", None),
@@ -2089,6 +2258,7 @@ mod tests {
 
         // One removed (kept private), none edited.
         let (o, c) = derive_outcome(
+            "",
             &s,
             &[
                 answer("a", "release_original", None),
@@ -2100,12 +2270,13 @@ mod tests {
         assert_eq!(c.removed, 1);
 
         // One unanswered counts as removed.
-        let (o, c) = derive_outcome(&s, &[answer("a", "release_original", None)]);
+        let (o, c) = derive_outcome("", &s, &[answer("a", "release_original", None)]);
         assert_eq!(o, ReviewOutcome::Redacted);
         assert_eq!((c.released, c.removed), (1, 2));
 
         // One edited, one removed: edited wins, the counts keep the detail.
         let (o, c) = derive_outcome(
+            "",
             &s,
             &[
                 answer("a", "generalize", Some("a woman I know")),
@@ -2118,6 +2289,7 @@ mod tests {
 
         // A generalise with no replacement text at all is a removal.
         let (o, c) = derive_outcome(
+            "",
             &spans(&["a"], vec![]),
             &[RecordedSpanDecision {
                 span_id: "a".into(),
@@ -2130,13 +2302,13 @@ mod tests {
         assert_eq!(c.removed, 1);
 
         // An unknown decision string is the most private one.
-        let (o, _) = derive_outcome(&spans(&["a"], vec![]), &[answer("a", "weird", None)]);
+        let (o, _) = derive_outcome("", &spans(&["a"], vec![]), &[answer("a", "weird", None)]);
         assert_eq!(o, ReviewOutcome::Redacted);
     }
 
     #[test]
     fn no_spans_is_clean_and_settled_only_is_standing_applied() {
-        let (o, c) = derive_outcome(&StoredSpans::default(), &[]);
+        let (o, c) = derive_outcome("", &StoredSpans::default(), &[]);
         assert_eq!((o, c), (ReviewOutcome::Clean, Counts::default()));
         let settled = vec![SettledSpan {
             start_byte: 0,
@@ -2144,8 +2316,9 @@ mod tests {
             decision: "release_original".into(),
             suggestion_text: None,
             user_modified_text: None,
+            allowed: Default::default(),
         }];
-        let (o, c) = derive_outcome(&spans(&[], settled), &[]);
+        let (o, c) = derive_outcome("", &spans(&[], settled), &[]);
         assert_eq!(o, ReviewOutcome::StandingApplied);
         assert_eq!((c.total, c.auto_resolved, c.released), (1, 1, 1));
     }
@@ -2163,6 +2336,7 @@ mod tests {
                 end_byte: start + "José García".len(),
                 category: "private_person".into(),
                 review_tier: "high".into(),
+                allowed: Default::default(),
             }],
             settled: vec![],
         };

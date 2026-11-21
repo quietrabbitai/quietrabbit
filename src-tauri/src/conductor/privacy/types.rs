@@ -176,6 +176,10 @@ pub struct AutoResolvedSpan {
     pub decision: String,
     pub suggestion_text: Option<String>,
     pub user_modified_text: Option<String>,
+    /// items.id=924: the answers this span allows (allowed_answers.rs). ALL for a
+    /// span the Privacy Filter found; the partition has already applied the rule to
+    /// `decision`.
+    pub allowed: crate::conductor::privacy::allowed_answers::AllowedAnswers,
 }
 
 #[derive(Debug, Default)]
@@ -319,6 +323,10 @@ pub struct ConsentSpanItem {
     /// in) -- this round-trip is what makes silent reapplication possible;
     /// gate3 never re-derives it from the frontend's own say-so.
     pub fact_key: Option<String>,
+    /// items.id=924: the answers this span allows (allowed_answers.rs). ALL for a
+    /// span the Privacy Filter found; less only for a span raised by source. Display
+    /// information for the frontend: the server applies the rule whatever it sends.
+    pub allowed: crate::conductor::privacy::allowed_answers::AllowedAnswers,
 }
 
 /// Full payload for the consent_request push event emitted by gate3.

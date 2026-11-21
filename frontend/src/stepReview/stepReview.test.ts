@@ -36,6 +36,7 @@ const span = (id: string, tier: 'low' | 'medium' | 'high' = 'high'): PendingStep
   score: 0.95,
   review_tier: tier,
   fact_key: null,
+  allowed: { release: true, standing_release: true },
 })
 
 const review = (id: string, state: 'ready' | 'needs_resume' = 'ready', run = RUN): PendingStepReview => ({

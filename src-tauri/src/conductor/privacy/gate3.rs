@@ -79,6 +79,7 @@ use uuid::Uuid;
 use crate::conductor::tokens::ExternalAccess;
 
 use super::{
+    allowed_answers::{admit_remembered, Admission, AllowedAnswers, Remembered},
     coref,
     errors::DisclosureLogWriteError,
     fact_identity,
@@ -130,10 +131,28 @@ pub const CARRIED_FIELD_CATEGORY: &str = "qr_personal_field";
 /// request and the removal all take the ordinary path. `suggestion` is the field's
 /// abstraction at the step's tier (a summarize label), or None. Only the outbound
 /// review passes any (a scan pins it). Debug never prints the text.
+/// items.id=924: `allowed` is the answers the span allows (allowed_answers.rs); the
+/// partition and the outbound review's application both apply it.
 #[derive(Clone)]
 pub struct SourceSpan {
     pub entity: PfEntityDecoded,
     pub suggestion: Option<String>,
+    pub allowed: AllowedAnswers,
+}
+
+/// items.id=924: the source span that raised `e` (same offsets and label), if any.
+fn source_of<'a>(e: &PfEntityDecoded, source_spans: &'a [SourceSpan]) -> Option<&'a SourceSpan> {
+    source_spans.iter().find(|s| {
+        s.entity.start_byte == e.start_byte
+            && s.entity.end_byte == e.end_byte
+            && s.entity.label == e.label
+    })
+}
+
+/// items.id=924: the answers `e` allows: its source span's, else every answer (a
+/// span the Privacy Filter found).
+fn allowed_of(e: &PfEntityDecoded, source_spans: &[SourceSpan]) -> AllowedAnswers {
+    source_of(e, source_spans).map_or(AllowedAnswers::ALL, |s| s.allowed)
 }
 
 impl std::fmt::Debug for SourceSpan {
@@ -142,6 +161,7 @@ impl std::fmt::Debug for SourceSpan {
             .field("start_byte", &self.entity.start_byte)
             .field("end_byte", &self.entity.end_byte)
             .field("label", &self.entity.label)
+            .field("allowed", &self.allowed)
             .finish_non_exhaustive()
     }
 }
@@ -694,6 +714,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
         entities,
         forced_high,
         kept_private,
+        source_spans,
     )
     .await?;
     if let Some(result) = partition.early_result {
@@ -920,6 +941,7 @@ async fn partition_by_prior_decision<L: DisclosureLogger>(
         entities,
         false,
         KeptPrivate::StopsContent,
+        &[],
     )
     .await
 }
@@ -950,6 +972,7 @@ pub(crate) async fn partition_early_result_for_test<L: DisclosureLogger>(
         entities,
         forced_high,
         kept_private,
+        &[],
     )
     .await
     .expect("partition")
@@ -976,6 +999,7 @@ async fn partition_with_rule<L: DisclosureLogger>(
     entities: Vec<PfEntityDecoded>,
     forced_high: bool,
     kept_private: KeptPrivate,
+    source_spans: &[SourceSpan],
 ) -> Result<PartitionOutcome, DisclosureLogWriteError> {
     if entities.is_empty() {
         return Ok(PartitionOutcome {
@@ -1020,9 +1044,14 @@ async fn partition_with_rule<L: DisclosureLogger>(
                 )
                 .await
                 {
-                    Ok(found) => {
-                        found.map(|p| (p.decision, p.suggestion_text, p.user_modified_text))
-                    }
+                    Ok(found) => found.map(|p| {
+                        (
+                            p.decision,
+                            p.suggestion_text,
+                            p.user_modified_text,
+                            Remembered::ThisRun,
+                        )
+                    }),
                     Err(e) => {
                         log::warn!(
                             "gate3: review-answer query failed, treating as unresolved: {e}"
@@ -1040,9 +1069,12 @@ async fn partition_with_rule<L: DisclosureLogger>(
                 )
                 .await
                 {
-                    Ok(Some(pref)) => {
-                        Some((pref.decision, pref.suggestion_text, pref.user_modified_text))
-                    }
+                    Ok(Some(pref)) => Some((
+                        pref.decision,
+                        pref.suggestion_text,
+                        pref.user_modified_text,
+                        Remembered::Standing,
+                    )),
                     Ok(None) => {
                         match crate::persistence::output_store::find_consent_decision_for_fact(
                             user_id,
@@ -1053,10 +1085,18 @@ async fn partition_with_rule<L: DisclosureLogger>(
                         )
                         .await
                         {
+                            // items.id=924: a row of this run the user did not
+                            // write (an auto-reapplied one) is a remembered
+                            // standing decision, not the user's answer.
                             Ok(Some(prior)) => Some((
                                 prior.decision,
                                 prior.suggestion_text,
                                 prior.user_modified_text,
+                                if prior.user_written {
+                                    Remembered::ThisRun
+                                } else {
+                                    Remembered::Standing
+                                },
                             )),
                             Ok(None) => None,
                             Err(e) => {
@@ -1077,6 +1117,25 @@ async fn partition_with_rule<L: DisclosureLogger>(
                 }
             }
         };
+
+        // items.id=924: the span's allowed answers decide what a remembered decision
+        // may do (allowed_answers::admit_remembered): applied, applied as keep
+        // private (no release allowed), or not applied and the span asked again.
+        let allowed = allowed_of(&entity, source_spans);
+        let prior_decision = prior_decision.and_then(|(decision, suggestion, modified, origin)| {
+            match admit_remembered(
+                allowed,
+                origin,
+                &decision,
+                suggestion.as_deref(),
+                modified.as_deref(),
+                &entity.span_text,
+            ) {
+                Admission::Apply => Some((decision, suggestion, modified)),
+                Admission::KeepPrivate => Some(("keep_private".to_owned(), None, None)),
+                Admission::AskAgain => None,
+            }
+        });
 
         match prior_decision {
             Some((decision, suggestion_text, user_modified_text)) => {
@@ -1127,6 +1186,7 @@ async fn partition_with_rule<L: DisclosureLogger>(
                     decision: decision.clone(),
                     suggestion_text: suggestion_text.clone(),
                     user_modified_text: user_modified_text.clone(),
+                    allowed,
                 });
                 auto_resolved_decisions.push(decision);
             }
@@ -1208,14 +1268,13 @@ fn build_consent_spans(
 ) -> Vec<ConsentSpanItem> {
     // items.id=933: a span raised by source carries its own suggestion (the field's
     // abstraction at the step's tier); a filter span keeps the category's.
+    // items.id=924: looked up by offsets AND label (source_of), so a source span of
+    // any category carries its own suggestion and allowed answers.
     let suggestion = |e: &PfEntityDecoded| -> Option<String> {
-        if e.label == CARRIED_FIELD_CATEGORY {
-            return source_spans
-                .iter()
-                .find(|s| s.entity.start_byte == e.start_byte && s.entity.end_byte == e.end_byte)
-                .and_then(|s| s.suggestion.clone());
+        match source_of(e, source_spans) {
+            Some(s) => s.suggestion.clone(),
+            None => generalization_suggestion(&e.label),
         }
-        generalization_suggestion(&e.label)
     };
     entities
         .iter()
@@ -1238,6 +1297,7 @@ fn build_consent_spans(
             // have been auto-reapplied there instead, never reaching here)
             // -- echoed to the frontend so a future decision can be found.
             fact_key: fact_key.clone(),
+            allowed: allowed_of(e, source_spans),
         })
         .collect()
 }
@@ -2489,6 +2549,7 @@ mod tests {
             vec![entity_with("private_email", F_EMAIL)],
             forced_high,
             kept,
+            &[],
         )
         .await
         .expect("partition")
@@ -2496,6 +2557,205 @@ mod tests {
 
     fn unsettled(o: &PartitionOutcome) -> bool {
         o.early_result.is_none() && o.needs_review.len() == 1 && o.auto_resolved.is_empty()
+    }
+
+    // -- items.id=924: allowed answers on a span raised by source ---------------
+
+    /// The email entity of these fixtures raised by source with `allowed`.
+    fn f_source(allowed: AllowedAnswers) -> SourceSpan {
+        SourceSpan {
+            entity: entity_with("private_email", F_EMAIL),
+            suggestion: Some("[email address]".to_owned()),
+            allowed,
+        }
+    }
+
+    async fn f_partition_allowed(
+        forced_high: bool,
+        kept: KeptPrivate,
+        allowed: AllowedAnswers,
+    ) -> PartitionOutcome {
+        partition_with_rule(
+            &TestLogger::new(),
+            F_USER,
+            F_PERSONA,
+            TEST_KEY_HEX,
+            F_ACTION,
+            F_RUN,
+            1,
+            vec![entity_with("private_email", F_EMAIL)],
+            forced_high,
+            kept,
+            &[f_source(allowed)],
+        )
+        .await
+        .expect("partition")
+    }
+
+    /// Every way a release can be remembered for the fixture fact.
+    #[derive(Debug, Clone, Copy)]
+    enum RememberedRelease {
+        Standing,
+        StandingEditCarryingTheValue,
+        UserAnswerThisRun,
+        AutoReappliedThisRun,
+    }
+
+    async fn f_remember(how: RememberedRelease) {
+        match how {
+            RememberedRelease::Standing => f_standing("release_original").await,
+            RememberedRelease::StandingEditCarryingTheValue => {
+                crate::persistence::personal_store::write_standing_preference(
+                    F_USER,
+                    F_PERSONA,
+                    TEST_KEY_HEX,
+                    &f_key(),
+                    "private_email",
+                    "generalize",
+                    Some("[email address]"),
+                    Some(F_EMAIL),
+                )
+                .await
+                .expect("standing preference");
+            }
+            RememberedRelease::UserAnswerThisRun => f_user_answer("s-g3", "release_original").await,
+            RememberedRelease::AutoReappliedThisRun => {
+                crate::persistence::output_store::write_auto_reapplied_consent_decision(
+                    F_USER,
+                    F_PERSONA,
+                    TEST_KEY_HEX,
+                    F_RUN,
+                    "release_original",
+                    None,
+                    None,
+                    "private_email",
+                    &f_key(),
+                    F_EMAIL,
+                )
+                .await
+                .unwrap();
+            }
+        }
+    }
+
+    const ALL_REMEMBERED: [RememberedRelease; 4] = [
+        RememberedRelease::Standing,
+        RememberedRelease::StandingEditCarryingTheValue,
+        RememberedRelease::UserAnswerThisRun,
+        RememberedRelease::AutoReappliedThisRun,
+    ];
+
+    #[tokio::test]
+    async fn a_span_that_allows_no_release_is_never_released_by_a_remembered_decision() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        for how in ALL_REMEMBERED {
+            for forced_high in [false, true] {
+                for kept in [KeptPrivate::RemovesSpans, KeptPrivate::StopsContent] {
+                    let _root = fresh_root();
+                    f_seed_run().await;
+                    f_park_snapshot(F_ACTION, LONG_AGO).await;
+                    f_remember(how).await;
+                    let o =
+                        f_partition_allowed(forced_high, kept, AllowedAnswers::NO_RELEASE).await;
+                    let case = format!("{how:?} forced_high={forced_high} {kept:?}");
+                    // Forced High is settled only by the user's answer to this review;
+                    // otherwise every remembered decision settles, as keep private.
+                    let settles =
+                        !forced_high || matches!(how, RememberedRelease::UserAnswerThisRun);
+                    assert_eq!(o.early_result.is_some(), settles, "{case}");
+                    for a in &o.auto_resolved {
+                        assert_eq!(a.decision, "keep_private", "{case}");
+                        assert_eq!(a.allowed, AllowedAnswers::NO_RELEASE, "{case}");
+                    }
+                    match o.early_result {
+                        // Settled: only ever as keep private.
+                        Some(r) => {
+                            assert_eq!(r.auto_resolved.len(), 1, "{case}");
+                            assert!(
+                                r.auto_resolved.iter().all(|a| a.decision == "keep_private"),
+                                "{case}"
+                            );
+                            match kept {
+                                KeptPrivate::RemovesSpans => assert!(r.approved, "{case}"),
+                                KeptPrivate::StopsContent => assert!(r.blocked, "{case}"),
+                            }
+                        }
+                        // Forced High with no answer of the user's to THIS review:
+                        // asked, as before this item.
+                        None => assert!(unsettled(&o), "{case}"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_remembered_release_is_asked_again_where_only_a_live_release_is_allowed() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        for how in ALL_REMEMBERED {
+            let _root = fresh_root();
+            f_seed_run().await;
+            f_park_snapshot(F_ACTION, LONG_AGO).await;
+            f_remember(how).await;
+            let o = f_partition_allowed(
+                false,
+                KeptPrivate::RemovesSpans,
+                AllowedAnswers::NO_STANDING_RELEASE,
+            )
+            .await;
+            match how {
+                // The user's own answer in this run still counts (D3).
+                RememberedRelease::UserAnswerThisRun => {
+                    let r = o.early_result.expect("settled by the user's answer");
+                    assert_eq!(r.auto_resolved[0].decision, "release_original");
+                }
+                // A standing generalization stands: it is not a release.
+                RememberedRelease::StandingEditCarryingTheValue => {
+                    let r = o.early_result.expect("settled");
+                    assert_eq!(r.auto_resolved[0].decision, "generalize");
+                }
+                // A standing release, and a row of this run the user did not write.
+                _ => assert!(unsettled(&o), "{how:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_span_that_allows_every_answer_is_settled_as_before() {
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let _root = fresh_root();
+        f_seed_run().await;
+        f_remember(RememberedRelease::Standing).await;
+        let o = f_partition_allowed(false, KeptPrivate::RemovesSpans, AllowedAnswers::ALL).await;
+        let r = o.early_result.expect("settled");
+        assert_eq!(r.auto_resolved[0].decision, "release_original");
+        assert!(r.auto_resolved[0].allowed.is_all());
+    }
+
+    #[test]
+    fn a_consent_span_carries_the_answers_its_source_allows() {
+        let e = entity_with("private_email", F_EMAIL);
+        let spans = build_consent_spans(
+            &[(e.clone(), None)],
+            1,
+            3,
+            &[f_source(AllowedAnswers::NO_RELEASE)],
+        );
+        assert_eq!(spans[0].allowed, AllowedAnswers::NO_RELEASE);
+        assert_eq!(spans[0].suggestion.as_deref(), Some("[email address]"));
+        // A filter span, and a source span of another label at the same offsets, are
+        // not the source's: every answer.
+        assert!(build_consent_spans(&[(e.clone(), None)], 1, 3, &[])[0]
+            .allowed
+            .is_all());
+        let other = SourceSpan {
+            entity: entity_with("private_phone", F_EMAIL),
+            suggestion: None,
+            allowed: AllowedAnswers::NO_RELEASE,
+        };
+        assert!(build_consent_spans(&[(e, None)], 1, 3, &[other])[0]
+            .allowed
+            .is_all());
     }
 
     const LONG_AGO: &str = "2020-01-01T00:00:00+00:00";
@@ -2661,7 +2921,10 @@ mod tests {
              content_sensitivity_severity,\n        destination_risk,\n        \
              severity_authoritative,\n    );"
         ));
-        assert!(body.contains("        forced_high,\n        kept_private,\n    )\n    .await?;"));
+        // items.id=924: and the source spans, whose allowed answers it applies.
+        assert!(body.contains(
+            "        forced_high,\n        kept_private,\n        source_spans,\n    )\n    .await?;"
+        ));
         let gate3_body = src
             .split("pub async fn gate3<")
             .nth(1)
@@ -2710,6 +2973,7 @@ mod tests {
                         end_byte: 3,
                         category: "private_email".into(),
                         review_tier: "high".into(),
+                        allowed: Default::default(),
                     }],
                     settled: vec![],
                 },
@@ -3062,6 +3326,7 @@ mod tests {
                 span_text: text.to_owned(),
             },
             suggestion: suggestion.map(str::to_owned),
+            allowed: Default::default(),
         }
     }
 
@@ -3206,6 +3471,7 @@ mod tests {
                 vec![entity_with(CARRIED_FIELD_CATEGORY, text)],
                 false,
                 KeptPrivate::RemovesSpans,
+                &[],
             )
             .await
             .expect("partition")

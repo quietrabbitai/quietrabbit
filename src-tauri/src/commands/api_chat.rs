@@ -1123,6 +1123,7 @@ mod tests {
                 score: 0.99,
                 review_tier: crate::conductor::privacy::types::ReviewTier::High,
                 fact_key: None,
+                allowed: Default::default(),
             }],
             ..Default::default()
         }
@@ -1278,6 +1279,7 @@ mod tests {
                 decision: "keep_private".into(),
                 suggestion_text: None,
                 user_modified_text: None,
+                allowed: Default::default(),
             }],
             ..Default::default()
         };

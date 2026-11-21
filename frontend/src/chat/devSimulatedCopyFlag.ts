@@ -65,7 +65,12 @@ export interface SimAutoResolved {
   decision: string
   suggestion_text: string | null
   user_modified_text: string | null
+  /** items.id=924: a simulated span is a filter span, so every answer. */
+  allowed: { release: boolean; standing_release: boolean }
 }
+
+/** items.id=924: every answer (a span the Privacy Filter found). */
+const ALL_ANSWERS = { release: true, standing_release: true }
 
 export interface SimulatedCopyFlag {
   /** null = nothing left for the modal (everything resolved silently). */
@@ -114,10 +119,10 @@ export function buildSimulatedFlag(text: string, runId: string, mode: 1 | 2 | 3)
   const last = words.length > 1 ? words[words.length - 1] : undefined
   if (mode === 3) {
     if (first) {
-      auto.push({ ...byteRange(first), decision: 'release_original', suggestion_text: null, user_modified_text: null })
+      auto.push({ ...byteRange(first), decision: 'release_original', suggestion_text: null, user_modified_text: null, allowed: ALL_ANSWERS })
     }
     if (last) {
-      auto.push({ ...byteRange(last), decision: 'keep_private', suggestion_text: null, user_modified_text: null })
+      auto.push({ ...byteRange(last), decision: 'keep_private', suggestion_text: null, user_modified_text: null, allowed: ALL_ANSWERS })
     }
     return { payload: null, auto }
   }
@@ -126,7 +131,7 @@ export function buildSimulatedFlag(text: string, runId: string, mode: 1 | 2 | 3)
     if (mode === 1) {
       spans.push(toSpan(last, 'sim-2', 'high', 'private_email', null))
     } else {
-      auto.push({ ...byteRange(last), decision: 'keep_private', suggestion_text: null, user_modified_text: null })
+      auto.push({ ...byteRange(last), decision: 'keep_private', suggestion_text: null, user_modified_text: null, allowed: ALL_ANSWERS })
     }
   }
   return {

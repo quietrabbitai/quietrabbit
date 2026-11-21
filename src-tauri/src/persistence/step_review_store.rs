@@ -29,6 +29,7 @@ use sqlx::{Row, SqliteConnection};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::conductor::privacy::allowed_answers::AllowedAnswers;
 use crate::providers::utils::now;
 
 // ---------------------------------------------------------------------------
@@ -119,6 +120,11 @@ pub struct AskedSpan {
     pub category: String,
     /// "low" | "medium" | "high" (informational).
     pub review_tier: String,
+    /// items.id=924: the answers the span allows. The resume applies the user's
+    /// answers under it (step_review::outbound_for). Absent (every answer) for a
+    /// span the Privacy Filter found and for a record written before this item.
+    #[serde(default, skip_serializing_if = "AllowedAnswers::is_all")]
+    pub allowed: AllowedAnswers,
 }
 
 /// A span a standing decision settled. `suggestion_text` and `user_modified_text`
@@ -131,6 +137,10 @@ pub struct SettledSpan {
     pub decision: String,
     pub suggestion_text: Option<String>,
     pub user_modified_text: Option<String>,
+    /// items.id=924: as AskedSpan's. The partition already applied it; the
+    /// application checks it again.
+    #[serde(default, skip_serializing_if = "AllowedAnswers::is_all")]
+    pub allowed: AllowedAnswers,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -559,6 +569,7 @@ mod tests {
                 end_byte: 7,
                 category: "private_person".into(),
                 review_tier: "high".into(),
+                allowed: Default::default(),
             }],
             settled: vec![SettledSpan {
                 start_byte: 10,
@@ -566,6 +577,7 @@ mod tests {
                 decision: "generalize".into(),
                 suggestion_text: Some("[person]".into()),
                 user_modified_text: None,
+                allowed: Default::default(),
             }],
         }
     }

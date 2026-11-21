@@ -9508,6 +9508,7 @@ mod tests {
             score: 0.9,
             review_tier: ReviewTier::High,
             fact_key: None,
+            allowed: Default::default(),
         };
         let cases = [
             (

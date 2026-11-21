@@ -1099,6 +1099,21 @@ export type ActiveBoardResponse = {
 };
 
 /**
+ *  The answers a review span allows (see the header). Serialized into the
+ *  step_reviews record and the consent payload; a record written before this item
+ *  has none and reads as ALL.
+ */
+export type AllowedAnswers = {
+	/**
+	 *  Release original may be applied (as a live answer, or remembered from this run
+	 *  by the user).
+	 */
+	release: boolean,
+	/**  A remembered (standing, Persona-wide) release may be applied. */
+	standing_release: boolean,
+};
+
+/**
  *  What approve_run_plan takes (a request struct: the generated bindings take at most ten
  *  arguments, and with the Tauri state this command has more).
  */
@@ -1132,6 +1147,12 @@ export type AutoResolvedSpan = {
 	decision: string,
 	suggestion_text: string | null,
 	user_modified_text: string | null,
+	/**
+	 *  items.id=924: the answers this span allows (allowed_answers.rs). ALL for a
+	 *  span the Privacy Filter found; the partition has already applied the rule to
+	 *  `decision`.
+	 */
+	allowed: AllowedAnswers,
 };
 
 export type CalibrationDto = {
@@ -2341,6 +2362,11 @@ export type PendingStepReviewSpan = {
 	score: number | null,
 	review_tier: ReviewTier,
 	fact_key: string | null,
+	/**
+	 *  items.id=924: the answers this span allows (display: the server applies the
+	 *  rule whatever the frontend sends).
+	 */
+	allowed: AllowedAnswers,
 };
 
 /**

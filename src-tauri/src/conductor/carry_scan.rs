@@ -34,6 +34,7 @@
 use crate::api_chat::redact::REMOVED_PLACEHOLDER;
 use crate::conductor::personal_fact_bridge::is_bridged_source;
 use crate::conductor::privacy::abstraction::{apply_abstraction, AbstractionLevel};
+use crate::conductor::privacy::allowed_answers::AllowedAnswers;
 use crate::conductor::privacy::gate2::scan_matches;
 use crate::conductor::privacy::gate3::{SourceSpan, CARRIED_FIELD_CATEGORY};
 use crate::conductor::privacy::privacy_filter::PfEntityDecoded;
@@ -187,6 +188,9 @@ pub fn source_spans(prompt: &str, ask: &[CarryHit]) -> Vec<SourceSpan> {
                 span_text: prompt[s..e].to_owned(),
             },
             suggestion: ask[i].suggestion.clone(),
+            // items.id=924: a bridged field that is asked allows every answer (its
+            // not_permitted values never reach the review: they are removed).
+            allowed: AllowedAnswers::ALL,
         })
         .collect()
 }

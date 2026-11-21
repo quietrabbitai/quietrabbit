@@ -419,6 +419,7 @@ mod tests {
                 decision: "weird".into(),
                 suggestion_text: None,
                 user_modified_text: None,
+                allowed: Default::default(),
             }],
             ..Default::default()
         };
