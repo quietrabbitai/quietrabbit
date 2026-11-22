@@ -41,6 +41,14 @@
 //      preserve) dependent facts explicitly inside a SAVEPOINT rather than
 //      rely on the cascade to do the right thing.
 //
+// WHO INSERTS ENTITY ROWS (items.id=914 rider; create_entity is NOT the only
+// path): create_entity / create_entity_conn here, create_owned_entity_conn here
+// (the only writer of owner_focus), source_registry_store::import_record (which
+// stamps the source edge under a SAVEPOINT), and two RAW `INSERT INTO entities`
+// statements that bypass this module: auth/persona_sharing.rs (a persona share
+// applying a payload) and persona_sync/engine.rs (a sync apply). Anything that
+// must hold for every entity row therefore cannot live only in create_entity.
+//
 // TESTABILITY: every public function opens the DB and delegates to a
 // `*_conn(&mut SqliteConnection, ...)` inner function — mirroring the
 // existing resolve_voice_profile_conn pattern in personal_store.rs. Tests

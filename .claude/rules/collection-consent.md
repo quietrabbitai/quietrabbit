@@ -19,7 +19,11 @@ data, stage 3 the frontend confirm.
   asked never opens the gate. focuses.collection_posture (per_field default,
   focus_level) is DECLARED BY THE FOCUS (the focuses row or the .focus key
   collection_posture) and is never "not required". focus_level also means the generic
-  extraction pass is skipped, wired by items.id=914, not here.
+  extraction pass is skipped (items.id=914: conductor::extract::extraction_pass_applies(screen_built,
+  posture), a pure posture-only fn, called by execute_and_finish after the EXTRACT_CONFIRM_SCREEN_BUILT
+  block; a missing definition counts as focus_level; the consent row is never read for it. While the
+  constant is false nothing runs for any Focus, so extract.rs's truth-table test is the LIVE GUARD that
+  items.id=38 inherits when it flips the constant).
 - ONLY focus_settings_store::set_collection_consent writes the state (stage 2's
   command is its only intended caller). The columns are NOT in
   UpdateFocusSettingsRequest, update_focus_settings does not touch them, so

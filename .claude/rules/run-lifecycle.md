@@ -105,7 +105,10 @@ and store sweeps" below.
     loses and takes resume_failed), Try again (ChatPane), lateReplyRecovery (reads status only).
 - THE EXTRACTION FLAG (F8). conductor/extract.rs EXTRACT_CONFIRM_SCREEN_BUILT = false, pinned by a test:
   execute_and_finish skips the WHOLE pass after output() (no personal.db read, no model call, no
-  candidate, no park) and completes the run. items.id=38 flips it with its confirm screen. resume_run's
+  candidate, no park) and completes the run. items.id=38 flips it with its confirm screen.
+  items.id=914 adds a second block right after it: extraction_pass_applies(built, posture) skips the
+  pass for a focus_level (or missing-definition) Focus even once the constant is true; see "Collection
+  consent". resume_run's
   replay branch and submit_extract_confirm are unchanged. awaiting_extract_confirm keeps no input
   (USER_INPUT_CLEARED_STATUSES).
 - THE POST-OUTPUT SWEEP (F8). run_retention::POST_OUTPUT_STATUSES = awaiting_extract_confirm,

@@ -93,6 +93,23 @@ pub const SOURCE_QUICK_CLOSE: &str = "quick_close";
 /// a test pins it false until then.
 pub const EXTRACT_CONFIRM_SCREEN_BUILT: bool = false;
 
+/// items.id=914 (decisions.id=940 ruling 4, decisions.id=944 point 2): whether the
+/// generic extraction pass may run for a Focus. It runs only when the confirm screen
+/// exists AND the Focus is per_field: a focus_level Focus collects through its own
+/// close-ticket pass and skips this one. PURE and posture-only: it never reads the
+/// consent row (consent gates SAVING, not this pass), and a missing definition
+/// (`None`) counts as focus_level, the same safe direction as
+/// FocusRun::current_collection. While EXTRACT_CONFIRM_SCREEN_BUILT is false this is
+/// false for every Focus, so THE TRUTH-TABLE TEST (with `built = true`) is the live
+/// guard that items.id=38 inherits when it flips the constant.
+pub fn extraction_pass_applies(
+    screen_built: bool,
+    posture: Option<crate::persistence::focus_composition_store::CollectionPosture>,
+) -> bool {
+    use crate::persistence::focus_composition_store::CollectionPosture;
+    screen_built && posture == Some(CollectionPosture::PerField)
+}
+
 /// A single candidate returned by extract_candidates() -- not yet persisted.
 #[derive(Debug, Clone)]
 pub struct ExtractCandidate {
@@ -801,6 +818,31 @@ pub async fn get_candidate_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// items.id=914: the truth table. With the screen built only a per_field Focus
+    /// runs the pass; focus_level and a missing definition skip; with the screen not
+    /// built (today) nothing runs. This test is the live guard when items.id=38 flips
+    /// EXTRACT_CONFIRM_SCREEN_BUILT.
+    #[test]
+    fn only_a_per_field_focus_runs_the_pass_and_only_with_the_screen_built() {
+        use crate::persistence::focus_composition_store::CollectionPosture::{
+            FocusLevel, PerField,
+        };
+        assert!(extraction_pass_applies(true, Some(PerField)));
+        assert!(!extraction_pass_applies(true, Some(FocusLevel)));
+        assert!(!extraction_pass_applies(true, None));
+        for posture in [Some(PerField), Some(FocusLevel), None] {
+            assert!(!extraction_pass_applies(false, posture));
+        }
+    }
+
+    #[test]
+    fn the_posture_decision_never_reads_the_consent_state() {
+        let src = include_str!("extract.rs");
+        let start = src.find("pub fn extraction_pass_applies(").unwrap();
+        let body = &src[start..src[start..].find("\n}\n").unwrap() + start];
+        assert!(!body.contains("consent"), "{body}");
+    }
 
     const PF_KEY: &str = "deadbeef00112233445566778899aabbccddeeff00112233445566778899aabb";
 

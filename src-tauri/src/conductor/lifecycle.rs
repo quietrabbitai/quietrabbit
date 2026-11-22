@@ -4804,6 +4804,19 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             return Ok(output_result);
         }
 
+        // items.id=914 (decisions.id=940 ruling 4, decisions.id=944 point 2): a focus_level
+        // Focus skips the generic extraction pass; its close-ticket pass is its only
+        // batch-confirm trigger. Posture only (never the consent row), a missing definition
+        // counts as focus_level, and nothing of the pass has run: no personal.db read, no
+        // model call, no candidate, no park. This holds when the constant above flips.
+        if !crate::conductor::extract::extraction_pass_applies(
+            crate::conductor::extract::EXTRACT_CONFIRM_SCREEN_BUILT,
+            self.focus_def.as_ref().map(|d| d.collection_posture),
+        ) {
+            self.cleanup("complete").await;
+            return Ok(output_result);
+        }
+
         // Build excluded fields: focus field_requirements + existing personal.db field names.
         // Field names only -- values never leave the PersonalTrack boundary.
         // Deduplicated via HashSet to avoid redundant model prompt context.
@@ -18382,6 +18395,44 @@ steps:
         let skip = &skip[..skip.find("\n        }\n").unwrap()];
         assert!(skip.contains("self.cleanup(\"complete\").await;"), "{skip}");
         assert!(skip.contains("return Ok(output_result);"), "{skip}");
+    }
+
+    /// items.id=914: the posture skip is a SECOND block after the constant's block,
+    /// before every part of the pass, and it is posture-only (no consent read).
+    #[test]
+    fn execute_and_finish_skips_a_focus_level_focus_before_any_part_of_the_pass() {
+        let source = include_str!("lifecycle.rs");
+        let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let start = production
+            .find("async fn execute_and_finish(&mut self)")
+            .unwrap();
+        let body = &production[start..];
+        let body = &body[..body.find("\n    }\n").unwrap()];
+        let flag = body
+            .find("if !crate::conductor::extract::EXTRACT_CONFIRM_SCREEN_BUILT {")
+            .expect("the flag check");
+        let posture = body
+            .find("if !crate::conductor::extract::extraction_pass_applies(")
+            .expect("the posture check");
+        assert!(flag < posture, "the constant's block stays first");
+        assert!(body.contains("self.focus_def.as_ref().map(|d| d.collection_posture)"));
+        for part in [
+            "list_personal_fields",
+            "extract_candidates(",
+            "persist_candidates(",
+            "extract_confirm_request",
+            "self.cleanup(\"awaiting_extract_confirm\")",
+        ] {
+            let at = body.find(part).unwrap_or_else(|| panic!("{part}"));
+            assert!(posture < at, "{part} comes after the posture check");
+        }
+        let skip = &body[posture..];
+        let skip = &skip[..skip.find("\n        }\n").unwrap()];
+        assert!(skip.contains("self.cleanup(\"complete\").await;"), "{skip}");
+        assert!(skip.contains("return Ok(output_result);"), "{skip}");
+        // Posture only: the decision never consults the consent state.
+        let decision = &body[posture..posture + skip.len()];
+        assert!(!decision.contains("consent"), "{decision}");
     }
 
     #[tokio::test]
