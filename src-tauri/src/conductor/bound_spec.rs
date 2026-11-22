@@ -152,6 +152,11 @@ pub const VALIDATION_REPORT: &str = "validation_report";
 pub const DELTA_ITEMS: &str = "delta_items";
 /// items.id=903: the Writing Assistant's working draft (ArtifactKind::WorkingDraft).
 pub const WORKING_DRAFT: &str = "working_draft";
+/// items.id=903: the three DERIVED names of a section pass (conductor::sections),
+/// computed at pass start from content_brief and working_draft.
+pub const NEXT_SECTION: &str = "next_section";
+pub const SECTION_HEADING: &str = "section_heading";
+pub const SECTIONS_STATE: &str = "sections_state";
 
 /// items.id=387: the two session names of a manual hand-off. handoff_pending holds
 /// the opaque id of a hand-off whose starter was rendered and whose reply has not
@@ -193,6 +198,9 @@ pub const NAMES: &[&str] = &[
     DELTA_CONTEXT,
     SUBJECT_CONTEXT,
     DEVICE_LIBRARY_BRIEF,
+    NEXT_SECTION,
+    SECTION_HEADING,
+    SECTIONS_STATE,
     CONTENT_BRIEF,
     VOICE_GUIDANCE,
     VALIDATION_REPORT,
@@ -271,6 +279,29 @@ pub const SPECS: &[BoundSpec] = &[
         presence: Presence::Always,
         literals: Literals::Authored,
         validate: valid_text,
+    },
+    // items.id=903: the section names. Always (a pass that asks gets a value: empty
+    // text and `none` when there is no brief), text bounded like every derived text.
+    BoundSpec {
+        name: NEXT_SECTION,
+        source: Source::Derived,
+        presence: Presence::Always,
+        literals: Literals::Authored,
+        validate: valid_text,
+    },
+    BoundSpec {
+        name: SECTION_HEADING,
+        source: Source::Derived,
+        presence: Presence::Always,
+        literals: Literals::Authored,
+        validate: valid_text,
+    },
+    BoundSpec {
+        name: SECTIONS_STATE,
+        source: Source::Derived,
+        presence: Presence::Always,
+        literals: Literals::Closed(crate::conductor::sections::SECTIONS_STATE_VALUES),
+        validate: valid_sections_state,
     },
     // items.id=895: the artifacts. Optional (absent until written, so a guard on
     // a name is false and its token renders as nothing) and Authored (open text).
@@ -381,6 +412,10 @@ pub fn spec(name: &str) -> Option<&'static BoundSpec> {
 
 fn valid_write_mode(s: &str) -> bool {
     WRITE_MODE_VALUES.contains(&s)
+}
+
+fn valid_sections_state(s: &str) -> bool {
+    crate::conductor::sections::SECTIONS_STATE_VALUES.contains(&s)
 }
 
 fn valid_open_ticket_state(s: &str) -> bool {

@@ -109,7 +109,7 @@ pub const PURE_STABLE_IDS: &[&str] = &["cb-06"];
 /// Every registered stable_id of every kind (pure, model, seed). Used by tests to
 /// hold the registry and the building_blocks mirror together, and by the
 /// admission test (conductor::model_block::admission_tests).
-pub const REGISTERED_STABLE_IDS: &[&str] = &["cb-06", "cb-12", "cb-13", "cb-14", "cb-15"];
+pub const REGISTERED_STABLE_IDS: &[&str] = &["cb-06", "cb-12", "cb-13", "cb-14", "cb-15", "pc-03"];
 
 /// items.id=387: every RENDER block's stable id (cb-15, the manual hand-off
 /// starter, conductor::handoff_render). A render block has no BlockHandler and no

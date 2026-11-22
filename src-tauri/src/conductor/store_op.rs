@@ -177,11 +177,15 @@ pub enum Op {
     ArtifactPut,
     ArtifactClear,
     HandoffIngest,
+    /// items.id=903: validate a StructuredBrief JSON, render it, store content_brief.
+    BriefPut,
+    /// items.id=903: append one headed section to working_draft.
+    ArtifactAppend,
 }
 
 impl Op {
     /// The closed set, in documentation order.
-    pub const ALL: [Op; 17] = [
+    pub const ALL: [Op; 19] = [
         Op::Latch,
         Op::SessionPut,
         Op::CaseOpen,
@@ -199,6 +203,8 @@ impl Op {
         Op::ArtifactPut,
         Op::ArtifactClear,
         Op::HandoffIngest,
+        Op::BriefPut,
+        Op::ArtifactAppend,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -220,6 +226,8 @@ impl Op {
             Op::ArtifactPut => "artifact_put",
             Op::ArtifactClear => "artifact_clear",
             Op::HandoffIngest => "handoff_ingest",
+            Op::BriefPut => "brief_put",
+            Op::ArtifactAppend => "artifact_append",
         }
     }
 
@@ -243,7 +251,9 @@ impl Op {
             | Op::SessionClear
             | Op::ArtifactPut
             | Op::ArtifactClear
-            | Op::HandoffIngest => false,
+            | Op::HandoffIngest
+            | Op::BriefPut
+            | Op::ArtifactAppend => false,
         }
     }
 
@@ -269,7 +279,9 @@ impl Op {
             | Op::EntityFindOrCreate
             | Op::ArtifactPut
             | Op::ArtifactClear
-            | Op::HandoffIngest => false,
+            | Op::HandoffIngest
+            | Op::BriefPut
+            | Op::ArtifactAppend => false,
         }
     }
 
@@ -309,7 +321,9 @@ impl Op {
             | Op::EntityFindOrCreate
             | Op::EntityFactPut
             | Op::ArtifactPut
-            | Op::HandoffIngest => true,
+            | Op::HandoffIngest
+            | Op::BriefPut
+            | Op::ArtifactAppend => true,
         }
     }
 
@@ -549,6 +563,24 @@ pub const OP_SPECS: &[OpSpec] = &[
         op: Op::HandoffIngest,
         target: TargetRule::PublishIdRequired,
         required: &[],
+        optional: &[],
+        needs_an_optional: false,
+    },
+    // items.id=903: the target is the pass variable the OUTCOME word is published
+    // under (brief_put: stored or invalid; artifact_append: appended or too_long), so
+    // a later reply row is guarded on what the store did, never on model text. The
+    // artifact each one writes is fixed (content_brief, working_draft).
+    OpSpec {
+        op: Op::BriefPut,
+        target: TargetRule::PublishIdRequired,
+        required: &[Slot::Value],
+        optional: &[],
+        needs_an_optional: false,
+    },
+    OpSpec {
+        op: Op::ArtifactAppend,
+        target: TargetRule::PublishIdRequired,
+        required: &[Slot::Value],
         optional: &[],
         needs_an_optional: false,
     },
@@ -860,9 +892,12 @@ impl StoreOp {
     /// always), else None.
     pub fn published_var(&self) -> Option<&str> {
         match self.op {
-            Op::CaseOpen | Op::DeltaRecord | Op::EntityFindOrCreate | Op::HandoffIngest => {
-                self.target.as_deref()
-            }
+            Op::CaseOpen
+            | Op::DeltaRecord
+            | Op::EntityFindOrCreate
+            | Op::HandoffIngest
+            | Op::BriefPut
+            | Op::ArtifactAppend => self.target.as_deref(),
             _ => None,
         }
     }
@@ -1773,7 +1808,7 @@ mod tests {
         assert!(!Op::HandoffIngest.takes_entity_ids());
         assert!(!Op::HandoffIngest.writes_case());
         assert!(Op::HandoffIngest.requires_collection_consent());
-        assert_eq!(Op::ALL.len(), 17);
+        assert_eq!(Op::ALL.len(), 19);
         assert_eq!(Op::ALL.len(), OP_SPECS.len());
     }
 

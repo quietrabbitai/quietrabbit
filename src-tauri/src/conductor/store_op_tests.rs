@@ -517,8 +517,29 @@ fn every_writer() -> Vec<(StoreOp, HashMap<String, String>)> {
         ("th", &handles::case_handle(FOCUS, "run-0:open")),
         ("dh", &handles::delta_handle(FOCUS, "run-0:rec")),
         ("brief", "A brief text"),
+        (
+            "bj",
+            r#"{"task": "A note", "recipient": null, "points": ["Thanks for the visit"]}"#,
+        ),
     ]);
     vec![
+        // items.id=903.
+        (
+            op(
+                "brief_put",
+                Some("brief_state"),
+                Some(serde_json::json!({"value": "bj"})),
+            ),
+            v.clone(),
+        ),
+        (
+            op(
+                "artifact_append",
+                Some("append_state"),
+                Some(serde_json::json!({"value": "val"})),
+            ),
+            v.clone(),
+        ),
         (
             op(
                 "session_put",
@@ -2022,7 +2043,7 @@ fn ctx_no_consent<'a>(focus: &'a str, run: &'a str, action: &'a str) -> WriterCo
 /// the Focus-owned entity writers (items.id=891), exercised with real entity
 /// stores in entity_writer_tests.rs. artifact_put (items.id=895) saves text.
 /// handoff_ingest (items.id=387) saves the user's pasted reply.
-const GATED_OPS: [&str; 14] = [
+const GATED_OPS: [&str; 16] = [
     "session_put",
     "case_select",
     "case_link",
@@ -2037,6 +2058,8 @@ const GATED_OPS: [&str; 14] = [
     "entity_fact_put",
     "artifact_put",
     "handoff_ingest",
+    "brief_put",
+    "artifact_append",
 ];
 
 /// An open chat holding a case and a delta, so a writer that was NOT refused

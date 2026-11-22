@@ -269,9 +269,7 @@ fn every_registered_id_has_exactly_one_kind_and_the_lists_agree() {
         .iter()
         .all(|id| block_kind(id) != Some(BlockKind::Seed)));
     // Nothing unregistered resolves.
-    for id in [
-        "cb-01", "cb-02", "cb-10", "pc-03", "pc-04", "cb-16", "nope", "",
-    ] {
+    for id in ["cb-01", "cb-02", "cb-10", "pc-04", "cb-16", "nope", ""] {
         assert!(registered_block(id).is_none(), "{id}");
     }
 }
@@ -757,8 +755,11 @@ async fn every_example_loads_through_the_real_loader_as_the_right_kind_of_step()
                     .collect();
             let declared: BTreeSet<String> = step.declared_inputs.iter().cloned().collect();
             assert_eq!(named, declared, "{id}");
+            // items.id=903: pc-03 reads the user's own request and is local only for
+            // that reason (READS_THE_REQUEST); no other block names it.
             assert!(
-                !named.contains("user_input") && !named.contains("persona_context"),
+                (READS_THE_REQUEST.contains(id) || !named.contains("user_input"))
+                    && !named.contains("persona_context"),
                 "{id}"
             );
             // Its range is within the Focus ceiling and the block's own.
@@ -807,7 +808,7 @@ async fn a_cataloged_block_without_a_registration_still_fails_at_load() {
         &env.pool,
         "no-handler",
         "local_only",
-        &[("the_block".to_owned(), Some("pc-03".to_owned()), json!({}))],
+        &[("the_block".to_owned(), Some("cb-02".to_owned()), json!({}))],
     )
     .await;
     let e = crate::conductor::lifecycle::load_focus_definition_from_db(&env.pool, "no-handler")
@@ -979,9 +980,42 @@ fn spec_var_key(id: &str) -> &'static str {
     }
 }
 
+/// items.id=903: the model blocks whose input IS the user's request (pc-03). The
+/// hosted rule refuses every hosted range of theirs, so they are local only.
+const READS_THE_REQUEST: &[&str] = &["pc-03"];
+
+#[test]
+fn a_block_that_reads_the_request_is_refused_any_hosted_range() {
+    for id in READS_THE_REQUEST {
+        let RegisteredBlock::Model(spec) = registered_block(id).unwrap() else {
+            unreachable!()
+        };
+        let mut ex = example_of(id);
+        ex["common"]["range"]["destinations"] = json!(["local", "hosted_api"]);
+        ex["common"]["range"]["highest_tier"] = json!("anonymous_preferred");
+        let parsed = (spec.parse)(&ex, true).unwrap();
+        let e = (spec.expand)(
+            &parsed,
+            &ExpandInput {
+                action_id: "the_block",
+                focus_ceiling: ExternalAccess::Unrestricted,
+                settings: None,
+                external_allowed: true,
+                document_type: None,
+                envelope_override: None,
+            },
+        )
+        .unwrap_err();
+        assert!(e.contains("{user_input}"), "{id}: {e}");
+    }
+}
+
 #[test]
 fn a_model_block_that_allows_hosted_api_names_neither_user_input_nor_persona_context() {
-    for id in MODEL_STABLE_IDS {
+    for id in MODEL_STABLE_IDS
+        .iter()
+        .filter(|id| !READS_THE_REQUEST.contains(id))
+    {
         let RegisteredBlock::Model(spec) = registered_block(id).unwrap() else {
             unreachable!()
         };
@@ -1521,11 +1555,12 @@ async fn every_shipped_launch_config_validates_and_every_default_is_an_option() 
     let ids = crate::conductor::launch_config::declared_focus_ids(&env.pool)
         .await
         .unwrap();
-    // decisions.id=948 point 6: none ship in items.id=897 (items.id=903 ships Writing
-    // Assistant's). Whatever ships later is held to the rules here.
-    assert!(
-        ids.is_empty(),
-        "unexpected shipped launch questions: {ids:?}"
+    // decisions.id=948 point 6: none shipped in items.id=897; items.id=903 ships the
+    // Writing Assistant's. Whatever ships later is held to the rules here.
+    assert_eq!(
+        ids,
+        ["writing-assistant"],
+        "unexpected shipped launch questions"
     );
     for id in ids {
         let c = crate::conductor::launch_config::read_validated(&env.pool, &id, reg)

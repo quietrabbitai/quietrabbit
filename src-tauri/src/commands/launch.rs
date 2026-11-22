@@ -639,12 +639,21 @@ mod tests {
             assert!(!json.contains(banned), "{banned}");
         }
         // A shipped Focus with no question: its display data and an empty list.
+        let ra = get_focus_launch_config_for_session(&e.pool, "role-assessment")
+            .await
+            .unwrap();
+        assert!(ra.ui_one_liner.is_some());
+        assert!(ra.questions.is_empty());
+        // items.id=903: the Writing Assistant ships its two questions, and no profile.
         let wa = get_focus_launch_config_for_session(&e.pool, "writing-assistant")
             .await
             .unwrap();
         assert_eq!(wa.display_name, "Writing Assistant");
-        assert!(wa.ui_one_liner.is_some());
-        assert!(wa.questions.is_empty());
+        let ids: Vec<&str> = wa.questions.iter().map(|q| q.id.as_str()).collect();
+        assert_eq!(ids, ["mode", "kind"]);
+        assert_eq!(wa.questions[0].kind, LaunchQuestionKindView::Mode);
+        assert_eq!(wa.questions[0].default_option, "medium");
+        assert_eq!(wa.questions[1].default_option, "personal_note");
         // An unknown or malformed Focus id.
         assert_eq!(
             get_focus_launch_config_for_session(&e.pool, "no-such-focus")
@@ -800,7 +809,7 @@ mod tests {
                 &e.key,
                 &e.persona,
                 CHAT,
-                "writing-assistant",
+                "role-assessment",
                 &[],
                 None,
             )

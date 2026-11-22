@@ -183,6 +183,10 @@ pub struct WriterContext<'a> {
 pub enum Outcome {
     Applied,
     AlreadyApplied,
+    /// items.id=903: the input did not fit (brief_put: not a valid brief;
+    /// artifact_append: the draft would pass the artifact limit). Nothing was written,
+    /// and the row publishes the refusal word so a reply row can say so.
+    RefusedInput,
     RefusedOneTime,
     /// items.id=920: focus_level Focus without the current consent.
     RefusedNoConsent,
@@ -362,6 +366,114 @@ async fn run_inner(
         },
 
         Op::HandoffIngest => handoff_writer::run_handoff_ingest(conn, key, ctx, op).await,
+
+        // items.id=903: the brief a pc-03 step wrote, as one JSON object. It is parsed
+        // as a StructuredBrief (deny_unknown_fields), validated, rendered with the
+        // shipped labels and stored as content_brief. Anything else stores nothing and
+        // publishes `invalid`.
+        Op::BriefPut => {
+            let state = op.target.as_deref().unwrap_or("");
+            // A one-time chat refuses before any input is judged, so the outcome is
+            // the latch's, never an input refusal.
+            latch_first(conn, key).await?;
+            let value = a.required(Slot::Value)?;
+            let Some(brief) = parse_brief(value) else {
+                return Ok(published(Outcome::RefusedInput, state, BRIEF_INVALID));
+            };
+            let labels = &crate::conductor::model_block::document_type::registry()
+                .map_err(|_| StoreWriteError::InvalidArtifactValue("content_brief".to_owned()))?
+                .phrases
+                .brief;
+            let text = brief.render(labels);
+            let kind = ArtifactKind::ContentBrief;
+            let valid = bound_spec::spec(kind.as_str()).is_some_and(|s| (s.validate)(&text));
+            if !valid {
+                return Ok(published(Outcome::RefusedInput, state, BRIEF_INVALID));
+            }
+            let current = pass_artifact_store::get_artifact(conn, key, ctx.focus_id, kind).await?;
+            let out = pass_artifact_store::put_artifact(
+                conn,
+                &ArtifactWrite {
+                    context_key: key,
+                    focus_id: ctx.focus_id,
+                    kind,
+                    content: &text,
+                    written_by_run: ctx.run_id,
+                    expected_version: current.map(|a| a.version),
+                },
+            )
+            .await?;
+            let outcome = match out {
+                PutOutcome::Created { .. } | PutOutcome::Updated { .. } => Outcome::Applied,
+                PutOutcome::Unchanged { .. } => Outcome::AlreadyApplied,
+            };
+            log_artifact_write(kind, outcome, &pass_artifact_store::fingerprint(&text));
+            Ok(published(outcome, state, BRIEF_STORED))
+        }
+
+        // items.id=903: one section of a section pass, appended to working_draft under
+        // its heading. The heading is computed HERE from the stored brief and draft by
+        // the same rule the section seeds use (conductor::sections), never taken from a
+        // variable, so a pass can append only the section that is due. Compare-and-set
+        // on the version read. No section due publishes `no_section`; an append that
+        // would pass ARTIFACT_MAX_BYTES publishes `too_long`; both write nothing.
+        Op::ArtifactAppend => {
+            let state = op.target.as_deref().unwrap_or("");
+            // A one-time chat refuses before any input is judged, so the outcome is
+            // the latch's, never an input refusal.
+            latch_first(conn, key).await?;
+            let value = a.required(Slot::Value)?;
+            let kind = ArtifactKind::WorkingDraft;
+            let brief = pass_artifact_store::get_artifact(
+                conn,
+                key,
+                ctx.focus_id,
+                ArtifactKind::ContentBrief,
+            )
+            .await?;
+            let current = pass_artifact_store::get_artifact(conn, key, ctx.focus_id, kind).await?;
+            let due = crate::conductor::sections::compute(
+                brief.as_ref().map(|b| b.content.as_str()),
+                current.as_ref().map(|c| c.content.as_str()),
+                "",
+            );
+            if due.state != crate::conductor::sections::SECTIONS_MORE {
+                return Ok(published(Outcome::RefusedInput, state, APPEND_NO_SECTION));
+            }
+            let heading = due.section_heading;
+            let section = format!("## {heading}\n\n{}", value.trim());
+            let text = match &current {
+                Some(c) => format!("{}\n\n{section}", c.content.trim_end()),
+                None => section,
+            };
+            if text.len() > pass_artifact_store::ARTIFACT_MAX_BYTES {
+                return Ok(published(Outcome::RefusedInput, state, APPEND_TOO_LONG));
+            }
+            let valid = bound_spec::spec(kind.as_str()).is_some_and(|s| (s.validate)(&text));
+            if !valid {
+                return Err(StoreWriteError::InvalidArtifactValue(
+                    kind.as_str().to_owned(),
+                ));
+            }
+            let out = pass_artifact_store::put_artifact(
+                conn,
+                &ArtifactWrite {
+                    context_key: key,
+                    focus_id: ctx.focus_id,
+                    kind,
+                    content: &text,
+                    written_by_run: ctx.run_id,
+                    expected_version: current.map(|a| a.version),
+                },
+            )
+            .await?;
+            let outcome = match out {
+                PutOutcome::Created { .. } | PutOutcome::Updated { .. } => Outcome::Applied,
+                PutOutcome::Unchanged { .. } => Outcome::AlreadyApplied,
+            };
+            log_artifact_write(kind, outcome, &pass_artifact_store::fingerprint(&text));
+            Ok(published(outcome, state, APPENDED))
+        }
 
         Op::Latch => {
             let out =
@@ -645,6 +757,52 @@ async fn run_inner(
 
 /// The artifact kind of an artifact writer's target. LOAD checks the target, so a
 /// miss here is a FocusDefinition that skipped the loader.
+/// items.id=903: the words brief_put and artifact_append publish under their target.
+pub const BRIEF_STORED: &str = "stored";
+pub const BRIEF_INVALID: &str = "invalid";
+pub const APPENDED: &str = "appended";
+pub const APPEND_TOO_LONG: &str = "too_long";
+pub const APPEND_NO_SECTION: &str = "no_section";
+
+/// items.id=903: refuse a latched chat (or an unreadable latch) before an operation
+/// that can publish an input refusal looks at its input. run_store_op turns the latch
+/// error into RefusedOneTime.
+async fn latch_first(conn: &mut SqliteConnection, key: &str) -> Result<(), StoreWriteError> {
+    match session_store::write_mode(conn, key).await {
+        Ok(WriteMode::Open) => Ok(()),
+        Ok(WriteMode::Suppressed) => Err(StoreWriteError::Artifact(PassArtifactError::Latch(
+            LatchError::Suppressed,
+        ))),
+        Err(e) => Err(StoreWriteError::Artifact(PassArtifactError::Latch(e))),
+    }
+}
+
+/// A Done that publishes an outcome word under the row's target.
+fn published(outcome: Outcome, var: &str, word: &str) -> Done {
+    Done {
+        outcome,
+        published: Some((var.to_owned(), word.to_owned())),
+    }
+}
+
+/// items.id=903: the one JSON object a pc-03 step wrote, read as a StructuredBrief.
+/// The object is taken from the first `{` to the last `}` (a model may still wrap it in
+/// a code fence or a sentence); it must parse with no unknown key and validate. Never
+/// logged.
+pub(crate) fn parse_brief(
+    text: &str,
+) -> Option<crate::conductor::model_block::brief::StructuredBrief> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    let brief: crate::conductor::model_block::brief::StructuredBrief =
+        serde_json::from_str(&text[start..=end]).ok()?;
+    brief.validate().ok()?;
+    Some(brief)
+}
+
 fn artifact_kind(name: &str) -> Result<ArtifactKind, StoreWriteError> {
     ArtifactKind::parse(name).ok_or_else(|| StoreWriteError::InvalidArtifactValue(name.to_owned()))
 }

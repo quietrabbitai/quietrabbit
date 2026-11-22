@@ -293,6 +293,9 @@ pub struct DraftPhrases {
     pub brief_label: String,
     pub sender_label: String,
     pub context_label: String,
+    /// items.id=903: the sentence after the brief in a section pass's next_section
+    /// (conductor::sections), followed by the section's heading.
+    pub section_label: String,
 }
 
 /// Every sentence the voice block emits.
@@ -325,6 +328,18 @@ pub struct RevisePhrases {
     pub changes_label: String,
 }
 
+/// items.id=903: the sentences of pc-03, the elicit block (elicit.rs). No brace: the
+/// JSON shape the step must answer with is described in words.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElicitPhrases {
+    pub lead: String,
+    pub shape: String,
+    pub only_supplied: String,
+    pub output_only: String,
+    pub request_label: String,
+}
+
 /// The labels a structured brief is rendered with (brief.rs).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -341,6 +356,7 @@ pub struct Phrases {
     pub voice: VoicePhrases,
     pub revise: RevisePhrases,
     pub brief: BriefPhrases,
+    pub elicit: ElicitPhrases,
 }
 
 impl DraftPhrases {
@@ -369,6 +385,7 @@ impl Phrases {
         let v = &self.voice;
         let r = &self.revise;
         let b = &self.brief;
+        let e = &self.elicit;
         let form: &[&str] = &["form"];
         let words: &[&str] = &["min_words", "max_words"];
         let none: &[&str] = &[];
@@ -383,6 +400,7 @@ impl Phrases {
             ("draft.brief_label", &d.brief_label, none),
             ("draft.sender_label", &d.sender_label, none),
             ("draft.context_label", &d.context_label, none),
+            ("draft.section_label", &d.section_label, none),
             ("voice.apply_lead", &v.apply_lead, none),
             ("voice.apply_output_only", &v.apply_output_only, none),
             ("voice.refine_lead", &v.refine_lead, none),
@@ -404,6 +422,11 @@ impl Phrases {
             ("brief.task_label", &b.task_label, none),
             ("brief.recipient_label", &b.recipient_label, none),
             ("brief.points_label", &b.points_label, none),
+            ("elicit.lead", &e.lead, form),
+            ("elicit.shape", &e.shape, none),
+            ("elicit.only_supplied", &e.only_supplied, none),
+            ("elicit.output_only", &e.output_only, none),
+            ("elicit.request_label", &e.request_label, none),
         ] {
             check_text(name, text, slots)?;
         }

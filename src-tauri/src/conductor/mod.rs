@@ -50,6 +50,7 @@ pub mod run_plan;
 pub mod run_retention;
 pub mod run_settings;
 pub mod scheduled_sweep;
+pub mod sections;
 pub mod seeding;
 pub mod step_review;
 pub mod step_treatment;
@@ -66,3 +67,5 @@ pub mod tier_manifest;
 pub mod tokens;
 pub mod types;
 pub mod visibility;
+#[cfg(test)]
+mod writing_assistant_tests;

@@ -590,6 +590,11 @@ static SCHEMA_FILES: &[SchemaFile] = &[
         sql: include_str!("../../schema/shared_047.sql"),
     },
     SchemaFile {
+        prefix: "shared",
+        version: 48,
+        sql: include_str!("../../schema/shared_048.sql"),
+    },
+    SchemaFile {
         prefix: "tier3_cookies",
         version: 1,
         sql: include_str!("../../schema/tier3_cookies_001.sql"),
@@ -2507,15 +2512,15 @@ mod tests {
             .await
             .expect("shared migration chain must apply cleanly on a fresh db");
         assert_eq!(
-            applied, 47,
-            "expected all forty-seven shared schema versions to apply"
+            applied, 48,
+            "expected all forty-eight shared schema versions to apply"
         );
 
         let version: (i64,) = sqlx::query_as("SELECT MAX(version) FROM schema_version")
             .fetch_one(&mut conn)
             .await
             .unwrap();
-        assert_eq!(version.0, 47);
+        assert_eq!(version.0, 48);
     }
 
     /// items.id=708 / items.id=703 / items.id=724: shared_026.sql and
@@ -3084,8 +3089,8 @@ mod tests {
             .expect("drift-healing run must succeed");
 
         assert_eq!(
-            applied, 46,
-            "shared v2 through v47 should count as newly applied from a stale v1 database"
+            applied, 47,
+            "shared v2 through v48 should count as newly applied from a stale v1 database"
         );
 
         // items.id=427: shared_013.sql drops tier3_providers (generalized
@@ -4134,7 +4139,7 @@ mod tests {
     #[tokio::test]
     async fn shared_039_adds_guard_columns_on_a_fresh_database() {
         let mut conn = make_test_conn().await;
-        run_migrations(&mut conn, "shared", None).await.unwrap();
+        run_shared_before_wa_rebuild(&mut conn).await;
         let cols: Vec<(String,)> = sqlx::query_as(
             "SELECT name FROM pragma_table_info('focus_block_compositions') \
              WHERE name LIKE 'guard_%' ORDER BY name",
@@ -4161,7 +4166,7 @@ mod tests {
     #[tokio::test]
     async fn shared_039_applies_to_a_database_already_at_038_and_keeps_its_rows() {
         let mut conn = make_test_conn().await;
-        run_migrations(&mut conn, "shared", None).await.unwrap();
+        run_shared_before_wa_rebuild(&mut conn).await;
         for col in ["guard_var", "guard_op", "guard_value"] {
             sqlx::query(&format!(
                 "ALTER TABLE focus_block_compositions DROP COLUMN {col}"
@@ -4195,7 +4200,7 @@ mod tests {
             .unwrap();
         assert!(before.0 > 0, "the 038 seed rows are there");
 
-        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 9);
+        assert_eq!(run_shared_before_wa_rebuild(&mut conn).await, 9);
 
         let after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM focus_block_compositions")
             .fetch_one(&mut conn)
@@ -4233,7 +4238,7 @@ mod tests {
     #[tokio::test]
     async fn shared_040_declares_the_draft_writing_inputs_on_a_fresh_database() {
         let mut conn = make_test_conn().await;
-        run_migrations(&mut conn, "shared", None).await.unwrap();
+        run_shared_before_wa_rebuild(&mut conn).await;
         let c = wa_draft_customization(&mut conn).await;
         assert_eq!(
             c["declared_inputs"],
@@ -4260,7 +4265,7 @@ mod tests {
     #[tokio::test]
     async fn shared_040_applies_to_a_database_already_at_039_and_changes_one_row() {
         let mut conn = make_test_conn().await;
-        run_migrations(&mut conn, "shared", None).await.unwrap();
+        run_shared_before_wa_rebuild(&mut conn).await;
         // Hand-build the 039 state: the seeded row as shared_038 wrote it.
         let fixed = wa_draft_customization(&mut conn).await;
         sqlx::query(
@@ -4293,7 +4298,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 8);
+        assert_eq!(run_shared_before_wa_rebuild(&mut conn).await, 8);
 
         assert_eq!(wa_draft_customization(&mut conn).await, fixed);
         let rows_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM focus_block_customization")
@@ -4313,7 +4318,7 @@ mod tests {
     #[tokio::test]
     async fn shared_041_adds_store_op_columns_on_a_fresh_database_all_null() {
         let mut conn = make_test_conn().await;
-        run_migrations(&mut conn, "shared", None).await.unwrap();
+        run_shared_before_wa_rebuild(&mut conn).await;
         let cols: Vec<(String, i64)> = sqlx::query_as(
             "SELECT name, \"notnull\" FROM pragma_table_info('focus_block_compositions') \
              WHERE name LIKE 'store_%' ORDER BY name",
@@ -4349,7 +4354,7 @@ mod tests {
     #[tokio::test]
     async fn shared_041_applies_to_a_database_already_at_040_and_keeps_its_rows() {
         let mut conn = make_test_conn().await;
-        run_migrations(&mut conn, "shared", None).await.unwrap();
+        run_shared_before_wa_rebuild(&mut conn).await;
         // A database at 040 has neither 041 nor 042.
         for col in ["store_op", "store_target", "store_args", "guard_clauses"] {
             sqlx::query(&format!(
@@ -4370,7 +4375,7 @@ mod tests {
             .unwrap();
         assert!(before.0 > 0, "the seed rows are there");
 
-        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 7);
+        assert_eq!(run_shared_before_wa_rebuild(&mut conn).await, 7);
 
         let after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM focus_block_compositions")
             .fetch_one(&mut conn)
@@ -4397,7 +4402,7 @@ mod tests {
     #[tokio::test]
     async fn shared_042_adds_guard_clauses_on_a_fresh_database_all_null() {
         let mut conn = make_test_conn().await;
-        run_migrations(&mut conn, "shared", None).await.unwrap();
+        run_shared_before_wa_rebuild(&mut conn).await;
         let cols: Vec<(String, i64)> = sqlx::query_as(
             "SELECT name, \"notnull\" FROM pragma_table_info('focus_block_compositions') \
              WHERE name LIKE 'guard_%' ORDER BY name",
@@ -4428,7 +4433,7 @@ mod tests {
     #[tokio::test]
     async fn shared_042_applies_to_a_database_already_at_041_and_keeps_its_rows() {
         let mut conn = make_test_conn().await;
-        run_migrations(&mut conn, "shared", None).await.unwrap();
+        run_shared_before_wa_rebuild(&mut conn).await;
         sqlx::query("ALTER TABLE focus_block_compositions DROP COLUMN guard_clauses")
             .execute(&mut conn)
             .await
@@ -4444,7 +4449,7 @@ mod tests {
             .unwrap();
         assert!(before.0 > 0, "the seed rows are there");
 
-        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 6);
+        assert_eq!(run_shared_before_wa_rebuild(&mut conn).await, 6);
 
         let after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM focus_block_compositions")
             .fetch_one(&mut conn)
@@ -4483,7 +4488,7 @@ mod tests {
                 .await
                 .unwrap();
         let versions: Vec<i64> = versions.into_iter().map(|v| v.0).collect();
-        assert_eq!(versions, (1..=47).collect::<Vec<i64>>());
+        assert_eq!(versions, (1..=48).collect::<Vec<i64>>());
         let description: String =
             sqlx::query_scalar("SELECT description FROM schema_version WHERE version = 8")
                 .fetch_one(&mut conn)
@@ -4842,7 +4847,7 @@ mod tests {
     #[tokio::test]
     async fn shared_044_applies_to_a_database_at_043_with_closed_defaults() {
         let mut conn = make_test_conn().await;
-        run_migrations(&mut conn, "shared", None).await.unwrap();
+        run_shared_before_wa_rebuild(&mut conn).await;
         drop_shared_044(&mut conn).await;
         // The runner applies what is above the highest recorded version, so a
         // database at 043 has neither 044 nor 045.
@@ -4870,7 +4875,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 4);
+        assert_eq!(run_shared_before_wa_rebuild(&mut conn).await, 4);
 
         let row: (String, i64) = sqlx::query_as(
             "SELECT collection_consent, collection_consent_version FROM focus_settings",
@@ -4894,7 +4899,7 @@ mod tests {
             .await
             .expect_err("the CHECK refuses an unknown posture");
         assert_eq!(
-            run_migrations(&mut conn, "shared", None).await.unwrap(),
+            run_shared_before_wa_rebuild(&mut conn).await,
             0,
             "a second run is a no-op"
         );
@@ -4907,7 +4912,7 @@ mod tests {
     #[tokio::test]
     async fn shared_045_applies_to_a_database_at_044_and_is_safe_to_run_again() {
         let mut conn = make_test_conn().await;
-        run_migrations(&mut conn, "shared", None).await.unwrap();
+        run_shared_before_wa_rebuild(&mut conn).await;
         sqlx::query("DROP TABLE model_capabilities")
             .execute(&mut conn)
             .await
@@ -4917,7 +4922,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 3);
+        assert_eq!(run_shared_before_wa_rebuild(&mut conn).await, 3);
 
         let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_capabilities")
             .fetch_one(&mut conn)
@@ -4980,7 +4985,7 @@ mod tests {
             .execute(&mut conn)
             .await
             .unwrap();
-        assert_eq!(run_migrations(&mut conn, "shared", None).await.unwrap(), 3);
+        assert_eq!(run_shared_before_wa_rebuild(&mut conn).await, 3);
         let kept: String = sqlx::query_scalar(
             "SELECT attained_bar FROM model_capabilities
               WHERE model_id = 'llama3.1:8b' AND profile = 'rma_letter'",
@@ -4990,7 +4995,7 @@ mod tests {
         .unwrap();
         assert_eq!(kept, "standard");
         assert_eq!(
-            run_migrations(&mut conn, "shared", None).await.unwrap(),
+            run_shared_before_wa_rebuild(&mut conn).await,
             0,
             "a second run is a no-op"
         );
@@ -5491,6 +5496,21 @@ mod tests {
     /// Builds a "before" database: applies every `prefix` schema file with
     /// version <= `max_version`, statement by statement, leaving the
     /// connection's foreign-key enforcement on.
+    /// items.id=903: shared_048 re-seeds the Writing Assistant (DELETE then INSERT of its
+    /// rows), so the tests of 039 to 045, which inspect the shared_038 seed rows on a
+    /// fresh or hand-built older database, run the chain up to shared_047 only.
+    const BEFORE_WA_REBUILD: u32 = 47;
+
+    async fn run_shared_before_wa_rebuild(conn: &mut SqliteConnection) -> u32 {
+        let steps: Vec<Step> = get_migration_steps("shared")
+            .into_iter()
+            .filter(|s| s.version <= BEFORE_WA_REBUILD)
+            .collect();
+        run_migrations_with_steps(conn, "shared", None, None, &steps)
+            .await
+            .unwrap()
+    }
+
     async fn apply_versions_up_to(conn: &mut SqliteConnection, prefix: &str, max_version: u32) {
         for (version, sql) in get_migration_files(prefix) {
             if version > max_version {

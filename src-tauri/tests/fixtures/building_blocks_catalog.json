@@ -76,6 +76,21 @@
       "capability_toggles": "template (the starter's words, authored per Focus as data), declared_inputs. Not exposed: any gate, routing tier, a provider or model, field_requirements.",
       "generic_customization_notes": "JSON {display_name, output_var, template, declared_inputs}, deny_unknown_fields, validated at LOAD. The template names only tokens listed in declared_inputs, each of which must be an earlier row's output variable or a system token the external lint allows. Nothing else is configurable.",
       "source": "qr_docs.db building_blocks id 19, read with db_query.py, exported 2026-11-15"
+    },
+    {
+      "stable_id": "pc-03",
+      "name": "Multi-turn elicitation-to-completion",
+      "kind": "model",
+      "block_kind": "promoted_from_focus",
+      "invocation_mode": "inline_composable",
+      "catalog_status": "promotion_candidate",
+      "description": "Conversational information-gathering that continues until a completeness condition is met (not a fixed turn count), rather than a single-pass form.",
+      "known_adopters": "Writing Assistant (Step 1 content_collection) -- sole adopter",
+      "second_adopter_status": null,
+      "floor_declaration": "Model block: it expands at LOAD into an ordinary model-call step, so Gate 1, the spend gate, Gate 2, Gate 3 and the declared-inputs lint all apply on the one existing path, and the block itself never has provider access. It reads the user's own request, so the hosted rule keeps it local (a range that allows hosted_api may not name {user_input}), and while EXTERNAL_MODEL_BLOCKS_ALLOWED is false it loads only at highest_tier local_only with destination local. Every sentence it emits is data (block_data/document_types.json, phrases.elicit) and contains no {token} and no brace. Its output is one structured brief as a JSON object, which only the brief_put store operation validates, renders and stores as the content_brief artifact. It never names a model id.",
+      "capability_toggles": "document type (the form the brief is for), rounds (single only until items.id=906 adds multi-turn elicitation), class_preference, range. Not exposed: any gate, step_type, a model id, the brief's JSON shape.",
+      "generic_customization_notes": "JSON {common: {display_name, output_var, need: {task_type, difficulty, output_size}, declared_inputs, range: {quality_floor: {min, max}, highest_tier, destinations}, class_preference}, spec: {document_type, rounds, input_var}}, deny_unknown_fields at every level, validated at LOAD, closed vocabularies (rounds: single). declared_inputs must be exactly the names the generated template uses (input_var). The output variable holds one StructuredBrief JSON object {task, recipient, points}; store it with a brief_put row.",
+      "source": "PROPOSED by Code for items.id=903 (decisions.id=963 ruling 4): qr_docs.db building_blocks pc-03 has floor_declaration, capability_toggles and generic_customization_notes NULL; Chat-PM writes these three columns as given here (and may confirm catalog_status), then Code re-exports"
     }
   ]
 }

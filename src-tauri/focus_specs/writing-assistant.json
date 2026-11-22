@@ -1,0 +1,1281 @@
+{
+  "format_version": 1,
+  "focus": {
+    "focus_id": "writing-assistant",
+    "display_name": "Writing Assistant",
+    "description": "Craft polished writing for any purpose. Your voice, your context, your words — refined for clarity and impact.\n",
+    "version": "1.0",
+    "max_routing_tier": "anonymous_required",
+    "output_type": "general",
+    "status": "shipped",
+    "collection_posture": "per_field"
+  },
+  "rows": [
+    {
+      "action_id": "brief",
+      "block": "pc-03",
+      "config": {
+        "common": {
+          "display_name": "Reading your request...",
+          "output_var": "brief_json",
+          "need": {
+            "task_type": "quick_response",
+            "difficulty": "low",
+            "output_size": "short"
+          },
+          "declared_inputs": [
+            "user_input"
+          ],
+          "range": {
+            "quality_floor": {
+              "min": "basic",
+              "max": "high"
+            },
+            "highest_tier": "local_only",
+            "destinations": [
+              "local"
+            ]
+          },
+          "class_preference": null
+        },
+        "spec": {
+          "document_type": "essay_section",
+          "rounds": "single",
+          "input_var": "user_input"
+        }
+      },
+      "guard": {
+        "var": "content_brief",
+        "op": "absent"
+      },
+      "guard_clauses": [
+        {
+          "var": "launch_mode",
+          "op": "ne",
+          "value": "quick"
+        }
+      ]
+    },
+    {
+      "action_id": "brief_store",
+      "guard": {
+        "var": "content_brief",
+        "op": "absent"
+      },
+      "guard_clauses": [
+        {
+          "var": "launch_mode",
+          "op": "ne",
+          "value": "quick"
+        }
+      ],
+      "store": {
+        "op": "brief_put",
+        "target": "brief_state",
+        "args": {
+          "value": "brief_json"
+        }
+      }
+    },
+    {
+      "action_id": "brief_reply",
+      "config": {
+        "display_name": "Showing your brief...",
+        "guide_id": "writing-voice",
+        "task_type": "quick_response",
+        "routing_tier": 1,
+        "step_type": "generate",
+        "output_var": "brief_reply",
+        "prompt_template": "Below is a brief prepared from the user's request, as JSON. Restate it for the user as a short plain list: what the document is for, who it is for, and the points it will cover. Then say in one sentence that their next message will start the draft. Do not write the document.\n\nBrief: {brief_json}",
+        "options_override": {
+          "temperature": 0.2,
+          "num_predict": 400
+        }
+      },
+      "guard": {
+        "var": "brief_state",
+        "op": "eq",
+        "value": "stored"
+      },
+      "guard_clauses": [
+        {
+          "var": "content_brief",
+          "op": "absent"
+        },
+        {
+          "var": "launch_mode",
+          "op": "ne",
+          "value": "quick"
+        }
+      ]
+    },
+    {
+      "action_id": "brief_retry",
+      "config": {
+        "display_name": "Asking for the details...",
+        "guide_id": "writing-voice",
+        "task_type": "quick_response",
+        "routing_tier": 1,
+        "step_type": "generate",
+        "output_var": "brief_retry",
+        "prompt_template": "Tell the user, in one or two plain sentences, that to write their document you need to know what it is for, who it is for and the points it must cover, and ask them to say those in their next message. Do not write the document.",
+        "options_override": {
+          "temperature": 0.2,
+          "num_predict": 400
+        }
+      },
+      "guard": {
+        "var": "brief_state",
+        "op": "ne",
+        "value": "stored"
+      },
+      "guard_clauses": [
+        {
+          "var": "content_brief",
+          "op": "absent"
+        },
+        {
+          "var": "launch_mode",
+          "op": "ne",
+          "value": "quick"
+        }
+      ]
+    },
+    {
+      "action_id": "quick_draft",
+      "block": "cb-12",
+      "config": {
+        "common": {
+          "display_name": "Writing your document...",
+          "output_var": "quick_text",
+          "need": {
+            "task_type": "creative_writing",
+            "difficulty": "medium",
+            "output_size": "medium"
+          },
+          "declared_inputs": [
+            "user_input"
+          ],
+          "range": {
+            "quality_floor": {
+              "min": "basic",
+              "max": "high"
+            },
+            "highest_tier": "local_only",
+            "destinations": [
+              "local"
+            ]
+          },
+          "class_preference": null
+        },
+        "spec": {
+          "document_type": "essay_section",
+          "brief_var": "user_input",
+          "sender_var": null,
+          "context_var": null
+        }
+      },
+      "guard": {
+        "var": "launch_mode",
+        "op": "eq",
+        "value": "quick"
+      },
+      "guard_clauses": [
+        {
+          "var": "working_draft",
+          "op": "absent"
+        }
+      ]
+    },
+    {
+      "action_id": "quick_check",
+      "block": "cb-06",
+      "config": {
+        "input_var": "quick_text",
+        "output_var": "quick_verdict",
+        "criteria": [
+          {
+            "name": "draft_not_empty",
+            "kind": "non_empty"
+          },
+          {
+            "name": "draft_min_length",
+            "kind": "min_length",
+            "min_length": 40
+          }
+        ],
+        "on_fail": "advisory"
+      },
+      "guard": {
+        "var": "launch_mode",
+        "op": "eq",
+        "value": "quick"
+      },
+      "guard_clauses": [
+        {
+          "var": "working_draft",
+          "op": "absent"
+        }
+      ]
+    },
+    {
+      "action_id": "quick_voice",
+      "block": "cb-13",
+      "config": {
+        "common": {
+          "display_name": "Putting it in your voice...",
+          "output_var": "final_text",
+          "need": {
+            "task_type": "quick_response",
+            "difficulty": "low",
+            "output_size": "medium"
+          },
+          "declared_inputs": [
+            "voice_profile",
+            "quick_text"
+          ],
+          "range": {
+            "quality_floor": {
+              "min": "basic",
+              "max": "high"
+            },
+            "highest_tier": "local_only",
+            "destinations": [
+              "local"
+            ]
+          },
+          "class_preference": null
+        },
+        "spec": {
+          "document_type": "essay_section",
+          "mode": "apply",
+          "input_var": "quick_text"
+        }
+      },
+      "guard": {
+        "var": "launch_mode",
+        "op": "eq",
+        "value": "quick"
+      },
+      "guard_clauses": [
+        {
+          "var": "working_draft",
+          "op": "absent"
+        }
+      ]
+    },
+    {
+      "action_id": "quick_store",
+      "guard": {
+        "var": "launch_mode",
+        "op": "eq",
+        "value": "quick"
+      },
+      "guard_clauses": [
+        {
+          "var": "working_draft",
+          "op": "absent"
+        }
+      ],
+      "store": {
+        "op": "artifact_put",
+        "target": "working_draft",
+        "args": {
+          "value": "final_text"
+        }
+      }
+    },
+    {
+      "action_id": "draft",
+      "block": "cb-12",
+      "config": {
+        "common": {
+          "display_name": "Writing your document...",
+          "output_var": "draft_text",
+          "need": {
+            "task_type": "creative_writing",
+            "difficulty": "medium",
+            "output_size": "medium"
+          },
+          "declared_inputs": [
+            "content_brief"
+          ],
+          "range": {
+            "quality_floor": {
+              "min": "basic",
+              "max": "high"
+            },
+            "highest_tier": "local_only",
+            "destinations": [
+              "local"
+            ]
+          },
+          "class_preference": null
+        },
+        "spec": {
+          "document_type": "essay_section",
+          "brief_var": "content_brief",
+          "sender_var": null,
+          "context_var": null
+        }
+      },
+      "guard": {
+        "var": "launch_mode",
+        "op": "ne",
+        "value": "high"
+      },
+      "guard_clauses": [
+        {
+          "var": "launch_mode",
+          "op": "ne",
+          "value": "quick"
+        },
+        {
+          "var": "working_draft",
+          "op": "absent"
+        }
+      ]
+    },
+    {
+      "action_id": "draft_check",
+      "block": "cb-06",
+      "config": {
+        "input_var": "draft_text",
+        "output_var": "check_verdict",
+        "criteria": [],
+        "on_fail": "advisory",
+        "draft_check": {
+          "document_type": "essay_section",
+          "emit": "verdict",
+          "attempt": 0,
+          "sources": [
+            {
+              "var": "content_brief"
+            }
+          ]
+        }
+      },
+      "guard": {
+        "var": "launch_mode",
+        "op": "ne",
+        "value": "high"
+      },
+      "guard_clauses": [
+        {
+          "var": "launch_mode",
+          "op": "ne",
+          "value": "quick"
+        },
+        {
+          "var": "content_brief",
+          "op": "present"
+        },
+        {
+          "var": "working_draft",
+          "op": "absent"
+        }
+      ]
+    },
+    {
+      "action_id": "draft_again",
+      "block": "cb-12",
+      "config": {
+        "common": {
+          "display_name": "Writing it again...",
+          "output_var": "draft_text",
+          "need": {
+            "task_type": "creative_writing",
+            "difficulty": "medium",
+            "output_size": "medium"
+          },
+          "declared_inputs": [
+            "content_brief"
+          ],
+          "range": {
+            "quality_floor": {
+              "min": "basic",
+              "max": "high"
+            },
+            "highest_tier": "local_only",
+            "destinations": [
+              "local"
+            ]
+          },
+          "class_preference": null
+        },
+        "spec": {
+          "document_type": "essay_section",
+          "brief_var": "content_brief",
+          "sender_var": null,
+          "context_var": null
+        }
+      },
+      "guard": {
+        "var": "check_verdict",
+        "op": "eq",
+        "value": "regenerate"
+      },
+      "guard_clauses": [
+        {
+          "var": "launch_mode",
+          "op": "eq",
+          "value": "medium"
+        },
+        {
+          "var": "working_draft",
+          "op": "absent"
+        }
+      ]
+    },
+    {
+      "action_id": "draft_check_again",
+      "block": "cb-06",
+      "config": {
+        "input_var": "draft_text",
+        "output_var": "check_verdict_again",
+        "criteria": [],
+        "on_fail": "advisory",
+        "draft_check": {
+          "document_type": "essay_section",
+          "emit": "verdict",
+          "attempt": 1,
+          "sources": [
+            {
+              "var": "content_brief"
+            }
+          ]
+        }
+      },
+      "guard": {
+        "var": "check_verdict",
+        "op": "eq",
+        "value": "regenerate"
+      },
+      "guard_clauses": [
+        {
+          "var": "launch_mode",
+          "op": "eq",
+          "value": "medium"
+        },
+        {
+          "var": "content_brief",
+          "op": "present"
+        }
+      ]
+    },
+    {
+      "action_id": "draft_report",
+      "block": "cb-06",
+      "config": {
+        "input_var": "draft_text",
+        "output_var": "check_report",
+        "criteria": [],
+        "on_fail": "advisory",
+        "draft_check": {
+          "document_type": "essay_section",
+          "emit": "report",
+          "attempt": 1,
+          "sources": [
+            {
+              "var": "content_brief"
+            }
+          ]
+        }
+      },
+      "guard": {
+        "var": "check_verdict",
+        "op": "present"
+      },
+      "guard_clauses": [
+        {
+          "var": "working_draft",
+          "op": "absent"
+        }
+      ]
+    },
+    {
+      "action_id": "draft_voice",
+      "block": "cb-13",
+      "config": {
+        "common": {
+          "display_name": "Putting it in your voice...",
+          "output_var": "final_text",
+          "need": {
+            "task_type": "quick_response",
+            "difficulty": "low",
+            "output_size": "medium"
+          },
+          "declared_inputs": [
+            "voice_profile",
+            "draft_text"
+          ],
+          "range": {
+            "quality_floor": {
+              "min": "basic",
+              "max": "high"
+            },
+            "highest_tier": "local_only",
+            "destinations": [
+              "local"
+            ]
+          },
+          "class_preference": null
+        },
+        "spec": {
+          "document_type": "essay_section",
+          "mode": "apply",
+          "input_var": "draft_text"
+        }
+      },
+      "guard": {
+        "var": "launch_mode",
+        "op": "ne",
+        "value": "high"
+      },
+      "guard_clauses": [
+        {
+          "var": "launch_mode",
+          "op": "ne",
+          "value": "quick"
+        },
+        {
+          "var": "content_brief",
+          "op": "present"
+        },
+        {
+          "var": "working_draft",
+          "op": "absent"
+        }
+      ]
+    },
+    {
+      "action_id": "draft_store",
+      "guard": {
+        "var": "launch_mode",
+        "op": "ne",
+        "value": "high"
+      },
+      "guard_clauses": [
+        {
+          "var": "launch_mode",
+          "op": "ne",
+          "value": "quick"
+        },
+        {
+          "var": "content_brief",
+          "op": "present"
+        },
+        {
+          "var": "working_draft",
+          "op": "absent"
+        }
+      ],
+      "store": {
+        "op": "artifact_put",
+        "target": "working_draft",
+        "args": {
+          "value": "final_text"
+        }
+      }
+    },
+    {
+      "action_id": "draft_report_store",
+      "guard": {
+        "var": "check_verdict",
+        "op": "present"
+      },
+      "guard_clauses": [
+        {
+          "var": "working_draft",
+          "op": "absent"
+        }
+      ],
+      "store": {
+        "op": "artifact_put",
+        "target": "validation_report",
+        "args": {
+          "value": "check_report"
+        }
+      }
+    },
+    {
+      "action_id": "revise",
+      "block": "cb-14",
+      "config": {
+        "common": {
+          "display_name": "Revising your document...",
+          "output_var": "revised_text",
+          "need": {
+            "task_type": "creative_writing",
+            "difficulty": "medium",
+            "output_size": "medium"
+          },
+          "declared_inputs": [
+            "user_input",
+            "working_draft"
+          ],
+          "range": {
+            "quality_floor": {
+              "min": "basic",
+              "max": "high"
+            },
+            "highest_tier": "local_only",
+            "destinations": [
+              "local"
+            ]
+          },
+          "class_preference": null
+        },
+        "spec": {
+          "document_type": "essay_section",
+          "draft_var": "working_draft",
+          "change_var": "user_input"
+        }
+      },
+      "guard": {
+        "var": "launch_mode",
+        "op": "ne",
+        "value": "high"
+      }
+    },
+    {
+      "action_id": "revise_report",
+      "block": "cb-06",
+      "config": {
+        "input_var": "revised_text",
+        "output_var": "revise_report",
+        "criteria": [],
+        "on_fail": "advisory",
+        "draft_check": {
+          "document_type": "essay_section",
+          "emit": "report",
+          "attempt": 1,
+          "sources": [
+            {
+              "var": "working_draft",
+              "weight": 0.0
+            }
+          ]
+        }
+      },
+      "guard": {
+        "var": "launch_mode",
+        "op": "ne",
+        "value": "high"
+      },
+      "guard_clauses": [
+        {
+          "var": "working_draft",
+          "op": "present"
+        }
+      ]
+    },
+    {
+      "action_id": "revise_voice",
+      "block": "cb-13",
+      "config": {
+        "common": {
+          "display_name": "Putting it in your voice...",
+          "output_var": "final_text",
+          "need": {
+            "task_type": "quick_response",
+            "difficulty": "low",
+            "output_size": "medium"
+          },
+          "declared_inputs": [
+            "voice_profile",
+            "revised_text"
+          ],
+          "range": {
+            "quality_floor": {
+              "min": "basic",
+              "max": "high"
+            },
+            "highest_tier": "local_only",
+            "destinations": [
+              "local"
+            ]
+          },
+          "class_preference": null
+        },
+        "spec": {
+          "document_type": "essay_section",
+          "mode": "apply",
+          "input_var": "revised_text"
+        }
+      },
+      "guard": {
+        "var": "launch_mode",
+        "op": "ne",
+        "value": "high"
+      },
+      "guard_clauses": [
+        {
+          "var": "working_draft",
+          "op": "present"
+        }
+      ]
+    },
+    {
+      "action_id": "revise_store",
+      "guard": {
+        "var": "launch_mode",
+        "op": "ne",
+        "value": "high"
+      },
+      "guard_clauses": [
+        {
+          "var": "working_draft",
+          "op": "present"
+        }
+      ],
+      "store": {
+        "op": "artifact_put",
+        "target": "working_draft",
+        "args": {
+          "value": "final_text"
+        }
+      }
+    },
+    {
+      "action_id": "revise_report_store",
+      "guard": {
+        "var": "launch_mode",
+        "op": "ne",
+        "value": "high"
+      },
+      "guard_clauses": [
+        {
+          "var": "working_draft",
+          "op": "present"
+        }
+      ],
+      "store": {
+        "op": "artifact_put",
+        "target": "validation_report",
+        "args": {
+          "value": "revise_report"
+        }
+      }
+    },
+    {
+      "action_id": "section_draft",
+      "block": "cb-12",
+      "config": {
+        "common": {
+          "display_name": "Writing the next section...",
+          "output_var": "section_text",
+          "need": {
+            "task_type": "creative_writing",
+            "difficulty": "medium",
+            "output_size": "medium"
+          },
+          "declared_inputs": [
+            "next_section"
+          ],
+          "range": {
+            "quality_floor": {
+              "min": "basic",
+              "max": "high"
+            },
+            "highest_tier": "local_only",
+            "destinations": [
+              "local"
+            ]
+          },
+          "class_preference": null
+        },
+        "spec": {
+          "document_type": "essay_section",
+          "brief_var": "next_section",
+          "sender_var": null,
+          "context_var": null
+        }
+      },
+      "guard": {
+        "var": "sections_state",
+        "op": "eq",
+        "value": "more"
+      },
+      "guard_clauses": [
+        {
+          "var": "launch_mode",
+          "op": "eq",
+          "value": "high"
+        }
+      ]
+    },
+    {
+      "action_id": "section_check",
+      "block": "cb-06",
+      "config": {
+        "input_var": "section_text",
+        "output_var": "section_report",
+        "criteria": [],
+        "on_fail": "advisory",
+        "draft_check": {
+          "document_type": "essay_section",
+          "emit": "report",
+          "attempt": 1,
+          "sources": [
+            {
+              "var": "content_brief",
+              "weight": 0.0
+            }
+          ],
+          "section_var": "section_heading"
+        }
+      },
+      "guard": {
+        "var": "sections_state",
+        "op": "eq",
+        "value": "more"
+      },
+      "guard_clauses": [
+        {
+          "var": "launch_mode",
+          "op": "eq",
+          "value": "high"
+        }
+      ]
+    },
+    {
+      "action_id": "section_voice",
+      "block": "cb-13",
+      "config": {
+        "common": {
+          "display_name": "Putting it in your voice...",
+          "output_var": "section_final",
+          "need": {
+            "task_type": "quick_response",
+            "difficulty": "low",
+            "output_size": "medium"
+          },
+          "declared_inputs": [
+            "voice_profile",
+            "section_text"
+          ],
+          "range": {
+            "quality_floor": {
+              "min": "basic",
+              "max": "high"
+            },
+            "highest_tier": "local_only",
+            "destinations": [
+              "local"
+            ]
+          },
+          "class_preference": null
+        },
+        "spec": {
+          "document_type": "essay_section",
+          "mode": "apply",
+          "input_var": "section_text"
+        }
+      },
+      "guard": {
+        "var": "sections_state",
+        "op": "eq",
+        "value": "more"
+      },
+      "guard_clauses": [
+        {
+          "var": "launch_mode",
+          "op": "eq",
+          "value": "high"
+        }
+      ]
+    },
+    {
+      "action_id": "section_append",
+      "guard": {
+        "var": "sections_state",
+        "op": "eq",
+        "value": "more"
+      },
+      "guard_clauses": [
+        {
+          "var": "launch_mode",
+          "op": "eq",
+          "value": "high"
+        }
+      ],
+      "store": {
+        "op": "artifact_append",
+        "target": "append_state",
+        "args": {
+          "value": "section_final"
+        }
+      }
+    },
+    {
+      "action_id": "section_too_long",
+      "config": {
+        "display_name": "Checking the length...",
+        "guide_id": "writing-voice",
+        "task_type": "quick_response",
+        "routing_tier": 1,
+        "step_type": "generate",
+        "output_var": "length_reply",
+        "prompt_template": "Tell the user plainly that their document has reached the longest length this assistant can keep, so the last section was not added, and that they can start a new chat for the rest. Do not write any of the document.",
+        "options_override": {
+          "temperature": 0.2,
+          "num_predict": 400
+        }
+      },
+      "guard": {
+        "var": "append_state",
+        "op": "eq",
+        "value": "too_long"
+      },
+      "guard_clauses": [
+        {
+          "var": "launch_mode",
+          "op": "eq",
+          "value": "high"
+        }
+      ]
+    },
+    {
+      "action_id": "section_report_store",
+      "guard": {
+        "var": "append_state",
+        "op": "ne",
+        "value": "too_long"
+      },
+      "guard_clauses": [
+        {
+          "var": "launch_mode",
+          "op": "eq",
+          "value": "high"
+        }
+      ],
+      "store": {
+        "op": "artifact_put",
+        "target": "validation_report",
+        "args": {
+          "value": "section_report"
+        }
+      }
+    },
+    {
+      "action_id": "high_revise",
+      "block": "cb-14",
+      "config": {
+        "common": {
+          "display_name": "Revising your document...",
+          "output_var": "high_revised_text",
+          "need": {
+            "task_type": "creative_writing",
+            "difficulty": "medium",
+            "output_size": "medium"
+          },
+          "declared_inputs": [
+            "user_input",
+            "working_draft"
+          ],
+          "range": {
+            "quality_floor": {
+              "min": "basic",
+              "max": "high"
+            },
+            "highest_tier": "local_only",
+            "destinations": [
+              "local"
+            ]
+          },
+          "class_preference": null
+        },
+        "spec": {
+          "document_type": "essay_section",
+          "draft_var": "working_draft",
+          "change_var": "user_input"
+        }
+      },
+      "guard": {
+        "var": "sections_state",
+        "op": "in",
+        "value": [
+          "none",
+          "done"
+        ]
+      },
+      "guard_clauses": [
+        {
+          "var": "launch_mode",
+          "op": "eq",
+          "value": "high"
+        }
+      ]
+    },
+    {
+      "action_id": "high_revise_report",
+      "block": "cb-06",
+      "config": {
+        "input_var": "high_revised_text",
+        "output_var": "high_revise_report",
+        "criteria": [],
+        "on_fail": "advisory",
+        "draft_check": {
+          "document_type": "essay_section",
+          "emit": "report",
+          "attempt": 1,
+          "sources": [
+            {
+              "var": "working_draft",
+              "weight": 0.0
+            }
+          ]
+        }
+      },
+      "guard": {
+        "var": "sections_state",
+        "op": "in",
+        "value": [
+          "none",
+          "done"
+        ]
+      },
+      "guard_clauses": [
+        {
+          "var": "launch_mode",
+          "op": "eq",
+          "value": "high"
+        },
+        {
+          "var": "working_draft",
+          "op": "present"
+        }
+      ]
+    },
+    {
+      "action_id": "high_revise_voice",
+      "block": "cb-13",
+      "config": {
+        "common": {
+          "display_name": "Putting it in your voice...",
+          "output_var": "final_text",
+          "need": {
+            "task_type": "quick_response",
+            "difficulty": "low",
+            "output_size": "medium"
+          },
+          "declared_inputs": [
+            "voice_profile",
+            "high_revised_text"
+          ],
+          "range": {
+            "quality_floor": {
+              "min": "basic",
+              "max": "high"
+            },
+            "highest_tier": "local_only",
+            "destinations": [
+              "local"
+            ]
+          },
+          "class_preference": null
+        },
+        "spec": {
+          "document_type": "essay_section",
+          "mode": "apply",
+          "input_var": "high_revised_text"
+        }
+      },
+      "guard": {
+        "var": "sections_state",
+        "op": "in",
+        "value": [
+          "none",
+          "done"
+        ]
+      },
+      "guard_clauses": [
+        {
+          "var": "launch_mode",
+          "op": "eq",
+          "value": "high"
+        },
+        {
+          "var": "working_draft",
+          "op": "present"
+        }
+      ]
+    },
+    {
+      "action_id": "high_revise_store",
+      "guard": {
+        "var": "sections_state",
+        "op": "in",
+        "value": [
+          "none",
+          "done"
+        ]
+      },
+      "guard_clauses": [
+        {
+          "var": "launch_mode",
+          "op": "eq",
+          "value": "high"
+        },
+        {
+          "var": "working_draft",
+          "op": "present"
+        }
+      ],
+      "store": {
+        "op": "artifact_put",
+        "target": "working_draft",
+        "args": {
+          "value": "final_text"
+        }
+      }
+    },
+    {
+      "action_id": "high_revise_report_store",
+      "guard": {
+        "var": "sections_state",
+        "op": "in",
+        "value": [
+          "none",
+          "done"
+        ]
+      },
+      "guard_clauses": [
+        {
+          "var": "launch_mode",
+          "op": "eq",
+          "value": "high"
+        },
+        {
+          "var": "working_draft",
+          "op": "present"
+        }
+      ],
+      "store": {
+        "op": "artifact_put",
+        "target": "validation_report",
+        "args": {
+          "value": "high_revise_report"
+        }
+      }
+    },
+    {
+      "action_id": "section_none",
+      "config": {
+        "display_name": "Checking the brief...",
+        "guide_id": "writing-voice",
+        "task_type": "quick_response",
+        "routing_tier": 1,
+        "step_type": "generate",
+        "output_var": "section_none_reply",
+        "prompt_template": "Tell the user in one or two plain sentences that their brief lists no points to write sections from, and ask them to start a new chat with the points the document must cover. Do not write the document.",
+        "options_override": {
+          "temperature": 0.2,
+          "num_predict": 400
+        }
+      },
+      "guard": {
+        "var": "sections_state",
+        "op": "ne",
+        "value": "more"
+      },
+      "guard_clauses": [
+        {
+          "var": "launch_mode",
+          "op": "eq",
+          "value": "high"
+        },
+        {
+          "var": "content_brief",
+          "op": "present"
+        },
+        {
+          "var": "working_draft",
+          "op": "absent"
+        }
+      ]
+    }
+  ],
+  "launch": [
+    {
+      "question_id": "mode",
+      "slot": "launch_mode",
+      "kind": "mode",
+      "asked": true,
+      "default_option": "medium",
+      "prompt": "How much care should go into it?",
+      "options": [
+        {
+          "option_id": "quick",
+          "label": "Quick",
+          "hint": "One step, straight from your message",
+          "envelope": {
+            "highest_tier": "local_only",
+            "destinations": [
+              "local"
+            ]
+          }
+        },
+        {
+          "option_id": "low",
+          "label": "Light",
+          "hint": "A brief first, then a draft",
+          "envelope": {}
+        },
+        {
+          "option_id": "medium",
+          "label": "Careful",
+          "hint": "Checked and drafted again if needed",
+          "envelope": {}
+        },
+        {
+          "option_id": "high",
+          "label": "Section by section",
+          "hint": "For longer documents",
+          "envelope": {
+            "quality_floor": {
+              "min": "standard",
+              "max": "high"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "question_id": "kind",
+      "slot": "document_type",
+      "kind": "choice",
+      "asked": true,
+      "default_option": "personal_note",
+      "prompt": "What are you writing?",
+      "options": [
+        {
+          "option_id": "personal_note",
+          "label": "Personal note"
+        },
+        {
+          "option_id": "cover_letter",
+          "label": "Cover letter"
+        },
+        {
+          "option_id": "rma_letter",
+          "label": "Return request letter"
+        },
+        {
+          "option_id": "complaint_email",
+          "label": "Complaint email"
+        },
+        {
+          "option_id": "essay_section",
+          "label": "Essay section"
+        },
+        {
+          "option_id": "creative_story",
+          "label": "Short story"
+        }
+      ]
+    }
+  ],
+  "ui_one_liner": "Write and polish letters, emails and notes in your own voice."
+}

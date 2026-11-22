@@ -1199,7 +1199,7 @@ pub(crate) fn composition_paths(
 /// step's non-empty output_var, or a block handler's declared output variable
 /// (ActionDefinition.output_var is None for a block row). Shared by the guard
 /// analysis (items.id=878) and the declared-inputs lint (items.id=879).
-fn row_output_vars(steps: &[ActionDefinition]) -> Vec<Option<String>> {
+pub(crate) fn row_output_vars(steps: &[ActionDefinition]) -> Vec<Option<String>> {
     steps
         .iter()
         .map(|s| match s.block_stable_id.as_deref() {
@@ -7760,6 +7760,67 @@ mod tests {
     /// create_persona() below already seeds one for "quick-ask" (one of
     /// persona_store::SEEDED_FOCUS_IDS) for every persona it creates.
     /// Mirrors commands::persona's own setup() (persona.rs:519-569).
+    /// items.id=903: the four-row shape the Writing Assistant had before its rebuild
+    /// (an analysis, a draft, a cb-06 check, a voice step), all local, as its own
+    /// composition-authored Focus, so the re-entry test keeps its subject.
+    async fn seed_reentry_fixture(pool: &sqlx::SqlitePool) {
+        sqlx::query(
+            "INSERT INTO focuses
+                (focus_id, display_name, description, version, max_routing_tier,
+                 output_type, suggest_in_focuses, multi_source_validation,
+                 generic_title_template, status, created_at, updated_at)
+             VALUES ('reentry-fixture', 'Re-entry Fixture', '', '1.0', 'local_only',
+                     'general', '[]', 0, 'Hidden item', 'shipped', 't', 't')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let plain = |out: &str, template: &str, step_type: &str| {
+            serde_json::json!({"routing_tier": 1, "task_type": "quick_response",
+                "step_type": step_type, "output_var": out, "prompt_template": template})
+            .to_string()
+        };
+        let rows = [
+            ("voice_analysis", None, plain("voice_analysis_output", "Analyse {user_input}", "generate")),
+            ("draft_writing", None, plain("draft_output", "Draft from {voice_analysis_output}", "generate")),
+            (
+                "quality_check",
+                Some("cb-06"),
+                serde_json::json!({"input_var": "draft_output", "output_var": "draft_quality_verdict",
+                    "criteria": [{"name": "draft_not_empty", "kind": "non_empty"}],
+                    "on_fail": "advisory"})
+                .to_string(),
+            ),
+            ("voice_transform", None, plain("final_output", "Refine {draft_output}", "voice_transform")),
+        ];
+        for (seq, (id, block, custom)) in rows.iter().enumerate() {
+            let comp = format!("reentry-fixture:{id}");
+            sqlx::query(
+                "INSERT INTO focus_block_compositions
+                    (id, focus_id, action_id, block_stable_id, sequence_index, created_at, updated_at)
+                 VALUES (?, 'reentry-fixture', ?, ?, ?, 't', 't')",
+            )
+            .bind(&comp)
+            .bind(id)
+            .bind(block)
+            .bind(seq as i64)
+            .execute(pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO focus_block_customization
+                    (id, composition_id, persona_id, customization, created_at, updated_at)
+                 VALUES (?, ?, NULL, ?, 't', 't')",
+            )
+            .bind(format!("{comp}:default"))
+            .bind(&comp)
+            .bind(custom)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
     async fn setup_shared_and_persona_for_resume_test(
         user_id: &str,
         persona_id: &str,
@@ -9707,6 +9768,20 @@ mod tests {
         let user_id = "reentry-user";
         let persona_id = "reentry-persona";
         let pool = setup_shared_and_persona_for_resume_test(user_id, persona_id).await;
+        seed_reentry_fixture(&pool).await;
+        crate::persistence::focus_settings_store::create_focus_settings(
+            &pool,
+            persona_id,
+            "reentry-fixture",
+            "bidirectional",
+            "shared",
+            2,
+            ExternalAccess::LocalOnly,
+            "open",
+            None,
+        )
+        .await
+        .expect("focus_settings row");
         let focus_run_id = uuid::Uuid::new_v4().to_string();
 
         {
@@ -9716,7 +9791,7 @@ mod tests {
             sqlx::query(
                 "INSERT INTO focus_runs
                  (id, focus_id, status, is_fast_lane, is_quick_ask, topic_id, user_input, started_at)
-                 VALUES (?, 'writing-assistant', 'awaiting_feedback', 0, 0, NULL, ?, ?)",
+                 VALUES (?, 'reentry-fixture', 'awaiting_feedback', 0, 0, NULL, ?, ?)",
             )
             .bind(&focus_run_id)
             .bind("Test user input for reentry")
@@ -9733,7 +9808,7 @@ mod tests {
             let mut seed_run: FocusRun = FocusRun::new(
                 user_id.to_owned(),
                 persona_id.to_owned(),
-                "writing-assistant".to_owned(),
+                "reentry-fixture".to_owned(),
                 pool.clone(),
                 scheduler,
                 "Test user input for reentry".to_owned(),
@@ -9823,7 +9898,7 @@ mod tests {
                 "quality_check".to_owned(),
                 "voice_transform".to_owned()
             ],
-            "writing-assistant now loads from the DB path with its cb-06 step (items.id=129)"
+            "the fixture loads from the DB path with its cb-06 step (the pre-903 Writing Assistant shape)"
         );
 
         let plan = run
@@ -10003,6 +10078,7 @@ mod tests {
         key_hex_str: &str,
     ) -> (sqlx::SqlitePool, String) {
         let pool = setup_shared_and_persona_for_resume_test(user_id, persona_id).await;
+        seed_reentry_fixture(&pool).await;
 
         crate::persistence::focus_settings_store::create_focus_settings(
             &pool,
@@ -10849,6 +10925,9 @@ mod tests {
     const WRITING_ASSISTANT_FOCUS: &str =
         include_str!("../../../app/core_artifacts/focuses/writing-assistant.focus");
 
+    /// items.id=903: the Writing Assistant's enumerated guard paths (constraint 5).
+    const WRITING_ASSISTANT_PATHS: usize = 78;
+
     /// The seeded writing-assistant row, loaded through the DB path only (no
     /// bundled-file cross-check).
     async fn seeded_wa(pool: &sqlx::SqlitePool) -> FocusDefinition {
@@ -10858,16 +10937,15 @@ mod tests {
             .expect("shared_038 seeds a writing-assistant row")
     }
 
-    /// PARITY: the DB-loaded Focus equals the parsed .focus field for field,
-    /// plus exactly one extra step (the cb-06 block).
+    /// items.id=903: the .focus file is display metadata and a local fallback. The DB
+    /// row keeps the file's display fields and ceiling (the drift and the stricter-tier
+    /// cross-check rely on both), and the file's one step is local.
     #[tokio::test]
-    async fn writing_assistant_db_focus_matches_the_focus_file_plus_one_block() {
+    async fn writing_assistant_db_focus_keeps_the_files_display_fields_and_ceiling() {
         with_temp_data_root(async {
             let pool = block_load_pool().await;
             let db = seeded_wa(&pool).await;
             let yaml = parse_focus_text(WRITING_ASSISTANT_FOCUS).expect("file parses");
-
-            // Focus level.
             assert_eq!(db.focus_id, yaml.focus_id);
             assert_eq!(db.display_name, yaml.display_name);
             assert_eq!(db.description, yaml.description);
@@ -10875,213 +10953,64 @@ mod tests {
             assert_eq!(db.max_routing_tier, yaml.max_routing_tier);
             assert_eq!(db.max_routing_tier, ExternalAccess::AnonymousRequired);
             assert_eq!(db.output_type, yaml.output_type);
-            assert_eq!(db.suggest_in_focuses, yaml.suggest_in_focuses);
-            assert_eq!(db.multi_source_validation, yaml.multi_source_validation);
-            assert_eq!(db.generic_title_template, yaml.generic_title_template);
-            assert_eq!(
-                db.high_priority_trigger.is_some(),
-                yaml.high_priority_trigger.is_some()
+            assert_eq!(yaml.steps.len(), 1);
+            assert_eq!(yaml.steps[0].routing_tier, ExternalAccess::LocalOnly);
+            assert!(
+                yaml.steps[0].external_access_override.is_none()
+                    || yaml.steps[0].external_access_override == Some(ExternalAccess::LocalOnly)
             );
-
-            // Exactly one extra step, and it is cb-06 between the two.
-            assert_eq!(db.steps.len(), yaml.steps.len() + 1);
-            let ids: Vec<&str> = db.steps.iter().map(|s| s.action_id.as_str()).collect();
-            assert_eq!(
-                ids,
-                [
-                    "voice_analysis",
-                    "draft_writing",
-                    "quality_check",
-                    "voice_transform"
-                ]
-            );
-            let blocks: Vec<&ActionDefinition> = db
-                .steps
-                .iter()
-                .filter(|s| s.block_stable_id.is_some())
-                .collect();
-            assert_eq!(blocks.len(), 1);
-            assert_eq!(blocks[0].action_id, "quality_check");
-            assert_eq!(blocks[0].block_stable_id.as_deref(), Some("cb-06"));
-
-            // Every ordinary step, field for field.
-            let ordinary: Vec<&ActionDefinition> = db
-                .steps
-                .iter()
-                .filter(|s| s.block_stable_id.is_none())
-                .collect();
-            assert_eq!(ordinary.len(), yaml.steps.len());
-            for (d, y) in ordinary.iter().zip(yaml.steps.iter()) {
-                let n = &y.action_id;
-                assert_eq!(d.action_id, y.action_id);
-                assert_eq!(d.display_name, y.display_name, "{n}");
-                assert_eq!(d.guide_id, y.guide_id, "{n}");
-                assert_eq!(d.guide_id, "writing-voice", "{n}");
-                assert_eq!(d.task_type, y.task_type, "{n}");
-                assert_eq!(d.routing_tier, y.routing_tier, "{n}");
-                assert_eq!(d.step_type, y.step_type, "{n}");
-                assert_eq!(d.output_var, y.output_var, "{n}");
-                assert_eq!(d.prompt_template, y.prompt_template, "{n}");
-                assert_eq!(d.field_requirements, y.field_requirements, "{n}");
-                assert_eq!(d.options_override, y.options_override, "{n}");
-                assert_eq!(
-                    d.external_access_override, y.external_access_override,
-                    "{n}"
-                );
-                assert_eq!(d.requires_user_handoff, y.requires_user_handoff, "{n}");
-                assert_eq!(d.revisitable, y.revisitable, "{n}");
-                // items.id=879: the declaration is part of the parity.
-                assert_eq!(d.declared_inputs, y.declared_inputs, "{n}");
-                assert!(d.block_stable_id.is_none() && d.block_customization.is_none());
-                assert!(d.schedule_trigger.is_none() && y.schedule_trigger.is_none());
-            }
         })
         .await;
     }
 
-    /// EXTERNAL-STEP PIN: adding cb-06 adds no external behavior and does not
-    /// change what voice_transform reads or what becomes the run's output.
+    /// items.id=903 constraints 5 to 7: every Writing Assistant step is local, no step
+    /// names {persona_context}, every recorded variable is token-shaped, the only rows
+    /// that read {user_input} are the local brief, quick-draft and revise rows, no
+    /// launch name reaches any template, and the old external draft step is gone.
     #[tokio::test]
-    async fn writing_assistant_external_step_pin() {
+    async fn writing_assistant_is_local_and_reads_the_request_only_where_planned() {
         with_temp_data_root(async {
             let pool = block_load_pool().await;
             let db = seeded_wa(&pool).await;
-            let yaml = parse_focus_text(WRITING_ASSISTANT_FOCUS).unwrap();
-
-            // Every block step is LocalOnly, no override, no handoff.
-            for b in db.steps.iter().filter(|s| s.block_stable_id.is_some()) {
-                assert_eq!(b.routing_tier, ExternalAccess::LocalOnly);
-                assert!(b.external_access_override.is_none());
-                assert!(!b.requires_user_handoff);
-            }
-            // Step tiers match the YAML: only draft_writing is external.
-            for y in &yaml.steps {
-                let d = db
-                    .steps
-                    .iter()
-                    .find(|s| s.action_id == y.action_id)
-                    .unwrap();
-                assert_eq!(d.routing_tier, y.routing_tier, "{}", y.action_id);
-            }
-            let ext: Vec<&str> = db
-                .steps
-                .iter()
-                .filter(|s| s.routing_tier != ExternalAccess::LocalOnly)
-                .map(|s| s.action_id.as_str())
-                .collect();
-            assert_eq!(ext, ["draft_writing"]);
-            // items.id=879: and its declaration, in the seed and in the file.
-            for set in [&db, &yaml] {
-                let dw = set
-                    .steps
-                    .iter()
-                    .find(|s| s.action_id == "draft_writing")
-                    .unwrap();
-                assert_eq!(
-                    dw.declared_inputs,
-                    ["user_input", "voice_analysis_output", "voice_profile"]
-                );
-            }
-
-            // The block is not directly before an external step and is not last.
-            let qi = db
-                .steps
-                .iter()
-                .position(|s| s.block_stable_id.is_some())
-                .unwrap();
-            let next = &db.steps[qi + 1];
-            assert_eq!(next.action_id, "voice_transform");
-            assert_eq!(next.routing_tier, ExternalAccess::LocalOnly);
-            assert!(qi + 1 < db.steps.len());
-
-            // voice_transform's input resolution is unchanged: it names
-            // draft_output explicitly, never previous_output, and nothing
-            // reads the verdict variable.
-            let vt = db
-                .steps
-                .iter()
-                .find(|s| s.action_id == "voice_transform")
-                .unwrap();
-            assert!(vt.prompt_template.contains("{draft_output}"));
-            assert!(!vt.prompt_template.contains("{previous_output}"));
-            let verdict_var = db.steps[qi]
-                .block_customization
-                .as_ref()
-                .and_then(|c| c["output_var"].as_str())
-                .unwrap()
-                .to_owned();
-            for s in &db.steps {
-                assert!(
-                    !s.prompt_template.contains(&format!("{{{verdict_var}}}")),
-                    "{} reads the verdict",
-                    s.action_id
-                );
-            }
-            // The verdict never shares an output_var with a real step.
             assert!(db
                 .steps
                 .iter()
-                .filter(|s| s.block_stable_id.is_none())
-                .all(|s| s.output_var.as_deref() != Some(verdict_var.as_str())));
-
-            // The run's output (last_output) stays voice_transform's: the
-            // block does not become output().
-            assert_eq!(db.steps.last().unwrap().action_id, "voice_transform");
-            assert_eq!(
-                db.steps.last().unwrap().output_var.as_deref(),
-                Some("final_output")
-            );
-        })
-        .await;
-    }
-
-    /// END TO END over the seeded row: run the real cb-06 step, dispatched
-    /// through execute_step, over a track holding the Writing Assistant's real
-    /// earlier outputs. The generate steps themselves are covered by parity
-    /// and need a model, so a real Tier 2 run stays a by-hand check.
-    #[tokio::test]
-    async fn writing_assistant_seeded_cb06_step_runs_over_a_seeded_track() {
-        with_temp_data_root(async {
-            let pool = block_load_pool().await;
-            let db = seeded_wa(&pool).await;
-            let step = db
+                .all(|s| s.routing_tier == ExternalAccess::LocalOnly && !s.requires_user_handoff));
+            let mut reads_request: Vec<&str> = db
                 .steps
                 .iter()
-                .find(|s| s.block_stable_id.is_some())
-                .unwrap()
-                .clone();
-
-            for (draft, expect_pass) in [
-                (
-                    "A solid draft that is comfortably longer than forty characters.",
-                    true,
-                ),
-                ("too short", false),
-            ] {
-                let mut run = tier3_ready_run(false);
-                run.focus_def = Some(db.clone());
-                let tt = run.task_track.as_mut().unwrap();
-                tt.add_step(TaskStep {
-                    action_id: "voice_analysis".to_owned(),
-                    output_var: Some("voice_analysis_output".to_owned()),
-                    content: "analysis".to_owned(),
-                    sensitivity_severity: 1,
-                    routing_tier_used: 1,
-                    personal_flagged: false,
-                    audit_unavailable: false,
-                });
-                tt.add_step(draft_step(draft));
-
-                assert!(run.execute_step(&step, 2).await.unwrap().is_none());
-
-                let tt = run.task_track.as_ref().unwrap();
-                assert_eq!(tt.get_output("draft_output"), Some(draft));
-                let verdict = tt.get_output("draft_quality_verdict").unwrap();
-                assert_eq!(verdict.contains("not passed"), !expect_pass, "{verdict}");
-                assert!(!verdict.contains("comfortably"), "no draft text: {verdict}");
-                assert!(!verdict.contains("too short"), "no draft text: {verdict}");
-                assert_eq!(tt.steps().len(), 3);
+                .filter(|s| {
+                    crate::conductor::executor::find_tokens(&s.prompt_template)
+                        .iter()
+                        .any(|t| t == "user_input")
+                })
+                .map(|s| s.action_id.as_str())
+                .collect();
+            reads_request.sort_unstable();
+            assert_eq!(
+                reads_request,
+                ["brief", "high_revise", "quick_draft", "revise"]
+            );
+            for s in &db.steps {
+                let names = crate::conductor::executor::find_tokens(&s.prompt_template);
+                assert!(
+                    !names.iter().any(|t| t == "persona_context"),
+                    "{}",
+                    s.action_id
+                );
+                for launch in crate::conductor::bound_spec::LAUNCH_NAMES {
+                    assert!(
+                        !names.iter().any(|t| t == launch),
+                        "{}: {launch}",
+                        s.action_id
+                    );
+                }
             }
+            assert!(row_output_vars(&db.steps)
+                .iter()
+                .flatten()
+                .all(|v| crate::conductor::executor::is_token_name(v)));
+            assert!(db.steps.iter().all(|s| s.action_id != "draft_writing"));
         })
         .await;
     }
@@ -11096,7 +11025,7 @@ mod tests {
             // Seeded row agrees with the file.
             let def = load_focus_definition(&pool, "writing-assistant").await.unwrap();
             assert_eq!(def.max_routing_tier, ExternalAccess::AnonymousRequired);
-            assert_eq!(def.steps.len(), 4);
+            assert_eq!(def.steps.len(), 33);
 
             // A widened DB row cannot widen the Focus.
             sqlx::query("UPDATE focuses SET max_routing_tier = 'unrestricted' WHERE focus_id = 'writing-assistant'")
@@ -11516,17 +11445,25 @@ mod tests {
         .await;
     }
 
-    /// PARITY: the seeded Writing Assistant has no guards and exactly one path.
+    /// items.id=903 constraint 5: launch_mode is the Writing Assistant's only guarded
+    /// launch slot (document_type changes expansion, never a guard), and its path count
+    /// is pinned well inside the MAX_PATHS cap.
     #[tokio::test]
-    async fn writing_assistant_has_no_guards_and_one_path() {
+    async fn writing_assistant_guards_one_launch_slot_and_pins_its_path_count() {
         with_temp_data_root(async {
             let pool = block_load_pool().await;
             let db = seeded_wa(&pool).await;
-            assert!(db.steps.iter().all(|s| s.guard.is_none()));
-            assert_eq!(
-                analyze_guarded_composition("writing-assistant", &db.steps).unwrap(),
-                1
-            );
+            let guarded: std::collections::BTreeSet<&str> = db
+                .steps
+                .iter()
+                .flat_map(|s| s.guards())
+                .map(|g| g.var.as_str())
+                .filter(|v| crate::conductor::bound_spec::LAUNCH_NAMES.contains(v))
+                .collect();
+            assert_eq!(guarded.into_iter().collect::<Vec<_>>(), ["launch_mode"]);
+            let paths = analyze_guarded_composition("writing-assistant", &db.steps).unwrap();
+            assert_eq!(paths, WRITING_ASSISTANT_PATHS);
+            assert!(paths <= guard::MAX_PATHS / 2, "{paths}");
         })
         .await;
     }
@@ -12787,7 +12724,6 @@ steps:
     /// Pinned so that declaring inputs makes nothing newly external or reachable.
     fn shipped_external_steps(id: &str) -> &'static [&'static str] {
         match id {
-            "writing-assistant" => &["draft_writing"],
             "research-and-buy" => &["research", "recommendation"],
             "role-assessment" => &["fit_analysis", "salary_research", "disposition"],
             "api-chat" => &["reply"],
@@ -12952,44 +12888,26 @@ steps:
         lint_declared_inputs("pc-yaml", &def.steps).unwrap();
     }
 
-    /// shared_038 seeded draft_writing WITHOUT a declaration. An existing
-    /// install holding that row fails the lint (which is why shared_040 exists),
-    /// and the repaired row loads.
+    /// items.id=903: shared_048 replaces the Writing Assistant's rows, so the stale
+    /// shared_038 draft_writing row (and the external step it carried) is gone from a
+    /// migrated database, and what is seeded loads.
     #[tokio::test]
-    async fn declared_inputs_a_stale_writing_assistant_seed_row_fails_and_the_repair_loads() {
+    async fn declared_inputs_the_old_writing_assistant_seed_rows_are_gone() {
         with_temp_data_root(async {
             let pool = block_load_pool().await;
-            sqlx::query(
-                "UPDATE focus_block_customization \
-                 SET customization = json_remove(customization, '$.declared_inputs') \
-                 WHERE id = 'writing-assistant:draft_writing:default'",
+            let old: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM focus_block_customization \
+                 WHERE id LIKE 'writing-assistant:%' \
+                   AND (id LIKE '%draft_writing%' OR id LIKE '%voice_analysis%')",
             )
-            .execute(&pool)
+            .fetch_one(&pool)
             .await
             .unwrap();
-            let err = load_focus_definition_from_db(&pool, "writing-assistant")
-                .await
-                .unwrap_err();
-            let LifecycleError::ValidationFailed(m) = err else {
-                panic!("expected ValidationFailed");
-            };
-            assert!(
-                m.contains("step 'draft_writing'") && m.contains("does not declare"),
-                "{m}"
-            );
-
-            sqlx::query(
-                "UPDATE focus_block_customization \
-                 SET customization = json_set(customization, '$.declared_inputs', \
-                     json('[\"user_input\",\"voice_analysis_output\",\"voice_profile\"]')) \
-                 WHERE id = 'writing-assistant:draft_writing:default'",
-            )
-            .execute(&pool)
-            .await
-            .unwrap();
+            assert_eq!(old, 0);
             assert!(load_focus_definition_from_db(&pool, "writing-assistant")
                 .await
-                .is_ok());
+                .unwrap()
+                .is_some());
         })
         .await;
     }
@@ -15658,13 +15576,16 @@ steps:
             .await
             .unwrap();
             assert_eq!(n, 0);
+            // items.id=903: the Writing Assistant is the only shipped Focus whose rows
+            // carry a clause list.
             let rows: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM focus_block_compositions WHERE guard_clauses IS NOT NULL",
+                "SELECT COUNT(*) FROM focus_block_compositions \
+                 WHERE guard_clauses IS NOT NULL AND focus_id <> 'writing-assistant'",
             )
             .fetch_one(&pool)
             .await
             .unwrap();
-            assert_eq!(rows, 0, "no shipped row carries a clause list");
+            assert_eq!(rows, 0, "no other shipped row carries a clause list");
         })
         .await;
     }

@@ -10,7 +10,8 @@
       "length": "Aim for between %min_words% and %max_words% words.",
       "brief_label": "The brief:",
       "sender_label": "Sender details (use only where the format or a point calls for them):",
-      "context_label": "Background about the writer (use only where a point calls for it):"
+      "context_label": "Background about the writer (use only where a point calls for it):",
+      "section_label": "Write only the section of the document that covers this point, without a heading:"
     },
     "voice": {
       "apply_lead": "Rewrite the draft below so it reads in the writer's voice. Keep every fact and all of the meaning. Change wording, rhythm and tone only, and add nothing new.",
@@ -38,6 +39,13 @@
       "task_label": "Task:",
       "recipient_label": "Recipient:",
       "points_label": "Points and facts to cover:"
+    },
+    "elicit": {
+      "lead": "Read the request below and set out what the %form% written from it must contain.",
+      "shape": "Answer with one JSON object and nothing else. It has three keys: task, a short phrase saying what the document is for; recipient, who it is for, or null when the request does not say; and points, a list of strings, one point or fact to cover in each.",
+      "only_supplied": "Use only what the request says. Do not add any fact, number, name, place or date, and do not write a placeholder.",
+      "output_only": "Output only the JSON object, with no opening or closing remarks and no code fence.",
+      "request_label": "The request:"
     }
   },
   "check": {

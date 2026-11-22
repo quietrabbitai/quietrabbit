@@ -269,10 +269,11 @@ async fn a_focus_with_no_model_step_has_no_plan_and_reads_nothing() {
 /// takes the old path. Reads the real loaded definitions (the six bundled .focus files
 /// and every Focus row seeded in shared.db).
 #[tokio::test]
-async fn no_shipped_focus_has_a_model_block_or_a_plan() {
+async fn no_shipped_focus_but_the_writing_assistant_has_a_model_block_or_a_plan() {
     with_temp_shared_db(|pool| async move {
+        // items.id=903: the Writing Assistant is built on model blocks (its plan is
+        // tested with the Focus); every other shipped Focus has none.
         let mut ids: Vec<String> = [
-            "writing-assistant",
             "quick-ask",
             "research-and-buy",
             "role-assessment",
@@ -287,11 +288,11 @@ async fn no_shipped_focus_has_a_model_block_or_a_plan() {
             .await
             .unwrap();
         for r in rows {
-            if !ids.contains(&r) {
+            if !ids.contains(&r) && r != "writing-assistant" {
                 ids.push(r);
             }
         }
-        assert!(ids.len() >= 6);
+        assert!(ids.len() >= 5);
         let dead = dead_pool();
         for id in ids {
             let def = crate::conductor::lifecycle::load_focus_definition(&pool, &id)

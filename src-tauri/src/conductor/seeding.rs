@@ -393,6 +393,27 @@ pub async fn read_seeds(
         }
     }
 
+    // items.id=903: the section names, from the two artifacts (conductor::sections).
+    if wants(spec::NEXT_SECTION) || wants(spec::SECTION_HEADING) || wants(spec::SECTIONS_STATE) {
+        let brief = read_artifact(conn, context_key, focus_id, ArtifactKind::ContentBrief).await?;
+        let draft = read_artifact(conn, context_key, focus_id, ArtifactKind::WorkingDraft).await?;
+        let label = &crate::conductor::model_block::document_type::registry()
+            .map_err(|e| store_err(spec::SECTIONS_STATE, e))?
+            .phrases
+            .draft
+            .section_label;
+        let s = crate::conductor::sections::compute(brief.as_deref(), draft.as_deref(), label);
+        if wants(spec::SECTIONS_STATE) {
+            out.insert(spec::SECTIONS_STATE.to_owned(), s.state.to_owned());
+        }
+        if wants(spec::SECTION_HEADING) {
+            out.insert(spec::SECTION_HEADING.to_owned(), cap(s.section_heading));
+        }
+        if wants(spec::NEXT_SECTION) {
+            out.insert(spec::NEXT_SECTION.to_owned(), cap(s.next_section));
+        }
+    }
+
     // Every value must satisfy its own spec, and every Always name must exist:
     // a violation fails the pass rather than reaching a prompt.
     for name in names {

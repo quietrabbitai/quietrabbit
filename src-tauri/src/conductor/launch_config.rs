@@ -953,16 +953,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_shipped_focus_declares_a_question_yet() {
-        // decisions.id=948 point 6: no real questions or modes ship in items.id=897.
-        // Writing Assistant's ship with its rebuild (items.id=903).
+    async fn only_the_writing_assistant_declares_questions() {
+        // decisions.id=948 point 6: no real questions or modes shipped in items.id=897.
+        // Writing Assistant's ship with its rebuild (items.id=903): two questions.
         let (pool, _dir) = migrated().await;
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM focus_launch_questions")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM focus_launch_questions WHERE focus_id <> 'writing-assistant'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(n, 0);
-        for f in ["writing-assistant", "quick-ask", "nothing"] {
+        let wa: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM focus_launch_questions WHERE focus_id = 'writing-assistant'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(wa, 2);
+        for f in ["quick-ask", "nothing"] {
             assert!(read_unvalidated(&pool, f).await.unwrap().is_none(), "{f}");
         }
     }

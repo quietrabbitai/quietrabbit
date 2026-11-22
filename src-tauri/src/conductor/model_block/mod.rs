@@ -54,6 +54,7 @@ pub mod config;
 pub mod document_type;
 
 pub(crate) mod draft;
+pub(crate) mod elicit;
 pub(crate) mod revise;
 pub(crate) mod voice;
 
@@ -111,6 +112,8 @@ pub enum BlockSpec {
     Draft(draft::DraftSpec),
     Voice(voice::VoiceSpec),
     Revise(revise::ReviseSpec),
+    /// items.id=903: pc-03 in its one-round form.
+    Elicit(elicit::ElicitSpec),
 }
 
 /// A parsed, validated customization JSON of a model block.
@@ -194,14 +197,24 @@ pub static CB14_REVISE: ModelBlockSpec = ModelBlockSpec {
     example: revise::example,
 };
 
+/// items.id=903 (decisions.id=963 ruling 4): pc-03, elicit, one round.
+pub static PC03_ELICIT: ModelBlockSpec = ModelBlockSpec {
+    stable_id: "pc-03",
+    display_name: "Elicit a brief",
+    parse: elicit::parse,
+    expand: elicit::expand,
+    example: elicit::example,
+};
+
 /// Every model block's stable id.
-pub const MODEL_STABLE_IDS: &[&str] = &["cb-12", "cb-13", "cb-14"];
+pub const MODEL_STABLE_IDS: &[&str] = &["cb-12", "cb-13", "cb-14", "pc-03"];
 
 pub fn model_block_spec(stable_id: &str) -> Option<&'static ModelBlockSpec> {
     match stable_id {
         "cb-12" => Some(&CB12_DRAFT),
         "cb-13" => Some(&CB13_VOICE),
         "cb-14" => Some(&CB14_REVISE),
+        "pc-03" => Some(&PC03_ELICIT),
         _ => None,
     }
 }

@@ -442,8 +442,11 @@ async fn a_chatless_run_is_approved_by_its_token_which_the_run_consumes_even_whe
 #[tokio::test]
 async fn a_focus_has_a_model_block_only_when_its_composition_cites_one() {
     with_temp_shared_db(|pool| async move {
+        // items.id=903: the Writing Assistant is built on model blocks.
+        assert!(focus_has_model_block(&pool, "writing-assistant")
+            .await
+            .unwrap());
         for id in [
-            "writing-assistant",
             "quick-ask",
             "research-and-buy",
             "role-assessment",
@@ -474,9 +477,7 @@ async fn a_focus_has_a_model_block_only_when_its_composition_cites_one() {
         .await
         .unwrap();
         assert!(focus_has_model_block(&pool, "model-focus").await.unwrap());
-        assert!(!focus_has_model_block(&pool, "writing-assistant")
-            .await
-            .unwrap());
+        assert!(!focus_has_model_block(&pool, "quick-ask").await.unwrap());
     })
     .await;
 }
