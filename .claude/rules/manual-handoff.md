@@ -37,8 +37,9 @@ in a run, so nothing depends on resume. The legacy requires_user_handoff pause i
     variable derived from one: DEVICE_NAMES_NEVER_IN_STARTER refuses them whatever the flag says
     (items.id=924 lifted the refusal for external MODEL steps and kept it for starters, which have no
     external rendering, carry scan or outbound review; see "Device facts in external steps and allowed
-    answers"). The real starter naming content_brief is therefore no longer blocked by the flag;
-    it is built with the Writing Assistant (still not built).
+    answers"). The real starter naming content_brief is therefore no longer blocked by the flag. It
+    is NOT in the Writing Assistant's composition (items.id=903): nothing can select manual_handoff
+    without a second guarded launch slot or the run plan's choice (items.id=901, 913).
   - Its record (handoff_render::inherit_from_inputs), over each DECLARED input: (1) takes the
     highest sensitivity_severity and ORs personal_flagged and audit_unavailable of the step that
     produced it (the last producer of the variable); (2) a STORE-BACKED declared input counts as
@@ -130,7 +131,7 @@ in a run, so nothing depends on resume. The legacy requires_user_handoff pause i
   existing behaviour for every imported document and was left alone here.
 - SCHEMA: shared_046.sql (data only, the cb-15 mirror row; the migration tests re-pinned to 46).
   No new table or column. items.id=633 must absorb shared_046.sql with the other shared files.
-- NOT BUILT: the real Writing Assistant starter (the flag flip it waited for has landed), a
+- NOT BUILT: the real Writing Assistant starter rows (see above: no selector for them yet), a
   Derived handoff_draft name, multiple hand-offs inside one pass (the return pass's row order is
   the Focus's), file or document replies beyond a plain paste, any model step after the return
   row (B7c delta validation reads the reply by handle).

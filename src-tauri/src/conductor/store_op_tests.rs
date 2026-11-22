@@ -2381,6 +2381,16 @@ fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
+/// items.id=903: the raise commands write a consent audit event and never the
+/// collection-consent state.
+#[test]
+fn raise_commands_never_set_consent() {
+    let text = include_str!("../commands/document_raise.rs");
+    let prod = text.split("\n#[cfg(test)]").next().unwrap();
+    assert!(!prod.contains("set_collection_consent"));
+    assert!(prod.contains("ConsentEventType::DocumentCeilingRaised"));
+}
+
 /// Only set_collection_consent writes the consent state, and the ONLY production
 /// callers of it and of the audit store are the user's own commands in
 /// commands/collection_consent.rs (stage 2). Nothing else names them: no
@@ -2397,9 +2407,12 @@ fn only_the_users_consent_commands_call_the_setter_and_the_audit_store() {
             .unwrap()
             .to_string_lossy()
             .to_string();
+        // items.id=903 unit D: the one-document raise appends its own audit event
+        // (document_ceiling_raised) from the user's confirm command, and nothing else.
         let own = rel == "persistence/focus_settings_store.rs"
             || rel == "persistence/consent_audit_store.rs"
-            || rel == "commands/collection_consent.rs";
+            || rel == "commands/collection_consent.rs"
+            || rel == "commands/document_raise.rs";
         // Files that mod.rs includes under #[cfg(test)] only (this one included).
         let test_only = rel.ends_with("tests.rs") || rel == "test_support.rs";
         if own || test_only {

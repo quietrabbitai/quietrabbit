@@ -31,6 +31,12 @@ selection and before Gate 1, through `derive_treatment(ctx, resolver_req, &selec
   network branch, the render and, for items.id=884, the outbound review: 884 triggers on
   `treatment.hosted` and takes its ceiling argument from `treatment.access`, not
   ctx.effective_access. The disagreement 884's amendment names is already an error before its hook.
+- THE DOCUMENT'S CEILING (items.id=903): before the ceiling values are computed, resolve_tier_config
+  replaces the user's focus_settings tier with document_session_store::effective_ceiling for a run of
+  a chat whose Focus selected a document type: a medical, financial or legal document flag makes it
+  local_only, and a one-document raise of the same document type lifts it to the raised tier (see
+  "Writing Assistant"). The Focus's own ceiling still clamps it, and derive is unchanged: a hosted pick
+  under a raised ceiling is external at min(ceiling, requirement tier), with none under local_only.
 - WHAT STILL READS THE CEILING (pinned by the_ceiling_values_are_read_only_where_reviewed): the
   bound-run stop, Step 4.5 and select_model (before selection), the resolver's candidate set, the
   floor-invariant check on the ceiling values, derive_treatment's own input, step_streams.

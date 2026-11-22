@@ -2421,10 +2421,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         // items.id=903 unit B: the chat's document privacy flag only TIGHTENS the
         // user's ceiling (medical, financial, legal: local_only). focus_settings is
         // never edited.
-        let max_permitted = match self.document_ceiling().await? {
-            Some(cap) => max_permitted.min(cap),
-            None => max_permitted,
-        };
+        let max_permitted = self.document_ceiling(max_permitted).await?;
         self._focus_max_permitted_tier = max_permitted;
         self._focus_privacy_tier = privacy_tier;
 
@@ -2456,19 +2453,22 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         Ok(())
     }
 
-    /// items.id=903 unit B (decisions.id=942 Q14 Path C): the ceiling the chat's
-    /// document allows, when this run is a pass of a document: a run of a chat whose
-    /// Focus selected a document type. Reads document_sessions in the persona's
+    /// items.id=903 units B and D (decisions.id=942 Q14 Paths B and C): the permitted
+    /// tier for the chat's document, from the user's ceiling, when this run is a pass of
+    /// a document: a run of a chat whose Focus selected a document type. Reads document_sessions in the persona's
     /// outputs.db; a read that fails ends the run start (fail closed, never the
     /// unflagged ceiling). Sets document_flag for the output stamp. A run with no chat
     /// or no document type reads nothing.
-    async fn document_ceiling(&mut self) -> Result<Option<ExternalAccess>, LifecycleError> {
+    async fn document_ceiling(
+        &mut self,
+        user_max: ExternalAccess,
+    ) -> Result<ExternalAccess, LifecycleError> {
         use crate::persistence::document_session_store;
         self.document_flag = None;
         let (Some(context_key), Some(document_type)) =
             (self.context_key.clone(), self.launch.document_type.clone())
         else {
-            return Ok(None);
+            return Ok(user_max);
         };
         let mut conn = crate::persistence::output_store::open_outputs_db_retrying(
             &self.user_id,
@@ -2481,9 +2481,12 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             .await
             .map_err(|e| LifecycleError::OutputStore(format!("document session: {e}")))?;
         self.document_flag = session.as_ref().and_then(|s| s.document_privacy_flag);
-        Ok(document_session_store::restricted_ceiling(
+        // items.id=903 unit D: the flag tightens; a one-document raise of THIS document
+        // type lifts (decisions.id=942 Q14 Path B). The Focus ceiling clamps after.
+        Ok(document_session_store::effective_ceiling(
             session.as_ref(),
             &document_type,
+            user_max,
         ))
     }
 

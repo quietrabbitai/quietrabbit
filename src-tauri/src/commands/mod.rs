@@ -58,6 +58,7 @@ pub mod cloud_chat_pane;
 pub mod collection_consent;
 pub mod consent;
 pub mod device_library;
+pub mod document_raise;
 pub mod document_session;
 pub mod execution;
 pub mod fact_policy;

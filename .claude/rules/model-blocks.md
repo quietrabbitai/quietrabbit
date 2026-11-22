@@ -70,10 +70,39 @@ with no requirement still goes through select_model.
   coverage) and decide(report, latitude, attempt) returns Accept, Regenerate, Mark or Skipped
   through CheckPolicy::for_latitude (strict: regenerate once then mark, framed: mark only,
   free: off). Coverage is keyed and used by the harness and tests only; production passes no
-  points. NOTHING in the executor calls it yet: items.id=903 consumes decide() (the guarded
-  second draft row of a composition is B7a and B7d), so no executor wiring lives in 899.
+  points. items.id=903 consumes it through cb-06's draft_check section (below), never from the
+  executor. CITATIONS (decisions.id=963 ruling 2, option A): CheckInput.citations is
+  DocumentType.citation_markers (none, numeric; numeric needs flag_unsupplied_references and is
+  tighten-only against based_on; essay_section only). Numeric markers ([1], [1, 3], [2-4], [2a]) are
+  cut out before the placeholder and unsupported-specific scans, and a marker the allowed text does
+  not carry itself is listed in unsupplied_references, which MARKS and never regenerates. The
+  harness and focus_calibration pass none, so 893/894 measurements stay comparable.
   The check cannot catch soft embellishment, an invented cause, a reversed fact that keeps the
   keywords, tone or readability.
+
+- BLOCK GUARD (items.id=903, decisions.id=963 ruling 1): a model block emits a `present` clause for
+  every required input that is an Optional bound name (cb-12 brief_var, cb-13 apply input_var, cb-14
+  draft_var and change_var; model_block::required_input_clauses). The DB loader MERGES it ahead of
+  the row's own clauses (merge_block_clauses: a restated clause is not repeated, the merged set is
+  capped by MAX_GUARD_CLAUSES); the run-start re-expansion keeps the merged list and refuses a row
+  that lost the block clause. A pure block (cb-06) emits none: a composition guards its check rows
+  on the brief itself.
+- CB-06 DRAFT CHECK (decisions.id=942 point 3, ruling 3; conductor/check_block.rs, pure): an
+  optional draft_check section (document_type, emit verdict|report, attempt 0|1, sources with
+  coverage weights, section_var, voice_check). verdict records exactly accept, regenerate, mark or
+  skipped (for guards); report records categories and counts only, never draft text. A missing
+  source marks and never accepts or regenerates. Voice data (suppress phrases, sentence bands per
+  pacing) is block_data CheckData. The run start fills draft_check.run (document type, latitude,
+  pacing) from the same resolution the blocks re-expand with; an authored run is refused at LOAD.
+  RULING 3 amends the pure-block contract: BlockHandler::declared_inputs names the stored values a
+  row reads (its declared_inputs: linted real for block rows too, seeded at pass start) and run()
+  takes BlockInputs (the track and ONLY those seeds, lifecycle::declared_seeds). No provider, store
+  handle or write.
+- PC-03 (ruling 4, model_block/elicit.rs): elicit, one round (rounds: single, a closed enum
+  items.id=906 extends). It turns the request into one StructuredBrief JSON object (phrases.elicit,
+  no brace); it reads {user_input}, so the hosted rule keeps it local (READS_THE_REQUEST in the
+  admission tests). Its catalog row in the fixture is PROPOSED by Code until Chat-PM writes the three
+  empty qr_docs.db columns.
 
 ## Calibration harness (items.id=899, decisions.id=950)
 src-tauri/examples/calibration_harness.rs (with examples/support/, examples/harness/ and

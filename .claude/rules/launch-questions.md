@@ -11,9 +11,10 @@ paths:
 
 ## Launch questions and run-start settings (items.id=897, decisions.id=942 point 8 and addendum 3 (g), decisions.id=948)
 A Focus may ask up to five closed-choice questions before a run, or none. The answers feed
-guards, the model resolver's document profile and the settings of every model block. No real
-question or mode ships for any Focus yet (items.id=903 ships Writing Assistant's); the
-mechanism is exercised by fixture Focuses in tests.
+guards, the model resolver's document profile and the settings of every model block. The
+Writing Assistant is the only Focus that ships questions (items.id=903, shared_048.sql: launch_mode
+quick/low/medium/high, default medium, and document_type with the six shipped types, default
+personal_note; see "Writing Assistant"); every other mechanism case is a fixture Focus in tests.
 - DATA (schema/shared_047.sql, shipped data only, identical for every install, no foreign keys,
   classified GlobalCatalog in shared_db_residual.rs; items.id=633 must absorb it): focus_launch_
   questions (slot, kind mode or choice, asked, default_option, prompt), focus_launch_options
@@ -25,8 +26,8 @@ mechanism is exercised by fixture Focuses in tests.
 - DISPLAY DATA IS NOT COPIED. A Focus's display name and description stay in their one existing
   home and conductor/focus_display.rs read() is the single reader (load_focus_definition: the
   focuses row, else the .focus file; plus the one-liner). Writing Assistant's name and description
-  are in both shared_038.sql and its .focus file and are pinned equal by a drift test; neither copy is
-  removed. FocusInfo is unchanged.
+  are in both its focuses row (shared_048.sql, from focus_specs/writing-assistant.json) and its .focus
+  file and are pinned equal by a drift test; neither copy is removed. FocusInfo is unchanged.
 - THE ONLY READER (conductor/launch_config.rs): validate() is the one rule set (at most 5
   questions, one question per slot, only the mode question on launch_mode, every question has at
   least one option and a default that is one of them, an asked question has two options, a
@@ -118,5 +119,5 @@ mechanism is exercised by fixture Focuses in tests.
   invalid_focus_id, invalid_context_key, no_launch_config, unknown_question, question_not_asked,
   invalid_answer, invalid_run_change, one_time_chat, launch_unavailable. The keys are in the orphan
   allowlist of styleAndI18nConsistency.test.ts until items.id=902 shows them. No screen is built.
-- NOT BUILT: saved adjustments and custom document types (items.id=905), a per-row mode selector, any
-  real Focus question (items.id=903), the generic launch screen (items.id=902).
+- NOT BUILT: saved adjustments and custom document types (items.id=905), a per-row mode selector, the
+  generic launch screen (items.id=902).

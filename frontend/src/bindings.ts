@@ -1084,6 +1084,8 @@ export const commands = {
 	getFactPolicies: (personaId: string) => typedError<FactPolicyInfo[], string>(__TAURI_INVOKE("get_fact_policies", { personaId })),
 	setFactPolicy: (personaId: string, fieldName: string, tier: number, policy: string) => typedError<FactPolicyInfo, string>(__TAURI_INVOKE("set_fact_policy", { personaId, fieldName, tier, policy })),
 	setDocumentPrivacyFlag: (personaId: string, contextKey: string, focusId: string, flag: DocumentPrivacyFlag, outputId: string | null) => typedError<DocumentSessionView, string>(__TAURI_INVOKE("set_document_privacy_flag", { personaId, contextKey, focusId, flag, outputId })),
+	requestDocumentCeilingRaise: (personaId: string, contextKey: string, focusId: string, target: ExternalAccess) => typedError<RaiseChallengeView, string>(__TAURI_INVOKE("request_document_ceiling_raise", { personaId, contextKey, focusId, target })),
+	confirmDocumentCeilingRaise: (token: string, acknowledged: boolean) => typedError<DocumentRaiseView, string>(__TAURI_INVOKE("confirm_document_ceiling_raise", { token, acknowledged })),
 };
 
 /* Types */
@@ -1570,6 +1572,11 @@ export type DisclosedAttributes = {
  *  outputs_020.sql); a round-trip test keeps ALL and the text together.
  */
 export type DocumentPrivacyFlag = "general" | "personal" | "medical" | "financial" | "legal";
+
+export type DocumentRaiseView = {
+	document_type: string,
+	raised_ceiling: ExternalAccess,
+};
 
 /**  The chat's document state, as stored. */
 export type DocumentSessionView = {
@@ -2703,6 +2710,21 @@ export type QrHostedConfig = {
 	provider: string,
 	configured: boolean,
 	expires_at: string | null,
+};
+
+/**
+ *  A raise the user is asked to confirm. The screen words the disclosure from these
+ *  fields (document.raise.* keys); the token is opaque.
+ */
+export type RaiseChallengeView = {
+	token: string,
+	document_type: string,
+	target: ExternalAccess,
+	/**  The confirm is refused until this many milliseconds after the request. */
+	wait_ms: number,
+	expires_in_ms: number,
+	/**  An earlier raise of this document type in this Persona and Focus, as stored. */
+	previous_raise_at: string | null,
 };
 
 /**

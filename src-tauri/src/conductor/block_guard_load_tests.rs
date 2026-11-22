@@ -635,6 +635,41 @@ async fn the_document_flag_tightens_the_runs_effective_ceiling() {
                 "{flag:?}"
             );
         }
+        // items.id=903 unit D: a one-document raise of this document type lifts the
+        // flagged document above the flag, and the Focus's own ceiling still clamps the
+        // run (this fixture's manifest ceiling is local_only).
+        document_session_store::set_raise(
+            &mut conn,
+            "chat-d",
+            "bg-doc",
+            "essay_section",
+            ExternalAccess::AnonymousRequired,
+            "audit-1",
+        )
+        .await
+        .unwrap();
+        let mut r = run_in(Some("chat-d"));
+        r.load().await.unwrap();
+        r.resolve_tier_config().await.unwrap();
+        assert_eq!(
+            r._focus_max_permitted_tier,
+            ExternalAccess::AnonymousRequired
+        );
+        assert!(r._focus_external_access <= r.focus_def.as_ref().unwrap().max_routing_tier);
+        // A raise for another document type is not this document's.
+        let wrong = document_session_store::set_raise(
+            &mut conn,
+            "chat-d",
+            "bg-doc",
+            "rma_letter",
+            ExternalAccess::AnonymousRequired,
+            "audit-2",
+        )
+        .await;
+        assert!(matches!(
+            wrong,
+            Err(document_session_store::DocumentSessionError::NoDocument)
+        ));
         // Another chat and a run with no chat read no flag.
         assert_eq!(
             ceiling(Some("chat-e")).await.0,

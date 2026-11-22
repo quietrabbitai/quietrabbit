@@ -11,7 +11,7 @@ paths:
 
 ## Per-pass artifact store (items.id=895, decisions.id=942 point 5, decisions.id=938 ruling 2)
 Multi-turn work rides on chat-level passes, so text a later pass needs from an earlier one
-(a brief, voice guidance, a validation report, delta items) that does not fit a 2048-byte
+(a brief, voice guidance, a validation report, delta items, a working draft) that does not fit a 2048-byte
 session variable lives in pass_artifacts, in the persona's encrypted outputs.db
 (schema/outputs_015.sql, persistence/pass_artifact_store.rs). items.id=633 must absorb
 outputs_015 with the other outputs files.
@@ -19,12 +19,14 @@ outputs_015 with the other outputs files.
   CHECK and ARTIFACT_MAX_BYTES), version compare-and-set, no foreign keys, no triggers, no
   revision history (a write replaces the text). kind is the closed Rust enum ArtifactKind
   (no SQL CHECK, a round-trip test pins it): content_brief, voice_guidance,
-  validation_report, delta_items. session_intent is not a kind.
+  validation_report, delta_items, working_draft (items.id=903, one enum line, no rebuild).
+  session_intent is not a kind. The 16384-byte cap is the Writing Assistant's document limit
+  (see "Writing Assistant").
 - Store module: put_artifact, get_artifact, clear_artifact ONLY, over session_store's
   BEGIN IMMEDIATE transaction and one-time latch (a latched chat refuses every write and the
   clear, an unreadable latch fails closed). Stored text is exact: nothing rewrites it.
-- RESERVED BOUND NAMES: content_brief, voice_guidance, validation_report, delta_items
-  (bound_spec.rs ARTIFACT_NAMES, Source::Artifact, Presence::Optional, Authored). A name
+- RESERVED BOUND NAMES: content_brief, voice_guidance, validation_report, delta_items,
+  working_draft (bound_spec.rs ARTIFACT_NAMES, Source::Artifact, Presence::Optional, Authored). A name
   equals its kind, a test pins it, and the name is the artifact's alone: LOAD refuses it as
   a row's output_var (declared-inputs lint), as a session_put target and as the argument of
   any store writer. A step that produces one of these texts uses another output_var (the
@@ -64,3 +66,12 @@ outputs_015 with the other outputs files.
   30-day sweep deletes any not written for STORE_RETENTION_DAYS (sweep_older_than_in_tx, on
   idx_pass_artifacts_updated_at). clear_artifact stays the only delete a pass can ask for.
   Not reached by the entity purge (an artifact names no entity id).
+- items.id=903 WRITERS: brief_put (target = the pass variable an outcome word is published
+  under; slot value) parses one StructuredBrief JSON object (first { to last }, no unknown key,
+  validated), renders it with the shipped labels and stores content_brief, publishing `stored` or
+  `invalid`. artifact_append (slot value) appends ONE section under its heading to working_draft;
+  the heading is computed in the writer from the stored brief and draft (conductor::sections),
+  never taken from a variable; it publishes `appended`, `too_long` (past the cap, nothing written)
+  or `no_section`. Both read the one-time latch FIRST, so a latched chat is RefusedOneTime, never
+  an input refusal; both are consent-gated. A derived name (next_section, section_heading,
+  sections_state) may not be a writer's argument (the loader refuses it).

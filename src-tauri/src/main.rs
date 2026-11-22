@@ -231,6 +231,8 @@ async fn async_main() {
         // serialized or logged; cleared when the key leaves (setup() below) and when
         // a chat is archived.
         .manage(quietrabbit_lib::conductor::plan_memory::PlanMemory::default())
+        // items.id=903: the one-document ceiling raise challenges (memory only).
+        .manage(quietrabbit_lib::conductor::document_raise::RaiseChallenges::default())
         // KeyRegistry: single-slot in-memory master-key registry (items.id=
         // 205, Architecture/AUTH_MULTIUSER_ARCHITECTURE.md Section 4.2).
         // Encapsulated type -- its own internal Mutex is not exposed
@@ -257,6 +259,13 @@ async fn async_main() {
                     .clone();
                 app.state::<quietrabbit_lib::auth::registry::KeyRegistry>()
                     .on_key_leave(move |left| memory.clear_user(&left.user_id));
+                // items.id=903: and no raise challenge outlives it either.
+                let challenges = app
+                    .state::<quietrabbit_lib::conductor::document_raise::RaiseChallenges>()
+                    .inner()
+                    .clone();
+                app.state::<quietrabbit_lib::auth::registry::KeyRegistry>()
+                    .on_key_leave(move |left| challenges.clear_user(&left.user_id));
             }
             // items.id=630: data-key rotation progress goes to the webview on
             // the shared task-progress event (kind key_rotation).

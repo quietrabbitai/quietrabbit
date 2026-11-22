@@ -17,9 +17,13 @@
 // rewrites the type and VOIDS any raise (raised_ceiling and consent_audit_id go NULL): a
 // raise was given for one document. The flag itself is kept or replaced by the new value.
 //
-// READS. get() for the command and the run start. The run's ceiling rule is
-// restricted_ceiling(): a flag of medical, financial or legal limits the run to
-// local_only. Unit D adds the raise to the same function.
+// READS. get() for the commands and the run start. The run's ceiling rule is
+// effective_ceiling(): a flag of medical, financial or legal limits the run to
+// local_only (restricted_ceiling), and a one-document raise of the same document type
+// lifts it to the raised tier; the caller then clamps to the Focus's own ceiling.
+//
+// THE RAISE (unit D) is written only by set_raise, whose one caller is
+// commands/document_raise.rs, after the consent audit row (a source scan pins it).
 //
 // DELETES. Only the archive hook (clear_chat_in_tx, persistence::chat_clear) and the
 // 30-day store sweep (sweep_older_than_in_tx, persistence::store_sweep). Neither is
@@ -101,6 +105,10 @@ pub enum DocumentSessionError {
     VersionConflict,
     #[error("{0}")]
     Latch(#[from] LatchError),
+    /// items.id=903 unit D: no document session for the chat, or one of another document
+    /// type: there is no document to raise the ceiling for.
+    #[error("no document of this type in this chat")]
+    NoDocument,
     /// A stored value outside its closed set: a corrupt or foreign row. Never skipped.
     #[error("document_sessions holds an unknown {0}")]
     Corrupt(&'static str),
@@ -293,6 +301,80 @@ pub fn restricted_ceiling(
     s.document_privacy_flag
         .filter(|f| f.restricts_to_local())
         .map(|_| ExternalAccess::LocalOnly)
+}
+
+/// items.id=903 unit D (decisions.id=942 Q14 Path B): record a ONE-DOCUMENT ceiling
+/// raise, after its consent audit row was appended (`consent_audit_id`). Only
+/// commands/document_raise.rs calls this (a source scan pins it): no model path, store
+/// operation or lifecycle code can raise a ceiling. Latch-gated, compare-and-set, and
+/// only for a row of the same document type (else NoDocument): a raise is for one
+/// document, and a changed type voids it (set_privacy_flag).
+pub(crate) async fn set_raise(
+    conn: &mut SqliteConnection,
+    context_key: &str,
+    focus_id: &str,
+    document_type: &str,
+    tier: ExternalAccess,
+    consent_audit_id: &str,
+) -> Result<DocumentSession, DocumentSessionError> {
+    validate_scope(context_key, focus_id)?;
+    validate_text("consent_audit_id", consent_audit_id, 128)
+        .map_err(DocumentSessionError::Validation)?;
+    begin_write(conn).await?;
+    let result = async {
+        ensure_writable(conn, context_key).await?;
+        let current = get_inner(conn, context_key, focus_id)
+            .await?
+            .filter(|s| s.document_type == document_type)
+            .ok_or(DocumentSessionError::NoDocument)?;
+        let done = sqlx::query(
+            "UPDATE document_sessions
+             SET raised_ceiling = ?, consent_audit_id = ?, version = version + 1, updated_at = ?
+             WHERE context_key = ? AND focus_id = ? AND version = ?",
+        )
+        .bind(tier.as_str())
+        .bind(consent_audit_id)
+        .bind(crate::providers::utils::now())
+        .bind(context_key)
+        .bind(focus_id)
+        .bind(current.version)
+        .execute(&mut *conn)
+        .await?;
+        if done.rows_affected() != 1 {
+            return Err(DocumentSessionError::VersionConflict);
+        }
+        get_inner(conn, context_key, focus_id)
+            .await?
+            .ok_or(DocumentSessionError::VersionConflict)
+    }
+    .await;
+    finish_write(conn, result).await
+}
+
+/// items.id=903 unit D: the run's permitted tier for its document, from the user's
+/// focus_settings ceiling (`user_max`):
+///   1. a flag of medical, financial or legal makes it local_only (restricted_ceiling);
+///   2. a ONE-DOCUMENT raise of this same document type lifts it to the raised tier
+///      (overriding the flag for this document only).
+///
+/// The caller then takes the minimum with the Focus's own ceiling, so nothing here can
+/// exceed it, and nothing here edits focus_settings.
+pub fn effective_ceiling(
+    session: Option<&DocumentSession>,
+    run_document_type: &str,
+    user_max: ExternalAccess,
+) -> ExternalAccess {
+    let base = match restricted_ceiling(session, run_document_type) {
+        Some(cap) => user_max.min(cap),
+        None => user_max,
+    };
+    match session.and_then(|s| {
+        s.raised_ceiling
+            .filter(|_| s.document_type == run_document_type)
+    }) {
+        Some(raised) => base.max(raised),
+        None => base,
+    }
 }
 
 /// items.id=903: remove the chat's document sessions, inside a write transaction the

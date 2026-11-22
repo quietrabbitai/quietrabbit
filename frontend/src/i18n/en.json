@@ -613,6 +613,22 @@
       "invalid_output_id": "That document is not part of this chat.",
       "one_time_chat": "This is a one-time session, so the label was not saved.",
       "document_unavailable": "Couldn't save the document label. Try again in a moment."
+    },
+    "raise_error": {
+      "persona_not_found": "This persona is not available.",
+      "invalid_focus_id": "This assistant is not available.",
+      "invalid_context_key": "This chat is not available.",
+      "no_document_type": "This assistant does not write documents.",
+      "protected_persona": "This persona keeps its documents on this device.",
+      "one_time_chat": "This is a one-time session, so nothing can be changed for it.",
+      "no_document": "There is no document of this kind in this chat yet.",
+      "above_focus_ceiling": "This assistant cannot send documents that far.",
+      "not_a_raise": "This document can already go that far.",
+      "invalid_token": "That confirmation is no longer valid. Ask again.",
+      "too_early": "Take a moment to read this, then confirm.",
+      "expired": "That confirmation timed out. Ask again.",
+      "not_acknowledged": "Confirm that you have read this first.",
+      "raise_unavailable": "Couldn't change this document's setting. Try again in a moment."
     }
   },
   "resolver": {

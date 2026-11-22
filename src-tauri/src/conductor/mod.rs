@@ -11,6 +11,7 @@ pub mod crisis;
 pub mod declared_inputs;
 pub mod device_fields;
 pub mod device_seeding;
+pub mod document_raise;
 pub mod draft_check;
 pub mod entity_writer;
 #[cfg(test)]

@@ -280,6 +280,11 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         // chat's document: the user's own label, stored for the chat and Focus and
         // stamped on a saved output (items.id=903, decisions.id=942 Q14 to Q16)
         commands::document_session::set_document_privacy_flag,
+        // Group 39 in this list -- The one-document ceiling raise: a challenge with a
+        // fixed disclosure, a minimum wait and a single-use token, then the audited
+        // confirm (items.id=903, decisions.id=942 Q14 Path B, decisions.id=944)
+        commands::document_raise::request_document_ceiling_raise,
+        commands::document_raise::confirm_document_ceiling_raise,
     ])
 }
 

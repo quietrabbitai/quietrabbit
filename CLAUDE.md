@@ -79,8 +79,7 @@ frontend gate -- a frontend change is not verified until all pass. oxlint
 warnings (30 as of 2026-10-04) do not fail the gate; errors do. npm test needs
 Node >= 22.6 (it runs the plain-node test files with --experimental-strip-types).
 
-## Index of rule files
-Plain links; each file loads automatically when a matching file is read.
+## Index of rule files (plain links; each loads when a matching file is read)
 - [ollama](.claude/rules/ollama.md) — Bundled Ollama sidecar: ports, ownership proof, no-cloud env, single instance
 - [privacy-model](.claude/rules/privacy-model.md) — Privacy Filter model: pin, install, marker, runtime, release asset
 - [model-blocks](.claude/rules/model-blocks.md) — Model blocks (cb-12/13/14), block registry, draft_check, calibration harness
@@ -105,6 +104,7 @@ Plain links; each file loads automatically when a matching file is read.
 - [entity-model](.claude/rules/entity-model.md) — Entity model (entities, entity_facts) and the fact-model decisions
 - [auth](.claude/rules/auth.md) — Account creation order and the recovery key
 - [ipc](.claude/rules/ipc.md) — Tauri IPC command conventions
+- [writing-assistant](.claude/rules/writing-assistant.md) — Writing Assistant passes, document sessions and flag, one-document ceiling raise, document limit
 In-repo docs: [README](README.md), [SETUP_GUIDE](SETUP_GUIDE.md), [CONTRIBUTING](CONTRIBUTING.md), [frontend/README](frontend/README.md).
 
 ## R1 Focuses

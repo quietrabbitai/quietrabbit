@@ -115,6 +115,20 @@ const PRE_EXISTING_ORPHAN_KEYS: string[] = [
   'document.error.invalid_output_id', // same
   'document.error.one_time_chat', // same: the data hook for "a one-time session saves no label"
   'document.error.document_unavailable', // same
+  'document.raise_error.persona_not_found', // items.id=903: the codes of the one-document ceiling raise commands; the screen that shows them is items.id=912
+  'document.raise_error.invalid_focus_id', // same
+  'document.raise_error.invalid_context_key', // same
+  'document.raise_error.no_document_type', // same
+  'document.raise_error.protected_persona', // same
+  'document.raise_error.one_time_chat', // same
+  'document.raise_error.no_document', // same
+  'document.raise_error.above_focus_ceiling', // same
+  'document.raise_error.not_a_raise', // same
+  'document.raise_error.invalid_token', // same
+  'document.raise_error.too_early', // same
+  'document.raise_error.expired', // same
+  'document.raise_error.not_acknowledged', // same
+  'document.raise_error.raise_unavailable', // same
 ]
 
 function walk(dir: string, exts: string[], out: string[] = []): string[] {
