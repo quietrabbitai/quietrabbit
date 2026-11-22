@@ -72,8 +72,9 @@ Focus and items.id=916 flips it; the hard purge ships before that.
   (DEVICE_NAMES_NEVER_IN_STARTER, DeviceNameInStarter: a starter, a variable derived from a device name,
   or {previous_output} after one) until its own design. They stay tainted like every store
   name. Seeds are read once per pass, so a device's facts appear one pass
-  late. The wording is provisional (Chat-PM reviewed; items.id=914 owns the other three texts and
-  edits seeding.rs/bound_spec.rs after this item).
+  late. The wording is provisional (Chat-PM reviewed). items.id=914 set the other three texts
+  (seeding.rs: BRIEF_CASES 3, DELTA_LINES 5, STRATEGY_LINES 5, body caps 600/2400/1200 bytes, per-field clips,
+  a trailing "and N more" or "and N earlier not shown" line; the numbers are unmeasured, items.id=916 measures them).
 - HARD PURGE (persistence/entity_purge.rs, the ONLY module that deletes the entity, case and delta
   tables; a scan pins it, and the case_store/session_store no-delete scans still hold). Order:
   1 MARK (entities.status = user_deleted, the commit point; the entity is invisible to every active-
@@ -108,7 +109,9 @@ Focus and items.id=916 flips it; the hard purge ships before that.
   configuration changes) and that chat history, earlier replies and the choice record are NOT
   deleted (tests pin it). Dev simulation: localStorage['qr.devSimulateDeviceLibrary'] = empty,
   devices or runs_blocked, behind import.meta.env.DEV, absent from the production bundle.
-- Six-intent fixture (conductor/tech_support_draft.rs): 33 rows, 126 of 256 paths, 2..6 local calls
+- Six-intent fixture (conductor/tech_support_draft.rs): 35 rows, 138 of 256 paths (items.id=914: the
+  event and closure routers fall back on ne, with an "unclear" value answered by its own reply row; it
+  was 33 rows and 126 paths), 2..6 local calls
   per path; its device rows are entity_find_or_create writers and its templates use both device names.
 - items.id=633 must absorb personal_011.sql (the owner_focus column and its index into the entities
   baseline CREATE); no shared or outputs file was added. items.id=888 built the archive hook, the store

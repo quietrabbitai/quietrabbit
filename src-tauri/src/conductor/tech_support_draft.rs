@@ -300,7 +300,7 @@ pub fn rows(variant: Variant) -> Vec<DraftRow> {
         m(
             "ci_event",
             "event",
-            "Did the user report a change on the device (changed or unchanged)? \
+            "Did the user report a change on the device (changed, unchanged or unclear)? \
              Message: {user_input}",
             vec![("intent", "eq", Some("check_in_update")), ac],
         ),
@@ -341,14 +341,26 @@ pub fn rows(variant: Variant) -> Vec<DraftRow> {
             "Respond to the check-in. Message: {user_input}",
             vec![
                 ("intent", "eq", Some("check_in_update")),
-                ("event", "present", None),
+                // ne, not present (items.id=914): a blank classifier reply is
+                // absent for present. "unclear" is a real value with its own
+                // reply below, so every event value has exactly one reply.
+                ("event", "ne", Some("unclear")),
+            ],
+        ),
+        m(
+            "ci_unclear_reply",
+            "reply",
+            "Ask what changed on the device. Message: {user_input}",
+            vec![
+                ("intent", "eq", Some("check_in_update")),
+                ("event", "eq", Some("unclear")),
             ],
         ),
         // -- close ticket ----------------------------------------------------
         m(
             "closure",
             "closure",
-            "Say resolved, replaced, closed or open. Message: {user_input}",
+            "Say resolved, replaced, closed, open or unclear. Message: {user_input}",
             vec![("intent", "eq", Some("close_ticket")), ac],
         ),
         m(
@@ -378,7 +390,19 @@ pub fn rows(variant: Variant) -> Vec<DraftRow> {
             "Confirm the ticket is closed. Message: {user_input}",
             vec![
                 ("intent", "eq", Some("close_ticket")),
-                ("closure", "present", None),
+                // ne, not present, with "unclear" answered by its own row (see
+                // ci_reply).
+                ("closure", "ne", Some("unclear")),
+            ],
+        ),
+        m(
+            "close_unclear_reply",
+            "reply",
+            "Ask whether the ticket is resolved, replaced, closed or still open. \
+             Message: {user_input}",
+            vec![
+                ("intent", "eq", Some("close_ticket")),
+                ("closure", "eq", Some("unclear")),
             ],
         ),
         w(
@@ -407,7 +431,13 @@ pub fn rows(variant: Variant) -> Vec<DraftRow> {
             "fallback_reply",
             "reply",
             "Ask what the user needs. Message: {user_input}",
-            vec![("intent", "present", None), ("reply", "absent", None)],
+            // An ne guard, not present: a blank classifier reply is absent for
+            // present (items.id=914), and the fallback must still run on it. The
+            // literal is any one intent; that intent has its own row.
+            vec![
+                ("intent", "ne", Some("one_time_session")),
+                ("reply", "absent", None),
+            ],
         ),
     ]
 }

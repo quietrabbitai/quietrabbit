@@ -14715,7 +14715,7 @@ steps:
                     ),
                     // `stage` is a router (the in clause), so it needs a row
                     // that still runs when it matches none of its literals.
-                    smodel("stage_fb", "out4").guarded("stage", "present", None),
+                    smodel("stage_fb", "out4").guarded("stage", "ne", Some("one")),
                 ]),
             )
             .await;
@@ -15137,8 +15137,8 @@ steps:
             };
             rows.push(row);
         }
-        // A reply and a fallback for the router.
-        rows.push(smodel("reply", "reply").guarded("closure", "present", None));
+        // A reply and an ne fallback for the router (closure is a step output, so present would not count).
+        rows.push(smodel("reply", "reply").guarded("closure", "ne", Some("open")));
         rows
     }
 

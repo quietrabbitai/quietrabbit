@@ -53,7 +53,7 @@ personal_note; see "Writing Assistant"); every other mechanism case is a fixture
   every mode profile, so a combination that cannot be applied refuses the Focus.
 - GUARD ANALYSIS. A slot is Authored, so a guard on it supplies its literals plus one implicit
   OTHER, exactly as for a model-produced router: a Focus guarded on a slot needs a fallback row (an
-  `ne` or `present` guard), even though the run's value is always one of the options, and every
+  `ne` guard, or `present` because a bound name is never blank; items.id=914), even though the run's value is always one of the options, and every
   guarded slot multiplies the enumerated paths, which count toward the 256-path cap
   (guard::MAX_PATHS).
 - RUN-START HOOK (FocusRun::load() calls apply_launch_settings(), before authorize() and

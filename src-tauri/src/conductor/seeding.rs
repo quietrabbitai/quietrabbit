@@ -24,9 +24,12 @@
 //
 // DERIVED NAMES (formats are plain text for a prompt, bounded, brace-free):
 //   open_ticket_state   none, one or many open cases in this persona
-//   open_tickets_brief  one line per open case (at most BRIEF_CASES)
-//   case_context        the active case (active_case_id) and the strategies tried
-//   delta_context       config deltas of the active case's primary entity
+//   open_tickets_brief  one line per open case (at most BRIEF_CASES, then "and N more");
+//                       body capped at BRIEF_MAX_BYTES
+//   case_context        the active case (active_case_id) and the strategies tried (newest
+//                       STRATEGY_LINES, then "and N earlier not shown"); CASE_MAX_BYTES
+//   delta_context       config deltas of the active case's primary entity (newest
+//                       DELTA_LINES, then "and N earlier not shown"); DELTAS_MAX_BYTES
 //
 // HANDLES (items.id=889): every ticket line and every delta line starts with
 // the row's short opaque HANDLE (T-XXXXXXXX, D-XXXXXXXX, persistence::handles),
@@ -77,12 +80,32 @@ use crate::persistence::handles;
 use crate::persistence::pass_artifact_store::{self, ArtifactKind};
 use crate::persistence::session_store::{self, WriteMode};
 
+// items.id=914 (decisions.id=940 ruling 8 amendment, decisions.id=515): the R1 caps of
+// the three Tech Support derived texts. THE NUMBERS ARE UNMEASURED: items.id=916
+// measures them against real prompts and may move them. DERIVED_TEXT_MAX_BYTES
+// (bound_spec.rs) stays the validator ceiling every cap here sits under.
+//
+// Each cap bounds the BODY; a trailing "and N ..." notice (whole lines cut by a
+// count, so the model can tell its history was truncated) is appended after the
+// cap and is never itself cut.
+
 /// Most open cases open_tickets_brief lists.
-pub const BRIEF_CASES: usize = 5;
-/// Most config deltas delta_context lists.
-pub const DELTA_LINES: usize = 10;
+pub const BRIEF_CASES: usize = 3;
+/// Most config deltas delta_context lists (the newest are kept).
+pub const DELTA_LINES: usize = 5;
 /// Most strategies case_context lists (the newest are kept).
-pub const STRATEGY_LINES: usize = 10;
+pub const STRATEGY_LINES: usize = 5;
+/// Body caps in bytes, per value.
+pub const BRIEF_MAX_BYTES: usize = 600;
+pub const CASE_MAX_BYTES: usize = 2400;
+pub const DELTAS_MAX_BYTES: usize = 1200;
+/// Per-field clips in characters (a clip is a plain cut, no ellipsis; a cut
+/// handle cannot occur because handles are never clipped).
+const SUBJECT_CLIP: usize = 60;
+const SYMPTOMS_CLIP: usize = 400;
+const OUTCOME_CLIP: usize = 300;
+const STRATEGY_CLIP: usize = 200;
+const DELTA_CLIP: usize = 160;
 
 /// Why a pass could not be seeded. The pass FAILS CLOSED on every variant.
 /// No variant carries a stored value.
@@ -507,11 +530,17 @@ pub(crate) fn clean(s: &str) -> String {
 }
 
 /// Cut at DERIVED_TEXT_MAX_BYTES on a character boundary.
-pub(crate) fn cap(mut s: String) -> String {
-    if s.len() <= DERIVED_TEXT_MAX_BYTES {
+pub(crate) fn cap(s: String) -> String {
+    cap_to(s, DERIVED_TEXT_MAX_BYTES)
+}
+
+/// Cut at `max` bytes (never above the validator ceiling) on a character boundary.
+fn cap_to(mut s: String, max: usize) -> String {
+    let max = max.min(DERIVED_TEXT_MAX_BYTES);
+    if s.len() <= max {
         return s;
     }
-    let mut end = DERIVED_TEXT_MAX_BYTES;
+    let mut end = max;
     while !s.is_char_boundary(end) {
         end -= 1;
     }
@@ -519,8 +548,28 @@ pub(crate) fn cap(mut s: String) -> String {
     s
 }
 
+/// Cleaned text cut to at most `n` characters.
+fn clip(s: &str, n: usize) -> String {
+    clean(s)
+        .chars()
+        .take(n)
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
+}
+
+/// The body cut to `max` bytes, then the notice (if any) on its own last line.
+fn with_notice(lines: Vec<String>, max: usize, notice: Option<String>) -> String {
+    let mut body = cap_to(lines.join("\n"), max);
+    if let Some(n) = notice {
+        body.push('\n');
+        body.push_str(&n);
+    }
+    body
+}
+
 fn label(subject: &str) -> String {
-    let c = clean(subject);
+    let c = clip(subject, SUBJECT_CLIP);
     if c.is_empty() {
         "unnamed subject".to_owned()
     } else {
@@ -529,7 +578,7 @@ fn label(subject: &str) -> String {
 }
 
 fn render_brief(focus_id: &str, open: &[CaseRecord]) -> String {
-    let mut lines: Vec<String> = open
+    let lines: Vec<String> = open
         .iter()
         .take(BRIEF_CASES)
         .map(|c| {
@@ -542,10 +591,9 @@ fn render_brief(focus_id: &str, open: &[CaseRecord]) -> String {
             )
         })
         .collect();
-    if open.len() > BRIEF_CASES {
-        lines.push(format!("- and {} more", open.len() - BRIEF_CASES));
-    }
-    cap(lines.join("\n"))
+    let notice =
+        (open.len() > BRIEF_CASES).then(|| format!("- and {} more", open.len() - BRIEF_CASES));
+    with_notice(lines, BRIEF_MAX_BYTES, notice)
 }
 
 fn render_case(focus_id: &str, c: &CaseRecord, strategies: &[case_store::CaseStrategy]) -> String {
@@ -554,16 +602,21 @@ fn render_case(focus_id: &str, c: &CaseRecord, strategies: &[case_store::CaseStr
         format!("Subject: {}", label(&c.subject_label)),
         format!("State: {} (step {} of 5)", c.state.as_str(), c.current_rung),
     ];
-    let symptoms = clean(&c.symptoms);
+    let symptoms = clip(&c.symptoms, SYMPTOMS_CLIP);
     if !symptoms.is_empty() {
         lines.push(format!("Symptoms: {symptoms}"));
     }
-    if let Some(outcome) = c.outcome.as_deref().map(clean).filter(|o| !o.is_empty()) {
+    if let Some(outcome) = c
+        .outcome
+        .as_deref()
+        .map(|o| clip(o, OUTCOME_CLIP))
+        .filter(|o| !o.is_empty())
+    {
         lines.push(format!("Outcome so far: {outcome}"));
     }
+    let skip = strategies.len().saturating_sub(STRATEGY_LINES);
     if !strategies.is_empty() {
         lines.push("Already tried:".to_owned());
-        let skip = strategies.len().saturating_sub(STRATEGY_LINES);
         for s in &strategies[skip..] {
             let mut line = format!("- {} -> {}", clean(&s.strategy), clean(&s.outcome));
             if let Some(sig) = s
@@ -574,10 +627,12 @@ fn render_case(focus_id: &str, c: &CaseRecord, strategies: &[case_store::CaseStr
             {
                 line.push_str(&format!(" (user said: {sig})"));
             }
-            lines.push(line);
+            // The handle line is never clipped; only a strategy line is.
+            lines.push(clip(&line, STRATEGY_CLIP));
         }
     }
-    cap(lines.join("\n"))
+    let notice = (skip > 0).then(|| format!("- and {skip} earlier not shown"));
+    with_notice(lines, CASE_MAX_BYTES, notice)
 }
 
 fn render_deltas(focus_id: &str, deltas: &[EntityConfigDelta]) -> String {
@@ -588,13 +643,15 @@ fn render_deltas(focus_id: &str, deltas: &[EntityConfigDelta]) -> String {
             format!(
                 "- {}: {} [{}, changed {}]",
                 handles::delta_handle(focus_id, &d.delta_id),
-                clean(&d.description),
+                clip(&d.description, DELTA_CLIP),
                 d.effective_status.as_str(),
                 clean(&d.changed_at)
             )
         })
         .collect();
-    cap(lines.join("\n"))
+    let notice = (deltas.len() > DELTA_LINES)
+        .then(|| format!("- and {} earlier not shown", deltas.len() - DELTA_LINES));
+    with_notice(lines, DELTAS_MAX_BYTES, notice)
 }
 
 #[cfg(test)]
@@ -1024,6 +1081,198 @@ mod tests {
         assert_eq!(s[OPEN_TICKET_STATE], "many");
         assert_eq!(s[OPEN_TICKETS_BRIEF].lines().count(), BRIEF_CASES + 1);
         assert!(s[OPEN_TICKETS_BRIEF].ends_with("- and 2 more"));
+    }
+
+    #[test]
+    fn the_r1_caps_are_pinned_and_sit_under_the_validator_ceiling() {
+        // items.id=914: unmeasured numbers (items.id=916 measures them).
+        assert_eq!(BRIEF_CASES, 3);
+        assert_eq!((DELTA_LINES, STRATEGY_LINES), (5, 5));
+        assert_eq!(
+            (BRIEF_MAX_BYTES, CASE_MAX_BYTES, DELTAS_MAX_BYTES),
+            (600, 2400, 1200)
+        );
+        const { assert!(CASE_MAX_BYTES <= DERIVED_TEXT_MAX_BYTES) };
+    }
+
+    #[tokio::test]
+    async fn the_brief_lists_three_and_says_how_many_more() {
+        for (n, notice) in [(3usize, None), (4, Some("- and 1 more"))] {
+            let mut conn = mem_outputs_conn().await;
+            for i in 0..n {
+                open_case(
+                    &mut conn,
+                    &NewCase {
+                        case_id: &format!("case-{i}"),
+                        focus_id: FOCUS,
+                        context_key: CHAT,
+                        primary_entity_id: &format!("ent-{i}"),
+                        subject_label: &format!("device {i}"),
+                        symptoms: "",
+                        opened_by_run: "run-1",
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            let s = read_seeds(
+                &mut conn,
+                Some(CHAT),
+                FOCUS,
+                &[OPEN_TICKETS_BRIEF],
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+            let text = &s[OPEN_TICKETS_BRIEF];
+            assert_eq!(
+                text.lines().count(),
+                3 + usize::from(notice.is_some()),
+                "{text}"
+            );
+            assert_eq!(
+                text.lines().last().filter(|l| l.starts_with("- and")),
+                notice
+            );
+        }
+    }
+
+    /// A case with `strategies` strategies (outcome text `text`) and `deltas`
+    /// deltas (description `text`), seeded through the real reader.
+    async fn history_seeds(
+        strategies: usize,
+        deltas: usize,
+        text: &str,
+    ) -> HashMap<String, String> {
+        let mut conn = mem_outputs_conn().await;
+        open_case(
+            &mut conn,
+            &NewCase {
+                case_id: "case-h",
+                focus_id: FOCUS,
+                context_key: CHAT,
+                primary_entity_id: "ent-h",
+                subject_label: &text.chars().take(120).collect::<String>(),
+                symptoms: text,
+                opened_by_run: "run-1",
+            },
+        )
+        .await
+        .unwrap();
+        for i in 0..strategies {
+            append_case_strategy(
+                &mut conn,
+                CHAT,
+                &NewStrategy {
+                    case_id: "case-h",
+                    source_run_id: "run-1",
+                    source_action_id: &format!("step_{i}"),
+                    source_attempt: 0,
+                    strategy: &format!("try {i}"),
+                    outcome: text,
+                    user_signal: None,
+                    rung_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        for i in 0..deltas {
+            let changed_at = (Utc::now() + chrono::Duration::seconds(i as i64)).to_rfc3339();
+            record_config_delta(
+                &mut conn,
+                &NewConfigDelta {
+                    delta_id: &format!("delta-{i}"),
+                    focus_id: FOCUS,
+                    source_case_id: None,
+                    context_key: CHAT,
+                    session_reference: "sess-1",
+                    description: text,
+                    relevance_tags: &[],
+                    entity_ids: &["ent-h"],
+                    changed_at: Some(&changed_at),
+                    recorded_by_run: "run-1",
+                },
+            )
+            .await
+            .unwrap();
+        }
+        put(&mut conn, ACTIVE_CASE_ID, "case-h").await;
+        read_seeds(
+            &mut conn,
+            Some(CHAT),
+            FOCUS,
+            &[CASE_CONTEXT, DELTA_CONTEXT],
+            Utc::now(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_cut_history_says_so_and_an_exact_fit_does_not() {
+        // Exactly at the limit: no notice. One over: the notice, counting the cut.
+        let at = history_seeds(STRATEGY_LINES, DELTA_LINES, "x").await;
+        assert!(
+            !at[CASE_CONTEXT].contains("earlier not shown"),
+            "{}",
+            at[CASE_CONTEXT]
+        );
+        assert!(
+            !at[DELTA_CONTEXT].contains("earlier not shown"),
+            "{}",
+            at[DELTA_CONTEXT]
+        );
+        let over = history_seeds(STRATEGY_LINES + 1, DELTA_LINES + 1, "x").await;
+        assert!(
+            over[CASE_CONTEXT].ends_with("- and 1 earlier not shown"),
+            "{}",
+            over[CASE_CONTEXT]
+        );
+        assert!(
+            over[DELTA_CONTEXT].ends_with("- and 1 earlier not shown"),
+            "{}",
+            over[DELTA_CONTEXT]
+        );
+        // The newest strategies are the ones kept.
+        assert!(!over[CASE_CONTEXT].contains("try 0 ->"));
+        assert!(over[CASE_CONTEXT].contains("try 5 ->"));
+        let many = history_seeds(STRATEGY_LINES + 4, DELTA_LINES + 7, "x").await;
+        assert!(many[CASE_CONTEXT].ends_with("- and 4 earlier not shown"));
+        assert!(many[DELTA_CONTEXT].ends_with("- and 7 earlier not shown"));
+    }
+
+    #[tokio::test]
+    async fn long_multibyte_text_is_clipped_and_capped_on_character_boundaries() {
+        let long = "é".repeat(1000);
+        let s = history_seeds(STRATEGY_LINES + 3, DELTA_LINES + 3, &long).await;
+        let (case, deltas) = (&s[CASE_CONTEXT], &s[DELTA_CONTEXT]);
+        // Body under its cap, plus the one short notice line.
+        let notice = "\n- and 3 earlier not shown";
+        assert!(
+            case.len() <= CASE_MAX_BYTES + notice.len(),
+            "{}",
+            case.len()
+        );
+        assert!(
+            deltas.len() <= DELTAS_MAX_BYTES + notice.len(),
+            "{}",
+            deltas.len()
+        );
+        assert!(case.ends_with("- and 3 earlier not shown"));
+        assert!(deltas.ends_with("- and 3 earlier not shown"));
+        // Clips: the subject is cut to 60 characters, a symptom to 400.
+        assert!(case.contains(&format!("Subject: {}\n", "é".repeat(60))));
+        assert!(case.contains(&format!("Symptoms: {}\n", "é".repeat(400))));
+        assert!(!case.contains(&"é".repeat(401)));
+        assert!(!deltas.contains(&"é".repeat(161)));
+        assert!(deltas.contains(&"é".repeat(160)));
+    }
+
+    #[test]
+    fn a_blank_derived_value_clips_to_nothing_and_a_label_falls_back() {
+        assert_eq!(clip("  {x}  ", 10), "(x)");
+        assert_eq!(label("   "), "unnamed subject");
     }
 
     /// Two Focuses in one persona, each with open cases: the seeds of the running

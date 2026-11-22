@@ -15,13 +15,17 @@
 //   eq      the variable is set and, trimmed, equals the one literal
 //   ne      the variable is set and, trimmed, differs from the literal
 //   in      the variable is set and, trimmed, equals one of the literals
-//   present the variable is set (its producing row ran and recorded it)
-//   absent  the variable is not set
+//   present the variable is set (its producing row ran and recorded it) and is
+//           not blank after trimming
+//   absent  the variable is not set, or is blank after trimming
 //
 // A variable is "set" exactly when TaskTrack holds an output for it, which is
 // the same fact collect_output_vars() and TaskTrack::get_output() report: the
-// row that names it as output_var executed and recorded a step. An empty model
-// reply is therefore a SET value that matches no literal.
+// row that names it as output_var executed and recorded a step. items.id=914
+// (decisions.id=940 addendum e): a BLANK (empty or whitespace-only) model reply
+// counts as ABSENT for present and absent ONLY. For eq, ne and in it stays a SET
+// value that matches no literal (the implicit OTHER), so an ne fallback still
+// fires on it. The stored value is untouched: the change is in evaluation.
 //
 // A GUARD ON AN ABSENT VARIABLE IS FALSE for eq, ne and in: with nothing to
 // compare, no value test holds. That is why ne is not simply "not eq". present
@@ -46,8 +50,11 @@
 //     path;
 //   * a router (a variable some eq, ne or in guard reads) needs an explicit
 //     fallback: on every path where the router is OTHER, a row guarded on that
-//     router must run. Of the five operators only ne and present can be true for
-//     OTHER, so one of those is the fallback row.
+//     router must run. Only ne and present can hold for OTHER. An ne guard always
+//     counts. A present guard counts unless some NON-BLOCK row produces the router
+//     (a step output can be a blank reply, and present is false on blank), so a
+//     router a block handler or a bound name supplies keeps present as a fallback
+//     and a step-produced router needs ne (items.id=914).
 //
 // BOUND NAMES (items.id=886, decisions.id=939 section 2): a guard variable may
 // also be a bound name (bound_spec.rs), a value read from the session or case
@@ -250,8 +257,8 @@ impl Guard {
     pub fn evaluate(&self, vars: &HashMap<String, String>) -> bool {
         let value = vars.get(&self.var).map(|v| v.trim());
         match (&self.condition, value) {
-            (Condition::Present, v) => v.is_some(),
-            (Condition::Absent, v) => v.is_none(),
+            (Condition::Present, v) => v.is_some_and(|v| !v.is_empty()),
+            (Condition::Absent, v) => v.is_none_or(str::is_empty),
             (_, None) => false,
             (Condition::Eq(lit), Some(v)) => v == lit,
             (Condition::Ne(lit), Some(v)) => v != lit,
@@ -451,7 +458,7 @@ pub enum CompositionError {
         later: String,
         path: String,
     },
-    #[error("router variable '{var}' has no fallback row: when it matches none of its literals no step guarded on it runs ({path}). Add a row with an 'ne' or 'present' guard on '{var}'")]
+    #[error("router variable '{var}' has no fallback row: when it matches none of its literals no step guarded on it runs ({path}). Add a row with an 'ne' guard on '{var}' (a 'present' guard is accepted only when a block or a bound name supplies the variable, because a step's reply can be blank)")]
     NoFallback { var: String, path: String },
 }
 
@@ -777,13 +784,26 @@ fn analyze_paths_with(
             if !is_other {
                 continue;
             }
-            // A row that runs on this path with a clause on the router: while
-            // the router is OTHER only an ne or present clause can hold, so any
-            // such row that ran is the fallback.
-            let has_fallback = p
-                .rows
+            // A row that runs on this path with an ne clause on the router: an ne
+            // clause holds for every reply that names no literal, a blank one
+            // included. A present clause counts only when no step (non-block row)
+            // produces the router: a step reply can be blank, and blank is absent
+            // for present. A block verdict is never blank (see
+            // draft_check_verdicts_are_never_blank) and a bound name is a stored
+            // value that cannot be blank (items.id=914).
+            let step_produced = rows
                 .iter()
-                .any(|&i| rows[i].guards.iter().any(|g| &g.var == router));
+                .any(|r| !r.is_block && r.output_var == Some(router.as_str()));
+            let has_fallback = p.rows.iter().any(|&i| {
+                rows[i].guards.iter().any(|g| {
+                    &g.var == router
+                        && match g.condition {
+                            Condition::Ne(_) => true,
+                            Condition::Present => !step_produced,
+                            _ => false,
+                        }
+                })
+            });
             if !has_fallback {
                 return Err(CompositionError::NoFallback {
                     var: router.clone(),
@@ -958,11 +978,66 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_reply_is_a_set_value_matching_no_literal() {
-        let v = vars(&[("intent", "")]);
+    fn a_blank_reply_is_absent_for_present_and_absent_only() {
+        // items.id=914: present is false and absent true on an empty or
+        // whitespace-only value; eq, ne and in still see a set value that
+        // matches no literal, so an ne fallback fires on it.
+        for blank in ["", "   ", "\n\t "] {
+            let v = vars(&[("intent", blank)]);
+            assert!(!g("intent", "present", None).evaluate(&v), "{blank:?}");
+            assert!(g("intent", "absent", None).evaluate(&v), "{blank:?}");
+            assert!(!g("intent", "eq", Some("a")).evaluate(&v));
+            assert!(g("intent", "ne", Some("a")).evaluate(&v));
+            assert!(!g("intent", "in", Some(r#"["a"]"#)).evaluate(&v));
+        }
+        let v = vars(&[("intent", " a ")]);
         assert!(g("intent", "present", None).evaluate(&v));
+        assert!(!g("intent", "absent", None).evaluate(&v));
+    }
+
+    /// A writer guarded on `present` of an extraction that came back blank is skipped.
+    #[test]
+    fn a_writer_guarded_on_present_of_a_blank_extraction_is_skipped() {
+        let guard = g("handle", "present", None);
+        assert!(!guard.evaluate(&vars(&[("handle", "  ")])));
+        assert!(guard.evaluate(&vars(&[("handle", "T-1")])));
+    }
+
+    /// A blank router reply reaches an ne fallback (and not a present one).
+    #[test]
+    fn a_blank_router_reply_reaches_an_ne_fallback() {
+        let v = vars(&[("intent", " ")]);
         assert!(!g("intent", "eq", Some("a")).evaluate(&v));
         assert!(g("intent", "ne", Some("a")).evaluate(&v));
+        assert!(!g("intent", "present", None).evaluate(&v));
+    }
+
+    /// The block-router exemption relies on this: every literal a check block
+    /// records is non-blank, so `present` on its verdict is always true.
+    #[test]
+    fn draft_check_verdicts_are_never_blank() {
+        use crate::conductor::draft_check::Verdict;
+        assert_eq!(crate::conductor::check_block::VERDICT_LITERALS.len(), 4);
+        for lit in crate::conductor::check_block::VERDICT_LITERALS {
+            assert!(!lit.trim().is_empty());
+        }
+        // Verdict has exactly the four variants VERDICT_LITERALS covers.
+        for v in [
+            Verdict::Accept,
+            Verdict::Regenerate,
+            Verdict::Mark,
+            Verdict::Skipped,
+        ] {
+            let idx = match v {
+                Verdict::Accept => 0,
+                Verdict::Regenerate => 1,
+                Verdict::Mark => 2,
+                Verdict::Skipped => 3,
+            };
+            assert!(!crate::conductor::check_block::VERDICT_LITERALS[idx]
+                .trim()
+                .is_empty());
+        }
     }
 
     #[test]
@@ -1039,14 +1114,85 @@ mod tests {
     }
 
     #[test]
-    fn a_router_with_a_present_fallback_enumerates_literals_plus_other() {
+    fn a_router_with_an_ne_fallback_enumerates_literals_plus_other() {
         let rows = [
             r("route", None, Some("intent")),
             r("billing", Some(g("intent", "eq", Some("billing"))), None),
             r("tech", Some(g("intent", "eq", Some("tech"))), None),
-            r("fallback", Some(g("intent", "present", None)), None),
+            r("fallback", Some(g("intent", "ne", Some("billing"))), None),
         ];
         assert_eq!(analyze(&rows), Ok(3));
+    }
+
+    fn block_route() -> R {
+        R {
+            id: "route",
+            guard: None,
+            out: Some("intent"),
+            block: true,
+            local: true,
+        }
+    }
+
+    /// items.id=914: a present fallback is accepted when a BLOCK produces the
+    /// router (its verdict is never blank), refused when a step does, and an ne
+    /// fallback is accepted for the same step router.
+    #[test]
+    fn a_present_fallback_needs_a_block_or_bound_router() {
+        let rows_with = |route: R, fallback: Guard| {
+            [
+                route,
+                r("billing", Some(g("intent", "eq", Some("billing"))), None),
+                r("fallback", Some(fallback), None),
+            ]
+        };
+        assert_eq!(
+            analyze(&rows_with(block_route(), g("intent", "present", None))),
+            Ok(2)
+        );
+        assert!(matches!(
+            analyze(&rows_with(
+                r("route", None, Some("intent")),
+                g("intent", "present", None)
+            )),
+            Err(CompositionError::NoFallback { ref var, .. }) if var == "intent"
+        ));
+        assert_eq!(
+            analyze(&rows_with(
+                r("route", None, Some("intent")),
+                g("intent", "ne", Some("billing"))
+            )),
+            Ok(2)
+        );
+    }
+
+    /// A bound name has no producing row: present is accepted as its fallback.
+    #[test]
+    fn a_present_fallback_is_accepted_for_a_bound_name_router() {
+        let bound = [BoundVar {
+            name: "locked_intent",
+            closed: None,
+            optional: false,
+        }];
+        let rows = [
+            r("a", Some(g("locked_intent", "eq", Some("x"))), None),
+            r("fb", Some(g("locked_intent", "present", None)), None),
+        ];
+        let shapes: Vec<RowShape> = rows
+            .iter()
+            .map(|x| RowShape {
+                action_id: x.id,
+                guards: x.guard.as_ref().into_iter().collect(),
+                output_var: x.out,
+                is_block: x.block,
+                local_and_no_handoff: x.local,
+                transparent: false,
+                reads: Vec::new(),
+                case_write: false,
+                state_var: None,
+            })
+            .collect();
+        assert_eq!(analyze_composition_with(&shapes, &bound), Ok(2));
     }
 
     #[test]
@@ -1154,7 +1300,7 @@ mod tests {
         };
         let rows = [
             r("route", None, Some("intent")),
-            r("fb", Some(g("intent", "present", None)), None),
+            r("fb", Some(g("intent", "ne", Some("a"))), None),
             block,
             r("g", Some(g("intent", "eq", Some("a"))), None),
             ext,
@@ -1241,9 +1387,9 @@ mod tests {
             r("inner", Some(g("intent", "eq", Some("a"))), Some("detail")),
             r("x_only", Some(g("detail", "eq", Some("x"))), None),
             r("fb1", Some(g("intent", "ne", Some("a"))), None),
-            r("fb2", Some(g("detail", "present", None)), None),
+            r("fb2", Some(g("detail", "ne", Some("x"))), None),
         ];
-        // detail is a router (eq): when detail is OTHER, fb2 (present) runs.
+        // detail is a router (eq): when detail is OTHER, fb2 (ne) runs.
         assert_eq!(analyze(&rows), Ok(3));
     }
 
@@ -1668,8 +1814,8 @@ mod tests {
                 vec![g("intent", "eq", Some("a")), g("stage", "eq", Some("x"))],
                 None,
             ),
-            mrow("fb", vec![g("intent", "present", None)], None),
-            mrow("fb2", vec![g("stage", "present", None)], None),
+            mrow("fb", vec![g("intent", "ne", Some("a"))], None),
+            mrow("fb2", vec![g("stage", "ne", Some("x"))], None),
         ];
         let paths = analyze_m(&rows).unwrap();
         assert_eq!(paths.len(), 4);
@@ -1686,7 +1832,7 @@ mod tests {
                 vec![g("intent", "eq", Some("a")), g("intent", "eq", Some("b"))],
                 None,
             ),
-            mrow("fb", vec![g("intent", "present", None)], None),
+            mrow("fb", vec![g("intent", "ne", Some("a"))], None),
         ];
         assert!(matches!(
             analyze_m(&rows),
@@ -1700,7 +1846,7 @@ mod tests {
                 vec![g("intent", "eq", Some("a")), g("intent", "ne", Some("a"))],
                 None,
             ),
-            mrow("fb", vec![g("intent", "present", None)], None),
+            mrow("fb", vec![g("intent", "ne", Some("a"))], None),
         ];
         assert!(matches!(
             analyze_m(&rows),
@@ -1721,8 +1867,8 @@ mod tests {
                 ],
                 None,
             ),
-            mrow("fb", vec![g("intent", "present", None)], None),
-            mrow("fb2", vec![g("stage", "present", None)], None),
+            mrow("fb", vec![g("intent", "ne", Some("a"))], None),
+            mrow("fb2", vec![g("stage", "ne", Some("x"))], None),
         ];
         let paths = analyze_m(&rows).unwrap();
         // intent: a, b, OTHER; stage: x, OTHER = 6 paths, the row on 2 of them.
@@ -1779,7 +1925,7 @@ mod tests {
                 vec![g("intent", "ne", Some("a")), g("stage", "eq", Some("x"))],
                 None,
             ),
-            mrow("sfb", vec![g("stage", "present", None)], None),
+            mrow("sfb", vec![g("stage", "ne", Some("x"))], None),
         ];
         // intent=OTHER with stage=OTHER: fb needs stage=x, so no row on intent runs.
         assert!(matches!(
@@ -1824,7 +1970,7 @@ mod tests {
             mrow("route", vec![], Some("closure")),
             writer("close", vec![terminal()], true, Some("closure")),
             writer("log", vec![terminal()], true, None),
-            mrow("reply", vec![g("closure", "present", None)], None),
+            mrow("reply", vec![g("closure", "ne", Some("resolved"))], None),
         ];
         match analyze_m(&rows) {
             Err(CompositionError::CloseNotLast {
@@ -1842,7 +1988,7 @@ mod tests {
             mrow("route", vec![], Some("closure")),
             writer("log", vec![terminal()], true, None),
             writer("close", vec![terminal()], true, Some("closure")),
-            mrow("reply", vec![g("closure", "present", None)], None),
+            mrow("reply", vec![g("closure", "ne", Some("open"))], None),
         ];
         assert!(analyze_m(&rows).is_ok());
     }
@@ -1854,7 +2000,7 @@ mod tests {
             mrow("route", vec![], Some("closure")),
             writer("update", vec![open()], true, Some("closure")),
             writer("log", vec![open()], true, None),
-            mrow("reply", vec![g("closure", "present", None)], None),
+            mrow("reply", vec![g("closure", "ne", Some("open"))], None),
         ];
         assert!(analyze_m(&rows).is_ok(), "pinned non-terminal never closes");
         // An ne clause does not pin a state: OTHER may be any terminal value.
@@ -1867,7 +2013,7 @@ mod tests {
                 Some("closure"),
             ),
             writer("log", vec![g("closure", "present", None)], true, None),
-            mrow("reply", vec![g("closure", "present", None)], None),
+            mrow("reply", vec![g("closure", "ne", Some("open"))], None),
         ];
         assert!(matches!(
             analyze_m(&rows),
