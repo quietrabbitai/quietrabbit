@@ -2735,9 +2735,10 @@ mod tests {
     }
 
     /// items.id=924 D3: a device span carries its own key (device_fact:...), which
-    /// replaces the cascade. A standing release under it is asked again (a field with
-    /// the access-credential flag allows a live release only); a standing
-    /// generalization under it applies; a preference under any other key is not its.
+    /// replaces the cascade. decisions.id=956: the serial is an ordinary ask field, so a
+    /// standing release under its key APPLIES on a later use without a new question; a
+    /// field with the access-credential flag (a fixture span here) still asks again;
+    /// a standing generalization applies; a preference under any other key is not its.
     #[tokio::test]
     async fn a_device_span_is_remembered_by_its_own_key() {
         let _lock = crate::test_support::ENV_MUTEX.lock().await;
@@ -2747,10 +2748,14 @@ mod tests {
         let src = SourceSpan {
             entity: entity_with(DEVICE_FIELD_CATEGORY, serial),
             suggestion: Some("[serial number]".to_owned()),
-            allowed: AllowedAnswers::NO_STANDING_RELEASE,
+            allowed: AllowedAnswers::ALL,
             fact_key: Some(key.clone()),
         };
-        let part = || async {
+        let flagged = SourceSpan {
+            allowed: AllowedAnswers::NO_STANDING_RELEASE,
+            ..src.clone()
+        };
+        let part_of = |src: SourceSpan| async move {
             partition_with_rule(
                 &TestLogger::new(),
                 F_USER,
@@ -2767,6 +2772,7 @@ mod tests {
             .await
             .expect("partition")
         };
+        let part = || part_of(src.clone());
         let standing = |fk: String, decision: &'static str, sugg: Option<&'static str>| async move {
             crate::persistence::personal_store::write_standing_preference(
                 F_USER,
@@ -2789,12 +2795,24 @@ mod tests {
             assert!(unsettled(&o));
             assert_eq!(o.needs_review[0].1.as_deref(), Some(key.as_str()));
         }
-        // A standing release under the key: asked again.
+        // A standing release under the key: applied on a later use, no new question.
         {
             let _root = fresh_root();
             f_seed_run().await;
             standing(key.clone(), "release_original", None).await;
-            assert!(unsettled(&part().await));
+            let r = part()
+                .await
+                .early_result
+                .expect("settled by the remembered release");
+            assert_eq!(r.auto_resolved[0].decision, "release_original");
+            assert_eq!(r.auto_resolved[0].allowed, AllowedAnswers::ALL);
+        }
+        // The same standing release under a flagged field (a fixture): asked again.
+        {
+            let _root = fresh_root();
+            f_seed_run().await;
+            standing(key.clone(), "release_original", None).await;
+            assert!(unsettled(&part_of(flagged.clone()).await));
         }
         // A standing generalization under the key: applied.
         {
@@ -2803,10 +2821,7 @@ mod tests {
             standing(key.clone(), "generalize", Some("[serial number]")).await;
             let r = part().await.early_result.expect("settled");
             assert_eq!(r.auto_resolved[0].decision, "generalize");
-            assert_eq!(
-                r.auto_resolved[0].allowed,
-                AllowedAnswers::NO_STANDING_RELEASE
-            );
+            assert_eq!(r.auto_resolved[0].allowed, AllowedAnswers::ALL);
         }
         // A preference under another key (the same text of another device) is not its.
         {

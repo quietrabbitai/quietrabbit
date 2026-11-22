@@ -1429,7 +1429,7 @@ mod tests {
             field: field.to_owned(),
             value: value.to_owned(),
             disclosure: d,
-            access_credential: field == "serial_number",
+            access_credential: false,
             suggestion: None,
         }
     }
@@ -1538,7 +1538,7 @@ mod tests {
                     "serial_number",
                     "PF2ABC3D",
                     Disclosure::Ask,
-                    true,
+                    false, // decisions.id=956: no credential flag
                     Some("[serial number]")
                 ),
             ]

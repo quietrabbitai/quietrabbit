@@ -26,13 +26,14 @@ frontend and docs (U4).
   same rule to live answers (step_review::applied_decisions: a refused answer is removed, and the counts
   follow what is sent). AskedSpan and SettledSpan store `allowed` (absent = ALL, so old rows read as
   before). Only carry_scan restricts a span (scan only_the_carry_scan_restricts_a_span).
-- THE CATALOGUE (block_data/device_fields.json, version 2). Each field has a disclosure: never (removed
+- THE CATALOGUE (block_data/device_fields.json, version 3). Each field has a disclosure: never (removed
   before the review, never shown), ask (every occurrence in a hosted prompt is raised) or pass (sent); an
   ask field has a suggestion (a fixed label such as "[serial number]", placeholder wording, Chat-BRAND's).
   The device NAME (entities.display_name, not a fact) has device_name_disclosure ask, "[device]". THE
   SHIPPED DEFAULT IS CONSERVATIVE AND PER-FIELD REVERSIBLE: the ten fields that were pass stay pass, the
   other ten (serial number, warranty contact and address included) are ask, none is never; any field can
-  move either way by a data edit. validate(): an access-credential field (the serial) may not be pass, an
+  move either way by a data edit. validate(): an access-credential-flagged field may not be pass (no shipped field has the
+  flag; the serial lost it, decisions.id=956), an
   ask field needs a suggestion, a pass or never field takes none, the credential-word refusal stays. The
   owned-fact writer stores never/ask/pass as not_permitted/omit/pass in entity_facts.abstraction_tier2/3;
   NOTHING READS THOSE COLUMNS for an owned fact (scan), and rows written before keep not_permitted. No
@@ -54,8 +55,10 @@ frontend and docs (U4).
   review and a carry_not_permitted_removed row naming the field (no value); ask -> a qr_device_field span
   ("Device detail", placeholder) with its suggestion, its own fact key `device_fact:` + SHA-256 of
   (entity, field, value), which gate3 uses in place of the Layer 1 to 3 cascade, and its allowed answers:
-  ALL, except the access-credential field, NO_STANDING_RELEASE (D3: a standing release is asked again, a
-  release in this run counts).
+  ALL (decisions.id=956: the serial is an ordinary ask field, so a remembered release applies on a later
+  use; it superseded D3 for the serial, items.id=936). A field with the access-credential flag, if one is
+  ever added, is NO_STANDING_RELEASE (a standing release is asked again, a release in this run counts);
+  no shipped field has the flag.
 - PERSONAL ask (D7). A bridged personal field the user set to ask (set_fact_policy accepts it; no screen)
   is released RAW only to a hosted step that gets the outbound review and only when its value has 4 or more
   characters (executor::to_gate_track_asks); classify_asked then raises every occurrence with every answer.

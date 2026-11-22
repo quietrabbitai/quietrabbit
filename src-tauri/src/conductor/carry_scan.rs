@@ -44,7 +44,9 @@
 //   value> (so a remembered answer applies to the same value only), and the answers it
 //   allows: every answer, except a field with the access-credential flag, whose
 //   remembered release is not applied (NO_STANDING_RELEASE: a release in this run still
-//   counts).
+//   counts). No shipped field has the flag since decisions.id=956 (the serial is an
+//   ordinary ask field: a remembered release applies); the branch stays for any
+//   flagged field.
 // - LIMITS, beside the ones above: a value seeded in an EARLIER pass that a session
 //   variable or artifact carries into this pass is not scanned unless this pass seeds
 //   the device again; a value reformatted (a serial with spaces or dashes added, a
@@ -507,7 +509,7 @@ mod tests {
                     "serial_number",
                     "PF2ABC3D",
                     Disclosure::Ask,
-                    true,
+                    false,
                     Some("[serial number]"),
                 ),
                 dv("make", "Lenovo", Disclosure::Pass, false, None),
@@ -532,7 +534,7 @@ mod tests {
 
     /// An ask value is raised wherever it is (a derived text, a carried output, the
     /// user's own words), with its suggestion, its device key and its allowed answers:
-    /// a live release only for the flagged serial, every answer for the name. A never
+    /// every answer for the name and the serial (decisions.id=956). A never
     /// value is removed and never raised; a pass value and a value under 4 characters
     /// are not looked at.
     #[test]
@@ -574,16 +576,8 @@ mod tests {
             [
                 ("study LAPTOP", Some("[device]"), AllowedAnswers::ALL),
                 ("Study laptop", Some("[device]"), AllowedAnswers::ALL),
-                (
-                    "PF2ABC3D",
-                    Some("[serial number]"),
-                    AllowedAnswers::NO_STANDING_RELEASE
-                ),
-                (
-                    "pf2abc3d",
-                    Some("[serial number]"),
-                    AllowedAnswers::NO_STANDING_RELEASE
-                ),
+                ("PF2ABC3D", Some("[serial number]"), AllowedAnswers::ALL),
+                ("pf2abc3d", Some("[serial number]"), AllowedAnswers::ALL),
             ]
         );
         for s in &spans {
@@ -609,6 +603,46 @@ mod tests {
         assert!(classify_devices(prompt, &DeviceSeed::default()).is_empty());
     }
 
+    /// decisions.id=956: the serial is an ordinary ask field, so its span allows every
+    /// answer, a remembered release included. A field the seed marks as an access
+    /// credential (a fixture: no shipped field has the flag) is still a live release
+    /// only, and its removal rule for a never value is unchanged.
+    #[test]
+    fn only_a_flagged_field_is_restricted_to_a_live_release() {
+        let seed = DeviceSeed::for_test(
+            vec![
+                dv(
+                    "serial_number",
+                    "PF2ABC3D",
+                    Disclosure::Ask,
+                    false,
+                    Some("[serial number]"),
+                ),
+                dv(
+                    "fixture_credential",
+                    "ZX-4471-Q",
+                    Disclosure::Ask,
+                    true,
+                    Some("[fixture]"),
+                ),
+            ],
+            None,
+        );
+        let hits = classify_devices("S/N PF2ABC3D and ref ZX-4471-Q", &seed);
+        let got: Vec<(&str, AllowedAnswers)> = hits
+            .ask
+            .iter()
+            .map(|h| (h.field_name.as_str(), h.allowed))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("serial_number", AllowedAnswers::ALL),
+                ("fixture_credential", AllowedAnswers::NO_STANDING_RELEASE),
+            ]
+        );
+    }
+
     /// The forms a rendering shows: a stored value with braces renders cleaned
     /// (parentheses), and both forms are looked for. A reformatted value is missed (a
     /// stated limit).
@@ -619,7 +653,7 @@ mod tests {
                 "serial_number",
                 "AB{12}CD",
                 Disclosure::Ask,
-                true,
+                false,
                 Some("[serial number]"),
             )],
             None,

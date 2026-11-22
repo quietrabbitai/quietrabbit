@@ -32,7 +32,9 @@ export function releaseAvailable(span: SpanLike): boolean {
 }
 
 /** "Remember this decision" may be ticked for a release (a remembered release of a
- *  span without standing_release is never applied: the serial number, D3). */
+ *  span without standing_release is never applied: a span the server restricts to a
+ *  live release, as an access-credential field is; the serial number is no longer one,
+ *  decisions.id=956). */
 export function rememberReleaseAvailable(span: SpanLike): boolean {
   const a = allowedOf(span)
   return a.release && a.standing_release

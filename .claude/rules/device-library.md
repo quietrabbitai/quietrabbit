@@ -28,7 +28,8 @@ Focus and items.id=916 flips it; the hard purge ships before that.
 - Facts (conductor/device_fields.rs, block_data/device_fields.json): a CLOSED catalogue, 7 categories
   and 20 fields, each with label, sensitivity, a disclosure (never, ask or pass) and for ask a
   suggestion (items.id=924, replacing the tier-2/3 abstraction policies), byte cap, and the
-  access_credential_flag on serial_number. validate() refuses a field NAME containing a credential
+  optional access_credential_flag (no shipped field has it since decisions.id=956/items.id=936: the serial is
+  an ordinary ask field; validate() still refuses a flagged field as pass). validate() refuses a field NAME containing a credential
   word (password, pin, token, secret, login...). known_issues (400 bytes) and hardware_specs (300) are
   free text in practice: nothing in code stops a typed secret, so the exclusion that covers them is
   prompt-level (the items.id=915 seed and its templates; decisions.id=507 credentials invariant) and

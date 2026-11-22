@@ -2062,7 +2062,8 @@ mod tests {
         assert_eq!(row.spans.settled[0].allowed, AllowedAnswers::NO_RELEASE);
     }
 
-    /// Where only a live release is allowed (the access-credential flag, D3), the
+    /// Where only a live release is allowed (a span restricted to NO_STANDING_RELEASE, as an
+    /// access-credential-flagged field is; the serial no longer is, decisions.id=956), the
     /// user's live release is sent as answered.
     #[tokio::test]
     async fn a_live_release_is_sent_where_only_a_remembered_one_is_refused() {
@@ -2079,8 +2080,8 @@ mod tests {
         assert_eq!(out, PROMPT);
     }
 
-    /// items.id=924 unit 3, the RMA use case at the outbound review: the serial span
-    /// (a live release only) is sent on the user's live release, removed on keep
+    /// items.id=924 unit 3, the RMA use case at the outbound review: a span restricted to a
+    /// live release (the mechanism the serial used before decisions.id=956) is sent on the user's live release, removed on keep
     /// private, and replaced on a generalization; the rest of the letter is untouched.
     #[tokio::test]
     async fn the_rma_serial_is_sent_on_a_live_release_and_removed_on_keep_private() {

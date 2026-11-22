@@ -23,13 +23,14 @@ assert.equal(rememberReleaseAvailable(span()), true)
 assert.equal(editCarriesOriginal(span(), 'PF2ABC3D'), false)
 assert.equal(saveForPersonaFor(span(), 'release_original', true), true)
 
-// The serial (a live release only, D3): release offered, remembering it is not.
-const serial = span({ release: true, standing_release: false })
-assert.equal(releaseAvailable(serial), true)
-assert.equal(rememberReleaseAvailable(serial), false)
-assert.equal(saveForPersonaFor(serial, 'release_original', true), false)
-assert.equal(saveForPersonaFor(serial, 'generalize', true), true)
-assert.equal(saveForPersonaFor(serial, 'keep_private', true), true)
+// A span the server restricts to a live release (an access-credential field; the serial
+// number is not one since decisions.id=956): release offered, remembering it is not.
+const liveOnly = span({ release: true, standing_release: false })
+assert.equal(releaseAvailable(liveOnly), true)
+assert.equal(rememberReleaseAvailable(liveOnly), false)
+assert.equal(saveForPersonaFor(liveOnly, 'release_original', true), false)
+assert.equal(saveForPersonaFor(liveOnly, 'generalize', true), true)
+assert.equal(saveForPersonaFor(liveOnly, 'keep_private', true), true)
 
 // A span with no release (a never value that reached the review, D1).
 const never = span({ release: false, standing_release: false })

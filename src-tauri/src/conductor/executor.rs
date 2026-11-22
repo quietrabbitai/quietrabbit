@@ -13048,7 +13048,8 @@ mod tests {
             field: field.to_owned(),
             value: value.to_owned(),
             disclosure: d,
-            access_credential: field == "serial_number",
+            // decisions.id=956: the serial carries no credential flag; no shipped field does.
+            access_credential: false,
             suggestion: sugg.map(str::to_owned),
         };
         with_temp_shared_db(|pool| async move {
@@ -13104,7 +13105,7 @@ mod tests {
             assert_eq!(seen.sources[0].allowed, AllowedAnswers::ALL);
             assert_eq!(seen.sources[0].suggestion.as_deref(), Some("[device]"));
             for s in &seen.sources[1..] {
-                assert_eq!(s.allowed, AllowedAnswers::NO_STANDING_RELEASE);
+                assert_eq!(s.allowed, AllowedAnswers::ALL);
                 assert_eq!(s.suggestion.as_deref(), Some("[serial number]"));
                 assert_eq!(s.fact_key.as_deref(), Some(serial_key.as_str()));
             }
@@ -13211,11 +13212,7 @@ mod tests {
                 [
                     ("Study laptop", Some("[device]"), AllowedAnswers::ALL),
                     ("2025-03-14", Some("[purchase date]"), AllowedAnswers::ALL),
-                    (
-                        "PF2ABC3D",
-                        Some("[serial number]"),
-                        AllowedAnswers::NO_STANDING_RELEASE
-                    ),
+                    ("PF2ABC3D", Some("[serial number]"), AllowedAnswers::ALL),
                 ]
             );
             for s in &seen.sources {

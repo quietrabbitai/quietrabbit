@@ -22,7 +22,8 @@
 // here), a label (the wording a derived text uses, never a {token}), the
 // sensitivity, its DISCLOSURE (items.id=924: never, ask or pass, what may reach a
 // hosted step) with the generalization a review suggests for an ask field, a byte
-// cap, and for the serial number the access_credential_flag of decisions.id=475.
+// cap, and an optional access_credential_flag (decisions.id=475; no shipped field keeps it,
+// the serial number lost it to decisions.id=956, items.id=936).
 //
 // DISCLOSURE (items.id=924, decisions.id=507 credentials invariant kept). never: the
 // value is removed from a hosted prompt before the outbound review and never shown;
@@ -32,7 +33,8 @@
 // choice is per field, so a later data edit can move one field either way. No shipped
 // field is never (the catalogue holds no credential; a never field is a data edit). A
 // field with the access-credential flag may not be pass, and a remembered release of
-// it is not applied (carry_scan restricts its spans to a live release). The device's NAME
+// it is not applied (carry_scan restricts its spans to a live release); no shipped
+// field has the flag since decisions.id=956 (the serial is an ordinary ask field). The device's NAME
 // is not a fact: its disclosure is the top-level device_name_disclosure.
 //
 // THE STORED COLUMNS. entity_facts.abstraction_tier2/3 of an owned fact are written
@@ -145,7 +147,9 @@ pub struct FieldDef {
     #[serde(default)]
     pub suggestion: Option<String>,
     pub max_bytes: usize,
-    /// decisions.id=475: a serial number can serve as access-credential metadata.
+    /// decisions.id=475: a field that can serve as access-credential metadata (a booking
+    /// reference) may not be pass and allows a live release only. No shipped field has it:
+    /// the serial number is an ordinary ask field (decisions.id=956, items.id=936).
     #[serde(default)]
     pub access_credential_flag: bool,
 }
@@ -364,7 +368,7 @@ mod tests {
     #[test]
     fn the_bundled_catalogue_validates_and_is_pinned() {
         let c = registry().expect("the bundled catalogue must validate");
-        assert_eq!(c.catalogue_version, 2);
+        assert_eq!(c.catalogue_version, 3);
         // The consent text and the seed list categories that match exactly what
         // is saved, so a new field is a deliberate act: change these with the data.
         let names: Vec<&str> = c.fields.iter().map(|f| f.name.as_str()).collect();
@@ -398,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn every_category_is_used_and_the_flagged_field_is_closed_upward() {
+    fn every_category_is_used_and_no_shipped_field_has_the_credential_flag() {
         let c = registry().unwrap();
         for cat in &c.categories {
             assert!(
@@ -408,7 +412,9 @@ mod tests {
             );
         }
         let serial = c.field("serial_number").unwrap();
-        assert!(serial.access_credential_flag);
+        // decisions.id=956: the serial is an ordinary ask field, no credential flag.
+        assert!(!serial.access_credential_flag);
+        assert!(c.fields.iter().all(|f| !f.access_credential_flag));
         assert_eq!(serial.disclosure, Disclosure::Ask);
         assert_eq!(serial.suggestion.as_deref(), Some("[serial number]"));
         assert_eq!(c.device_name_disclosure, Disclosure::Ask);
@@ -536,14 +542,12 @@ mod tests {
         });
         push("empty label", &|c| c.fields[1].label = " ".to_owned());
         push("bad name", &|c| c.fields[1].name = "Bad Name".to_owned());
-        push("flag without closed tiers", &|c| {
-            let i = c
-                .fields
-                .iter()
-                .position(|f| f.name == "serial_number")
-                .unwrap();
-            c.fields[i].disclosure = Disclosure::Pass;
-            c.fields[i].suggestion = None;
+        // decisions.id=956: no shipped field has the flag, so a fixture sets it on a pass
+        // field (make). A flagged field may not be pass.
+        push("flagged field that is pass", &|c| {
+            let i = c.fields.iter().position(|f| f.name == "make").unwrap();
+            assert_eq!(c.fields[i].disclosure, Disclosure::Pass);
+            c.fields[i].access_credential_flag = true;
         });
         push("no subject_class", &|c| {
             c.fields.retain(|f| f.name != SUBJECT_CLASS_FIELD)
@@ -552,7 +556,8 @@ mod tests {
             assert!(c.validate().is_err(), "{what} must be refused");
         }
         assert!(bundled().validate().is_ok());
-        // A never field, and the flagged field as never, validate.
+        // A never field validates, a fixture-flagged field validates as ask or never,
+        // and the serial (no flag since decisions.id=956) validates as pass.
         let mut c = bundled();
         let i = c
             .fields
@@ -562,6 +567,25 @@ mod tests {
         c.fields[i].disclosure = Disclosure::Never;
         c.fields[i].suggestion = None;
         assert!(c.validate().is_ok());
+        let mut c = bundled();
+        let i = c.fields.iter().position(|f| f.name == "retailer").unwrap();
+        c.fields[i].access_credential_flag = true;
+        assert!(c.validate().is_ok(), "a flagged ask field is allowed");
+        c.fields[i].disclosure = Disclosure::Never;
+        c.fields[i].suggestion = None;
+        assert!(c.validate().is_ok(), "a flagged never field is allowed");
+        let mut c = bundled();
+        let i = c
+            .fields
+            .iter()
+            .position(|f| f.name == "serial_number")
+            .unwrap();
+        c.fields[i].disclosure = Disclosure::Pass;
+        c.fields[i].suggestion = None;
+        assert!(
+            c.validate().is_ok(),
+            "the serial is no longer closed upward"
+        );
         // An unknown disclosure word does not parse.
         let bad = BUNDLED.replacen("\"disclosure\": \"pass\"", "\"disclosure\": \"maybe\"", 1);
         assert!(serde_json::from_str::<Catalogue>(&bad).is_err());

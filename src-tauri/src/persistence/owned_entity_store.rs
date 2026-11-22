@@ -744,7 +744,8 @@ mod tests {
         assert_eq!(row.get::<i64, _>("cross_persona_export"), 0);
         let meta: serde_json::Value =
             serde_json::from_str(&row.get::<String, _>("extra_metadata")).unwrap();
-        assert_eq!(meta["access_credential_flag"], true);
+        // decisions.id=956: the serial has no credential flag, so its metadata is empty.
+        assert_eq!(meta, serde_json::json!({}));
 
         // A general field is written with pass, and no credential flag.
         put_owned_fact(&mut conn, FOCUS, PERSONA, &id, "make", "Netgear")

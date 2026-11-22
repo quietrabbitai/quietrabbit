@@ -274,12 +274,13 @@ assert.deepEqual(reduce(INITIAL_STATE, { type: 'run_status', runId: 'api-chat-se
   const nan = modalPayload({ ...review('r1'), spans: [{ ...span('a'), score: null }] }, 'x')
   assert.equal(nan.spans[0].score, 0)
   assert.equal(modalPayload({ ...review('r1'), spans: [] }, 'x').review_tier, 'high')
-  // items.id=924: the allowed answers reach the modal unchanged.
-  const serial = modalPayload(
+  // items.id=924: the allowed answers reach the modal unchanged (a live-release-only span
+  // here is a fixture; the serial allows every answer since decisions.id=956).
+  const liveOnly = modalPayload(
     { ...review('r1'), spans: [{ ...span('a'), allowed: { release: true, standing_release: false } }] },
     'x',
   )
-  assert.deepEqual(serial.spans[0].allowed, { release: true, standing_release: false })
+  assert.deepEqual(liveOnly.spans[0].allowed, { release: true, standing_release: false })
 }
 
 // -- the command's error codes ----------------------------------------------------

@@ -1,5 +1,5 @@
 {
-  "catalogue_version": 2,
+  "catalogue_version": 3,
   "device_name_disclosure": "ask",
   "device_name_suggestion": "[device]",
   "categories": [
@@ -29,7 +29,7 @@
 
     { "name": "purchase_date", "category": "purchase_warranty", "label": "Bought on", "sensitivity": "personal", "disclosure": "ask", "suggestion": "[purchase date]", "max_bytes": 40 },
     { "name": "retailer", "category": "purchase_warranty", "label": "Bought from", "sensitivity": "personal", "disclosure": "ask", "suggestion": "[retailer]", "max_bytes": 120 },
-    { "name": "serial_number", "category": "purchase_warranty", "label": "Serial number", "sensitivity": "personal", "disclosure": "ask", "suggestion": "[serial number]", "max_bytes": 80, "access_credential_flag": true },
+    { "name": "serial_number", "category": "purchase_warranty", "label": "Serial number", "sensitivity": "personal", "disclosure": "ask", "suggestion": "[serial number]", "max_bytes": 80 },
     { "name": "warranty_expiry", "category": "purchase_warranty", "label": "Warranty ends", "sensitivity": "personal", "disclosure": "ask", "suggestion": "[warranty end date]", "max_bytes": 40 },
     { "name": "warranty_provider", "category": "purchase_warranty", "label": "Warranty provider", "sensitivity": "personal", "disclosure": "ask", "suggestion": "[warranty provider]", "max_bytes": 120 },
     { "name": "warranty_contact", "category": "purchase_warranty", "label": "Warranty contact", "sensitivity": "personal", "disclosure": "ask", "suggestion": "[warranty contact]", "max_bytes": 160 },
