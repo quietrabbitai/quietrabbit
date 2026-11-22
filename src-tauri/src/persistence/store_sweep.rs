@@ -37,6 +37,8 @@ pub struct StoreSweep {
     pub session_variables: u64,
     pub pass_artifacts: u64,
     pub plan_approvals: u64,
+    /// items.id=903: document_sessions (idx_document_sessions_updated_at).
+    pub document_sessions: u64,
 }
 
 /// The cutoff text: rows with updated_at below it are swept.
@@ -76,6 +78,11 @@ pub async fn sweep_stores_on(
             .await
             .map_err(|e| OutputStoreError::Validation(e.to_string()))?,
             plan_approvals: crate::persistence::plan_approval_store::sweep_older_than_in_tx(
+                conn, &before,
+            )
+            .await
+            .map_err(|e| OutputStoreError::Validation(e.to_string()))?,
+            document_sessions: crate::persistence::document_session_store::sweep_older_than_in_tx(
                 conn, &before,
             )
             .await

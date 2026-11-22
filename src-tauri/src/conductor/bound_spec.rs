@@ -150,6 +150,8 @@ pub const CONTENT_BRIEF: &str = "content_brief";
 pub const VOICE_GUIDANCE: &str = "voice_guidance";
 pub const VALIDATION_REPORT: &str = "validation_report";
 pub const DELTA_ITEMS: &str = "delta_items";
+/// items.id=903: the Writing Assistant's working draft (ArtifactKind::WorkingDraft).
+pub const WORKING_DRAFT: &str = "working_draft";
 
 /// items.id=387: the two session names of a manual hand-off. handoff_pending holds
 /// the opaque id of a hand-off whose starter was rendered and whose reply has not
@@ -169,11 +171,12 @@ pub const HANDOFF_RECEIVED: &str = "handoff_received";
 pub const HANDOFF_NAMES: [&str; 2] = [HANDOFF_PENDING, HANDOFF_RECEIVED];
 
 /// The artifact names, in table order.
-pub const ARTIFACT_NAMES: [&str; 4] = [
+pub const ARTIFACT_NAMES: [&str; 5] = [
     CONTENT_BRIEF,
     VOICE_GUIDANCE,
     VALIDATION_REPORT,
     DELTA_ITEMS,
+    WORKING_DRAFT,
 ];
 
 pub const WRITE_MODE_VALUES: &[&str] = &["open", "suppressed"];
@@ -194,6 +197,7 @@ pub const NAMES: &[&str] = &[
     VOICE_GUIDANCE,
     VALIDATION_REPORT,
     DELTA_ITEMS,
+    WORKING_DRAFT,
     HANDOFF_PENDING,
     HANDOFF_RECEIVED,
     DOCUMENT_TYPE,
@@ -293,6 +297,13 @@ pub const SPECS: &[BoundSpec] = &[
     },
     BoundSpec {
         name: DELTA_ITEMS,
+        source: Source::Artifact,
+        presence: Presence::Optional,
+        literals: Literals::Authored,
+        validate: valid_artifact,
+    },
+    BoundSpec {
+        name: WORKING_DRAFT,
         source: Source::Artifact,
         presence: Presence::Optional,
         literals: Literals::Authored,

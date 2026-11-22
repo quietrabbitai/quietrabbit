@@ -276,6 +276,10 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         // (items.id=930, decisions.id=953)
         commands::fact_policy::get_fact_policies,
         commands::fact_policy::set_fact_policy,
+        // Group 38 in this list -- The document privacy flag of a Writing Assistant
+        // chat's document: the user's own label, stored for the chat and Focus and
+        // stamped on a saved output (items.id=903, decisions.id=942 Q14 to Q16)
+        commands::document_session::set_document_privacy_flag,
     ])
 }
 

@@ -173,9 +173,18 @@ async fn seed_chat_with(c: &mut SqliteConnection, chat: &str, runs: &[(&str, &st
         &[chat, FOCUS],
     )
     .await;
+    // items.id=903: a document session (flag and raise).
+    exec(
+        c,
+        "INSERT INTO document_sessions (context_key, focus_id, document_type,
+                                        document_privacy_flag, raised_ceiling, created_at, updated_at)
+         VALUES (?, ?, 'cover_letter', 'legal', 'anonymous_required', 't', 't')",
+        &[chat, FOCUS],
+    )
+    .await;
 }
 
-async fn saved_rows(c: &mut SqliteConnection, chat: &str) -> [i64; 4] {
+async fn saved_rows(c: &mut SqliteConnection, chat: &str) -> [i64; 5] {
     [
         count(
             c,
@@ -199,6 +208,12 @@ async fn saved_rows(c: &mut SqliteConnection, chat: &str) -> [i64; 4] {
             c,
             "SELECT COUNT(*) FROM run_parks WHERE run_id IN
              (SELECT id FROM focus_runs WHERE context_key = ?)",
+            chat,
+        )
+        .await,
+        count(
+            c,
+            "SELECT COUNT(*) FROM document_sessions WHERE context_key = ?",
             chat,
         )
         .await,
@@ -228,7 +243,7 @@ async fn clear_chat_removes_what_the_chat_saved_and_nothing_else() {
 
     // Everything but the latch: the chat still has a live run (items.id=888 stage 6
     // delta), so the latch stays and only the latch.
-    assert_eq!(saved_rows(&mut c, CHAT).await, [1, 0, 0, 0]);
+    assert_eq!(saved_rows(&mut c, CHAT).await, [1, 0, 0, 0, 0]);
     assert_eq!(
         session_store::write_mode(&mut c, CHAT).await.unwrap(),
         WriteMode::Suppressed,
@@ -288,7 +303,7 @@ async fn clear_chat_removes_what_the_chat_saved_and_nothing_else() {
     }
 
     // The other chat and the run with no chat are as they were.
-    assert_eq!(saved_rows(&mut c, OTHER).await, [2, 1, 1, 2]);
+    assert_eq!(saved_rows(&mut c, OTHER).await, [2, 1, 1, 2, 1]);
     assert_eq!(
         count(
             &mut c,

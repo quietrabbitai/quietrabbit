@@ -1949,6 +1949,11 @@ pub struct FocusRun<L: DisclosureLoggerForRun = SqliteDisclosureLogger> {
     /// run_settings), computed once by load() and seeded by every pass. In memory
     /// only: never persisted, so a retry and a resumed run resolve again.
     pub(crate) launch: crate::conductor::run_settings::LaunchResolution,
+    /// items.id=903 unit B: the chat's document privacy flag for this Focus, read by
+    /// resolve_tier_config (document_session_store) and stamped on the run's saved
+    /// output. In memory only; each run start reads it again.
+    pub(crate) document_flag:
+        Option<crate::persistence::document_session_store::DocumentPrivacyFlag>,
     /// items.id=897: set by rehydrate_focus_run before load(), because a resumed run
     /// has no context_key and so cannot read the chat's launch answers.
     pub(crate) rehydrated: bool,
@@ -2042,6 +2047,7 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
             store_tokens: crate::conductor::taint::StoreTokens::default(),
             store_vars: HashMap::new(),
             launch: crate::conductor::run_settings::LaunchResolution::default(),
+            document_flag: None,
             rehydrated: false,
             resume_basis: None,
             resume_claimed: false,
@@ -2412,6 +2418,13 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
     /// (load() must have run first).
     async fn resolve_tier_config(&mut self) -> Result<(), LifecycleError> {
         let (max_permitted, privacy_tier) = self.get_focus_tier_ceiling().await?;
+        // items.id=903 unit B: the chat's document privacy flag only TIGHTENS the
+        // user's ceiling (medical, financial, legal: local_only). focus_settings is
+        // never edited.
+        let max_permitted = match self.document_ceiling().await? {
+            Some(cap) => max_permitted.min(cap),
+            None => max_permitted,
+        };
         self._focus_max_permitted_tier = max_permitted;
         self._focus_privacy_tier = privacy_tier;
 
@@ -2441,6 +2454,37 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         }
 
         Ok(())
+    }
+
+    /// items.id=903 unit B (decisions.id=942 Q14 Path C): the ceiling the chat's
+    /// document allows, when this run is a pass of a document: a run of a chat whose
+    /// Focus selected a document type. Reads document_sessions in the persona's
+    /// outputs.db; a read that fails ends the run start (fail closed, never the
+    /// unflagged ceiling). Sets document_flag for the output stamp. A run with no chat
+    /// or no document type reads nothing.
+    async fn document_ceiling(&mut self) -> Result<Option<ExternalAccess>, LifecycleError> {
+        use crate::persistence::document_session_store;
+        self.document_flag = None;
+        let (Some(context_key), Some(document_type)) =
+            (self.context_key.clone(), self.launch.document_type.clone())
+        else {
+            return Ok(None);
+        };
+        let mut conn = crate::persistence::output_store::open_outputs_db_retrying(
+            &self.user_id,
+            &self.persona_id,
+            self.key_hex.as_deref().unwrap_or(""),
+        )
+        .await
+        .map_err(|e| LifecycleError::OutputStore(format!("document session: {e}")))?;
+        let session = document_session_store::get(&mut conn, &context_key, &self.focus_id)
+            .await
+            .map_err(|e| LifecycleError::OutputStore(format!("document session: {e}")))?;
+        self.document_flag = session.as_ref().and_then(|s| s.document_privacy_flag);
+        Ok(document_session_store::restricted_ceiling(
+            session.as_ref(),
+            &document_type,
+        ))
     }
 
     /// Read (max_permitted_tier, privacy_tier) from focus_settings.
@@ -4475,6 +4519,33 @@ impl<L: DisclosureLoggerForRun> FocusRun<L> {
         )
         .await
         .map_err(|e| LifecycleError::OutputStore(e.to_string()))?;
+
+        // items.id=903 unit B: the chat's document flag goes onto the saved document.
+        // Best effort: the output stands, and the flag stays on the chat's session.
+        if let (Some(flag), Some(context_key)) = (self.document_flag, self.context_key.as_deref()) {
+            let stamped = async {
+                let mut conn = crate::persistence::output_store::open_outputs_db_retrying(
+                    &self.user_id,
+                    &self.persona_id,
+                    &key_hex,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                crate::persistence::document_session_store::stamp_output_flag(
+                    &mut conn,
+                    &output_id,
+                    context_key,
+                    &self.focus_id,
+                    flag,
+                )
+                .await
+                .map_err(|e| e.to_string())
+            }
+            .await;
+            if let Err(e) = stamped {
+                log::warn!("lifecycle: the document flag was not stamped on the output: {e}");
+            }
+        }
 
         self._output_id = Some(output_id.clone());
         self.purge_snapshots().await;

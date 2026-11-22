@@ -1083,6 +1083,7 @@ export const commands = {
 } | null, string>(__TAURI_INVOKE("get_run_park", { personaId, runId })),
 	getFactPolicies: (personaId: string) => typedError<FactPolicyInfo[], string>(__TAURI_INVOKE("get_fact_policies", { personaId })),
 	setFactPolicy: (personaId: string, fieldName: string, tier: number, policy: string) => typedError<FactPolicyInfo, string>(__TAURI_INVOKE("set_fact_policy", { personaId, fieldName, tier, policy })),
+	setDocumentPrivacyFlag: (personaId: string, contextKey: string, focusId: string, flag: DocumentPrivacyFlag, outputId: string | null) => typedError<DocumentSessionView, string>(__TAURI_INVOKE("set_document_privacy_flag", { personaId, contextKey, focusId, flag, outputId })),
 };
 
 /* Types */
@@ -1562,6 +1563,21 @@ export type DisclosedAttributes = {
 	 */
 	model_overrides: string[],
 	disclosures: string[],
+};
+
+/**
+ *  The user's label for a document. Closed, held here and not as a SQL CHECK (see
+ *  outputs_020.sql); a round-trip test keeps ALL and the text together.
+ */
+export type DocumentPrivacyFlag = "general" | "personal" | "medical" | "financial" | "legal";
+
+/**  The chat's document state, as stored. */
+export type DocumentSessionView = {
+	focus_id: string,
+	document_type: string,
+	document_privacy_flag: DocumentPrivacyFlag | null,
+	/**  The flag keeps later passes of this document on the device. */
+	local_only: boolean,
 };
 
 export type EstimateCostRequest = {

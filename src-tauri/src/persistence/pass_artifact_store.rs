@@ -78,15 +78,19 @@ pub enum ArtifactKind {
     ValidationReport,
     /// The delta items found by session delta validation.
     DeltaItems,
+    /// items.id=903: the document a Writing Assistant chat is writing, as the last
+    /// pass left it (written by artifact_put, and by artifact_append section by section).
+    WorkingDraft,
 }
 
 impl ArtifactKind {
     /// The closed set, in documentation order.
-    pub const ALL: [ArtifactKind; 4] = [
+    pub const ALL: [ArtifactKind; 5] = [
         ArtifactKind::ContentBrief,
         ArtifactKind::VoiceGuidance,
         ArtifactKind::ValidationReport,
         ArtifactKind::DeltaItems,
+        ArtifactKind::WorkingDraft,
     ];
 
     /// The value stored in the kind column.
@@ -96,6 +100,7 @@ impl ArtifactKind {
             ArtifactKind::VoiceGuidance => "voice_guidance",
             ArtifactKind::ValidationReport => "validation_report",
             ArtifactKind::DeltaItems => "delta_items",
+            ArtifactKind::WorkingDraft => "working_draft",
         }
     }
 
@@ -516,7 +521,8 @@ mod tests {
                 "content_brief",
                 "voice_guidance",
                 "validation_report",
-                "delta_items"
+                "delta_items",
+                "working_draft"
             ]
         );
         for k in ArtifactKind::ALL {
@@ -691,7 +697,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(count(&mut conn).await, 6);
+        assert_eq!(count(&mut conn).await, 7);
 
         let own = get_artifact(&mut conn, CHAT, FOCUS, BRIEF)
             .await
@@ -906,7 +912,7 @@ mod tests {
             ClearOutcome::AlreadyAbsent
         );
         // Everything else is untouched.
-        assert_eq!(count(&mut conn).await, 4);
+        assert_eq!(count(&mut conn).await, 5);
         let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_variables")
             .fetch_one(&mut conn)
             .await

@@ -108,6 +108,13 @@ const PRE_EXISTING_ORPHAN_KEYS: string[] = [
   'launch.error.invalid_run_change', // same
   'launch.error.one_time_chat', // same: the data hook for "not saved, one-time session, defaults apply"
   'launch.error.launch_unavailable', // same
+  'document.error.persona_not_found', // items.id=903: the codes of set_document_privacy_flag; the screen that shows them is items.id=912
+  'document.error.invalid_focus_id', // same
+  'document.error.invalid_context_key', // same
+  'document.error.no_document_type', // same
+  'document.error.invalid_output_id', // same
+  'document.error.one_time_chat', // same: the data hook for "a one-time session saves no label"
+  'document.error.document_unavailable', // same
 ]
 
 function walk(dir: string, exts: string[], out: string[] = []): string[] {

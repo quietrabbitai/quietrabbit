@@ -61,15 +61,20 @@ fn row(id: &'static str, block: Option<&'static str>, custom: Value) -> Row {
 /// A Focus with a fixed document_type question (essay_section, no sender or context
 /// fields) and the given rows.
 async fn seed(pool: &sqlx::SqlitePool, focus_id: &str, rows: Vec<Row>) {
+    seed_with_tier(pool, focus_id, "local_only", rows).await
+}
+
+async fn seed_with_tier(pool: &sqlx::SqlitePool, focus_id: &str, tier: &str, rows: Vec<Row>) {
     sqlx::query(
         "INSERT INTO focuses
             (focus_id, display_name, description, version, max_routing_tier,
              output_type, suggest_in_focuses, multi_source_validation,
              generic_title_template, status, created_at, updated_at)
-         VALUES (?, 'Block Guard Focus', '', '1.0', 'local_only', 'general', '[]', 0,
+         VALUES (?, 'Block Guard Focus', '', '1.0', ?, 'general', '[]', 0,
                  'Hidden', 'shipped', datetime('now'), datetime('now'))",
     )
     .bind(focus_id)
+    .bind(tier)
     .execute(pool)
     .await
     .unwrap();
@@ -518,6 +523,134 @@ async fn the_regenerate_row_runs_only_on_regenerate_and_at_most_once() {
                 x.rows.contains(&idx("check_again"))
             );
         }
+    })
+    .await;
+}
+
+/// items.id=903 unit B: the chat's document privacy flag tightens the run's ceiling
+/// (medical, financial, legal: local_only) and never loosens it; a run with no chat
+/// reads nothing; focus_settings is unchanged. Read on the user's max_permitted after
+/// the flag: the fixture Focus has no tier-manifest entry, so its own ceiling is
+/// local_only whatever its row says (tier_manifest::apply_manifest).
+#[tokio::test]
+async fn the_document_flag_tightens_the_runs_effective_ceiling() {
+    use crate::persistence::document_session_store::{self, DocumentPrivacyFlag};
+    with_root(async {
+        let p = pool().await;
+        let key = "11".repeat(32);
+        let user = uuid::Uuid::new_v4().to_string();
+        crate::auth::user_store::create_user(
+            &p,
+            &user,
+            "Doc User",
+            "user",
+            false,
+            &[0u8; crate::auth::kdf::SALT_LEN],
+            crate::auth::kdf::DEFAULT_ARGON2_MEMORY_KIB,
+            crate::auth::kdf::DEFAULT_ARGON2_ITERATIONS,
+            crate::auth::kdf::DEFAULT_ARGON2_PARALLELISM,
+            &[0u8; 32],
+        )
+        .await
+        .unwrap();
+        let persona = uuid::Uuid::new_v4().to_string();
+        crate::persistence::persona_store::create_persona(
+            &p, &persona, "P", "personal", &user, &key, None,
+        )
+        .await
+        .unwrap();
+        seed_with_tier(&p, "bg-doc", "anonymous_required", vec![tail()]).await;
+        crate::persistence::focus_settings_store::create_focus_settings(
+            &p,
+            &persona,
+            "bg-doc",
+            "bidirectional",
+            "shared",
+            2,
+            ExternalAccess::AnonymousRequired,
+            "open",
+            None,
+        )
+        .await
+        .unwrap();
+        let run_in = |chat: Option<&str>| {
+            let mut r: FocusRun = FocusRun::new(
+                user.clone(),
+                persona.clone(),
+                "bg-doc".to_owned(),
+                p.clone(),
+                std::sync::Arc::new(crate::conductor::concurrency::ConductorScheduler::new()),
+                String::new(),
+                false,
+                Some(key.clone()),
+                None,
+                false,
+                std::collections::HashSet::new(),
+                None,
+            );
+            r.context_key = chat.map(str::to_owned);
+            r
+        };
+        let ceiling = |chat: Option<&'static str>| {
+            let mut r = run_in(chat);
+            async move {
+                r.load().await.unwrap();
+                r.resolve_tier_config().await.unwrap();
+                (r._focus_max_permitted_tier, r.document_flag)
+            }
+        };
+        assert_eq!(
+            ceiling(Some("chat-d")).await,
+            (ExternalAccess::AnonymousRequired, None)
+        );
+        let mut conn =
+            crate::persistence::output_store::open_outputs_db_retrying(&user, &persona, &key)
+                .await
+                .unwrap();
+        for (flag, want) in [
+            (
+                DocumentPrivacyFlag::General,
+                ExternalAccess::AnonymousRequired,
+            ),
+            (
+                DocumentPrivacyFlag::Personal,
+                ExternalAccess::AnonymousRequired,
+            ),
+            (DocumentPrivacyFlag::Medical, ExternalAccess::LocalOnly),
+            (DocumentPrivacyFlag::Financial, ExternalAccess::LocalOnly),
+            (DocumentPrivacyFlag::Legal, ExternalAccess::LocalOnly),
+        ] {
+            document_session_store::set_privacy_flag(
+                &mut conn,
+                "chat-d",
+                "bg-doc",
+                "essay_section",
+                flag,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                ceiling(Some("chat-d")).await,
+                (want, Some(flag)),
+                "{flag:?}"
+            );
+        }
+        // Another chat and a run with no chat read no flag.
+        assert_eq!(
+            ceiling(Some("chat-e")).await.0,
+            ExternalAccess::AnonymousRequired
+        );
+        assert_eq!(
+            ceiling(None).await,
+            (ExternalAccess::AnonymousRequired, None)
+        );
+        // focus_settings is unchanged.
+        let s =
+            crate::persistence::focus_settings_store::get_focus_settings(&p, &persona, "bg-doc")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(s.max_permitted_tier, ExternalAccess::AnonymousRequired);
     })
     .await;
 }

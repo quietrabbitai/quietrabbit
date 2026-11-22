@@ -94,13 +94,31 @@ async fn seed(c: &mut SqliteConnection, chat: &str, at: &str) {
     .await
     .unwrap();
     crate::persistence::plan_approval_store::set_updated_at_for_test(c, chat, at).await;
+    // items.id=903: a document session.
+    sqlx::query(
+        "INSERT INTO document_sessions (context_key, focus_id, document_type,
+                                        document_privacy_flag, created_at, updated_at)
+         VALUES (?, ?, 'cover_letter', 'legal', ?, ?)",
+    )
+    .bind(chat)
+    .bind(FOCUS)
+    .bind(at)
+    .bind(at)
+    .execute(&mut *c)
+    .await
+    .unwrap();
 }
 
-async fn rows(c: &mut SqliteConnection, chat: &str) -> [i64; 3] {
-    let mut out = [0; 3];
-    for (i, table) in ["session_variables", "pass_artifacts", "plan_approvals"]
-        .iter()
-        .enumerate()
+async fn rows(c: &mut SqliteConnection, chat: &str) -> [i64; 4] {
+    let mut out = [0; 4];
+    for (i, table) in [
+        "session_variables",
+        "pass_artifacts",
+        "plan_approvals",
+        "document_sessions",
+    ]
+    .iter()
+    .enumerate()
     {
         out[i] = sqlx::query_scalar(&format!(
             "SELECT COUNT(*) FROM {table} WHERE context_key = ?"
@@ -135,11 +153,12 @@ async fn rows_older_than_the_period_are_swept_and_younger_rows_stay() {
         StoreSweep {
             session_variables: 1,
             pass_artifacts: 1,
-            plan_approvals: 1
+            plan_approvals: 1,
+            document_sessions: 1
         }
     );
-    assert_eq!(rows(&mut c, "chat-old").await, [0, 0, 0]);
-    assert_eq!(rows(&mut c, "chat-young").await, [1, 1, 1]);
+    assert_eq!(rows(&mut c, "chat-old").await, [0, 0, 0, 0]);
+    assert_eq!(rows(&mut c, "chat-young").await, [1, 1, 1, 1]);
 }
 
 /// The one-time latch is EXEMPT: a latched chat is still latched after the period, while its
@@ -209,7 +228,7 @@ async fn a_word_in_updated_at_sorts_after_the_cutoff_and_is_kept() {
     let mut c = outputs().await;
     seed(&mut c, "chat-odd", "not a time").await;
     sweep_stores(USER, PERSONA, KEY_HEX, now()).await.unwrap();
-    assert_eq!(rows(&mut c, "chat-odd").await, [1, 1, 1]);
+    assert_eq!(rows(&mut c, "chat-odd").await, [1, 1, 1, 1]);
 }
 
 /// Each sweep delete uses its table's updated_at index.

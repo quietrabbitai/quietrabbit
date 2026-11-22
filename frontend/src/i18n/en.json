@@ -604,6 +604,17 @@
       "launch_unavailable": "Couldn't check your setup choices. Try again in a moment."
     }
   },
+  "document": {
+    "error": {
+      "persona_not_found": "This persona is not available.",
+      "invalid_focus_id": "This assistant is not available.",
+      "invalid_context_key": "This chat is not available.",
+      "no_document_type": "This assistant does not write documents.",
+      "invalid_output_id": "That document is not part of this chat.",
+      "one_time_chat": "This is a one-time session, so the label was not saved.",
+      "document_unavailable": "Couldn't save the document label. Try again in a moment."
+    }
+  },
   "resolver": {
     "stop": {
       "too_weak": "None of the AI models available for this task is good enough for it yet, so nothing was run.",

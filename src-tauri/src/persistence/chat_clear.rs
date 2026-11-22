@@ -106,6 +106,10 @@ pub async fn clear_chat_on(
         crate::persistence::pass_artifact_store::clear_chat_in_tx(conn, context_key)
             .await
             .map_err(|e| OutputStoreError::Validation(e.to_string()))?;
+        // items.id=903: the chat's document sessions (flag and raise).
+        crate::persistence::document_session_store::clear_chat_in_tx(conn, context_key)
+            .await
+            .map_err(|e| OutputStoreError::Validation(e.to_string()))?;
         report.reviews_deleted =
             crate::persistence::step_review_store::delete_reviews_of_ended_chat_runs_in_tx(
                 conn,

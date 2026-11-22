@@ -1455,8 +1455,8 @@ mod tests {
         let bound = bound_names();
         assert_eq!(
             crate::conductor::bound_spec::ARTIFACT_NAMES.len(),
-            4,
-            "the pin covers all four"
+            5,
+            "the pin covers all five"
         );
         for name in crate::conductor::bound_spec::ARTIFACT_NAMES {
             assert!(bound.contains(&name), "{name} is a registered bound name");
