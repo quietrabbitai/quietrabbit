@@ -113,7 +113,7 @@ pub struct ConsentAuditEvent {
 /// two failures answer alike (persona_not_found): nothing is learned about
 /// another account's Personas. Private on purpose, so items.id=638 can lift it
 /// into one shared check without a caller outside this module to move.
-async fn require_persona(
+pub(crate) async fn require_persona(
     pool: &sqlx::SqlitePool,
     user_id: &str,
     persona_id: &str,

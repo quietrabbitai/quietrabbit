@@ -285,6 +285,10 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         // confirm (items.id=903, decisions.id=942 Q14 Path B, decisions.id=944)
         commands::document_raise::request_document_ceiling_raise,
         commands::document_raise::confirm_document_ceiling_raise,
+        // Group 40 in this list -- What QR shared: the per-Persona read-only view over
+        // disclosure_log and consent_audit_records (items.id=957, decisions.id=967)
+        commands::shared_log::get_shared_log_summary,
+        commands::shared_log::get_shared_log_group_items,
     ])
 }
 

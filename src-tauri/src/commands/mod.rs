@@ -84,6 +84,8 @@ pub mod provider_models;
 pub mod provider_spend;
 pub mod qr_hosted;
 pub mod run_plan;
+pub mod shared_log;
+pub mod shared_log_deck;
 pub mod step_review;
 pub mod system;
 pub mod turn_marker;

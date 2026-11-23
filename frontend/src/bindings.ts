@@ -1086,6 +1086,8 @@ export const commands = {
 	setDocumentPrivacyFlag: (personaId: string, contextKey: string, focusId: string, flag: DocumentPrivacyFlag, outputId: string | null) => typedError<DocumentSessionView, string>(__TAURI_INVOKE("set_document_privacy_flag", { personaId, contextKey, focusId, flag, outputId })),
 	requestDocumentCeilingRaise: (personaId: string, contextKey: string, focusId: string, target: ExternalAccess) => typedError<RaiseChallengeView, string>(__TAURI_INVOKE("request_document_ceiling_raise", { personaId, contextKey, focusId, target })),
 	confirmDocumentCeilingRaise: (token: string, acknowledged: boolean) => typedError<DocumentRaiseView, string>(__TAURI_INVOKE("confirm_document_ceiling_raise", { token, acknowledged })),
+	getSharedLogSummary: (personaId: string, window: SharedLogWindow, utcOffsetMinutes: number, focusId: string | null, providerId: string | null) => typedError<SharedLogSummary, string>(__TAURI_INVOKE("get_shared_log_summary", { personaId, window, utcOffsetMinutes, focusId, providerId })),
+	getSharedLogGroupItems: (personaId: string, day: string, focusId: string, utcOffsetMinutes: number, providerId: string | null) => typedError<SharedLogItem[], string>(__TAURI_INVOKE("get_shared_log_group_items", { personaId, day, focusId, utcOffsetMinutes, providerId })),
 };
 
 /* Types */
@@ -3120,6 +3122,91 @@ export type SetPriceOverrideRequest = {
 	 */
 	confirmed_free: boolean,
 };
+
+export type SharedLogFocus = {
+	id: string,
+	/**  None when the Focus cannot be resolved: the view says "A Focus". */
+	name: string | null,
+	/**  True for quick-ask, shown as "Quick chat". */
+	quick_chat: boolean,
+};
+
+export type SharedLogGroup = {
+	day: string,
+	focus: SharedLogFocus,
+	runs: number,
+	sends: number,
+	/**  True when the group has sends and every one went through review. */
+	all_reviewed: boolean,
+	providers: SharedLogProvider[],
+	kept_back: number,
+	choices: number,
+	/**  Background checks, shown only under "Show background checks". */
+	background: number,
+};
+
+export type SharedLogItem = {
+	/**  RFC 3339. */
+	time: string,
+	tag: SharedLogTag,
+	/**  A key under navShell.shared.sentence.*, never an event string. */
+	sentence: string,
+	provider: SharedLogProvider | null,
+	shared: SharedLogLabel[],
+	kept_back: SharedLogLabel[],
+	/**  The display name of a document type (document_ceiling_raised only). */
+	document_type: string | null,
+	/**  A consent record's fixed description, shown under Details only. */
+	summary: string | null,
+};
+
+export type SharedLogLabel = {
+	kind: SharedLogLabelKind,
+	/**  The catalogue label for `catalogued`, else None. */
+	text: string | null,
+};
+
+export type SharedLogLabelKind = "catalogued" | "draft" | "message" | "other";
+
+export type SharedLogMode = "web" | "api" | 
+/**  A local provider or a missing provider row. */
+"unknown";
+
+export type SharedLogMonth = {
+	/**  "2026-10". */
+	month: string,
+	runs: number,
+	sends: number,
+	kept_back: number,
+	groups: SharedLogGroup[],
+};
+
+export type SharedLogProvider = {
+	id: string,
+	/**  None when the provider row is gone: the view says "an outside service". */
+	name: string | null,
+	mode: SharedLogMode,
+};
+
+export type SharedLogSummary = {
+	/**  Newest day first. */
+	groups: SharedLogGroup[],
+	/**  Older than the window, newest month first. Empty for "Everything". */
+	months: SharedLogMonth[],
+	/**  Filter options, from the unfiltered data. */
+	focuses: SharedLogFocus[],
+	providers: SharedLogProvider[],
+	/**  False only when nothing at all is recorded (the empty state). */
+	has_any: boolean,
+	/**  Consent records a purge would remove (the cleared-on marker is not one). */
+	consent_record_count: number,
+	/**  created_at of the newest "history cleared" record: the permanent line. */
+	cleared_on: string | null,
+};
+
+export type SharedLogTag = "sent" | "kept_back" | "choice" | "hidden";
+
+export type SharedLogWindow = "last30" | "last7" | "everything";
 
 export type StepReviewRunRequest = {
 	persona_id: string,
