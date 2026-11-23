@@ -248,6 +248,7 @@ mod tests {
         ("persistence/plan_state_store.rs", "one-shot: open_plan_state_db"),
         ("persistence/output_store.rs", "one-shot: open_outputs_db (the _conn fns' only production callers pass it)"),
         ("persistence/source_registry_store.rs", "caller-supplied connection; the only production caller, import_record, passes a one-shot personal.db connection"),
+        ("persistence/facts_stop_store.rs", "caller-supplied personal.db connection; the only production callers (commands/my_facts.rs, items.id=959) pass a one-shot open_personal_db connection"),
         ("persistence/owned_entity_store.rs", "caller-supplied personal.db connection; the production callers (items.id=891 stages 3 and 5) pass a one-shot open_personal_db connection"),
         ("persistence/dedup_store.rs", "caller-supplied connection; the only production caller, resolve_candidate, passes a one-shot personal.db connection"),
         ("persistence/cloud_chat_cookie_store.rs", "caller-supplied connection; the only production caller, upsert_cookies, passes a one-shot cookies db connection"),

@@ -11,15 +11,18 @@
 // across Personas (decisions.id=546, 968). Errors are short codes: persona_not_found,
 // facts_unreadable (fails closed, no partial tree), fact_not_found, query_empty.
 //
-// Add, change, stop using and use again are NOT here (items.id=961 and the later
-// units of items.id=959).
+// Unit 2 adds the direct, non-model writes: stop_using_fact, stop_using_section,
+// use_again_fact, use_again_section and the read list_removed. They take the same gate,
+// session and membership check, and removal is end-dating only (no DELETE anywhere).
+// Add and change are NOT here (items.id=961).
 
 use tauri::State;
 
 use crate::auth::registry::KeyRegistry;
 use crate::commands::persona::session_user_and_key;
+use crate::persistence::facts_stop_store as stop;
 use crate::persistence::facts_view_store::{
-    self as store, EarlierValue, FactsTree, FactsViewError,
+    self as store, EarlierValue, FactsTree, FactsViewError, RemovedList,
 };
 use crate::persistence::personal_store::open_personal_db;
 
@@ -78,6 +81,66 @@ pub(crate) async fn search_facts_for_session(
         .map_err(code)
 }
 
+pub(crate) async fn list_removed_for_session(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    key_hex: &str,
+    persona_id: &str,
+) -> Result<RemovedList, String> {
+    let mut conn = open_checked(pool, user_id, key_hex, persona_id).await?;
+    store::list_removed_conn(&mut conn).await.map_err(code)
+}
+
+pub(crate) async fn stop_using_fact_for_session(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    key_hex: &str,
+    persona_id: &str,
+    fact_id: &str,
+) -> Result<(), String> {
+    let mut conn = open_checked(pool, user_id, key_hex, persona_id).await?;
+    stop::stop_fact_conn(&mut conn, fact_id).await.map_err(code)
+}
+
+pub(crate) async fn stop_using_section_for_session(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    key_hex: &str,
+    persona_id: &str,
+    section_id: &str,
+) -> Result<u32, String> {
+    let mut conn = open_checked(pool, user_id, key_hex, persona_id).await?;
+    stop::stop_section_conn(&mut conn, section_id)
+        .await
+        .map_err(code)
+}
+
+pub(crate) async fn use_again_fact_for_session(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    key_hex: &str,
+    persona_id: &str,
+    fact_id: &str,
+) -> Result<(), String> {
+    let mut conn = open_checked(pool, user_id, key_hex, persona_id).await?;
+    stop::use_again_fact_conn(&mut conn, fact_id)
+        .await
+        .map_err(code)
+}
+
+pub(crate) async fn use_again_section_for_session(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    key_hex: &str,
+    persona_id: &str,
+    section_id: &str,
+) -> Result<u32, String> {
+    let mut conn = open_checked(pool, user_id, key_hex, persona_id).await?;
+    stop::use_again_section_conn(&mut conn, section_id)
+        .await
+        .map_err(code)
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn get_facts_tree(
@@ -114,6 +177,74 @@ pub async fn search_facts(
     let _lease = crate::auth::writer_gate::command(&key_registry).await?;
     let (user_id, key_hex) = session_user_and_key(&key_registry).await?;
     search_facts_for_session(&pool, &user_id, &key_hex, &persona_id, &query).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_removed(
+    persona_id: String,
+    key_registry: State<'_, KeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
+) -> Result<RemovedList, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
+    let (user_id, key_hex) = session_user_and_key(&key_registry).await?;
+    list_removed_for_session(&pool, &user_id, &key_hex, &persona_id).await
+}
+
+/// Stop using one fact. Direct, no model, no reason asked (decisions.id=968).
+#[tauri::command]
+#[specta::specta]
+pub async fn stop_using_fact(
+    persona_id: String,
+    fact_id: String,
+    key_registry: State<'_, KeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
+) -> Result<(), String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
+    let (user_id, key_hex) = session_user_and_key(&key_registry).await?;
+    stop_using_fact_for_session(&pool, &user_id, &key_hex, &persona_id, &fact_id).await
+}
+
+/// Stop using a section. Returns how many of its own facts were ended.
+#[tauri::command]
+#[specta::specta]
+pub async fn stop_using_section(
+    persona_id: String,
+    section_id: String,
+    key_registry: State<'_, KeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
+) -> Result<u32, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
+    let (user_id, key_hex) = session_user_and_key(&key_registry).await?;
+    stop_using_section_for_session(&pool, &user_id, &key_hex, &persona_id, &section_id).await
+}
+
+/// Use a stopped fact again (a new active row). `fact_id` is RemovedFact.id.
+#[tauri::command]
+#[specta::specta]
+pub async fn use_again_fact(
+    persona_id: String,
+    fact_id: String,
+    key_registry: State<'_, KeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
+) -> Result<(), String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
+    let (user_id, key_hex) = session_user_and_key(&key_registry).await?;
+    use_again_fact_for_session(&pool, &user_id, &key_hex, &persona_id, &fact_id).await
+}
+
+/// Use a stopped section again. Returns how many facts came back.
+#[tauri::command]
+#[specta::specta]
+pub async fn use_again_section(
+    persona_id: String,
+    section_id: String,
+    key_registry: State<'_, KeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
+) -> Result<u32, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
+    let (user_id, key_hex) = session_user_and_key(&key_registry).await?;
+    use_again_section_for_session(&pool, &user_id, &key_hex, &persona_id, &section_id).await
 }
 
 #[cfg(test)]
@@ -613,7 +744,11 @@ mod tests {
     fn every_command_takes_the_gate_first_and_one_persona() {
         let src = production(include_str!("my_facts.rs"));
         let commands: Vec<&str> = src.split("#[tauri::command]").skip(1).collect();
-        assert_eq!(commands.len(), 3, "the unit 1 read set, no more");
+        assert_eq!(
+            commands.len(),
+            8,
+            "the read set and the unit 2 writes, no more"
+        );
         for body in commands {
             let sig_end = body.find("{\n").unwrap();
             let sig = &body[..sig_end];
@@ -663,11 +798,786 @@ mod tests {
             );
             reads += 1;
         }
-        assert_eq!(reads, 2, "the section loader and the alias search");
+        assert_eq!(
+            reads, 3,
+            "the section loader, the alias search and the removed sections"
+        );
         assert!(!src.contains("entity_store::"), "no entity_store reader");
         assert!(
             !src.contains("search_entities"),
             "search_entities not widened"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Unit 2: stop using, Removed, use again (items.id=959, decisions.id=969)
+    // ------------------------------------------------------------------
+
+    async fn meta(c: &mut sqlx::SqliteConnection, id: &str) -> serde_json::Value {
+        let s: String = sqlx::query_scalar("SELECT extra_metadata FROM entity_facts WHERE id = ?")
+            .bind(id)
+            .fetch_one(c)
+            .await
+            .unwrap();
+        serde_json::from_str(&s).unwrap()
+    }
+
+    async fn count_facts(c: &mut sqlx::SqliteConnection) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM entity_facts")
+            .fetch_one(c)
+            .await
+            .unwrap()
+    }
+
+    async fn removed(e: &Env, persona: &str) -> RemovedList {
+        list_removed_for_session(&e.pool, &e.user, &e.key, persona)
+            .await
+            .unwrap()
+    }
+
+    async fn stop_fact(e: &Env, persona: &str, id: &str) -> Result<(), String> {
+        stop_using_fact_for_session(&e.pool, &e.user, &e.key, persona, id).await
+    }
+
+    async fn stop_section(e: &Env, persona: &str, id: &str) -> Result<u32, String> {
+        stop_using_section_for_session(&e.pool, &e.user, &e.key, persona, id).await
+    }
+
+    async fn again_fact(e: &Env, persona: &str, id: &str) -> Result<(), String> {
+        use_again_fact_for_session(&e.pool, &e.user, &e.key, persona, id).await
+    }
+
+    async fn again_section(e: &Env, persona: &str, id: &str) -> Result<u32, String> {
+        use_again_section_for_session(&e.pool, &e.user, &e.key, persona, id).await
+    }
+
+    /// Stopping a fact end-dates it with a marker, leaves the row, and lists it.
+    /// A stop is not a supersession: it is not an earlier value.
+    #[tokio::test]
+    async fn stop_using_a_fact_end_dates_marks_and_lists_it() {
+        let e = env().await;
+        let mut c = conn(&e, &e.a).await;
+        let maya = entity(&mut c, "Maya", &[], None).await;
+        let old = fact(&mut c, &e.a, Some(&maya), "City", "Leeds", "ipc").await;
+        let city = fact(&mut c, &e.a, Some(&maya), "City", "Bristol", "ipc").await;
+        let job = fact(&mut c, &e.a, None, "job_title", "Nurse", "ipc").await;
+        let before = count_facts(&mut c).await;
+        // A pristine (imported, unedited) record flips to user_modified on a stop.
+        sqlx::query("UPDATE entities SET modification_state = 'pristine' WHERE id = ?")
+            .bind(&maya)
+            .execute(&mut c)
+            .await
+            .unwrap();
+        drop(c);
+
+        stop_fact(&e, &e.a, &city).await.unwrap();
+        stop_fact(&e, &e.a, &job).await.unwrap();
+
+        let t = tree(&e, &e.a).await.unwrap();
+        assert!(t.general.is_empty());
+        assert_eq!(t.fact_count, 0);
+        let r = removed(&e, &e.a).await;
+        assert_eq!(r.count, 2);
+        assert!(r.sections.is_empty());
+        let got = r.facts.iter().find(|f| f.label == "City").unwrap();
+        assert_eq!(got.id, city);
+        assert_eq!(got.value, "Bristol");
+        assert_eq!(got.section_name.as_deref(), Some("Maya"));
+        assert!(r
+            .facts
+            .iter()
+            .any(|f| f.id == job && f.section_name.is_none()));
+
+        let mut c = conn(&e, &e.a).await;
+        assert_eq!(count_facts(&mut c).await, before, "nothing was deleted");
+        let m = meta(&mut c, &city).await;
+        assert_eq!(m["stop_scope"], "fact");
+        let until: String = sqlx::query_scalar("SELECT valid_until FROM entity_facts WHERE id = ?")
+            .bind(&city)
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(m["stopped_at"], until.as_str());
+        // The earlier superseded row has no marker.
+        assert!(meta(&mut c, &old).await.get("stopped_at").is_none());
+        // The entity was edited by the user.
+        let state: String =
+            sqlx::query_scalar("SELECT modification_state FROM entities WHERE id = ?")
+                .bind(&maya)
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+        assert_eq!(state, "user_modified");
+    }
+
+    /// A stopped row is removed, never an earlier value: not in earlier_count, not in
+    /// history, even once the value is used again.
+    #[tokio::test]
+    async fn a_stopped_row_is_never_an_earlier_value() {
+        let e = env().await;
+        let mut c = conn(&e, &e.a).await;
+        let maya = entity(&mut c, "Maya", &[], None).await;
+        fact(&mut c, &e.a, Some(&maya), "City", "Leeds", "ipc").await;
+        let city = fact(&mut c, &e.a, Some(&maya), "City", "Bristol", "ipc").await;
+        drop(c);
+        let hist = |id: String| {
+            let (p, u, k, a) = (e.pool.clone(), e.user.clone(), e.key.clone(), e.a.clone());
+            async move { fact_history_for_session(&p, &u, &k, &a, &id).await.unwrap() }
+        };
+        assert_eq!(
+            tree(&e, &e.a).await.unwrap().sections[0].facts[0].earlier_count,
+            1
+        );
+
+        stop_fact(&e, &e.a, &city).await.unwrap();
+        again_fact(&e, &e.a, &city).await.unwrap();
+
+        let t = tree(&e, &e.a).await.unwrap();
+        let back = &t.sections[0].facts[0];
+        assert_ne!(back.id, city, "a new row, not the stopped one");
+        assert_eq!(back.value, "Bristol");
+        assert_eq!(
+            back.earlier_count, 1,
+            "Leeds only: Bristol is not its own history"
+        );
+        let h = hist(back.id.clone()).await;
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].value, "Leeds");
+        assert_eq!(removed(&e, &e.a).await.count, 0);
+        // The stopped id is no longer an addressable fact for history either.
+        let r = fact_history_for_session(&e.pool, &e.user, &e.key, &e.a, &city).await;
+        assert_eq!(r.unwrap_err(), "fact_not_found");
+    }
+
+    /// Use again keeps the provenance columns (a copied-in fact stays copied-in), the
+    /// policies and the source, and drops the stop marker.
+    #[tokio::test]
+    async fn use_again_copies_provenance_and_drops_the_marker() {
+        let e = env().await;
+        let mut c = conn(&e, &e.a).await;
+        let maya = entity(&mut c, "Maya", &[], None).await;
+        let id = create_entity_fact_with_provenance_conn(
+            &mut c,
+            Some(&maya),
+            "City",
+            "Leeds",
+            "medical",
+            "extract_confirm",
+            &e.b,
+            true,
+            Some(&e.b),
+            Some(serde_json::json!({"source_id": "x"})),
+        )
+        .await
+        .unwrap();
+        drop(c);
+        stop_fact(&e, &e.a, &id).await.unwrap();
+        again_fact(&e, &e.a, &id).await.unwrap();
+
+        let mut c = conn(&e, &e.a).await;
+        let row = sqlx::query(
+            "SELECT sensitivity, source, source_persona_id, cross_persona_export,
+                    origin_persona_id, extra_metadata, abstraction_tier2
+             FROM entity_facts WHERE entity_id = ? AND valid_until IS NULL",
+        )
+        .bind(&maya)
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
+        use sqlx::Row;
+        assert_eq!(row.get::<String, _>("sensitivity"), "medical");
+        assert_eq!(row.get::<String, _>("source"), "extract_confirm");
+        assert_eq!(row.get::<String, _>("source_persona_id"), e.b);
+        assert_eq!(row.get::<i64, _>("cross_persona_export"), 1);
+        assert_eq!(
+            row.get::<Option<String>, _>("origin_persona_id"),
+            Some(e.b.clone())
+        );
+        let m: serde_json::Value =
+            serde_json::from_str(&row.get::<String, _>("extra_metadata")).unwrap();
+        assert_eq!(m["source_id"], "x");
+        assert!(m.get("stopped_at").is_none() && m.get("stop_scope").is_none());
+    }
+
+    /// Use again is refused when a newer active value for the label exists, and when
+    /// the stop was already used again (the older row is no longer the latest).
+    #[tokio::test]
+    async fn use_again_is_refused_for_a_newer_value_and_for_a_stale_stop() {
+        let e = env().await;
+        let mut c = conn(&e, &e.a).await;
+        let maya = entity(&mut c, "Maya", &[], None).await;
+        let first = fact(&mut c, &e.a, Some(&maya), "City", "Leeds", "ipc").await;
+        drop(c);
+        stop_fact(&e, &e.a, &first).await.unwrap();
+        // Someone writes a newer value for the same label.
+        let mut c = conn(&e, &e.a).await;
+        let newer = fact(&mut c, &e.a, Some(&maya), "City", "Bristol", "ipc").await;
+        let before = count_facts(&mut c).await;
+        drop(c);
+        assert_eq!(
+            again_fact(&e, &e.a, &first).await.unwrap_err(),
+            "newer_value_exists"
+        );
+        let mut c = conn(&e, &e.a).await;
+        assert_eq!(count_facts(&mut c).await, before, "nothing was written");
+        drop(c);
+        let t = tree(&e, &e.a).await.unwrap();
+        assert_eq!(t.sections[0].facts[0].value, "Bristol");
+
+        // Stale: stop the newer one, use the OLD stop again, then try the old id again.
+        stop_fact(&e, &e.a, &newer).await.unwrap();
+        again_fact(&e, &e.a, &newer).await.unwrap();
+        stop_fact(
+            &e,
+            &e.a,
+            &tree(&e, &e.a).await.unwrap().sections[0].facts[0].id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            again_fact(&e, &e.a, &first).await.unwrap_err(),
+            "fact_not_found",
+            "an older stop is not the latest"
+        );
+        // Not a stop at all: a plain active or superseded row id.
+        assert_eq!(
+            again_fact(&e, &e.a, "no-such").await.unwrap_err(),
+            "fact_not_found"
+        );
+    }
+
+    /// Stopping twice is a clean not-found, and a superseded row is not stoppable.
+    #[tokio::test]
+    async fn stopping_twice_or_a_superseded_row_is_not_found() {
+        let e = env().await;
+        let mut c = conn(&e, &e.a).await;
+        let maya = entity(&mut c, "Maya", &[], None).await;
+        let old = fact(&mut c, &e.a, Some(&maya), "City", "Leeds", "ipc").await;
+        let new = fact(&mut c, &e.a, Some(&maya), "City", "Bristol", "ipc").await;
+        drop(c);
+        assert_eq!(
+            stop_fact(&e, &e.a, &old).await.unwrap_err(),
+            "fact_not_found"
+        );
+        stop_fact(&e, &e.a, &new).await.unwrap();
+        assert_eq!(
+            stop_fact(&e, &e.a, &new).await.unwrap_err(),
+            "fact_not_found"
+        );
+        // A superseded (not stopped) row cannot be "used again" either.
+        assert_eq!(
+            again_fact(&e, &e.a, &old).await.unwrap_err(),
+            "fact_not_found"
+        );
+    }
+
+    /// A stopped section: the PARENT only is archived, its own facts share one
+    /// timestamp, the child is untouched but hidden at read time, and the Removed list
+    /// shows the section with its fact count (the child is not listed alone).
+    #[tokio::test]
+    async fn stopping_a_section_archives_the_parent_only() {
+        let e = env().await;
+        let mut c = conn(&e, &e.a).await;
+        let home = entity(&mut c, "Home", &[], None).await;
+        let h1 = fact(&mut c, &e.a, Some(&home), "Address", "1 High St", "ipc").await;
+        let h2 = fact(&mut c, &e.a, Some(&home), "Size", "Large", "ipc").await;
+        let kid = entity(&mut c, "Garden", &[], Some(&home)).await;
+        let k1 = fact(&mut c, &e.a, Some(&kid), "Size", "Small", "ipc").await;
+        drop(c);
+
+        assert_eq!(stop_section(&e, &e.a, &home).await.unwrap(), 2);
+
+        let mut c = conn(&e, &e.a).await;
+        let parent: String = sqlx::query_scalar("SELECT status FROM entities WHERE id = ?")
+            .bind(&home)
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+        let child: String = sqlx::query_scalar("SELECT status FROM entities WHERE id = ?")
+            .bind(&kid)
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(parent, "archived");
+        assert_eq!(child, "active", "children are not written (invariant 14)");
+        let stamp = meta(&mut c, &h1).await["stopped_at"].clone();
+        assert_eq!(
+            meta(&mut c, &h2).await["stopped_at"],
+            stamp,
+            "one shared timestamp"
+        );
+        assert_eq!(meta(&mut c, &h1).await["stop_scope"], "section");
+        let ent_meta: String =
+            sqlx::query_scalar("SELECT extra_metadata FROM entities WHERE id = ?")
+                .bind(&home)
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+        let ent_meta: serde_json::Value = serde_json::from_str(&ent_meta).unwrap();
+        assert_eq!(ent_meta["stopped_at"], stamp);
+        // The child's fact is still active.
+        assert!(meta(&mut c, &k1).await.get("stopped_at").is_none());
+        drop(c);
+
+        assert!(tree(&e, &e.a).await.unwrap().sections.is_empty());
+        let r = removed(&e, &e.a).await;
+        assert_eq!(r.count, 1);
+        assert!(r.facts.is_empty(), "its facts are listed with the section");
+        assert_eq!(r.sections[0].name, "Home");
+        assert_eq!(r.sections[0].fact_count, 2);
+        assert_eq!(
+            stop_section(&e, &e.a, &home).await.unwrap_err(),
+            "section_not_found",
+            "already stopped"
+        );
+    }
+
+    /// Use again on a section: status active, marker gone, a new row per fact stopped
+    /// with it. A fact stopped on its own first stays stopped; a child stopped on its
+    /// own stays stopped when the parent returns.
+    #[tokio::test]
+    async fn using_a_section_again_restores_only_what_was_stopped_with_it() {
+        let e = env().await;
+        let mut c = conn(&e, &e.a).await;
+        let home = entity(&mut c, "Home", &[], None).await;
+        fact(&mut c, &e.a, Some(&home), "Address", "1 High St", "ipc").await;
+        let size = fact(&mut c, &e.a, Some(&home), "Size", "Large", "ipc").await;
+        let kid = entity(&mut c, "Garden", &[], Some(&home)).await;
+        fact(&mut c, &e.a, Some(&kid), "Size", "Small", "ipc").await;
+        drop(c);
+        // The user first stops one fact alone, then the child on its own, then Home.
+        stop_fact(&e, &e.a, &size).await.unwrap();
+        assert_eq!(stop_section(&e, &e.a, &kid).await.unwrap(), 1);
+        assert_eq!(
+            stop_section(&e, &e.a, &home).await.unwrap(),
+            1,
+            "Address only"
+        );
+
+        // The child sits under a stopped parent: not listed on its own.
+        let r = removed(&e, &e.a).await;
+        assert_eq!(r.sections.len(), 1);
+        assert_eq!(r.sections[0].fact_count, 1);
+
+        assert_eq!(again_section(&e, &e.a, &home).await.unwrap(), 1);
+
+        let t = tree(&e, &e.a).await.unwrap();
+        assert_eq!(names(&t), ["Home"], "the child stays stopped");
+        let labels: Vec<_> = t.sections[0]
+            .facts
+            .iter()
+            .map(|f| f.label.as_str())
+            .collect();
+        assert_eq!(labels, ["Address"], "the fact stopped alone stays stopped");
+        let r = removed(&e, &e.a).await;
+        assert!(r.facts.iter().any(|f| f.id == size && f.label == "Size"));
+        assert!(r.sections.iter().any(|s| s.name == "Garden"));
+        assert_eq!(r.count, 2);
+        let mut c = conn(&e, &e.a).await;
+        let ent_meta: String =
+            sqlx::query_scalar("SELECT extra_metadata FROM entities WHERE id = ?")
+                .bind(&home)
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+        assert!(!ent_meta.contains("stopped_at"));
+        drop(c);
+        // And the child can be brought back on its own.
+        assert_eq!(again_section(&e, &e.a, &kid).await.unwrap(), 1);
+        assert_eq!(names(&tree(&e, &e.a).await.unwrap()), ["Home", "Garden"]);
+    }
+
+    /// A conflict on section restore refuses the whole thing and writes nothing.
+    #[tokio::test]
+    async fn using_a_section_again_is_atomic_on_a_conflict() {
+        let e = env().await;
+        let mut c = conn(&e, &e.a).await;
+        let home = entity(&mut c, "Home", &[], None).await;
+        fact(&mut c, &e.a, Some(&home), "Address", "1 High St", "ipc").await;
+        fact(&mut c, &e.a, Some(&home), "Size", "Large", "ipc").await;
+        drop(c);
+        stop_section(&e, &e.a, &home).await.unwrap();
+        let mut c = conn(&e, &e.a).await;
+        // A newer active value for one label appears while the section is stopped.
+        fact(&mut c, &e.a, Some(&home), "Size", "Huge", "ipc").await;
+        let before = count_facts(&mut c).await;
+        drop(c);
+        assert_eq!(
+            again_section(&e, &e.a, &home).await.unwrap_err(),
+            "newer_value_exists"
+        );
+        let mut c = conn(&e, &e.a).await;
+        assert_eq!(count_facts(&mut c).await, before, "no partial restore");
+        let status: String = sqlx::query_scalar("SELECT status FROM entities WHERE id = ?")
+            .bind(&home)
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(status, "archived");
+    }
+
+    /// A section archived by something else (no stop marker) is neither listed nor
+    /// restorable here, and is not stoppable once archived.
+    #[tokio::test]
+    async fn a_section_archived_elsewhere_is_not_ours_to_restore() {
+        let e = env().await;
+        let mut c = conn(&e, &e.a).await;
+        let other = entity(&mut c, "Archived Elsewhere", &[], None).await;
+        entity_store::retire_entity_conn(&mut c, &other, "archived")
+            .await
+            .unwrap();
+        drop(c);
+        assert_eq!(removed(&e, &e.a).await.count, 0);
+        assert_eq!(
+            again_section(&e, &e.a, &other).await.unwrap_err(),
+            "section_not_found"
+        );
+        assert_eq!(
+            stop_section(&e, &e.a, &other).await.unwrap_err(),
+            "section_not_found"
+        );
+    }
+
+    /// OWNED entities are refused on EVERY write path and in the Removed list, and
+    /// nothing changes (decisions.id=945).
+    #[tokio::test]
+    async fn owned_entities_are_refused_on_every_write_path() {
+        let e = env().await;
+        let mut c = conn(&e, &e.a).await;
+        let dev = owned(&mut c, "Netgear Router").await;
+        let dev_fact = fact(&mut c, &e.a, Some(&dev), "firmware", "FW-1", "ipc").await;
+        // An owned entity that is stopped (marker forged by hand) with a stopped fact.
+        let gone = owned(&mut c, "Old Device").await;
+        let gone_fact = fact(&mut c, &e.a, Some(&gone), "firmware", "FW-0", "ipc").await;
+        sqlx::query(
+            "UPDATE entity_facts SET valid_until = 't1',
+             extra_metadata = '{\"stopped_at\":\"t1\",\"stop_scope\":\"fact\"}' WHERE id = ?",
+        )
+        .bind(&gone_fact)
+        .execute(&mut c)
+        .await
+        .unwrap();
+        let sect_fact = fact(&mut c, &e.a, Some(&gone), "make", "Acme", "ipc").await;
+        sqlx::query(
+            "UPDATE entity_facts SET valid_until = 't2',
+             extra_metadata = '{\"stopped_at\":\"t2\",\"stop_scope\":\"section\"}' WHERE id = ?",
+        )
+        .bind(&sect_fact)
+        .execute(&mut c)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE entities SET status = 'archived', extra_metadata = '{\"stopped_at\":\"t2\"}' WHERE id = ?",
+        )
+        .bind(&gone)
+        .execute(&mut c)
+        .await
+        .unwrap();
+        let snapshot = |rows: Vec<sqlx::sqlite::SqliteRow>| {
+            use sqlx::Row;
+            rows.iter()
+                .map(|r| {
+                    format!(
+                        "{}|{:?}|{}",
+                        r.get::<String, _>("id"),
+                        r.get::<Option<String>, _>("valid_until"),
+                        r.get::<String, _>("extra_metadata")
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let facts_before = snapshot(
+            sqlx::query("SELECT id, valid_until, extra_metadata FROM entity_facts ORDER BY id")
+                .fetch_all(&mut c)
+                .await
+                .unwrap(),
+        );
+        let ents_before: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT id, status, extra_metadata FROM entities ORDER BY id")
+                .fetch_all(&mut c)
+                .await
+                .unwrap();
+        drop(c);
+
+        assert_eq!(
+            stop_fact(&e, &e.a, &dev_fact).await.unwrap_err(),
+            "fact_not_found"
+        );
+        assert_eq!(
+            stop_section(&e, &e.a, &dev).await.unwrap_err(),
+            "section_not_found"
+        );
+        assert_eq!(
+            again_fact(&e, &e.a, &gone_fact).await.unwrap_err(),
+            "fact_not_found"
+        );
+        assert_eq!(
+            again_section(&e, &e.a, &gone).await.unwrap_err(),
+            "section_not_found"
+        );
+        let r = removed(&e, &e.a).await;
+        assert_eq!(r.count, 0, "an owned entity is never listed as removed");
+
+        let mut c = conn(&e, &e.a).await;
+        let facts_after = snapshot(
+            sqlx::query("SELECT id, valid_until, extra_metadata FROM entity_facts ORDER BY id")
+                .fetch_all(&mut c)
+                .await
+                .unwrap(),
+        );
+        let ents_after: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT id, status, extra_metadata FROM entities ORDER BY id")
+                .fetch_all(&mut c)
+                .await
+                .unwrap();
+        assert_eq!(facts_before, facts_after, "no fact row changed");
+        assert_eq!(ents_before, ents_after, "no entity row changed");
+    }
+
+    /// A fact or section id from another Persona is refused on every write, and the
+    /// other Persona's file is untouched.
+    #[tokio::test]
+    async fn another_personas_ids_are_refused_on_every_write() {
+        let e = env().await;
+        let mut ca = conn(&e, &e.a).await;
+        fact(&mut ca, &e.a, None, "location_city", "Leeds", "ipc").await;
+        drop(ca);
+        let mut cb = conn(&e, &e.b).await;
+        let zoe = entity(&mut cb, "ZoeOnlyInB", &[], None).await;
+        let b_fact = fact(&mut cb, &e.b, Some(&zoe), "Vet", "Parkside", "ipc").await;
+        let b_single = fact(&mut cb, &e.b, None, "job_title", "Nurse", "ipc").await;
+        // B also has a stopped fact and a stopped section of its own.
+        let gone = entity(&mut cb, "GoneInB", &[], None).await;
+        let gone_fact = fact(&mut cb, &e.b, Some(&gone), "Note", "x", "ipc").await;
+        drop(cb);
+        stop_fact(&e, &e.b, &b_single).await.unwrap();
+        stop_section(&e, &e.b, &gone).await.unwrap();
+        let mut cb = conn(&e, &e.b).await;
+        let before: Vec<(String, Option<String>, String)> =
+            sqlx::query_as("SELECT id, valid_until, extra_metadata FROM entity_facts ORDER BY id")
+                .fetch_all(&mut cb)
+                .await
+                .unwrap();
+        let ents_before: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT id, status, extra_metadata FROM entities ORDER BY id")
+                .fetch_all(&mut cb)
+                .await
+                .unwrap();
+        drop(cb);
+
+        // Through A, none of B's ids resolve.
+        assert_eq!(
+            stop_fact(&e, &e.a, &b_fact).await.unwrap_err(),
+            "fact_not_found"
+        );
+        assert_eq!(
+            stop_section(&e, &e.a, &zoe).await.unwrap_err(),
+            "section_not_found"
+        );
+        assert_eq!(
+            again_fact(&e, &e.a, &b_single).await.unwrap_err(),
+            "fact_not_found"
+        );
+        assert_eq!(
+            again_section(&e, &e.a, &gone).await.unwrap_err(),
+            "section_not_found"
+        );
+        // B's stopped items are not in A's Removed list.
+        assert_eq!(removed(&e, &e.a).await.count, 0);
+        assert!(
+            removed(&e, &e.b).await.count > 0,
+            "so the empty list is isolation"
+        );
+        let _ = gone_fact;
+
+        let mut cb = conn(&e, &e.b).await;
+        let after: Vec<(String, Option<String>, String)> =
+            sqlx::query_as("SELECT id, valid_until, extra_metadata FROM entity_facts ORDER BY id")
+                .fetch_all(&mut cb)
+                .await
+                .unwrap();
+        let ents_after: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT id, status, extra_metadata FROM entities ORDER BY id")
+                .fetch_all(&mut cb)
+                .await
+                .unwrap();
+        assert_eq!(before, after, "B's facts were not touched through A");
+        assert_eq!(
+            ents_before, ents_after,
+            "B's sections were not touched through A"
+        );
+    }
+
+    /// Non-member, malformed and wrong-key Personas refuse every write, writing nothing.
+    #[tokio::test]
+    async fn writes_need_membership_and_a_readable_file() {
+        let e = env().await;
+        let mut c = conn(&e, &e.stranger_persona).await;
+        let sf = fact(
+            &mut c,
+            &e.stranger_persona,
+            None,
+            "location_city",
+            "Elsewhere",
+            "ipc",
+        )
+        .await;
+        drop(c);
+        for p in [
+            e.stranger_persona.as_str(),
+            "not-a-uuid",
+            "00000000-0000-0000-0000-000000000000",
+        ] {
+            assert_eq!(
+                stop_fact(&e, p, &sf).await.unwrap_err(),
+                "persona_not_found"
+            );
+            assert_eq!(
+                stop_section(&e, p, "x").await.unwrap_err(),
+                "persona_not_found"
+            );
+            assert_eq!(
+                again_fact(&e, p, &sf).await.unwrap_err(),
+                "persona_not_found"
+            );
+            assert_eq!(
+                again_section(&e, p, "x").await.unwrap_err(),
+                "persona_not_found"
+            );
+            let r = list_removed_for_session(&e.pool, &e.user, &e.key, p).await;
+            assert_eq!(r.unwrap_err(), "persona_not_found");
+        }
+        let mut c = conn(&e, &e.stranger_persona).await;
+        let until: Option<String> =
+            sqlx::query_scalar("SELECT valid_until FROM entity_facts WHERE id = ?")
+                .bind(&sf)
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+        assert!(until.is_none(), "the stranger's fact is untouched");
+        drop(c);
+
+        // Persona A's file must exist (created with the real key) for a wrong key to
+        // be a wrong key rather than a new empty file.
+        let mut c = conn(&e, &e.a).await;
+        fact(&mut c, &e.a, None, "location_city", "Leeds", "ipc").await;
+        drop(c);
+        let bad = key_hex(&OTHER_KEY);
+        let r = stop_using_fact_for_session(&e.pool, &e.user, &bad, &e.a, "x").await;
+        assert_eq!(r.unwrap_err(), "facts_unreadable");
+        let r = stop_using_section_for_session(&e.pool, &e.user, &bad, &e.a, "x").await;
+        assert_eq!(r.unwrap_err(), "facts_unreadable");
+        let r = use_again_fact_for_session(&e.pool, &e.user, &bad, &e.a, "x").await;
+        assert_eq!(r.unwrap_err(), "facts_unreadable");
+        let r = use_again_section_for_session(&e.pool, &e.user, &bad, &e.a, "x").await;
+        assert_eq!(r.unwrap_err(), "facts_unreadable");
+        let r = list_removed_for_session(&e.pool, &e.user, &bad, &e.a).await;
+        assert_eq!(r.unwrap_err(), "facts_unreadable");
+    }
+
+    /// The unit 2 commands need a session.
+    #[tokio::test]
+    async fn the_write_commands_need_a_session() {
+        let e = env().await;
+        let app = mock_app_with_registry(e.pool.clone());
+        let registry = app.state::<KeyRegistry>();
+        let pool = app.state::<sqlx::SqlitePool>();
+        let (a, s) = (e.a.clone(), "x".to_owned());
+        assert!(list_removed(a.clone(), registry.clone(), pool.clone())
+            .await
+            .is_err());
+        assert!(
+            stop_using_fact(a.clone(), s.clone(), registry.clone(), pool.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            stop_using_section(a.clone(), s.clone(), registry.clone(), pool.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            use_again_fact(a.clone(), s.clone(), registry.clone(), pool.clone())
+                .await
+                .is_err()
+        );
+        assert!(use_again_section(a, s, registry.clone(), pool.clone())
+            .await
+            .is_err());
+    }
+
+    /// No DELETE statement exists in any module that writes the Facts view, and no
+    /// command or store reads or writes entity_facts outside the owner-checked path.
+    #[test]
+    fn nothing_that_writes_the_facts_view_can_delete() {
+        for (name, src) in [
+            ("my_facts.rs", include_str!("my_facts.rs")),
+            (
+                "facts_stop_store.rs",
+                include_str!("../persistence/facts_stop_store.rs"),
+            ),
+            (
+                "facts_view_store.rs",
+                include_str!("../persistence/facts_view_store.rs"),
+            ),
+        ] {
+            let code: String = production(src)
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let upper = code.to_uppercase();
+            assert!(!upper.contains("DELETE"), "{name}: a DELETE");
+            assert!(!upper.contains("DROP "), "{name}: a DROP");
+            assert!(!upper.contains("TRUNCATE"), "{name}: a TRUNCATE");
+        }
+    }
+
+    /// Every direct write on the entities table carries the owner filter, every write
+    /// resolves its id in the visible set (or the owner-filtered SELECT) first, and the
+    /// provenance columns are never assigned by an UPDATE.
+    #[test]
+    fn the_write_store_is_owner_filtered_and_never_touches_provenance() {
+        let code: String = production(include_str!("../persistence/facts_stop_store.rs"))
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut n = 0;
+        for marker in ["FROM entities", "UPDATE entities"] {
+            for part in code.split(marker).skip(1) {
+                let window: String = part.chars().take(400).collect();
+                assert!(
+                    window.contains("owner_focus IS NULL"),
+                    "{marker} without the owner filter: {window}"
+                );
+                n += 1;
+            }
+        }
+        assert_eq!(n, 3, "two entities UPDATEs and the restore SELECT");
+        for col in [
+            "source_persona_id =",
+            "cross_persona_export =",
+            "origin_persona_id =",
+        ] {
+            assert!(!code.contains(col), "an UPDATE assigns {col}");
+        }
+        // The stop and the restore each check the visible set before any write.
+        for f in ["stop_fact_conn", "stop_section_conn", "use_again_fact_conn"] {
+            let start = code.find(&format!("pub async fn {f}")).unwrap();
+            let body = &code[start..];
+            let end = body.find("\n}\n").unwrap();
+            let body = &body[..end];
+            let guard = body.find("visible_ids(conn)").expect("visible set");
+            let write = body.find("atomic!").expect("a write");
+            assert!(guard < write, "{f}: the visible set comes before the write");
+        }
+        // Every one of the eight _for_session bodies opens through open_checked.
+        let src = production(include_str!("my_facts.rs"));
+        assert_eq!(
+            src.matches("open_checked(pool, user_id, key_hex, persona_id)")
+                .count(),
+            8
         );
     }
 }

@@ -1092,6 +1092,15 @@ export const commands = {
 	getFactsTree: (personaId: string) => typedError<FactsTree, string>(__TAURI_INVOKE("get_facts_tree", { personaId })),
 	getFactHistory: (personaId: string, factId: string) => typedError<EarlierValue[], string>(__TAURI_INVOKE("get_fact_history", { personaId, factId })),
 	searchFacts: (personaId: string, query: string) => typedError<FactsTree, string>(__TAURI_INVOKE("search_facts", { personaId, query })),
+	listRemoved: (personaId: string) => typedError<RemovedList, string>(__TAURI_INVOKE("list_removed", { personaId })),
+	/**  Stop using one fact. Direct, no model, no reason asked (decisions.id=968). */
+	stopUsingFact: (personaId: string, factId: string) => typedError<null, string>(__TAURI_INVOKE("stop_using_fact", { personaId, factId })),
+	/**  Stop using a section. Returns how many of its own facts were ended. */
+	stopUsingSection: (personaId: string, sectionId: string) => typedError<number, string>(__TAURI_INVOKE("stop_using_section", { personaId, sectionId })),
+	/**  Use a stopped fact again (a new active row). `fact_id` is RemovedFact.id. */
+	useAgainFact: (personaId: string, factId: string) => typedError<null, string>(__TAURI_INVOKE("use_again_fact", { personaId, factId })),
+	/**  Use a stopped section again. Returns how many facts came back. */
+	useAgainSection: (personaId: string, sectionId: string) => typedError<number, string>(__TAURI_INVOKE("use_again_section", { personaId, sectionId })),
 };
 
 /* Types */
@@ -2878,6 +2887,35 @@ export type RefreshResultDto = {
 	/**  Flagged before, listed again. */
 	returned: number,
 	refreshed_at: string,
+};
+
+export type RemovedFact = {
+	/**  The stopped row's id: what use again takes. */
+	id: string,
+	/**  None = the General row. */
+	section_id: string | null,
+	section_name: string | null,
+	label: string,
+	value: string,
+	sensitivity: string,
+	stopped_at: string,
+};
+
+export type RemovedList = {
+	facts: RemovedFact[],
+	sections: RemovedSection[],
+	/**  facts plus sections: the Removed (n) count. */
+	count: number,
+};
+
+export type RemovedSection = {
+	id: string,
+	entity_type: string,
+	name: string,
+	parent_id: string | null,
+	/**  Facts that were stopped together with the section (what use again restores). */
+	fact_count: number,
+	stopped_at: string,
 };
 
 /**

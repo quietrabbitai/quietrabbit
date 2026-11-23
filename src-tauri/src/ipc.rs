@@ -295,6 +295,11 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::my_facts::get_facts_tree,
         commands::my_facts::get_fact_history,
         commands::my_facts::search_facts,
+        commands::my_facts::list_removed,
+        commands::my_facts::stop_using_fact,
+        commands::my_facts::stop_using_section,
+        commands::my_facts::use_again_fact,
+        commands::my_facts::use_again_section,
     ])
 }
 

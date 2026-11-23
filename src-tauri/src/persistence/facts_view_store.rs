@@ -37,6 +37,30 @@
 
 use std::collections::{HashMap, HashSet};
 
+/// The stop marker (items.id=959 unit 2, decisions.id=969). A stop end-dates a fact
+/// (valid_until = the stop timestamp) AND writes these two keys into the row's
+/// extra_metadata (mutable; only the three provenance columns are immutable), so a
+/// STOP is distinguishable from a SUPERSESSION. STOP_AT holds the timestamp, and
+/// STOP_SCOPE says whether the user stopped the fact itself ("fact") or the section
+/// it sat in ("section"), so use again on a section finds the facts ended with it
+/// and leaves a fact that was stopped on its own alone. A stopped section carries
+/// STOP_AT in its entities.extra_metadata (and status archived on the parent only),
+/// which also tells a section WE stopped from one archived by something else.
+/// A marked row is never an earlier value: use again writes the same value back, so
+/// listing the stopped row as history would show it twice.
+pub const STOP_AT: &str = "stopped_at";
+pub const STOP_SCOPE: &str = "stop_scope";
+pub const SCOPE_FACT: &str = "fact";
+pub const SCOPE_SECTION: &str = "section";
+
+/// The marker of a fact row's extra_metadata JSON text: (stopped_at, scope).
+pub(crate) fn stop_marker(extra_metadata: &str) -> Option<(String, String)> {
+    let v: serde_json::Value = serde_json::from_str(extra_metadata).ok()?;
+    let at = v.get(STOP_AT)?.as_str()?.to_owned();
+    let scope = v.get(STOP_SCOPE)?.as_str()?.to_owned();
+    Some((at, scope))
+}
+
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use sqlx::{Row, SqliteConnection};
@@ -122,6 +146,13 @@ pub enum FactsViewError {
     FactNotFound,
     #[error("query_empty")]
     QueryEmpty,
+    /// No visible section has this id in this Persona (also: an owned entity, a
+    /// section that is already stopped, one archived by something else).
+    #[error("section_not_found")]
+    SectionNotFound,
+    /// Use again refused: a newer active value for the same label exists.
+    #[error("newer_value_exists")]
+    NewerValueExists,
 }
 
 impl From<sqlx::Error> for FactsViewError {
@@ -131,11 +162,11 @@ impl From<sqlx::Error> for FactsViewError {
     }
 }
 
-struct Ent {
-    id: String,
-    entity_type: String,
-    name: String,
-    parent_id: Option<String>,
+pub(crate) struct Ent {
+    pub(crate) id: String,
+    pub(crate) entity_type: String,
+    pub(crate) name: String,
+    pub(crate) parent_id: Option<String>,
 }
 
 struct Row_ {
@@ -151,7 +182,9 @@ struct Row_ {
 /// The visible sections, ordered root A to Z each followed by its descendants A to Z.
 /// `owner_focus IS NULL` and `status = 'active'` are the two filters; a child
 /// whose parent is not in that set is dropped (invariant 14, at read time).
-async fn visible_entities(conn: &mut SqliteConnection) -> Result<Vec<Ent>, FactsViewError> {
+pub(crate) async fn visible_entities(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<Ent>, FactsViewError> {
     let rows = sqlx::query(
         "SELECT id, entity_type, display_name, aliases, parent_entity_id
          FROM entities
@@ -233,7 +266,7 @@ async fn active_rows(
 ) -> Result<(Vec<Row_>, HashMap<(Option<String>, String), u32>), FactsViewError> {
     let rows = sqlx::query(
         "SELECT id, entity_id, field_name, field_value, sensitivity, source,
-                COALESCE(valid_from, created_at) AS since, valid_until
+                COALESCE(valid_from, created_at) AS since, valid_until, extra_metadata
          FROM entity_facts
          ORDER BY lower(field_name), created_at, id",
     )
@@ -252,6 +285,11 @@ async fn active_rows(
         let label: String = r.try_get("field_name")?;
         let valid_until: Option<String> = r.try_get("valid_until")?;
         if valid_until.is_some() {
+            // A stopped row is removed, never an earlier value (see STOP_AT).
+            let meta: String = r.try_get("extra_metadata")?;
+            if stop_marker(&meta).is_some() {
+                continue;
+            }
             *earlier.entry((entity_id, label)).or_insert(0) += 1;
             continue;
         }
@@ -347,6 +385,7 @@ pub async fn fact_history_conn(
         "SELECT field_value, source, COALESCE(valid_from, created_at) AS since, valid_until
          FROM entity_facts
          WHERE field_name = ? AND valid_until IS NOT NULL
+           AND json_extract(extra_metadata, '$.stopped_at') IS NULL
            AND ((entity_id IS NULL AND ? IS NULL) OR entity_id = ?)
          ORDER BY valid_until DESC, created_at DESC, id",
     )
@@ -463,4 +502,173 @@ fn escape_like(term: &str) -> String {
         out.push(ch);
     }
     out
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct RemovedFact {
+    /// The stopped row's id: what use again takes.
+    pub id: String,
+    /// None = the General row.
+    pub section_id: Option<String>,
+    pub section_name: Option<String>,
+    pub label: String,
+    pub value: String,
+    pub sensitivity: String,
+    pub stopped_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct RemovedSection {
+    pub id: String,
+    pub entity_type: String,
+    pub name: String,
+    pub parent_id: Option<String>,
+    /// Facts that were stopped together with the section (what use again restores).
+    pub fact_count: u32,
+    pub stopped_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct RemovedList {
+    pub facts: Vec<RemovedFact>,
+    pub sections: Vec<RemovedSection>,
+    /// facts plus sections: the Removed (n) count.
+    pub count: u32,
+}
+
+/// What the user has stopped, in this Persona. A removed FACT is a (section, label)
+/// with no active row whose latest ended row carries a fact-scope stop marker, in the
+/// General row or a visible section (a fact inside a stopped section is listed with
+/// that section, not alone). A removed SECTION is an unowned archived entity that WE
+/// stopped (it carries the marker, so an entity archived by something else is not
+/// listed) and whose parent is visible.
+pub async fn list_removed_conn(conn: &mut SqliteConnection) -> Result<RemovedList, FactsViewError> {
+    let ents = visible_entities(conn).await?;
+    let names: HashMap<&str, &str> = ents
+        .iter()
+        .map(|e| (e.id.as_str(), e.name.as_str()))
+        .collect();
+
+    let rows = sqlx::query(
+        "SELECT id, entity_id, field_name, field_value, sensitivity, valid_until,
+                created_at, extra_metadata
+         FROM entity_facts",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+
+    struct R {
+        id: String,
+        value: String,
+        sensitivity: String,
+        ended: Option<(String, String)>, // (valid_until, created_at)
+        marker: Option<(String, String)>,
+    }
+    let mut by_key: HashMap<(Option<String>, String), Vec<R>> = HashMap::new();
+    for r in &rows {
+        let meta: String = r.try_get("extra_metadata")?;
+        let valid_until: Option<String> = r.try_get("valid_until")?;
+        let created: String = r.try_get("created_at")?;
+        by_key
+            .entry((r.try_get("entity_id")?, r.try_get("field_name")?))
+            .or_default()
+            .push(R {
+                id: r.try_get("id")?,
+                value: r.try_get("field_value")?,
+                sensitivity: r.try_get("sensitivity")?,
+                ended: valid_until.map(|u| (u, created)),
+                marker: stop_marker(&meta),
+            });
+    }
+
+    let mut facts: Vec<RemovedFact> = Vec::new();
+    let mut section_fact_count: HashMap<(String, String), u32> = HashMap::new();
+    for ((entity_id, label), group) in &by_key {
+        // Facts ended together with a section, by (section, stamp).
+        if let Some(eid) = entity_id {
+            for r in group {
+                if let Some((at, scope)) = &r.marker {
+                    if scope == SCOPE_SECTION {
+                        *section_fact_count
+                            .entry((eid.clone(), at.clone()))
+                            .or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        if let Some(eid) = entity_id {
+            if !names.contains_key(eid.as_str()) {
+                continue;
+            }
+        }
+        if group.iter().any(|r| r.ended.is_none()) {
+            continue; // a value is in use
+        }
+        let Some(latest) = group.iter().max_by(|a, b| a.ended.cmp(&b.ended)) else {
+            continue;
+        };
+        if let Some((at, scope)) = &latest.marker {
+            if scope == SCOPE_FACT {
+                facts.push(RemovedFact {
+                    id: latest.id.clone(),
+                    section_id: entity_id.clone(),
+                    section_name: entity_id
+                        .as_deref()
+                        .and_then(|e| names.get(e).map(|n| (*n).to_owned())),
+                    label: label.clone(),
+                    value: latest.value.clone(),
+                    sensitivity: latest.sensitivity.clone(),
+                    stopped_at: at.clone(),
+                });
+            }
+        }
+    }
+    facts.sort_by(|a, b| {
+        (a.section_name.as_deref(), a.label.to_lowercase(), &a.id).cmp(&(
+            b.section_name.as_deref(),
+            b.label.to_lowercase(),
+            &b.id,
+        ))
+    });
+
+    let visible: HashSet<&str> = names.keys().copied().collect();
+    let srows = sqlx::query(
+        "SELECT id, entity_type, display_name, parent_entity_id,
+                json_extract(extra_metadata, '$.stopped_at') AS stopped_at
+         FROM entities
+         WHERE owner_focus IS NULL AND status = 'archived'
+           AND json_extract(extra_metadata, '$.stopped_at') IS NOT NULL
+         ORDER BY lower(display_name), id",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut sections = Vec::new();
+    for r in &srows {
+        let parent_id: Option<String> = r.try_get("parent_entity_id")?;
+        if let Some(p) = &parent_id {
+            if !visible.contains(p.as_str()) {
+                continue; // it sits under a stopped or owned parent
+            }
+        }
+        let id: String = r.try_get("id")?;
+        let stopped_at: String = r.try_get("stopped_at")?;
+        let fact_count = section_fact_count
+            .get(&(id.clone(), stopped_at.clone()))
+            .copied()
+            .unwrap_or(0);
+        sections.push(RemovedSection {
+            id,
+            entity_type: r.try_get("entity_type")?,
+            name: r.try_get("display_name")?,
+            parent_id,
+            fact_count,
+            stopped_at,
+        });
+    }
+    let count = u32::try_from(facts.len() + sections.len()).unwrap_or(u32::MAX);
+    Ok(RemovedList {
+        facts,
+        sections,
+        count,
+    })
 }
