@@ -2,8 +2,10 @@
 // reworking items.id=404's row-stack + action-pane History screen into a
 // flat, always-visible button frame: PersonaPillRow (Library's own
 // local-filter variant, per decisions.id=833) at top, then Documents /
-// Facts / Chat History / User Info / Group Info as sibling buttons,
-// Documents pre-selected on entry. The file/component/prop names
+// Facts / Chat History / What QR shared (items.id=957) / User Info / Group Info
+// as sibling buttons,
+// Documents pre-selected on entry. The row is flex-wrap, so a sixth button wraps to
+// a second row at a narrow width instead of overflowing. The file/component/prop names
 // (HistoryScreen, HistoryScreenProps, HistoryOpenTarget) are deliberately
 // NOT renamed to match -- only the user-facing label changes (WorkspaceShell
 // now shows this rail as "Library", reusing the navShell.library string
@@ -33,6 +35,7 @@ import { useTranslation } from 'react-i18next'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { commands, type ChatInfo, type PersonaInfo } from '../bindings'
 import { LibraryPane } from '../library/LibraryPane'
+import { SharedLogView } from './SharedLogView'
 import { PersonaPillRow } from './persona/PersonaPillRow'
 import { usePersonaLocalFilter } from './persona/usePersonaLocalFilter'
 import '../chat/ChatHistoryList.css'
@@ -73,7 +76,7 @@ export interface HistoryScreenProps {
   onOpenTargetConsumed: () => void
 }
 
-type LibraryView = 'documents' | 'facts' | 'chatHistory' | 'userInfo' | 'groupInfo'
+type LibraryView = 'documents' | 'facts' | 'chatHistory' | 'shared' | 'userInfo' | 'groupInfo'
 
 export function HistoryScreen({
   userId,
@@ -171,6 +174,14 @@ export function HistoryScreen({
         <button
           type="button"
           className="history-screen__view-button"
+          data-selected={view === 'shared' ? '' : undefined}
+          onClick={() => setView('shared')}
+        >
+          {t('navShell.shared.button')}
+        </button>
+        <button
+          type="button"
+          className="history-screen__view-button"
           data-selected={view === 'userInfo' ? '' : undefined}
           onClick={() => setView('userInfo')}
         >
@@ -209,6 +220,19 @@ export function HistoryScreen({
               userId={userId}
               personaId={libraryFilter}
               onResumeChat={(chat) => onOpenPersonaChat(libraryFilter, chat)}
+            />
+          ))}
+        {view === 'shared' &&
+          (libraryFilter === null ? (
+            <p className="history-screen__notice">{t('navShell.history.noPersonaSelected')}</p>
+          ) : (
+            <SharedLogView
+              key={libraryFilter}
+              personaId={libraryFilter}
+              personaName={
+                personas.find((p) => p.id === libraryFilter)?.display_name ?? ''
+              }
+              personaColor={personas.find((p) => p.id === libraryFilter)?.color ?? null}
             />
           ))}
         {view === 'userInfo' && (

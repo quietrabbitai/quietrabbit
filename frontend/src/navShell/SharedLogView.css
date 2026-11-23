@@ -1,0 +1,233 @@
+/* SharedLogView.tsx -- items.id=957, the "What QR shared" view. Same convention as
+ * HistoryScreen.css: consumes index.css's custom properties, declares no colors of
+ * its own. The per-Persona bar takes the Persona's own color inline (palette v3). */
+
+.shared-log {
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+}
+
+.shared-log__title {
+  font-size: 15px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.shared-log__purpose,
+.shared-log__footer,
+.shared-log__empty-body {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.shared-log__cleared {
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-sunken);
+  font-size: 12px;
+}
+
+.shared-log__empty {
+  padding: 12px 4px;
+}
+
+.shared-log__empty-title {
+  margin: 0 0 4px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.shared-log__filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.shared-log__filter {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 11px;
+  color: var(--text-label);
+}
+
+.shared-log__filter select {
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.shared-log__reset,
+.shared-log__details-link {
+  border: none;
+  background: none;
+  padding: 2px 4px;
+  color: var(--text);
+  font-size: 12px;
+  text-decoration: underline;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.shared-log__day,
+.shared-log__earlier {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.shared-log__day-head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 4px 12px;
+}
+
+.shared-log__day-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.shared-log__day-count {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.shared-log__group,
+.shared-log__month {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.shared-log__group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.shared-log__group-head:hover {
+  background: var(--surface-hover);
+}
+
+.shared-log__bar {
+  flex: none;
+  align-self: stretch;
+  width: 4px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+.shared-log__summary {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.shared-log__chevron {
+  flex: none;
+  color: var(--text-label);
+}
+
+.shared-log__items {
+  list-style: none;
+  margin: 0;
+  padding: 0 10px 8px 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.shared-log__item {
+  display: flex;
+  flex-direction: column;
+}
+
+.shared-log__item-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  font-size: 13px;
+}
+
+.shared-log__tag {
+  flex: none;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.shared-log__tag[data-tag='kept_back'] {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.shared-log__sentence {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.shared-log__grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 12px;
+  margin: 4px 0 0;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--surface-sunken);
+  font-size: 12px;
+}
+
+.shared-log__grid dt {
+  color: var(--text-label);
+}
+
+.shared-log__grid dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.shared-log__grid-note {
+  grid-column: 1 / -1;
+  color: var(--text-muted);
+}
+
+.shared-log__background {
+  padding: 0 10px 8px 22px;
+}
+
+.shared-log__background .shared-log__items {
+  padding: 4px 0 0;
+}
+
+@media (max-width: 480px) {
+  .shared-log__grid {
+    grid-template-columns: 1fr;
+  }
+}
