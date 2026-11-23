@@ -3199,7 +3199,10 @@ export type SharedLogSummary = {
 	providers: SharedLogProvider[],
 	/**  False only when nothing at all is recorded (the empty state). */
 	has_any: boolean,
-	/**  Consent records a purge would remove (the cleared-on marker is not one). */
+	/**
+	 *  Consent records a purge would delete: the older ones. Records showing what is in
+	 *  force, and the cleared-on markers, are never counted.
+	 */
 	consent_record_count: number,
 	/**  created_at of the newest "history cleared" record: the permanent line. */
 	cleared_on: string | null,
