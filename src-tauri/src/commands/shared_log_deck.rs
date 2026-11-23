@@ -126,6 +126,96 @@ pub fn counts_as_send(key: &str) -> bool {
     matches!(key, "sent.plain" | "sent.reviewed" | "sent.noReview")
 }
 
+// ---------------------------------------------------------------------------
+// One send per action (items.id=958 unit 2, decisions.id=967 addendum)
+// ---------------------------------------------------------------------------
+//
+// A hosted step writes several rows for ONE send: a gate1_pass (before the review,
+// on every attempt) and the review's own gate3 rows. The view counts per
+// (focus_run_id, action_id), never per row, from these three sets. The same
+// constants build the read query, so the two cannot drift apart.
+
+/// The rows that can make an action a send.
+pub const SEND_EVENTS: [&str; 3] = [
+    "gate1_pass",
+    "gate3_promotion_approved",
+    "gate3_pf_no_spans",
+];
+
+/// A held gate3 row: the review stopped the content. Held rows keep being counted as
+/// kept back, one each; for an action they cancel a bare gate1_pass.
+pub const HOLD_EVENTS: [&str; 7] = [
+    "gate3_tier_ceiling_block",
+    "gate3_source_spans_unreviewed",
+    "gate3_sensitivity_block",
+    "gate3_pf_error_block",
+    "gate3_pf_too_long",
+    "gate3_pf_unavailable_block",
+    "gate_timeout",
+];
+
+/// A row that makes a send "reviewed": the review ran and a person's standing or
+/// live decision applied (a no-span review is NOT one: decisions.id=967 point 2).
+pub const REVIEW_MARK_EVENTS: [&str; 3] = [
+    "gate3_promotion_approved",
+    "gate3_consent_pending",
+    "gate3_fact_reapplied",
+];
+
+/// What the rows of one action add up to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionOutcome {
+    /// No send: a held gate3 row and nothing that approved it, or no sending row.
+    NotSent,
+    /// A gate1_pass only (sent.plain).
+    Plain,
+    /// Approved by gate3_pf_no_spans only: counts, is not reviewed (sent.noReview).
+    NoReview,
+    /// A promotion, a pending consent or a reapplied choice (sent.reviewed).
+    Reviewed,
+}
+
+/// The one counting rule. `gate1`: a gate1_pass row; `approved`: a promotion or
+/// no-span row; `marked`: a review mark; `held`: a held gate3 row. A send is an
+/// approval, or a gate1_pass with no held row. Retries and resumes only repeat rows
+/// of the same action, so they count once.
+pub fn action_outcome(gate1: bool, approved: bool, marked: bool, held: bool) -> ActionOutcome {
+    let sent = approved || (gate1 && !held);
+    if !sent {
+        ActionOutcome::NotSent
+    } else if marked {
+        ActionOutcome::Reviewed
+    } else if approved {
+        ActionOutcome::NoReview
+    } else {
+        ActionOutcome::Plain
+    }
+}
+
+impl ActionOutcome {
+    /// The sentence key of the item a send of this kind shows.
+    pub fn key(self) -> Option<&'static str> {
+        match self {
+            ActionOutcome::NotSent => None,
+            ActionOutcome::Plain => Some("sent.plain"),
+            ActionOutcome::NoReview => Some("sent.noReview"),
+            ActionOutcome::Reviewed => Some("sent.reviewed"),
+        }
+    }
+}
+
+/// A SQL `('a','b')` list of event strings, for the read query.
+pub fn sql_list(events: &[&str]) -> String {
+    format!(
+        "({})",
+        events
+            .iter()
+            .map(|e| format!("'{e}'"))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
 /// Every consent event type of consent_audit_store::ConsentEventType, plus the
 /// history cleared marker (written by the purge, unit 3). A string this version
 /// does not know gets the unknown background sentence.
@@ -362,6 +452,53 @@ mod tests {
                 key: UNKNOWN_KEY
             }
         );
+    }
+
+    #[test]
+    fn the_send_hold_and_mark_sets_agree_with_the_classification() {
+        for e in SEND_EVENTS {
+            assert!(
+                matches!(classify_disclosure(e, false), Classified::Item { tag: Tag::Sent, key } if counts_as_send(key)),
+                "{e}"
+            );
+        }
+        for e in HOLD_EVENTS {
+            assert!(
+                matches!(
+                    classify_disclosure(e, false),
+                    Classified::Item {
+                        tag: Tag::KeptBack,
+                        ..
+                    }
+                ),
+                "{e}"
+            );
+        }
+        for e in REVIEW_MARK_EVENTS {
+            assert!(
+                matches!(classify_disclosure(e, false), Classified::Item { tag, .. } if tag != Tag::KeptBack),
+                "{e}"
+            );
+        }
+        assert_eq!(sql_list(&["a", "b"]), "('a','b')");
+    }
+
+    #[test]
+    fn one_action_is_one_send_and_the_outcome_follows_its_rows() {
+        use ActionOutcome::*;
+        // (gate1, approved, marked, held)
+        assert_eq!(action_outcome(true, false, false, false), Plain);
+        assert_eq!(action_outcome(true, true, false, false), NoReview);
+        assert_eq!(action_outcome(true, true, true, false), Reviewed);
+        assert_eq!(action_outcome(true, false, true, false), Reviewed);
+        // A held row cancels a bare gate1_pass; an approval after a retry still sends.
+        assert_eq!(action_outcome(true, false, false, true), NotSent);
+        assert_eq!(action_outcome(true, true, false, true), NoReview);
+        // No sending row at all.
+        assert_eq!(action_outcome(false, false, true, false), NotSent);
+        assert_eq!(action_outcome(false, true, true, false), Reviewed);
+        assert_eq!(NotSent.key(), None);
+        assert_eq!(Reviewed.key(), Some("sent.reviewed"));
     }
 
     #[test]

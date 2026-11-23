@@ -33,13 +33,14 @@ use tauri::State;
 use crate::auth::registry::KeyRegistry;
 use crate::commands::persona::session_user_and_key;
 use crate::commands::shared_log_deck::{
-    self as deck, classify_consent, classify_disclosure, counts_as_send, Classified, Tag,
-    HISTORY_CLEARED,
+    self as deck, action_outcome, classify_consent, classify_disclosure, ActionOutcome, Classified,
+    Tag, HISTORY_CLEARED, SEND_EVENTS,
 };
 use crate::persistence::consent_history_purge as deletion;
+use crate::persistence::output_store::API_SEND_REVIEW_FOCUS_ID;
 use crate::persistence::provider_store::ProviderMode;
 use crate::persistence::shared_log_read::{
-    self as read, ConsentRowView, DisclosureAggregate, ProviderInfo, SharedLogRaw,
+    self as read, ConsentRowView, ProviderInfo, SharedLogRaw,
 };
 
 /// The Focus whose display name is "Quick chat" (CloudChatAccessPane's hardcoded id).
@@ -238,31 +239,44 @@ fn clamp_u32(n: i64) -> u32 {
     u32::try_from(n.max(0)).unwrap_or(u32::MAX)
 }
 
-/// The Focus of an aggregate: the run's Focus, or "" when focus_runs has no row.
-fn focus_of<'a>(raw: &'a SharedLogRaw, a: &DisclosureAggregate) -> &'a str {
-    raw.run_focus
-        .get(&a.focus_run_id)
-        .map(String::as_str)
-        .unwrap_or("")
+/// The Focus a run's rows are shown under: the run's Focus, or "" when focus_runs has
+/// no row. The synthetic run that reviews one API Chat message (items.id=716) is shown
+/// under the api-chat Focus, so its background and held rows land in that group.
+fn focus_of<'a>(raw: &'a SharedLogRaw, run_id: &str) -> &'a str {
+    match raw.run_focus.get(run_id).map(String::as_str) {
+        Some(API_SEND_REVIEW_FOCUS_ID) => crate::api_chat::API_CHAT_FOCUS_ID,
+        Some(f) => f,
+        None => "",
+    }
+}
+
+/// True for a run that only reviewed an API Chat message. Its rows are the review's
+/// audit rows: the send itself is the api-chat run's own gate1_pass, so nothing under
+/// this run ever counts as a send.
+fn is_review_run(raw: &SharedLogRaw, run_id: &str) -> bool {
+    raw.run_focus.get(run_id).map(String::as_str) == Some(API_SEND_REVIEW_FOCUS_ID)
 }
 
 /// The (day, Focus) accumulators of the raw rows under the filters.
 fn accumulate(raw: &SharedLogRaw, f: &Filters<'_>) -> BTreeMap<(String, String), Acc> {
     let mut map: BTreeMap<(String, String), Acc> = BTreeMap::new();
     for a in &raw.aggregates {
-        let focus = focus_of(raw, a);
+        let focus = focus_of(raw, &a.focus_run_id);
         if f.focus_id.is_some_and(|want| want != focus) {
             continue;
         }
-        let Classified::Item { tag, key } = classify_disclosure(&a.event_type, a.override_declined)
+        // A row that makes a send is counted through its action below, never here.
+        if SEND_EVENTS.contains(&a.event_type.as_str()) {
+            continue;
+        }
+        let Classified::Item { tag, key: _ } =
+            classify_disclosure(&a.event_type, a.override_declined)
         else {
             continue;
         };
-        // A provider filter keeps only Sent items to that provider.
-        if let Some(want) = f.provider_id {
-            if tag != Tag::Sent || a.provider.as_deref() != Some(want) {
-                continue;
-            }
+        // A provider filter keeps only sends to that provider; no event row is one.
+        if f.provider_id.is_some() {
+            continue;
         }
         let acc = map.entry((a.day.clone(), focus.to_owned())).or_default();
         if !a.focus_run_id.is_empty() {
@@ -270,21 +284,41 @@ fn accumulate(raw: &SharedLogRaw, f: &Filters<'_>) -> BTreeMap<(String, String),
         }
         let n = clamp_u32(a.rows);
         match tag {
-            Tag::Sent => {
-                if counts_as_send(key) {
-                    acc.sends += n;
-                    if key == "sent.reviewed" {
-                        acc.reviewed += n;
-                    }
-                    acc.kept_back += clamp_u32(a.withheld);
-                    if let Some(p) = &a.provider {
-                        acc.providers.insert(p.clone());
-                    }
-                }
-            }
             Tag::KeptBack => acc.kept_back += n,
             Tag::Hidden => acc.background += n,
-            Tag::Choice => {}
+            // A reapplied choice is shown as an item and is not a send.
+            Tag::Sent | Tag::Choice => {}
+        }
+    }
+    // One send per (run, action): the counting rule is deck::action_outcome.
+    for a in &raw.actions {
+        if is_review_run(raw, &a.focus_run_id) {
+            continue;
+        }
+        let focus = focus_of(raw, &a.focus_run_id);
+        if f.focus_id.is_some_and(|want| want != focus) {
+            continue;
+        }
+        let outcome = action_outcome(a.gate1, a.approved, a.marked, a.held);
+        if outcome == ActionOutcome::NotSent {
+            continue;
+        }
+        if let Some(want) = f.provider_id {
+            if a.provider.as_deref() != Some(want) {
+                continue;
+            }
+        }
+        let acc = map.entry((a.day.clone(), focus.to_owned())).or_default();
+        if !a.focus_run_id.is_empty() {
+            acc.runs.insert(a.focus_run_id.clone());
+        }
+        acc.sends += 1;
+        if outcome == ActionOutcome::Reviewed {
+            acc.reviewed += 1;
+        }
+        acc.kept_back += clamp_u32(a.withheld);
+        if let Some(p) = &a.provider {
+            acc.providers.insert(p.clone());
         }
     }
     if f.provider_id.is_none() {
@@ -447,17 +481,33 @@ fn wire_tag(t: Tag) -> SharedLogTag {
     }
 }
 
-/// The items of one (day, Focus) group, oldest first. `details` are the disclosure
-/// rows of that Focus's runs on that day; `consent` are that day's consent rows.
+/// The items of one (day, Focus) group, oldest first. `details` are every disclosure
+/// row of that Focus's runs (each with its own local day); `consent` are that day's
+/// consent rows; `review_runs` are the runs that only reviewed an API Chat message.
+///
+/// Sends are folded the way the summary counts them: ONE item per (run, action), made
+/// from its sending rows, never one per row (items.id=958 unit 2). Every other row
+/// (held, background, a reapplied choice) is one item as before, on its own day.
 pub(crate) fn build_items(
     details: &[read::DisclosureDetailRow],
     consent: &[ConsentRowView],
     focus_id: &str,
+    day: &str,
+    review_runs: &HashSet<String>,
     lk: &Lookups,
     provider_id: Option<&str>,
 ) -> Vec<SharedLogItem> {
     let mut items: Vec<SharedLogItem> = Vec::new();
+    let labels = |names: &[String]| -> Vec<SharedLogLabel> {
+        deck::labels_for(names)
+            .into_iter()
+            .map(wire_label)
+            .collect()
+    };
     for d in details {
+        if d.day != day || SEND_EVENTS.contains(&d.event_type.as_str()) {
+            continue;
+        }
         let Classified::Item { tag, key } = classify_disclosure(&d.event_type, d.override_declined)
         else {
             continue;
@@ -472,14 +522,77 @@ pub(crate) fn build_items(
             tag: wire_tag(tag),
             sentence: key.to_owned(),
             provider: d.provider.as_deref().map(|p| lk.provider(p)),
-            shared: deck::labels_for(&d.shared)
-                .into_iter()
-                .map(wire_label)
-                .collect(),
-            kept_back: deck::labels_for(&d.withheld)
-                .into_iter()
-                .map(wire_label)
-                .collect(),
+            shared: labels(&d.shared),
+            kept_back: labels(&d.withheld),
+            document_type: None,
+            summary: None,
+        });
+    }
+    // The sends: group the rows of each (run, action), oldest first.
+    let mut actions: BTreeMap<(&str, &str), Vec<&read::DisclosureDetailRow>> = BTreeMap::new();
+    for d in details {
+        if deck::SEND_EVENTS.contains(&d.event_type.as_str())
+            || deck::HOLD_EVENTS.contains(&d.event_type.as_str())
+            || deck::REVIEW_MARK_EVENTS.contains(&d.event_type.as_str())
+        {
+            actions
+                .entry((d.focus_run_id.as_str(), d.action_id.as_str()))
+                .or_default()
+                .push(d);
+        }
+    }
+    for ((run, _), rows) in actions {
+        if review_runs.contains(run) {
+            continue;
+        }
+        let is_in =
+            |set: &[&str], d: &&read::DisclosureDetailRow| set.contains(&d.event_type.as_str());
+        // The action's day is that of its newest sending or held row, as in step 1.
+        let action_day = rows
+            .iter()
+            .filter(|d| is_in(&deck::SEND_EVENTS, d) || is_in(&deck::HOLD_EVENTS, d))
+            .map(|d| d.day.as_str())
+            .max();
+        if action_day != Some(day) {
+            continue;
+        }
+        let outcome = action_outcome(
+            rows.iter().any(|d| d.event_type == "gate1_pass"),
+            rows.iter().any(|d| {
+                d.event_type == "gate3_promotion_approved" || d.event_type == "gate3_pf_no_spans"
+            }),
+            rows.iter().any(|d| is_in(&deck::REVIEW_MARK_EVENTS, d)),
+            rows.iter().any(|d| is_in(&deck::HOLD_EVENTS, d)),
+        );
+        let Some(key) = outcome.key() else { continue };
+        let provider = rows.iter().filter_map(|d| d.provider.as_deref()).max();
+        if provider_id.is_some_and(|want| provider != Some(want)) {
+            continue;
+        }
+        let sending: Vec<&&read::DisclosureDetailRow> = rows
+            .iter()
+            .filter(|d| is_in(&deck::SEND_EVENTS, d))
+            .collect();
+        // What was shared and kept back: the newest gate1_pass row says it; an action
+        // with none (a promotion only) shows its first sending row.
+        let shown = sending
+            .iter()
+            .rev()
+            .find(|d| d.event_type == "gate1_pass")
+            .or(sending.first());
+        let Some(shown) = shown else { continue };
+        items.push(SharedLogItem {
+            time: sending
+                .iter()
+                .map(|d| d.created_at.as_str())
+                .min()
+                .unwrap_or(shown.created_at.as_str())
+                .to_owned(),
+            tag: SharedLogTag::Sent,
+            sentence: key.to_owned(),
+            provider: provider.map(|p| lk.provider(p)),
+            shared: labels(&shown.shared),
+            kept_back: labels(&shown.withheld),
             document_type: None,
             summary: None,
         });
@@ -526,13 +639,18 @@ fn parse_day(day: &str) -> Result<NaiveDate, String> {
 }
 
 fn ids_of_raw(raw: &SharedLogRaw) -> (Vec<String>, Vec<String>) {
-    let mut focuses: BTreeSet<String> = raw.run_focus.values().cloned().collect();
+    let mut focuses: BTreeSet<String> = raw
+        .run_focus
+        .keys()
+        .map(|run| focus_of(raw, run).to_owned())
+        .collect();
     focuses.extend(raw.consent.iter().map(|c| c.focus_slug.clone()));
     focuses.retain(|f| !f.is_empty());
     let providers: BTreeSet<String> = raw
         .aggregates
         .iter()
         .filter_map(|a| a.provider.clone())
+        .chain(raw.actions.iter().filter_map(|a| a.provider.clone()))
         .collect();
     (
         focuses.into_iter().collect(),
@@ -606,16 +724,29 @@ pub(crate) async fn items_for_session(
     let run_ids: Vec<String> = raw
         .aggregates
         .iter()
-        .filter(|a| a.day == day && focus_of(&raw, a) == focus_id)
-        .map(|a| a.focus_run_id.clone())
+        .filter(|a| a.day == day)
+        .map(|a| &a.focus_run_id)
+        .chain(
+            raw.actions
+                .iter()
+                .filter(|a| a.day == day)
+                .map(|a| &a.focus_run_id),
+        )
+        .filter(|run| focus_of(&raw, run) == focus_id)
+        .cloned()
         .collect::<BTreeSet<_>>()
         .into_iter()
+        .collect();
+    let review_runs: HashSet<String> = run_ids
+        .iter()
+        .filter(|run| is_review_run(&raw, run))
+        .cloned()
         .collect();
     let mut personal =
         crate::persistence::personal_store::open_personal_db(user_id, persona_id, key_hex)
             .await
             .map_err(|e| e.to_string())?;
-    let details = read::disclosure_details(&mut personal, &run_ids, day, utc_offset_minutes)
+    let details = read::disclosure_details(&mut personal, &run_ids, utc_offset_minutes)
         .await
         .map_err(|e| e.to_string())?;
     drop(personal);
@@ -632,7 +763,15 @@ pub(crate) async fn items_for_session(
             .await
             .map_err(|e| e.to_string())?,
     };
-    Ok(build_items(&details, &consent, focus_id, &lk, provider_id))
+    Ok(build_items(
+        &details,
+        &consent,
+        focus_id,
+        day,
+        &review_runs,
+        &lk,
+        provider_id,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -743,6 +882,7 @@ pub async fn clear_consent_history(
 mod tests {
     use super::*;
     use crate::persistence::migrations::parse_statements;
+    use crate::persistence::shared_log_read::{ActionAggregate, DisclosureAggregate};
     use sqlx::sqlite::SqliteConnectOptions;
     use sqlx::{ConnectOptions, SqliteConnection};
 
@@ -767,6 +907,31 @@ mod tests {
             rows: n,
             shared,
             withheld,
+        }
+    }
+
+    /// One action: its rows as flags, the way step 1 returns them.
+    #[allow(clippy::too_many_arguments)]
+    fn act(
+        day: &str,
+        run: &str,
+        action: &str,
+        prov: Option<&str>,
+        withheld: i64,
+        flags: &str,
+    ) -> ActionAggregate {
+        // flags: g = gate1_pass, a = promotion or no-span approval, m = review mark,
+        // h = held row.
+        ActionAggregate {
+            day: day.into(),
+            focus_run_id: run.into(),
+            action_id: action.into(),
+            provider: prov.map(str::to_owned),
+            withheld,
+            gate1: flags.contains('g'),
+            approved: flags.contains('a'),
+            marked: flags.contains('m'),
+            held: flags.contains('h'),
         }
     }
 
@@ -802,16 +967,6 @@ mod tests {
     fn raw() -> SharedLogRaw {
         SharedLogRaw {
             aggregates: vec![
-                agg("2026-11-20", "r1", "gate1_pass", Some("prov-a"), 2, 3, 1),
-                agg(
-                    "2026-11-20",
-                    "r1",
-                    "gate3_promotion_approved",
-                    None,
-                    1,
-                    1,
-                    0,
-                ),
                 agg("2026-11-20", "r1", "gate3_sensitivity_block", None, 1, 0, 1),
                 agg(
                     "2026-11-20",
@@ -822,7 +977,6 @@ mod tests {
                     0,
                     1,
                 ),
-                agg("2026-11-20", "r2", "gate1_pass", Some("prov-b"), 1, 1, 0),
                 agg("2026-11-19", "r3", "output_scan_light", None, 4, 0, 0),
                 agg(
                     "2026-11-18",
@@ -833,7 +987,14 @@ mod tests {
                     0,
                     9,
                 ),
-                agg("2026-09-02", "r5", "gate1_pass", Some("prov-a"), 1, 1, 0),
+            ],
+            actions: vec![
+                // r1: two plain sends (one withheld field) and one reviewed send.
+                act("2026-11-20", "r1", "a1", Some("prov-a"), 1, "g"),
+                act("2026-11-20", "r1", "a2", Some("prov-a"), 0, "g"),
+                act("2026-11-20", "r1", "a3", None, 0, "am"),
+                act("2026-11-20", "r2", "a4", Some("prov-b"), 0, "g"),
+                act("2026-09-02", "r5", "a5", Some("prov-a"), 0, "g"),
             ],
             consent: vec![
                 consent(
@@ -1016,72 +1177,559 @@ mod tests {
         assert!(build_summary(&only, &lookups(), SharedLogWindow::Last30, today(), &NONE).has_any);
     }
 
+    fn run_of(actions: Vec<ActionAggregate>) -> SharedLogRaw {
+        let runs: HashSet<String> = actions.iter().map(|a| a.focus_run_id.clone()).collect();
+        SharedLogRaw {
+            actions,
+            run_focus: runs
+                .into_iter()
+                .map(|r| (r, "writing-assistant".to_owned()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn one_group(raw: &SharedLogRaw, f: &Filters<'_>) -> SharedLogGroup {
+        let s = build_summary(raw, &lookups(), SharedLogWindow::Last30, today(), f);
+        assert_eq!(s.groups.len(), 1, "{:?}", s.groups);
+        s.groups[0].clone()
+    }
+
     #[test]
     fn all_reviewed_only_when_every_send_went_through_review() {
-        let r = SharedLogRaw {
+        // Two actions each reviewed by a promotion: two sends, both reviewed.
+        let r = run_of(vec![
+            act("2026-11-20", "r1", "a1", None, 0, "am"),
+            act("2026-11-20", "r1", "a2", None, 0, "am"),
+        ]);
+        let g = one_group(&r, &NONE);
+        assert!(g.all_reviewed && g.sends == 2);
+        // A plain send beside them: no longer every send.
+        let r = run_of(vec![
+            act("2026-11-20", "r1", "a1", None, 0, "am"),
+            act("2026-11-20", "r1", "a2", None, 0, "g"),
+        ]);
+        let g = one_group(&r, &NONE);
+        assert!(!g.all_reviewed && g.sends == 2);
+    }
+
+    /// items.id=958 unit 2, one send per (run, action): the rows one send writes are
+    /// ONE send, and what the review adds decides whether it reads reviewed.
+    #[test]
+    fn a_hosted_send_reads_one_send_whatever_rows_it_wrote() {
+        // gate1_pass + a no-span review row: one PLAIN send (sentNoReview), not reviewed.
+        let g = one_group(
+            &run_of(vec![act("2026-11-20", "r1", "a", Some("prov-a"), 2, "ga")]),
+            &NONE,
+        );
+        assert_eq!((g.sends, g.all_reviewed, g.kept_back), (1, false, 2));
+        // gate1_pass + a promotion: one reviewed send.
+        let g = one_group(
+            &run_of(vec![act("2026-11-20", "r1", "a", Some("prov-a"), 2, "gam")]),
+            &NONE,
+        );
+        assert_eq!((g.sends, g.all_reviewed, g.kept_back), (1, true, 2));
+        // A pending consent, then an answer and a second gate1_pass: one reviewed send.
+        let g = one_group(
+            &run_of(vec![act("2026-11-20", "r1", "a", Some("prov-a"), 2, "gm")]),
+            &NONE,
+        );
+        assert_eq!((g.sends, g.all_reviewed), (1, true));
+        // A gate1_pass only (a step with no review row, a bound API Chat run): plain.
+        let g = one_group(
+            &run_of(vec![act("2026-11-20", "r1", "a", Some("prov-a"), 0, "g")]),
+            &NONE,
+        );
+        assert_eq!((g.sends, g.all_reviewed), (1, false));
+        // Withheld counts once per send, from the gate1_pass: a second action adds its own.
+        let g = one_group(
+            &run_of(vec![
+                act("2026-11-20", "r1", "a", Some("prov-a"), 2, "gam"),
+                act("2026-11-20", "r1", "b", Some("prov-a"), 1, "g"),
+            ]),
+            &NONE,
+        );
+        assert_eq!((g.sends, g.kept_back), (2, 3));
+    }
+
+    #[test]
+    fn a_held_action_is_no_send_and_its_held_row_still_counts_as_kept_back() {
+        let mut r = run_of(vec![act("2026-11-20", "r1", "a", Some("prov-a"), 2, "gh")]);
+        r.aggregates = vec![agg(
+            "2026-11-20",
+            "r1",
+            "gate3_pf_unavailable_block",
+            Some("prov-a"),
+            1,
+            0,
+            1,
+        )];
+        let g = one_group(&r, &NONE);
+        // Nothing was sent; one item was held (the gate1_pass's withheld is not counted).
+        assert_eq!((g.sends, g.kept_back), (0, 1));
+        // A retry that then went out reads one send, still with the held row.
+        r.actions[0].approved = true;
+        let g = one_group(&r, &NONE);
+        assert_eq!((g.sends, g.kept_back), (1, 3));
+    }
+
+    #[test]
+    fn a_reapplied_choice_is_shown_but_is_not_a_send() {
+        let mut r = SharedLogRaw {
             aggregates: vec![agg(
                 "2026-11-20",
                 "r1",
-                "gate3_promotion_approved",
-                None,
-                2,
-                1,
+                "gate3_fact_reapplied",
+                Some("prov-a"),
+                3,
+                0,
                 0,
             )],
             run_focus: HashMap::from([("r1".to_owned(), "writing-assistant".to_owned())]),
             ..Default::default()
         };
         let s = build_summary(&r, &lookups(), SharedLogWindow::Last30, today(), &NONE);
-        assert!(s.groups[0].all_reviewed && s.groups[0].sends == 2);
+        assert!(
+            s.groups.is_empty(),
+            "a reapplied choice alone is not a send"
+        );
+        // Beside a gate1_pass it makes that send reviewed and adds none.
+        r.actions = vec![act("2026-11-20", "r1", "a", Some("prov-a"), 0, "gm")];
+        let g = one_group(&r, &NONE);
+        assert_eq!((g.sends, g.all_reviewed), (1, true));
     }
 
-    /// items.id=958: a reviewed send whose row now carries its provider is named in
-    /// the group and kept by that provider's filter; the same row with no provider
-    /// (an older row, Step 13, the copy review) keeps the fallback and is absent
-    /// under the filter. Nothing about counting changes.
+    /// items.id=958 unit 2: the synthetic run that reviews one API Chat message never
+    /// counts as a send; the api-chat run's own gate1_pass is the send, and it reads plain.
     #[test]
-    fn a_reviewed_send_with_a_provider_is_named_and_survives_the_provider_filter() {
-        let raw_with = |provider: Option<&str>| SharedLogRaw {
-            aggregates: vec![agg(
-                "2026-11-20",
-                "r1",
-                "gate3_promotion_approved",
-                provider,
-                2,
-                1,
-                0,
-            )],
-            run_focus: HashMap::from([("r1".to_owned(), "writing-assistant".to_owned())]),
-            ..Default::default()
+    fn the_api_chat_review_run_never_counts_and_its_send_reads_plain() {
+        let raw = SharedLogRaw {
+            aggregates: vec![
+                agg(
+                    "2026-11-20",
+                    "stub",
+                    "gate3_consent_pending",
+                    Some("prov-a"),
+                    1,
+                    0,
+                    1,
+                ),
+                agg(
+                    "2026-11-20",
+                    "stub",
+                    "gate3_pf_unavailable_block",
+                    Some("prov-a"),
+                    1,
+                    0,
+                    1,
+                ),
+            ],
+            actions: vec![
+                // The review's own approval row, under the stub run, and the send.
+                act(
+                    "2026-11-20",
+                    "stub",
+                    "api-chat-send",
+                    Some("prov-a"),
+                    0,
+                    "a",
+                ),
+                act("2026-11-20", "chat", "a4", Some("prov-a"), 2, "g"),
+            ],
+            consent: vec![],
+            run_focus: HashMap::from([
+                ("stub".to_owned(), "api-chat-send".to_owned()),
+                ("chat".to_owned(), "api-chat".to_owned()),
+            ]),
         };
+        let s = build_summary(&raw, &lookups(), SharedLogWindow::Last30, today(), &NONE);
+        assert_eq!(
+            s.groups.len(),
+            1,
+            "one group, not one per run: {:?}",
+            s.groups
+        );
+        let g = &s.groups[0];
+        assert_eq!(g.focus.id, "api-chat");
+        // One plain send; the stub's held row and the send's withheld count as kept back;
+        // the stub's pending consent is a background check of the same group.
+        assert_eq!(
+            (g.sends, g.all_reviewed, g.kept_back, g.background),
+            (1, false, 3, 1)
+        );
+        assert!(s.focuses.iter().all(|f| f.id != "api-chat-send"));
+        // The filter keeps the one send.
         let f = Filters {
             focus_id: None,
             provider_id: Some("prov-a"),
         };
-        let named = raw_with(Some("prov-a"));
-        let s = build_summary(&named, &lookups(), SharedLogWindow::Last30, today(), &NONE);
-        let g = &s.groups[0];
-        assert!(g.all_reviewed && g.sends == 2);
-        assert_eq!(g.providers.len(), 1);
-        assert_eq!(g.providers[0].name.as_deref(), Some("Provider A"));
-        let s = build_summary(&named, &lookups(), SharedLogWindow::Last30, today(), &f);
-        assert_eq!(s.groups.len(), 1);
-        assert_eq!((s.groups[0].sends, s.groups[0].all_reviewed), (2, true));
+        assert_eq!(one_group(&raw, &f).sends, 1);
+    }
 
-        let unnamed = raw_with(None);
-        let s = build_summary(
-            &unnamed,
-            &lookups(),
-            SharedLogWindow::Last30,
-            today(),
-            &NONE,
-        );
+    /// items.id=958: a reviewed send with a provider is named in the group and kept by
+    /// that provider's filter; the same send with no provider (an older row) keeps the
+    /// fallback and is absent under the filter.
+    #[test]
+    fn a_reviewed_send_with_a_provider_is_named_and_survives_the_provider_filter() {
+        let f = Filters {
+            focus_id: None,
+            provider_id: Some("prov-a"),
+        };
+        let named = run_of(vec![act("2026-11-20", "r1", "a", Some("prov-a"), 0, "gam")]);
+        let g = one_group(&named, &NONE);
+        assert!(g.all_reviewed && g.sends == 1);
+        assert_eq!(g.providers[0].name.as_deref(), Some("Provider A"));
+        let g = one_group(&named, &f);
+        assert_eq!((g.sends, g.all_reviewed), (1, true));
+        // Another provider's filter does not keep it.
+        let other = Filters {
+            focus_id: None,
+            provider_id: Some("prov-b"),
+        };
         assert!(
-            s.groups[0].providers.is_empty() && s.groups[0].sends == 2,
+            build_summary(&named, &lookups(), SharedLogWindow::Last30, today(), &other)
+                .groups
+                .is_empty()
+        );
+
+        let unnamed = run_of(vec![act("2026-11-20", "r1", "a", None, 0, "gam")]);
+        let g = one_group(&unnamed, &NONE);
+        assert!(
+            g.providers.is_empty() && g.sends == 1,
             "no provider listed: the view falls back to the generic wording"
         );
         let s = build_summary(&unnamed, &lookups(), SharedLogWindow::Last30, today(), &f);
         assert!(s.groups.is_empty());
+    }
+
+    // ---- the group's items fold the same way ---------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    fn det(
+        run: &str,
+        action: &str,
+        day: &str,
+        at: &str,
+        ev: &str,
+        prov: Option<&str>,
+        shared: &[&str],
+        withheld: &[&str],
+    ) -> read::DisclosureDetailRow {
+        read::DisclosureDetailRow {
+            focus_run_id: run.into(),
+            action_id: action.into(),
+            day: day.into(),
+            created_at: at.into(),
+            event_type: ev.into(),
+            provider: prov.map(str::to_owned),
+            override_declined: false,
+            shared: shared.iter().map(|s| (*s).to_owned()).collect(),
+            withheld: withheld.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    fn items_of(
+        rows: &[read::DisclosureDetailRow],
+        review_runs: &[&str],
+        day: &str,
+        provider: Option<&str>,
+    ) -> Vec<SharedLogItem> {
+        let review: HashSet<String> = review_runs.iter().map(|r| (*r).to_owned()).collect();
+        build_items(
+            rows,
+            &[],
+            "writing-assistant",
+            day,
+            &review,
+            &lookups(),
+            provider,
+        )
+    }
+
+    #[test]
+    fn one_send_is_one_item_with_the_review_deciding_its_sentence() {
+        let d = "2026-11-20";
+        // gate1_pass + promotion: ONE reviewed item that shows what gate1 shared.
+        let rows = [
+            det(
+                "r1",
+                "a",
+                d,
+                "2026-11-20T10:00:00+00:00",
+                "gate1_pass",
+                Some("prov-a"),
+                &["job_title"],
+                &["draft"],
+            ),
+            det(
+                "r1",
+                "a",
+                d,
+                "2026-11-20T10:00:01+00:00",
+                "gate3_promotion_approved",
+                Some("prov-a"),
+                &["x"],
+                &[],
+            ),
+        ];
+        let items = items_of(&rows, &[], d, None);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(
+            (items[0].tag, items[0].sentence.as_str()),
+            (SharedLogTag::Sent, "sent.reviewed")
+        );
+        assert_eq!(items[0].shared[0].text.as_deref(), Some("Job title"));
+        assert_eq!(items[0].kept_back[0].kind, SharedLogLabelKind::Draft);
+        assert_eq!(
+            items[0].provider.as_ref().unwrap().name.as_deref(),
+            Some("Provider A")
+        );
+        // gate1_pass + no-span row: one item, the no-review sentence.
+        let rows = [
+            det(
+                "r1",
+                "a",
+                d,
+                "2026-11-20T10:00:00+00:00",
+                "gate1_pass",
+                Some("prov-a"),
+                &[],
+                &[],
+            ),
+            det(
+                "r1",
+                "a",
+                d,
+                "2026-11-20T10:00:01+00:00",
+                "gate3_pf_no_spans",
+                Some("prov-a"),
+                &[],
+                &[],
+            ),
+        ];
+        let items = items_of(&rows, &[], d, None);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].sentence, "sent.noReview");
+        // gate1_pass alone, twice (a retry): one plain item.
+        let rows = [
+            det(
+                "r1",
+                "a",
+                d,
+                "2026-11-20T10:00:00+00:00",
+                "gate1_pass",
+                Some("prov-a"),
+                &[],
+                &[],
+            ),
+            det(
+                "r1",
+                "a",
+                d,
+                "2026-11-20T10:09:00+00:00",
+                "gate1_pass",
+                Some("prov-a"),
+                &[],
+                &[],
+            ),
+        ];
+        let items = items_of(&rows, &[], d, None);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].sentence, "sent.plain");
+        assert_eq!(items[0].time, "2026-11-20T10:00:00+00:00");
+        // A pending consent beside the gate1_pass: reviewed, and the background row shows too.
+        let rows = [
+            det(
+                "r1",
+                "a",
+                d,
+                "2026-11-20T10:00:00+00:00",
+                "gate1_pass",
+                Some("prov-a"),
+                &[],
+                &[],
+            ),
+            det(
+                "r1",
+                "a",
+                d,
+                "2026-11-20T10:00:01+00:00",
+                "gate3_consent_pending",
+                Some("prov-a"),
+                &[],
+                &[],
+            ),
+        ];
+        let items = items_of(&rows, &[], d, None);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().any(|i| i.sentence == "sent.reviewed"));
+        assert!(items.iter().any(|i| i.tag == SharedLogTag::Hidden));
+    }
+
+    #[test]
+    fn a_held_action_shows_the_held_item_and_no_send_item() {
+        let d = "2026-11-20";
+        let rows = [
+            det(
+                "r1",
+                "a",
+                d,
+                "2026-11-20T10:00:00+00:00",
+                "gate1_pass",
+                Some("prov-a"),
+                &[],
+                &[],
+            ),
+            det(
+                "r1",
+                "a",
+                d,
+                "2026-11-20T10:00:01+00:00",
+                "gate3_pf_unavailable_block",
+                Some("prov-a"),
+                &[],
+                &["draft"],
+            ),
+        ];
+        let items = items_of(&rows, &[], d, None);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            (items[0].tag, items[0].sentence.as_str()),
+            (SharedLogTag::KeptBack, "held.pfUnavailable")
+        );
+    }
+
+    #[test]
+    fn the_api_chat_review_runs_rows_are_not_send_items_and_a_send_shows_on_its_newest_day_only() {
+        let d = "2026-11-20";
+        // The stub run's approval row is not an item; its pending consent still is.
+        let rows = [
+            det(
+                "stub",
+                "api-chat-send",
+                d,
+                "2026-11-20T10:00:00+00:00",
+                "gate3_pf_no_spans",
+                Some("prov-a"),
+                &[],
+                &[],
+            ),
+            det(
+                "stub",
+                "api-chat-send",
+                d,
+                "2026-11-20T10:00:01+00:00",
+                "gate3_consent_pending",
+                Some("prov-a"),
+                &[],
+                &[],
+            ),
+            det(
+                "chat",
+                "a4",
+                d,
+                "2026-11-20T10:00:02+00:00",
+                "gate1_pass",
+                Some("prov-a"),
+                &[],
+                &[],
+            ),
+        ];
+        let items = items_of(&rows, &["stub"], d, None);
+        let sentences: Vec<&str> = items.iter().map(|i| i.sentence.as_str()).collect();
+        assert_eq!(sentences, ["bg.reviewRaised", "sent.plain"]);
+        // An action across two days: the second day's gate1_pass is the newest, so it is
+        // that day's send and the earlier day shows only its background row.
+        let rows = [
+            det(
+                "r1",
+                "a",
+                "2026-11-19",
+                "2026-11-19T23:00:00+00:00",
+                "gate1_pass",
+                Some("prov-a"),
+                &[],
+                &[],
+            ),
+            det(
+                "r1",
+                "a",
+                "2026-11-19",
+                "2026-11-19T23:01:00+00:00",
+                "gate3_consent_pending",
+                Some("prov-a"),
+                &[],
+                &[],
+            ),
+            det(
+                "r1",
+                "a",
+                "2026-11-20",
+                "2026-11-20T09:00:00+00:00",
+                "gate1_pass",
+                Some("prov-a"),
+                &[],
+                &[],
+            ),
+        ];
+        let early = items_of(&rows, &[], "2026-11-19", None);
+        assert!(
+            early.iter().all(|i| i.tag != SharedLogTag::Sent),
+            "{early:?}"
+        );
+        let late = items_of(&rows, &[], "2026-11-20", None);
+        assert_eq!(late.len(), 1);
+        assert_eq!(late[0].sentence, "sent.reviewed");
+    }
+
+    #[test]
+    fn the_provider_filter_keeps_only_the_sends_of_that_provider_in_the_items() {
+        let d = "2026-11-20";
+        let rows = [
+            det(
+                "r1",
+                "a",
+                d,
+                "2026-11-20T10:00:00+00:00",
+                "gate1_pass",
+                Some("prov-a"),
+                &[],
+                &[],
+            ),
+            det(
+                "r1",
+                "a",
+                d,
+                "2026-11-20T10:00:01+00:00",
+                "gate3_promotion_approved",
+                Some("prov-a"),
+                &[],
+                &[],
+            ),
+            det(
+                "r1",
+                "b",
+                d,
+                "2026-11-20T10:01:00+00:00",
+                "gate1_pass",
+                Some("prov-b"),
+                &[],
+                &[],
+            ),
+            det(
+                "r1",
+                "c",
+                d,
+                "2026-11-20T10:02:00+00:00",
+                "gate3_sensitivity_block",
+                None,
+                &[],
+                &["draft"],
+            ),
+        ];
+        let items = items_of(&rows, &[], d, Some("prov-a"));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].sentence, "sent.reviewed");
     }
 
     async fn personal_db() -> SqliteConnection {
@@ -1123,16 +1771,25 @@ mod tests {
         .await
         .unwrap();
         let aggs = read::disclosure_aggregates(&mut c, None, 0).await.unwrap();
-        let details = read::disclosure_details(&mut c, &["r1".into()], "2026-11-20", 0)
+        let details = read::disclosure_details(&mut c, &["r1".into()], 0)
             .await
             .unwrap();
         let raw = SharedLogRaw {
-            aggregates: aggs,
+            aggregates: aggs.events,
+            actions: aggs.actions,
             consent: vec![],
             run_focus: HashMap::from([("r1".to_owned(), "writing-assistant".to_owned())]),
         };
         let summary = build_summary(&raw, &lookups(), SharedLogWindow::Last30, today(), &NONE);
-        let items = build_items(&details, &[], "writing-assistant", &lookups(), None);
+        let items = build_items(
+            &details,
+            &[],
+            "writing-assistant",
+            "2026-11-20",
+            &HashSet::new(),
+            &lookups(),
+            None,
+        );
         let out = format!(
             "{} {}",
             serde_json::to_string(&summary_json(&summary)).unwrap(),
@@ -1164,6 +1821,9 @@ mod tests {
     fn items_carry_sentence_keys_labels_and_a_fixed_consent_summary() {
         let det = vec![
             read::DisclosureDetailRow {
+                focus_run_id: "r1".into(),
+                action_id: "a".into(),
+                day: "2026-11-20".into(),
                 created_at: "2026-11-20T10:00:00+00:00".into(),
                 event_type: "gate3_sensitivity_block".into(),
                 provider: None,
@@ -1172,6 +1832,9 @@ mod tests {
                 withheld: vec!["draft".into()],
             },
             read::DisclosureDetailRow {
+                focus_run_id: "r1".into(),
+                action_id: "a".into(),
+                day: "2026-11-20".into(),
                 created_at: "2026-11-20T10:01:00+00:00".into(),
                 event_type: "provenance_cross_persona_omitted".into(),
                 provider: None,
@@ -1187,7 +1850,15 @@ mod tests {
             "2026-11-20T10:02:00+00:00",
         );
         ceiling.document_type = Some("cover_letter".into());
-        let items = build_items(&det, &[ceiling], "writing-assistant", &lookups(), None);
+        let items = build_items(
+            &det,
+            &[ceiling],
+            "writing-assistant",
+            "2026-11-20",
+            &HashSet::new(),
+            &lookups(),
+            None,
+        );
         // The tier-1 provenance row is dropped; the block and the choice remain.
         assert_eq!(items.len(), 2);
         assert_eq!(
@@ -1207,6 +1878,8 @@ mod tests {
                 "t"
             )],
             "writing-assistant",
+            "2026-11-20",
+            &HashSet::new(),
             &lookups(),
             None
         )
@@ -1218,13 +1891,9 @@ mod tests {
     #[test]
     #[ignore]
     fn summary_size_for_a_heavy_month() {
-        let events = [
-            "gate1_pass",
-            "gate3_promotion_approved",
-            "gate3_sensitivity_block",
-            "output_scan_light",
-        ];
+        let held_and_background = ["gate3_sensitivity_block", "output_scan_light"];
         let mut aggregates = Vec::new();
+        let mut actions = Vec::new();
         let mut run_focus = HashMap::new();
         for i in 0..27_772usize {
             let day = format!("2026-11-{:02}", 1 + i % 22);
@@ -1233,10 +1902,18 @@ mod tests {
                 run.clone(),
                 ["writing-assistant", "quick-ask", "research-and-buy"][i % 3].to_owned(),
             );
-            aggregates.push(agg(&day, &run, events[i % 4], Some("prov-a"), 1, 2, 1));
+            if i % 4 < 2 {
+                // Sends: a plain one and a reviewed one, one action each.
+                let flags = if i % 4 == 0 { "g" } else { "am" };
+                actions.push(act(&day, &run, &format!("a{i}"), Some("prov-a"), 1, flags));
+            } else {
+                let ev = held_and_background[i % 2];
+                aggregates.push(agg(&day, &run, ev, Some("prov-a"), 1, 2, 1));
+            }
         }
         let raw = SharedLogRaw {
             aggregates,
+            actions,
             consent: vec![],
             run_focus,
         };
@@ -1614,5 +2291,272 @@ mod tests {
             after[1].consent_reference_id.as_deref(),
             Some(kept_grant.as_str())
         );
+    }
+
+    /// items.id=958 unit 2: the double count, reproduced with ROWS WRITTEN BY THE REAL
+    /// WRITERS into an encrypted personal.db and read back by the real read path.
+    ///
+    /// REAL: every gate1_pass (gate1 through PrivacyGateway) and the legacy-path
+    /// gate3_promotion_approved (gate3 itself, without the Privacy Filter).
+    /// EMULATED, because the Privacy Filter and an app handle are not available in a
+    /// unit test: `emulated_no_spans_row` (gate3_pf_no_spans), `emulated_consent_pending_row`
+    /// (gate3_consent_pending) and `emulated_unavailable_block_row`
+    /// (gate3_pf_unavailable_block). Each is written through the real logger with the
+    /// entry shape gate3_with_pf / pf_unavailable_block build (gate3.rs), so the read
+    /// path sees what a real review would leave.
+    #[tokio::test]
+    async fn real_writers_leave_rows_that_read_as_one_send_each() {
+        use crate::conductor::privacy::gate3::KeptPrivate;
+        use crate::conductor::privacy::logger::{DisclosureLogEntry, DisclosureLogger};
+        use crate::conductor::privacy::types::{
+            AbstractionPolicy, PersonalField, PersonalTrack, Sensitivity,
+        };
+        use crate::conductor::privacy::PrivacyGateway;
+        use crate::conductor::tokens::ExternalAccess;
+        use crate::persistence::disclosure_log_store::SqliteDisclosureLogger;
+        type Gw = PrivacyGateway<SqliteDisclosureLogger>;
+
+        let e = env().await;
+        let gw = PrivacyGateway::new(SqliteDisclosureLogger::new(&e.user, &e.persona, &e.key));
+        let mut track = PersonalTrack::new();
+        for (n, v) in [("city", "Leeds"), ("employer", "Acme")] {
+            track
+                .add_field(PersonalField {
+                    field_name: n.into(),
+                    field_value: v.into(),
+                    sensitivity: Sensitivity::Personal,
+                    sensitivity_severity: 2,
+                    source_id: "s".into(),
+                    abstraction_tier2: AbstractionPolicy::Omit,
+                    abstraction_tier3: AbstractionPolicy::Omit,
+                })
+                .unwrap();
+        }
+        track.seal();
+        let scope: HashSet<String> = ["city".to_owned(), "employer".to_owned()].into();
+        for (run, focus) in [
+            ("r-s1", "writing-assistant"),
+            ("r-s2", "writing-assistant"),
+            ("r-s3", "writing-assistant"),
+            ("r-s5", "writing-assistant"),
+            ("r-s6", "writing-assistant"),
+            ("api-chat-send-stub", "api-chat-send"),
+            ("r-chat", "api-chat"),
+        ] {
+            crate::persistence::output_store::test_seed_focus_run(
+                &e.user, &e.persona, &e.key, run, focus,
+            )
+            .await
+            .unwrap();
+        }
+        // REAL: gate1 withholds both fields (the Omit policy), one row per attempt.
+        async fn gate1_row(
+            gw: &Gw,
+            run: &str,
+            action: &str,
+            t: &PersonalTrack,
+            sc: &HashSet<String>,
+        ) {
+            gw.gate1(
+                action,
+                run,
+                t,
+                2,
+                1,
+                2,
+                ExternalAccess::AnonymousRequired,
+                Some("prov-a".into()),
+                Some(sc),
+            )
+            .await
+            .unwrap();
+        }
+        // REAL: gate3 on its legacy path writes gate3_promotion_approved.
+        async fn real_promotion_row(gw: &Gw, run: &str, action: &str) {
+            let r = gw
+                .gate3(
+                    action,
+                    run,
+                    "Focus",
+                    action,
+                    "text",
+                    1,
+                    2,
+                    ExternalAccess::AnonymousRequired,
+                    2,
+                    None,
+                    Some(1),
+                    false,
+                    "",
+                    "",
+                    "",
+                    KeptPrivate::RemovesSpans,
+                    &[],
+                    Some("prov-a"),
+                )
+                .await
+                .unwrap();
+            assert!(r.approved);
+        }
+        // EMULATED (see the doc comment): written through the real logger.
+        async fn emulated(
+            gw: &Gw,
+            run: &str,
+            action: &str,
+            ev: &str,
+            shared: &[&str],
+            withheld: &[&str],
+        ) {
+            gw.logger
+                .write(DisclosureLogEntry {
+                    action_id: action.into(),
+                    focus_run_id: run.into(),
+                    execution_tier: 2,
+                    abstraction_tier: None,
+                    provider: Some("prov-a".into()),
+                    fields_shared: shared.iter().map(|s| (*s).to_owned()).collect(),
+                    fields_abstracted: Default::default(),
+                    fields_withheld: withheld.iter().map(|s| (*s).to_owned()).collect(),
+                    override_declined: false,
+                    event_type: ev.into(),
+                    category: None,
+                    fact_key: None,
+                })
+                .await
+                .unwrap();
+        }
+        async fn emulated_no_spans_row(gw: &Gw, run: &str, action: &str) {
+            emulated(gw, run, action, "gate3_pf_no_spans", &[action], &[]).await;
+        }
+        async fn emulated_consent_pending_row(gw: &Gw, run: &str, action: &str) {
+            emulated(gw, run, action, "gate3_consent_pending", &[], &[action]).await;
+        }
+        async fn emulated_unavailable_block_row(gw: &Gw, run: &str, action: &str) {
+            emulated(
+                gw,
+                run,
+                action,
+                "gate3_pf_unavailable_block",
+                &[],
+                &[action],
+            )
+            .await;
+        }
+
+        // S1: a hosted step whose review approves on the legacy path.
+        gate1_row(&gw, "r-s1", "a1", &track, &scope).await;
+        real_promotion_row(&gw, "r-s1", "a1").await;
+        // S2: the review finds no spans (the production path).
+        gate1_row(&gw, "r-s2", "a2", &track, &scope).await;
+        emulated_no_spans_row(&gw, "r-s2", "a2").await;
+        // S3: spans asked, the user answers, the resume runs gate1 again.
+        gate1_row(&gw, "r-s3", "a3", &track, &scope).await;
+        emulated_consent_pending_row(&gw, "r-s3", "a3").await;
+        gate1_row(&gw, "r-s3", "a3", &track, &scope).await;
+        // S4: API Chat: the review's rows sit under a synthetic run, the send under the real one.
+        emulated_no_spans_row(&gw, "api-chat-send-stub", "api-chat-send").await;
+        gate1_row(&gw, "r-chat", "a4", &track, &scope).await;
+        // S5: a hosted step with no review row.
+        gate1_row(&gw, "r-s5", "a5", &track, &scope).await;
+        // S6: gate1 runs, then the review blocks.
+        gate1_row(&gw, "r-s6", "a6", &track, &scope).await;
+        emulated_unavailable_block_row(&gw, "r-s6", "a6").await;
+
+        let summary = |provider| {
+            let (pool, user, key, persona) = (&e.pool, &e.user, &e.key, &e.persona);
+            async move {
+                summary_for_session(
+                    pool,
+                    user,
+                    key,
+                    persona,
+                    SharedLogWindow::Everything,
+                    0,
+                    None,
+                    provider,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let s = summary(None).await;
+        // Five writing-assistant runs: S1 reviewed, S2 plain (no review step), S3 reviewed,
+        // S5 plain, S6 held (0 sends). Four sends, two reviewed, two withheld fields each,
+        // plus the one held item. One background check (the pending consent).
+        let wa = s
+            .groups
+            .iter()
+            .find(|g| g.focus.id == "writing-assistant")
+            .unwrap();
+        assert_eq!(
+            (
+                wa.runs,
+                wa.sends,
+                wa.all_reviewed,
+                wa.kept_back,
+                wa.background
+            ),
+            (5, 4, false, 9, 1)
+        );
+        // API Chat: one plain send in ONE group, no group for the review's synthetic run.
+        assert_eq!(s.groups.len(), 2, "{:?}", s.groups);
+        let chat = s.groups.iter().find(|g| g.focus.id == "api-chat").unwrap();
+        assert_eq!(
+            (chat.sends, chat.all_reviewed, chat.kept_back),
+            (1, false, 2)
+        );
+        assert!(s.focuses.iter().all(|f| f.id != "api-chat-send"));
+        // The provider filter keeps the sends, not the held item.
+        let f = summary(Some("prov-a")).await;
+        let wa = f
+            .groups
+            .iter()
+            .find(|g| g.focus.id == "writing-assistant")
+            .unwrap();
+        assert_eq!((wa.sends, wa.kept_back), (4, 8));
+        assert_eq!(
+            f.groups
+                .iter()
+                .find(|g| g.focus.id == "api-chat")
+                .unwrap()
+                .sends,
+            1
+        );
+
+        // The group's items fold the same way: one item per send, plus the held item and
+        // the background row.
+        let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let items = items_for_session(
+            &e.pool,
+            &e.user,
+            &e.key,
+            &e.persona,
+            &day,
+            "writing-assistant",
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut keys: Vec<&str> = items.iter().map(|i| i.sentence.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "bg.reviewRaised",
+                "held.pfUnavailable",
+                "sent.noReview",
+                "sent.plain",
+                "sent.reviewed",
+                "sent.reviewed"
+            ]
+        );
+        let chat_items = items_for_session(
+            &e.pool, &e.user, &e.key, &e.persona, &day, "api-chat", 0, None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(chat_items.len(), 1);
+        assert_eq!(chat_items[0].sentence, "sent.plain");
     }
 }
