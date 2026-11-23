@@ -46,10 +46,13 @@ pub enum ConsentEventType {
     SensitivityOverride,
     StandingConsentUse,
     OutputPrivacyDisclosure,
+    /// The permanent "cleared on" marker the user-initiated purge writes
+    /// (persistence/consent_history_purge.rs, items.id=957). No purge removes it.
+    HistoryCleared,
 }
 
 impl ConsentEventType {
-    pub const ALL: [ConsentEventType; 8] = [
+    pub const ALL: [ConsentEventType; 9] = [
         ConsentEventType::CollectionConsentGranted,
         ConsentEventType::CollectionConsentWithdrawn,
         ConsentEventType::DocumentCeilingRaised,
@@ -58,6 +61,7 @@ impl ConsentEventType {
         ConsentEventType::SensitivityOverride,
         ConsentEventType::StandingConsentUse,
         ConsentEventType::OutputPrivacyDisclosure,
+        ConsentEventType::HistoryCleared,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -70,6 +74,7 @@ impl ConsentEventType {
             ConsentEventType::SensitivityOverride => "sensitivity_override",
             ConsentEventType::StandingConsentUse => "standing_consent_use",
             ConsentEventType::OutputPrivacyDisclosure => "output_privacy_disclosure",
+            ConsentEventType::HistoryCleared => "history_cleared",
         }
     }
 
@@ -282,10 +287,11 @@ mod tests {
             "sensitivity_override",
             "standing_consent_use",
             "output_privacy_disclosure",
+            "history_cleared",
         ] {
             assert!(ConsentEventType::parse(s).is_some(), "{s}");
         }
-        assert_eq!(ConsentEventType::ALL.len(), 8);
+        assert_eq!(ConsentEventType::ALL.len(), 9);
     }
 
     #[tokio::test]

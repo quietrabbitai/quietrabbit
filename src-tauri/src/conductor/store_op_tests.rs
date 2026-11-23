@@ -2412,7 +2412,13 @@ fn only_the_users_consent_commands_call_the_setter_and_the_audit_store() {
         let own = rel == "persistence/focus_settings_store.rs"
             || rel == "persistence/consent_audit_store.rs"
             || rel == "commands/collection_consent.rs"
-            || rel == "commands/document_raise.rs";
+            || rel == "commands/document_raise.rs"
+            // items.id=957: the What QR shared view READS the records (a source scan in
+            // the module pins it read-only) and the user's own purge removes them
+            // (a source scan pins that it deletes consent records only). Neither is a
+            // model path and neither sets the consent state.
+            || rel == "persistence/shared_log_read.rs"
+            || rel == "persistence/consent_history_purge.rs";
         // Files that mod.rs includes under #[cfg(test)] only (this one included).
         let test_only = rel.ends_with("tests.rs") || rel == "test_support.rs";
         if own || test_only {
@@ -2430,7 +2436,9 @@ fn only_the_users_consent_commands_call_the_setter_and_the_audit_store() {
             let hits: Vec<_> = hits
                 .into_iter()
                 .filter(|l| {
-                    !(rel == "persistence/mod.rs" && l.trim() == "pub mod consent_audit_store;")
+                    !(rel == "persistence/mod.rs"
+                        && (l.trim() == "pub mod consent_audit_store;"
+                            || l.trim() == "pub mod consent_history_purge;"))
                 })
                 .collect();
             assert!(hits.is_empty(), "{rel}: `{forbidden}`: {hits:?}");

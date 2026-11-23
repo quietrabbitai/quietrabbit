@@ -289,6 +289,7 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         // disclosure_log and consent_audit_records (items.id=957, decisions.id=967)
         commands::shared_log::get_shared_log_summary,
         commands::shared_log::get_shared_log_group_items,
+        commands::shared_log::clear_consent_history,
     ])
 }
 

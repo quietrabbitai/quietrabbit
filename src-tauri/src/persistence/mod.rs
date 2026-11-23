@@ -6,6 +6,7 @@ pub mod chat_clear;
 pub mod chat_store;
 pub mod cloud_chat_cookie_store;
 pub mod consent_audit_store;
+pub mod consent_history_purge;
 pub mod dedup_store;
 pub mod disclosure_log_store;
 pub mod document_fork_store;

@@ -1,12 +1,14 @@
 // src-tauri/src/commands/shared_log.rs
 //
-// items.id=957 unit 2 (decisions.id=967, 434, 944): the IPC surface of the
-// "What QR shared" view. READ ONLY (the purge is unit 3, a separate command).
+// items.id=957 units 2 and 3 (decisions.id=967, 434, 944): the IPC surface of the
+// "What QR shared" view. Read only, except clear_consent_history.
 //
 //   get_shared_log_summary(persona_id, window, utc_offset_minutes, focus_id,
 //                          provider_id)        one row per (day, Focus) group
 //   get_shared_log_group_items(persona_id, day, focus_id, utc_offset_minutes,
 //                          provider_id)        the items of ONE group, opened
+//   clear_consent_history(persona_id, confirm) the user-initiated purge of consent
+//                          records only (unit 3): the one WRITE here
 //
 // The view loads from the summary only: one row per (day, Focus) with counts, never
 // one row per log row. Items load when a group is opened.
@@ -674,6 +676,50 @@ pub async fn get_shared_log_group_items(
     .await
 }
 
+/// The purge of a Persona's consent records (items.id=957 unit 3, GATE-CRITICAL).
+/// `confirm` must be true: the frontend sets it only after the user ticks "I
+/// understand this can't be undone" and presses the button. Consent records only:
+/// disclosure_log is never deleted (persistence/consent_history_purge.rs). Errors are
+/// short codes: confirmation_required, nothing_to_clear, persona_not_found.
+pub(crate) async fn clear_history_for_session(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+    key_hex: &str,
+    persona_id: &str,
+    confirm: bool,
+) -> Result<u32, String> {
+    if !confirm {
+        return Err("confirmation_required".to_owned());
+    }
+    crate::commands::collection_consent::require_persona(pool, user_id, persona_id).await?;
+    let mut conn =
+        crate::persistence::personal_store::open_personal_db(user_id, persona_id, key_hex)
+            .await
+            .map_err(|e| e.to_string())?;
+    match crate::persistence::consent_history_purge::purge_consent_history(&mut conn).await {
+        Ok(outcome) => Ok(clamp_u32(
+            i64::try_from(outcome.removed).unwrap_or(i64::MAX),
+        )),
+        Err(crate::persistence::consent_history_purge::PurgeError::NothingToClear) => {
+            Err("nothing_to_clear".to_owned())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn clear_consent_history(
+    persona_id: String,
+    confirm: bool,
+    key_registry: State<'_, KeyRegistry>,
+    pool: State<'_, sqlx::SqlitePool>,
+) -> Result<u32, String> {
+    let _lease = crate::auth::writer_gate::command(&key_registry).await?;
+    let (user_id, key_hex) = session_user_and_key(&key_registry).await?;
+    clear_history_for_session(&pool, &user_id, &key_hex, &persona_id, confirm).await
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1131,7 +1177,11 @@ mod tests {
     fn every_command_takes_the_gate_first_and_derives_the_user_from_the_session() {
         let src = include_str!("shared_log.rs");
         let production = src.split("#[cfg(test)]").next().unwrap();
-        for name in ["get_shared_log_summary", "get_shared_log_group_items"] {
+        for name in [
+            "get_shared_log_summary",
+            "get_shared_log_group_items",
+            "clear_consent_history",
+        ] {
             let body = production
                 .split(&format!("pub async fn {name}("))
                 .nth(1)
@@ -1145,5 +1195,190 @@ mod tests {
                 "{name} takes a client user id"
             );
         }
+    }
+
+    // -- clear_consent_history: real encrypted files under a scratch QR_DATA_ROOT --
+
+    use crate::auth::registry::key_hex;
+    use crate::persistence::consent_audit_store::{
+        self as cstore, ConsentEventType, NewConsentEvent,
+    };
+    use crate::persistence::persona_store;
+    use crate::test_support::ENV_MUTEX;
+    use sqlx::Row;
+
+    const MASTER_KEY: [u8; crate::auth::kdf::MASTER_KEY_LEN] =
+        [0xABu8; crate::auth::kdf::MASTER_KEY_LEN];
+
+    struct Env {
+        _tempdir: tempfile::TempDir,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+        saved_root: Option<String>,
+        pool: sqlx::SqlitePool,
+        user: String,
+        persona: String,
+        other_persona: String,
+        key: String,
+    }
+
+    impl Drop for Env {
+        fn drop(&mut self) {
+            match &self.saved_root {
+                Some(v) => std::env::set_var("QR_DATA_ROOT", v),
+                None => std::env::remove_var("QR_DATA_ROOT"),
+            }
+        }
+    }
+
+    async fn env() -> Env {
+        let lock = ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+        crate::persistence::migrations::migrate_shared_db()
+            .await
+            .expect("shared.db");
+        let pool =
+            sqlx::SqlitePool::connect_with(crate::providers::utils::connect_options_unencrypted(
+                &crate::providers::utils::db_path_shared(),
+            ))
+            .await
+            .expect("pool");
+        let key = key_hex(&MASTER_KEY);
+        let user = uuid::Uuid::new_v4().to_string();
+        crate::auth::user_store::create_user(
+            &pool,
+            &user,
+            "Purge User",
+            "user",
+            false,
+            &[0u8; crate::auth::kdf::SALT_LEN],
+            crate::auth::kdf::DEFAULT_ARGON2_MEMORY_KIB,
+            crate::auth::kdf::DEFAULT_ARGON2_ITERATIONS,
+            crate::auth::kdf::DEFAULT_ARGON2_PARALLELISM,
+            &[0u8; 32],
+        )
+        .await
+        .expect("create_user");
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let id = uuid::Uuid::new_v4().to_string();
+            persona_store::create_persona(&pool, &id, "P", "personal", &user, &key, None)
+                .await
+                .expect("create_persona");
+            ids.push(id);
+        }
+        Env {
+            _tempdir: tempdir,
+            _lock: lock,
+            saved_root,
+            pool,
+            user,
+            persona: ids[0].clone(),
+            other_persona: ids[1].clone(),
+            key,
+        }
+    }
+
+    async fn seed(e: &Env, persona: &str, consents: usize, disclosures: usize) {
+        let mut c = crate::persistence::personal_store::open_personal_db(&e.user, persona, &e.key)
+            .await
+            .unwrap();
+        for _ in 0..consents {
+            cstore::append(
+                &mut c,
+                &NewConsentEvent {
+                    event_type: ConsentEventType::SensitivityOverride,
+                    focus_slug: "writing-assistant",
+                    run_id: None,
+                    text_version: None,
+                    consent_reference_id: None,
+                    content_summary: "A fixed description.",
+                    document_type: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        for i in 0..disclosures {
+            sqlx::query(
+                "INSERT INTO disclosure_log
+                 (id, user_id, persona_id, focus_run_id, action_id, routing_tier, created_at,
+                  extra_metadata, execution_tier)
+                 VALUES (?, 'u', 'p', 'r', 'a', 2, '2026-11-20T10:00:00+00:00',
+                         '{\"event_type\":\"gate1_pass\"}', 2)",
+            )
+            .bind(format!("{persona}-{i}"))
+            .execute(&mut c)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn counts(e: &Env, persona: &str) -> (i64, i64, i64) {
+        let mut c = crate::persistence::personal_store::open_personal_db(&e.user, persona, &e.key)
+            .await
+            .unwrap();
+        let consent = sqlx::query(
+            "SELECT COUNT(*) FROM consent_audit_records WHERE event_type != 'history_cleared'",
+        )
+        .fetch_one(&mut c)
+        .await
+        .unwrap()
+        .get::<i64, _>(0);
+        let markers = sqlx::query(
+            "SELECT COUNT(*) FROM consent_audit_records WHERE event_type = 'history_cleared'",
+        )
+        .fetch_one(&mut c)
+        .await
+        .unwrap()
+        .get::<i64, _>(0);
+        let disclosure = sqlx::query("SELECT COUNT(*) FROM disclosure_log")
+            .fetch_one(&mut c)
+            .await
+            .unwrap()
+            .get::<i64, _>(0);
+        (consent, markers, disclosure)
+    }
+
+    #[tokio::test]
+    async fn the_purge_needs_confirm_and_a_persona_the_user_owns() {
+        let e = env().await;
+        seed(&e, &e.persona, 2, 3).await;
+        // No confirmation: refused before anything is opened, nothing changes.
+        assert_eq!(
+            clear_history_for_session(&e.pool, &e.user, &e.key, &e.persona, false).await,
+            Err("confirmation_required".to_owned())
+        );
+        // A non-UUID Persona and a Persona of another user are refused.
+        for bad in ["not-a-uuid".to_owned(), uuid::Uuid::new_v4().to_string()] {
+            assert_eq!(
+                clear_history_for_session(&e.pool, &e.user, &e.key, &bad, true).await,
+                Err("persona_not_found".to_owned()),
+                "{bad}"
+            );
+        }
+        assert_eq!(counts(&e, &e.persona).await, (2, 0, 3));
+    }
+
+    #[tokio::test]
+    async fn the_purge_removes_this_personas_consent_records_and_nothing_else() {
+        let e = env().await;
+        seed(&e, &e.persona, 2, 3).await;
+        seed(&e, &e.other_persona, 4, 5).await;
+        assert_eq!(
+            clear_history_for_session(&e.pool, &e.user, &e.key, &e.persona, true).await,
+            Ok(2)
+        );
+        // This Persona: no consent record, one marker, every disclosure row kept.
+        assert_eq!(counts(&e, &e.persona).await, (0, 1, 3));
+        // The other Persona is untouched.
+        assert_eq!(counts(&e, &e.other_persona).await, (4, 0, 5));
+        // Nothing left to clear: an error code, and no second marker.
+        assert_eq!(
+            clear_history_for_session(&e.pool, &e.user, &e.key, &e.persona, true).await,
+            Err("nothing_to_clear".to_owned())
+        );
+        assert_eq!(counts(&e, &e.persona).await, (0, 1, 3));
     }
 }

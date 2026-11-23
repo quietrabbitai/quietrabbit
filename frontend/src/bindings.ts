@@ -1088,6 +1088,7 @@ export const commands = {
 	confirmDocumentCeilingRaise: (token: string, acknowledged: boolean) => typedError<DocumentRaiseView, string>(__TAURI_INVOKE("confirm_document_ceiling_raise", { token, acknowledged })),
 	getSharedLogSummary: (personaId: string, window: SharedLogWindow, utcOffsetMinutes: number, focusId: string | null, providerId: string | null) => typedError<SharedLogSummary, string>(__TAURI_INVOKE("get_shared_log_summary", { personaId, window, utcOffsetMinutes, focusId, providerId })),
 	getSharedLogGroupItems: (personaId: string, day: string, focusId: string, utcOffsetMinutes: number, providerId: string | null) => typedError<SharedLogItem[], string>(__TAURI_INVOKE("get_shared_log_group_items", { personaId, day, focusId, utcOffsetMinutes, providerId })),
+	clearConsentHistory: (personaId: string, confirm: boolean) => typedError<number, string>(__TAURI_INVOKE("clear_consent_history", { personaId, confirm })),
 };
 
 /* Types */

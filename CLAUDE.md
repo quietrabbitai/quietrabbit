@@ -105,8 +105,8 @@ Node >= 22.6 (it runs the plain-node test files with --experimental-strip-types)
 - [auth](.claude/rules/auth.md) — Account creation order and the recovery key
 - [ipc](.claude/rules/ipc.md) — Tauri IPC command conventions
 - [writing-assistant](.claude/rules/writing-assistant.md) — Writing Assistant passes, document sessions and flag, one-document ceiling raise, document limit
+- [what-qr-shared](.claude/rules/what-qr-shared.md) — What QR shared view: read path, event deck, labels, consent-history purge
 In-repo docs: [README](README.md), [SETUP_GUIDE](SETUP_GUIDE.md), [CONTRIBUTING](CONTRIBUTING.md), [frontend/README](frontend/README.md).
-
 ## R1 Focuses
 R1 core (ships installed) is Writing Assistant and Tech Support only; every
 other Focus is available from the gallery, default off (decisions.id=600, a

@@ -335,6 +335,9 @@ mod tests {
     #[test]
     fn every_consent_type_has_a_sentence_and_the_unknown_one_is_never_silent() {
         for t in ConsentEventType::ALL {
+            if t == ConsentEventType::HistoryCleared {
+                continue; // the permanent cleared-on line, asserted as None below
+            }
             let c = classify_consent(t.as_str(), false);
             assert!(
                 matches!(c, Some((Tag::Choice, k)) if k != UNKNOWN_KEY),

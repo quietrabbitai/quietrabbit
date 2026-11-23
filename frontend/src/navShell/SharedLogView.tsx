@@ -40,6 +40,7 @@ import {
   tagLabel,
   type T,
 } from './sharedLogFormat'
+import { ClearConsentHistoryDialog } from './ClearConsentHistoryDialog'
 import './SharedLogView.css'
 
 export interface SharedLogViewProps {
@@ -63,6 +64,12 @@ export function SharedLogView({ personaId, personaName, personaColor }: SharedLo
   const [openDetails, setOpenDetails] = useState<Set<string>>(new Set())
   const [openBackground, setOpenBackground] = useState<Set<string>>(new Set())
   const [items, setItems] = useState<Record<string, ItemsState>>({})
+  const [manageOpen, setManageOpen] = useState(false)
+  const [clearOpen, setClearOpen] = useState(false)
+  const [clearBusy, setClearBusy] = useState(false)
+  const [clearError, setClearError] = useState<string | null>(null)
+  // Bumped after a purge so the summary is read again.
+  const [reloadKey, setReloadKey] = useState(0)
   // Minutes east of UTC, so a day is the user's own calendar day.
   const offset = useMemo(() => -new Date().getTimezoneOffset(), [])
   const filterSig = `${windowSel}|${focusFilter ?? ''}|${providerFilter ?? ''}`
@@ -80,7 +87,7 @@ export function SharedLogView({ personaId, personaName, personaColor }: SharedLo
     return () => {
       cancelled = true
     }
-  }, [personaId, windowSel, focusFilter, providerFilter, offset])
+  }, [personaId, windowSel, focusFilter, providerFilter, offset, reloadKey])
 
   // A new filter or window changes what a group holds: drop what was loaded.
   useEffect(() => {
@@ -114,6 +121,26 @@ export function SharedLogView({ personaId, personaName, personaColor }: SharedLo
     if (next.has(key)) next.delete(key)
     else next.add(key)
     apply(next)
+  }
+
+  function clearHistory() {
+    setClearBusy(true)
+    setClearError(null)
+    commands.clearConsentHistory(personaId, true).then((result) => {
+      setClearBusy(false)
+      if (result.status === 'ok') {
+        setClearOpen(false)
+        setManageOpen(false)
+        setItems({})
+        setReloadKey((k) => k + 1)
+      } else {
+        setClearError(
+          result.error === 'nothing_to_clear'
+            ? t('navShell.shared.clearNothing')
+            : t('navShell.shared.clearError', { message: result.error }),
+        )
+      }
+    })
   }
 
   const filtersChanged = windowSel !== 'last30' || focusFilter !== null || providerFilter !== null
@@ -264,6 +291,45 @@ export function SharedLogView({ personaId, personaName, personaColor }: SharedLo
     <div className="shared-log">
       <h2 className="shared-log__title">{t('navShell.shared.title', { persona: personaName })}</h2>
       <p className="shared-log__purpose">{t('navShell.shared.purpose')}</p>
+
+      {summary.has_any && (
+        <div className="shared-log__manage">
+          <button
+            type="button"
+            className="shared-log__reset"
+            aria-expanded={manageOpen}
+            onClick={() => setManageOpen(!manageOpen)}
+          >
+            {t('navShell.shared.manage')}
+          </button>
+          {manageOpen && (
+            <div className="shared-log__manage-menu">
+              <button
+                type="button"
+                className="shared-log__reset"
+                disabled={summary.consent_record_count === 0}
+                onClick={() => {
+                  setClearError(null)
+                  setClearOpen(true)
+                }}
+              >
+                {t('navShell.shared.clearMenuItem')}
+              </button>
+              <p className="shared-log__purpose">{t('navShell.shared.manageNote')}</p>
+            </div>
+          )}
+        </div>
+      )}
+      {clearOpen && (
+        <ClearConsentHistoryDialog
+          personaName={personaName}
+          count={summary.consent_record_count}
+          busy={clearBusy}
+          error={clearError}
+          onConfirm={clearHistory}
+          onCancel={() => setClearOpen(false)}
+        />
+      )}
 
       {summary.cleared_on !== null && (
         <p className="shared-log__cleared" role="note">
