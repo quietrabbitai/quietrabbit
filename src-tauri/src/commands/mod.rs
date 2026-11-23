@@ -71,6 +71,7 @@ pub mod launch;
 pub mod library;
 pub mod messages;
 pub mod model_install;
+pub mod my_facts;
 pub mod notifications;
 pub mod onboarding;
 pub mod persona;

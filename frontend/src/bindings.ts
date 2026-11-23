@@ -1089,6 +1089,9 @@ export const commands = {
 	getSharedLogSummary: (personaId: string, window: SharedLogWindow, utcOffsetMinutes: number, focusId: string | null, providerId: string | null) => typedError<SharedLogSummary, string>(__TAURI_INVOKE("get_shared_log_summary", { personaId, window, utcOffsetMinutes, focusId, providerId })),
 	getSharedLogGroupItems: (personaId: string, day: string, focusId: string, utcOffsetMinutes: number, providerId: string | null) => typedError<SharedLogItem[], string>(__TAURI_INVOKE("get_shared_log_group_items", { personaId, day, focusId, utcOffsetMinutes, providerId })),
 	clearConsentHistory: (personaId: string, confirm: boolean) => typedError<number, string>(__TAURI_INVOKE("clear_consent_history", { personaId, confirm })),
+	getFactsTree: (personaId: string) => typedError<FactsTree, string>(__TAURI_INVOKE("get_facts_tree", { personaId })),
+	getFactHistory: (personaId: string, factId: string) => typedError<EarlierValue[], string>(__TAURI_INVOKE("get_fact_history", { personaId, factId })),
+	searchFacts: (personaId: string, query: string) => typedError<FactsTree, string>(__TAURI_INVOKE("search_facts", { personaId, query })),
 };
 
 /* Types */
@@ -1590,6 +1593,14 @@ export type DocumentSessionView = {
 	local_only: boolean,
 };
 
+export type EarlierValue = {
+	value: string,
+	provenance: FactProvenance | null,
+	since: string,
+	/**  When it stopped being the value (valid_until). */
+	until: string,
+};
+
 export type EstimateCostRequest = {
 	provider_id: string,
 	/**
@@ -1660,6 +1671,44 @@ export type FactPolicyTier = {
 	effective: string,
 	/**  Whether the user may choose pass here. */
 	can_share: boolean,
+};
+
+/**
+ *  What the view shows for where a fact came from (decisions.id=969 ruling 5).
+ *  A source value outside the mapping has NO provenance: the view never invents
+ *  a claim (the column default `interview`, and `synced_share`, show nothing).
+ */
+export type FactProvenance = 
+/**  user_confirmed, ipc, extract_confirm: the user entered or approved it. */
+"you_confirmed" | 
+/**  corrected. */
+"you_corrected" | 
+/**  conversation. */
+"from_chat" | 
+/**  extracted. */
+"found_by_quiet_rabbit";
+
+export type FactView = {
+	/**  The fact row id, valid only inside this Persona. */
+	id: string,
+	label: string,
+	value: string,
+	/**  general, personal, medical or financial. */
+	sensitivity: string,
+	provenance: FactProvenance | null,
+	/**  When this value began (valid_from, else created_at). */
+	since: string,
+	/**  How many earlier (end-dated) values the same label has. */
+	earlier_count: number,
+};
+
+export type FactsTree = {
+	/**  Singleton facts (entity_id IS NULL). */
+	general: FactView[],
+	/**  Top-level sections A to Z, each followed by its descendants A to Z. */
+	sections: SectionView[],
+	/**  Active facts shown, across General and every section. */
+	fact_count: number,
 };
 
 export type Fit = "comfortable" | "tight" | "slow";
@@ -2991,6 +3040,15 @@ export type SaveOutcome = {
 };
 
 export type ScopeKind = "all" | "provider" | "persona" | "focus";
+
+export type SectionView = {
+	id: string,
+	entity_type: string,
+	name: string,
+	/**  The parent section, or None for a top-level one. */
+	parent_id: string | null,
+	facts: FactView[],
+};
 
 export type SelectionInfoDto = {
 	/**  The stored selection at this Persona and Focus, None = the default. */

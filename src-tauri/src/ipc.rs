@@ -290,6 +290,11 @@ pub fn specta_builder() -> Builder<tauri::Wry> {
         commands::shared_log::get_shared_log_summary,
         commands::shared_log::get_shared_log_group_items,
         commands::shared_log::clear_consent_history,
+        // Group 41 in this list -- My Facts: the per-Persona Summary read commands
+        // (items.id=959, decisions.id=968 and 969)
+        commands::my_facts::get_facts_tree,
+        commands::my_facts::get_fact_history,
+        commands::my_facts::search_facts,
     ])
 }
 

@@ -15,6 +15,7 @@ pub mod domain_context_store;
 pub mod entity_purge;
 pub mod entity_store;
 pub mod fact_policy_store;
+pub mod facts_view_store;
 pub mod focus_composition_store;
 pub mod focus_provider_criteria_store;
 pub mod focus_settings_store;
