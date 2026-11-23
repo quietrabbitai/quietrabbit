@@ -37,7 +37,7 @@ use crate::commands::shared_log_deck::{
     Tag, HISTORY_CLEARED, SEND_EVENTS,
 };
 use crate::persistence::consent_history_purge as deletion;
-use crate::persistence::output_store::API_SEND_REVIEW_FOCUS_ID;
+use crate::persistence::output_store::{API_SEND_REVIEW_FOCUS_ID, API_SEND_REVIEW_RUN_ID_PREFIX};
 use crate::persistence::provider_store::ProviderMode;
 use crate::persistence::shared_log_read::{
     self as read, ConsentRowView, ProviderInfo, SharedLogRaw,
@@ -239,22 +239,27 @@ fn clamp_u32(n: i64) -> u32 {
     u32::try_from(n.max(0)).unwrap_or(u32::MAX)
 }
 
+/// True for a run that only reviewed an API Chat message. Its rows are the review's
+/// audit rows: the send itself is the api-chat run's own gate1_pass, so nothing under
+/// this run ever counts as a send.
+///
+/// Recognised by the run id's prefix OR by its focus_runs row. The row exists only after
+/// the user answers a span (write_chat_copy_consent_decisions); a zero-span review
+/// writes its gate3_pf_no_spans row under `api-chat-send-<x>` and NO focus_runs row, so
+/// the prefix is what catches it (items.id=958 unit 2 fix).
+fn is_review_run(raw: &SharedLogRaw, run_id: &str) -> bool {
+    run_id.starts_with(API_SEND_REVIEW_RUN_ID_PREFIX)
+        || raw.run_focus.get(run_id).map(String::as_str) == Some(API_SEND_REVIEW_FOCUS_ID)
+}
+
 /// The Focus a run's rows are shown under: the run's Focus, or "" when focus_runs has
 /// no row. The synthetic run that reviews one API Chat message (items.id=716) is shown
 /// under the api-chat Focus, so its background and held rows land in that group.
 fn focus_of<'a>(raw: &'a SharedLogRaw, run_id: &str) -> &'a str {
-    match raw.run_focus.get(run_id).map(String::as_str) {
-        Some(API_SEND_REVIEW_FOCUS_ID) => crate::api_chat::API_CHAT_FOCUS_ID,
-        Some(f) => f,
-        None => "",
+    if is_review_run(raw, run_id) {
+        return crate::api_chat::API_CHAT_FOCUS_ID;
     }
-}
-
-/// True for a run that only reviewed an API Chat message. Its rows are the review's
-/// audit rows: the send itself is the api-chat run's own gate1_pass, so nothing under
-/// this run ever counts as a send.
-fn is_review_run(raw: &SharedLogRaw, run_id: &str) -> bool {
-    raw.run_focus.get(run_id).map(String::as_str) == Some(API_SEND_REVIEW_FOCUS_ID)
+    raw.run_focus.get(run_id).map(String::as_str).unwrap_or("")
 }
 
 /// The (day, Focus) accumulators of the raw rows under the filters.
@@ -882,6 +887,7 @@ pub async fn clear_consent_history(
 mod tests {
     use super::*;
     use crate::persistence::migrations::parse_statements;
+    use crate::persistence::output_store::API_SEND_REVIEW_RUN_ID_PREFIX;
     use crate::persistence::shared_log_read::{ActionAggregate, DisclosureAggregate};
     use sqlx::sqlite::SqliteConnectOptions;
     use sqlx::{ConnectOptions, SqliteConnection};
@@ -1364,6 +1370,63 @@ mod tests {
             provider_id: Some("prov-a"),
         };
         assert_eq!(one_group(&raw, &f).sends, 1);
+    }
+
+    /// The production shape of a ZERO-SPAN API Chat review: its gate3_pf_no_spans row sits
+    /// under `api-chat-send-<x>` and NO focus_runs row exists for that run (the row is
+    /// written only when the user answers a span). The prefix alone must recognise it:
+    /// otherwise it counts as a send in a blank-Focus group and the one API Chat send is
+    /// counted twice.
+    #[test]
+    fn a_zero_span_api_chat_review_with_no_focus_runs_row_never_counts() {
+        let stub = format!("{API_SEND_REVIEW_RUN_ID_PREFIX}persona-2026-11-23-uuid");
+        let raw = SharedLogRaw {
+            aggregates: vec![],
+            actions: vec![
+                // The review's approval row under the stub, and the real run's send.
+                act("2026-11-20", &stub, "api-chat-send", Some("prov-a"), 0, "a"),
+                act("2026-11-20", "chat", "a4", Some("prov-a"), 2, "g"),
+            ],
+            consent: vec![],
+            // NO row for the stub run: only the real run has a focus_runs row.
+            run_focus: HashMap::from([("chat".to_owned(), "api-chat".to_owned())]),
+        };
+        let s = build_summary(&raw, &lookups(), SharedLogWindow::Last30, today(), &NONE);
+        assert_eq!(s.groups.len(), 1, "no blank-Focus group: {:?}", s.groups);
+        let g = &s.groups[0];
+        assert_eq!(g.focus.id, "api-chat");
+        assert_eq!(
+            (g.sends, g.all_reviewed, g.kept_back, g.runs),
+            (1, false, 2, 1)
+        );
+        // Nothing is listed under the stub, or under a blank Focus, in the filter options.
+        assert!(
+            s.focuses.iter().all(|f| f.id == "api-chat"),
+            "{:?}",
+            s.focuses
+        );
+        // Its rows land in the api-chat group, never a blank one.
+        assert_eq!(focus_of(&raw, &stub), "api-chat");
+        assert!(is_review_run(&raw, &stub));
+        assert!(!is_review_run(&raw, "chat"));
+        // A background row under the unseeded stub is shown in the api-chat group too.
+        let with_bg = SharedLogRaw {
+            aggregates: vec![agg(
+                "2026-11-20",
+                &stub,
+                "gate3_consent_pending",
+                Some("prov-a"),
+                1,
+                0,
+                1,
+            )],
+            ..raw
+        };
+        let g = one_group(&with_bg, &NONE);
+        assert_eq!(
+            (g.focus.id.as_str(), g.sends, g.background),
+            ("api-chat", 1, 1)
+        );
     }
 
     /// items.id=958: a reviewed send with a provider is named in the group and kept by
@@ -2340,8 +2403,11 @@ mod tests {
             ("r-s3", "writing-assistant"),
             ("r-s5", "writing-assistant"),
             ("r-s6", "writing-assistant"),
-            ("api-chat-send-stub", "api-chat-send"),
             ("r-chat", "api-chat"),
+            ("r-chat2", "api-chat"),
+            // The after-answer shape: the stub has a focus_runs row (written when the
+            // user answers a span). The zero-span stub below is deliberately NOT seeded.
+            ("api-chat-send-answered", "api-chat-send"),
         ] {
             crate::persistence::output_store::test_seed_focus_run(
                 &e.user, &e.persona, &e.key, run, focus,
@@ -2453,9 +2519,13 @@ mod tests {
         gate1_row(&gw, "r-s3", "a3", &track, &scope).await;
         emulated_consent_pending_row(&gw, "r-s3", "a3").await;
         gate1_row(&gw, "r-s3", "a3", &track, &scope).await;
-        // S4: API Chat: the review's rows sit under a synthetic run, the send under the real one.
+        // S4: API Chat, zero spans (the production shape): the review's row sits under a
+        // synthetic run with NO focus_runs row, the send under the real one.
         emulated_no_spans_row(&gw, "api-chat-send-stub", "api-chat-send").await;
         gate1_row(&gw, "r-chat", "a4", &track, &scope).await;
+        // S7: API Chat after an answer: the stub has a focus_runs row and a pending consent.
+        emulated_consent_pending_row(&gw, "api-chat-send-answered", "api-chat-send").await;
+        gate1_row(&gw, "r-chat2", "a7", &track, &scope).await;
         // S5: a hosted step with no review row.
         gate1_row(&gw, "r-s5", "a5", &track, &scope).await;
         // S6: gate1 runs, then the review blocks.
@@ -2498,14 +2568,23 @@ mod tests {
             ),
             (5, 4, false, 9, 1)
         );
-        // API Chat: one plain send in ONE group, no group for the review's synthetic run.
+        // API Chat: two plain sends in ONE group (a stub with a focus_runs row and one
+        // without), no group for the review's synthetic runs and no blank-Focus group.
         assert_eq!(s.groups.len(), 2, "{:?}", s.groups);
         let chat = s.groups.iter().find(|g| g.focus.id == "api-chat").unwrap();
         assert_eq!(
-            (chat.sends, chat.all_reviewed, chat.kept_back),
-            (1, false, 2)
+            (
+                chat.sends,
+                chat.all_reviewed,
+                chat.kept_back,
+                chat.background
+            ),
+            (2, false, 4, 1)
         );
-        assert!(s.focuses.iter().all(|f| f.id != "api-chat-send"));
+        assert!(s
+            .focuses
+            .iter()
+            .all(|f| f.id == "writing-assistant" || f.id == "api-chat"));
         // The provider filter keeps the sends, not the held item.
         let f = summary(Some("prov-a")).await;
         let wa = f
@@ -2520,7 +2599,7 @@ mod tests {
                 .find(|g| g.focus.id == "api-chat")
                 .unwrap()
                 .sends,
-            1
+            2
         );
 
         // The group's items fold the same way: one item per send, plus the held item and
@@ -2556,7 +2635,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(chat_items.len(), 1);
-        assert_eq!(chat_items[0].sentence, "sent.plain");
+        let mut chat_keys: Vec<&str> = chat_items.iter().map(|i| i.sentence.as_str()).collect();
+        chat_keys.sort_unstable();
+        // Two plain sends (one per run), the unseeded stub's approval row is no item, and
+        // the answered stub's pending consent is a background item of the same group.
+        assert_eq!(chat_keys, ["bg.reviewRaised", "sent.plain", "sent.plain"]);
     }
 }

@@ -50,12 +50,17 @@ Library screen after Chat History (HistoryScreen.tsx). Placeholder copy under na
   action's non-null provider; the provider filter keeps a send whose provider matches and hides held items,
   choices and background checks. A gate1_pass with no held row is a send even if the step later parked or the
   call failed: gate1 is written before the review and the call, and step_reviews is not read (accepted, D4).
+  A retry, a resume or a re-entry (reenter_step) of one step in one run writes the same (run, action) and
+  reads as ONE send, so the view can UNDER-report how many times a provider received content; a gate1_pass
+  with no held row counts even if the step parked or the call failed (OVER-report).
   A reapplied choice is shown as an item and is not a send. The group's items (build_items) fold the same way:
   one item per send, held and background rows one each, an action across two days shown on the day of its
   newest sending or held row.
-- API CHAT. The synthetic run that reviews one message (focus api-chat-send, action api-chat-send,
-  output_store::API_SEND_REVIEW_FOCUS_ID) never counts as a send: its held and Hidden rows are shown in the
-  api-chat group and its approval row is ignored. The send is the api-chat run's own gate1_pass and reads
+- API CHAT. The synthetic run that reviews one message (run id prefix API_SEND_REVIEW_RUN_ID_PREFIX or focus
+  api-chat-send, action api-chat-send, output_store::API_SEND_REVIEW_FOCUS_ID) never counts as a send: its held and Hidden rows are shown in the
+  api-chat group and its approval row is ignored. It is recognised by the run id PREFIX as well as by its
+  focus_runs row, because a zero-span review writes no focus_runs row (write_chat_copy_consent_decisions
+  writes it only when the user answers a span). The send is the api-chat run's own gate1_pass and reads
   plain (not reviewed): nothing in disclosure_log links the two runs and no column is added.
 - LINK FROM A SEND TO ITS PROVIDER (items.id=958): gate1 and the outbound review run in one execute_once, so
   the gate3 rows carry the same provider as the gate1_pass row (unit 1: Gate3Scanner.provider_id, API Chat's
