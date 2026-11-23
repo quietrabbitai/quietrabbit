@@ -802,6 +802,9 @@ pub async fn request_chat_copy_gate3_review(
             &key_hex_str,
             crate::conductor::privacy::gate3::KeptPrivate::StopsContent,
             &[],
+            // No provider: the copy goes to the user's own clipboard and a Cloud Chat
+            // pane, so there is no provider to name (items.id=958).
+            None,
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -1207,6 +1210,7 @@ mod tests {
             &key_hex_str(),
             crate::conductor::privacy::gate3::KeptPrivate::StopsContent,
             &[],
+            None,
         )
         .await
         .expect("gate3 must not error");
@@ -1246,6 +1250,7 @@ mod tests {
             &key_hex_str(),
             crate::conductor::privacy::gate3::KeptPrivate::StopsContent,
             &[],
+            None,
         )
         .await
         .expect("gate3 must not error");

@@ -382,6 +382,7 @@ async fn review_new_turn<L: crate::conductor::privacy::logger::DisclosureLogger>
     user_id: &str,
     persona_id: &str,
     key_hex_str: &str,
+    provider_id: &str,
 ) -> Result<Gate3Result, crate::conductor::privacy::errors::DisclosureLogWriteError> {
     gateway
         .gate3(
@@ -408,6 +409,8 @@ async fn review_new_turn<L: crate::conductor::privacy::logger::DisclosureLogger>
             key_hex_str,
             crate::conductor::privacy::gate3::KeptPrivate::RemovesSpans,
             &[],
+            // The bound destination: the one provider this turn goes to.
+            Some(provider_id),
         )
         .await
 }
@@ -498,6 +501,7 @@ pub async fn send_api_chat_message(
                 &user_id,
                 &persona_id,
                 &key_hex_str,
+                &destination.provider_id,
             )
             .await;
             match result {
@@ -942,6 +946,30 @@ mod tests {
         .await;
     }
 
+    /// items.id=958: the review writes the bound destination's provider on its row.
+    #[tokio::test]
+    async fn the_review_row_carries_the_bound_provider() {
+        use crate::conductor::privacy::logger::TestLogger;
+        let gateway = PrivacyGateway::new(TestLogger::new());
+        review_new_turn(
+            &gateway,
+            None,
+            "api-chat-send-p",
+            "hello there",
+            ExternalAccess::LocalOnly,
+            USER,
+            PERSONA,
+            "",
+            "bound-provider",
+        )
+        .await
+        .unwrap();
+        let rows = gateway.logger.entries();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_type, "gate3_tier_ceiling_block");
+        assert_eq!(rows[0].provider.as_deref(), Some("bound-provider"));
+    }
+
     /// The review gives gate3 the ceiling it was handed. gate3 echoes it into
     /// its result (and so the audit record) on its ceiling check, so a local
     /// only ceiling shows up there as itself.
@@ -958,6 +986,7 @@ mod tests {
             USER,
             PERSONA,
             "",
+            "test-provider",
         )
         .await
         .unwrap();
@@ -982,6 +1011,7 @@ mod tests {
             USER,
             PERSONA,
             "",
+            "test-provider",
         )
         .await
         .unwrap();

@@ -1035,6 +1035,55 @@ mod tests {
         assert!(s.groups[0].all_reviewed && s.groups[0].sends == 2);
     }
 
+    /// items.id=958: a reviewed send whose row now carries its provider is named in
+    /// the group and kept by that provider's filter; the same row with no provider
+    /// (an older row, Step 13, the copy review) keeps the fallback and is absent
+    /// under the filter. Nothing about counting changes.
+    #[test]
+    fn a_reviewed_send_with_a_provider_is_named_and_survives_the_provider_filter() {
+        let raw_with = |provider: Option<&str>| SharedLogRaw {
+            aggregates: vec![agg(
+                "2026-11-20",
+                "r1",
+                "gate3_promotion_approved",
+                provider,
+                2,
+                1,
+                0,
+            )],
+            run_focus: HashMap::from([("r1".to_owned(), "writing-assistant".to_owned())]),
+            ..Default::default()
+        };
+        let f = Filters {
+            focus_id: None,
+            provider_id: Some("prov-a"),
+        };
+        let named = raw_with(Some("prov-a"));
+        let s = build_summary(&named, &lookups(), SharedLogWindow::Last30, today(), &NONE);
+        let g = &s.groups[0];
+        assert!(g.all_reviewed && g.sends == 2);
+        assert_eq!(g.providers.len(), 1);
+        assert_eq!(g.providers[0].name.as_deref(), Some("Provider A"));
+        let s = build_summary(&named, &lookups(), SharedLogWindow::Last30, today(), &f);
+        assert_eq!(s.groups.len(), 1);
+        assert_eq!((s.groups[0].sends, s.groups[0].all_reviewed), (2, true));
+
+        let unnamed = raw_with(None);
+        let s = build_summary(
+            &unnamed,
+            &lookups(),
+            SharedLogWindow::Last30,
+            today(),
+            &NONE,
+        );
+        assert!(
+            s.groups[0].providers.is_empty() && s.groups[0].sends == 2,
+            "no provider listed: the view falls back to the generic wording"
+        );
+        let s = build_summary(&unnamed, &lookups(), SharedLogWindow::Last30, today(), &f);
+        assert!(s.groups.is_empty());
+    }
+
     async fn personal_db() -> SqliteConnection {
         let mut conn = SqliteConnectOptions::new()
             .filename(":memory:")

@@ -1193,6 +1193,10 @@ impl StepExecutor {
                         &ctx.key_hex,
                         crate::conductor::privacy::gate3::KeptPrivate::StopsContent,
                         &[],
+                        // items.id=958: None on purpose. This reviews step N's output for
+                        // the NEXT step, whose model is not selected yet; this step's
+                        // selected_model is the producer, not the destination.
+                        None,
                     )
                     .await
                     .map_err(|e| ConductorError::DisclosureLogWrite {
@@ -4964,6 +4968,7 @@ mod tests {
                 "",
                 crate::conductor::privacy::gate3::KeptPrivate::StopsContent,
                 &[],
+                None,
             )
             .await
             .unwrap()
@@ -8290,6 +8295,7 @@ mod tests {
                         "",
                         crate::conductor::privacy::gate3::KeptPrivate::StopsContent,
                         &[],
+                        None,
                     )
                     .await
                     .unwrap()

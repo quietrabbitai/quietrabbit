@@ -220,6 +220,10 @@ pub struct Gate3Scanner<'a, L: DisclosureLogger> {
     pub user_id: &'a str,
     pub persona_id: &'a str,
     pub key_hex: &'a str,
+    /// items.id=958: the provider this attempt goes to (`selected_model.provider_id`),
+    /// written on every disclosure row the review produces. `None` only when the
+    /// attempt has no provider id.
+    pub provider_id: Option<&'a str>,
 }
 
 #[async_trait]
@@ -271,6 +275,7 @@ impl<L: DisclosureLogger> ReviewScanner for Gate3Scanner<'_, L> {
                 self.key_hex,
                 crate::conductor::privacy::gate3::KeptPrivate::RemovesSpans,
                 source_spans,
+                self.provider_id,
             )
             .await
     }
@@ -1157,6 +1162,7 @@ pub async fn review_hosted_step<L: DisclosureLogger>(
         user_id: &ctx.user_id,
         persona_id: &ctx.persona_id,
         key_hex: &ctx.key_hex,
+        provider_id,
     };
     let input = ReviewInput {
         run_id: &ctx.focus_run_id,
@@ -1575,6 +1581,34 @@ mod tests {
             prompt,
             provider_id: Some("prov"),
             source_spans: &[],
+        }
+    }
+
+    /// items.id=958: the real scanner writes the attempt's provider on the row its
+    /// gate3 call writes (a LocalOnly ceiling against the external review target
+    /// makes gate3 write its tier-ceiling row without the Privacy Filter).
+    #[tokio::test]
+    async fn the_scanner_stamps_the_attempts_provider_on_the_row() {
+        use crate::conductor::privacy::logger::TestLogger;
+        for (provider, expected) in [(Some("prov-x"), Some("prov-x")), (None, None)] {
+            let gateway = PrivacyGateway::new(TestLogger::new());
+            let scanner = Gate3Scanner {
+                gateway: &gateway,
+                app_handle: None,
+                focus_name: "Test Focus",
+                ceiling: ExternalAccess::LocalOnly,
+                execution_tier: 2,
+                user_id: "u",
+                persona_id: "p",
+                key_hex: "",
+                provider_id: provider,
+            };
+            let r = scanner.scan(RUN, ACTION, PROMPT, &[]).await.unwrap();
+            assert!(r.blocked);
+            let rows = gateway.logger.entries();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].event_type, "gate3_tier_ceiling_block");
+            assert_eq!(rows[0].provider.as_deref(), expected);
         }
     }
 

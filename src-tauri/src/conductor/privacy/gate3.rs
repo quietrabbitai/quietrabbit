@@ -262,6 +262,7 @@ pub async fn gate3<L: DisclosureLogger>(
     // but the outbound review. Read only on the Privacy Filter path; any other path
     // that would approve with one present blocks instead (Check 2c).
     source_spans: &[SourceSpan],
+    provider: Option<&str>,
 ) -> Result<Gate3Result, DisclosureLogWriteError> {
     // Check 1: external-access ceiling block — fires first, before any other
     // check. See this function's header comment for why this is a
@@ -278,7 +279,7 @@ pub async fn gate3<L: DisclosureLogger>(
                 focus_run_id: focus_run_id.to_string(),
                 execution_tier,
                 abstraction_tier: None,
-                provider: None,
+                provider: provider.map(str::to_owned),
                 fields_shared: vec![],
                 fields_abstracted: IndexMap::new(),
                 fields_withheld: vec![content_key.to_string()],
@@ -313,8 +314,15 @@ pub async fn gate3<L: DisclosureLogger>(
         && privacy_filter::unavailable_action(privacy_filter::is_available(), fail_closed)
             == privacy_filter::UnavailableAction::Block
     {
-        return pf_unavailable_block(logger, action_id, focus_run_id, execution_tier, content_key)
-            .await;
+        return pf_unavailable_block(
+            logger,
+            action_id,
+            focus_run_id,
+            execution_tier,
+            content_key,
+            provider,
+        )
+        .await;
     }
 
     // Check 2a: Privacy Filter path.
@@ -340,6 +348,7 @@ pub async fn gate3<L: DisclosureLogger>(
                 key_hex,
                 kept_private,
                 source_spans,
+                provider,
             )
             .await;
         }
@@ -356,7 +365,7 @@ pub async fn gate3<L: DisclosureLogger>(
                 focus_run_id: focus_run_id.to_string(),
                 execution_tier,
                 abstraction_tier: None,
-                provider: None,
+                provider: provider.map(str::to_owned),
                 fields_shared: vec![],
                 fields_abstracted: IndexMap::new(),
                 fields_withheld: vec![content_key.to_string()],
@@ -387,7 +396,7 @@ pub async fn gate3<L: DisclosureLogger>(
                 focus_run_id: focus_run_id.to_string(),
                 execution_tier,
                 abstraction_tier: None,
-                provider: None,
+                provider: provider.map(str::to_owned),
                 fields_shared: vec![],
                 fields_abstracted: IndexMap::new(),
                 fields_withheld: vec![content_key.to_string()],
@@ -417,7 +426,7 @@ pub async fn gate3<L: DisclosureLogger>(
             focus_run_id: focus_run_id.to_string(),
             execution_tier,
             abstraction_tier: None,
-            provider: None,
+            provider: provider.map(str::to_owned),
             fields_shared: vec![content_key.to_string()],
             fields_abstracted: IndexMap::new(),
             fields_withheld: vec![],
@@ -449,6 +458,7 @@ async fn pf_error_block<L: DisclosureLogger>(
     execution_tier: u8,
     content_key: &str,
     reason: &str,
+    provider: Option<&str>,
 ) -> Result<Gate3Result, DisclosureLogWriteError> {
     log::error!("gate3: Privacy Filter error, content blocked (fail closed): {reason}");
     logger
@@ -457,7 +467,7 @@ async fn pf_error_block<L: DisclosureLogger>(
             focus_run_id: focus_run_id.to_string(),
             execution_tier,
             abstraction_tier: None,
-            provider: None,
+            provider: provider.map(str::to_owned),
             fields_shared: vec![],
             fields_abstracted: IndexMap::new(),
             fields_withheld: vec![content_key.to_string()],
@@ -487,6 +497,7 @@ async fn pf_too_long_block<L: DisclosureLogger>(
     focus_run_id: &str,
     execution_tier: u8,
     content_key: &str,
+    provider: Option<&str>,
 ) -> Result<Gate3Result, DisclosureLogWriteError> {
     log::warn!(
         "gate3: content over {} bytes, blocked without review (fail closed)",
@@ -498,7 +509,7 @@ async fn pf_too_long_block<L: DisclosureLogger>(
             focus_run_id: focus_run_id.to_string(),
             execution_tier,
             abstraction_tier: None,
-            provider: None,
+            provider: provider.map(str::to_owned),
             fields_shared: vec![],
             fields_abstracted: IndexMap::new(),
             fields_withheld: vec![content_key.to_string()],
@@ -529,6 +540,7 @@ async fn pf_unavailable_block<L: DisclosureLogger>(
     focus_run_id: &str,
     execution_tier: u8,
     content_key: &str,
+    provider: Option<&str>,
 ) -> Result<Gate3Result, DisclosureLogWriteError> {
     log::error!("gate3: Privacy Filter unavailable in a release build, content blocked");
     logger
@@ -537,7 +549,7 @@ async fn pf_unavailable_block<L: DisclosureLogger>(
             focus_run_id: focus_run_id.to_string(),
             execution_tier,
             abstraction_tier: None,
-            provider: None,
+            provider: provider.map(str::to_owned),
             fields_shared: vec![],
             fields_abstracted: IndexMap::new(),
             fields_withheld: vec![content_key.to_string()],
@@ -577,6 +589,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
     key_hex: &str,
     kept_private: KeptPrivate,
     source_spans: &[SourceSpan],
+    provider: Option<&str>,
 ) -> Result<Gate3Result, DisclosureLogWriteError> {
     // items.id=406: the value that actually feeds the High-forcing side of
     // assign_review_tier_for_span's OR-condition -- a live per-provider risk
@@ -607,7 +620,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
                     focus_run_id: focus_run_id.to_string(),
                     execution_tier,
                     abstraction_tier: None,
-                    provider: None,
+                    provider: provider.map(str::to_owned),
                     fields_shared: vec![],
                     fields_abstracted: IndexMap::new(),
                     fields_withheld: vec![content_key.to_string()],
@@ -640,7 +653,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
                     focus_run_id: focus_run_id.to_string(),
                     execution_tier,
                     abstraction_tier: None,
-                    provider: None,
+                    provider: provider.map(str::to_owned),
                     fields_shared: vec![],
                     fields_abstracted: IndexMap::new(),
                     fields_withheld: vec![content_key.to_string()],
@@ -678,6 +691,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
                 execution_tier,
                 content_key,
                 &reason,
+                provider,
             )
             .await;
         }
@@ -685,8 +699,15 @@ async fn gate3_with_pf<L: DisclosureLogger>(
         // items.id=923: over MAX_REVIEW_BYTES. Nothing was classified, so
         // nothing passes. Not a timeout and not a classifier error.
         ChunkedOutcome::TooLong => {
-            return pf_too_long_block(logger, action_id, focus_run_id, execution_tier, content_key)
-                .await;
+            return pf_too_long_block(
+                logger,
+                action_id,
+                focus_run_id,
+                execution_tier,
+                content_key,
+                provider,
+            )
+            .await;
         }
     };
 
@@ -722,6 +743,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
         forced_high,
         kept_private,
         source_spans,
+        provider,
     )
     .await?;
     if let Some(result) = partition.early_result {
@@ -754,7 +776,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
                 focus_run_id: focus_run_id.to_string(),
                 execution_tier,
                 abstraction_tier: None,
-                provider: None,
+                provider: provider.map(str::to_owned),
                 fields_shared: vec![content_key.to_string()],
                 fields_abstracted: IndexMap::new(),
                 fields_withheld: vec![],
@@ -816,7 +838,7 @@ async fn gate3_with_pf<L: DisclosureLogger>(
             focus_run_id: focus_run_id.to_string(),
             execution_tier,
             abstraction_tier: None,
-            provider: None,
+            provider: provider.map(str::to_owned),
             fields_shared: vec![],
             fields_abstracted: IndexMap::new(),
             fields_withheld: vec![content_key.to_string()],
@@ -949,6 +971,7 @@ async fn partition_by_prior_decision<L: DisclosureLogger>(
         false,
         KeptPrivate::StopsContent,
         &[],
+        None,
     )
     .await
 }
@@ -980,6 +1003,7 @@ pub(crate) async fn partition_early_result_for_test<L: DisclosureLogger>(
         forced_high,
         kept_private,
         &[],
+        None,
     )
     .await
     .expect("partition")
@@ -1007,6 +1031,7 @@ async fn partition_with_rule<L: DisclosureLogger>(
     forced_high: bool,
     kept_private: KeptPrivate,
     source_spans: &[SourceSpan],
+    provider: Option<&str>,
 ) -> Result<PartitionOutcome, DisclosureLogWriteError> {
     if entities.is_empty() {
         return Ok(PartitionOutcome {
@@ -1158,7 +1183,7 @@ async fn partition_with_rule<L: DisclosureLogger>(
                         focus_run_id: focus_run_id.to_string(),
                         execution_tier,
                         abstraction_tier: None,
-                        provider: None,
+                        provider: provider.map(str::to_owned),
                         fields_shared: vec![],
                         fields_abstracted: IndexMap::new(),
                         fields_withheld: vec![],
@@ -1473,7 +1498,7 @@ mod tests {
             };
 
             let logger = TestLogger::new();
-            let result = pf_error_block(&logger, "step-1", "run-1", 2, "msg-1", &reason)
+            let result = pf_error_block(&logger, "step-1", "run-1", 2, "msg-1", &reason, None)
                 .await
                 .unwrap();
 
@@ -1508,7 +1533,7 @@ mod tests {
         // takes neither, so no input can reach an approval.
         use crate::conductor::privacy::logger::TestLogger;
         let logger = TestLogger::new();
-        let result = pf_error_block(&logger, "s", "r", 1, "k", "rc=-1")
+        let result = pf_error_block(&logger, "s", "r", 1, "k", "rc=-1", None)
             .await
             .unwrap();
         assert!(result.blocked && !result.approved);
@@ -1518,7 +1543,7 @@ mod tests {
     async fn pf_unavailable_block_blocks_and_logs_without_approving() {
         use crate::conductor::privacy::logger::TestLogger;
         let logger = TestLogger::new();
-        let result = pf_unavailable_block(&logger, "step-1", "run-1", 2, "msg-1")
+        let result = pf_unavailable_block(&logger, "step-1", "run-1", 2, "msg-1", None)
             .await
             .unwrap();
         assert!(result.blocked && !result.approved && !result.pending_consent);
@@ -1535,7 +1560,7 @@ mod tests {
     #[tokio::test]
     async fn pf_unavailable_block_propagates_log_write_failure() {
         use crate::conductor::privacy::logger::FailLogger;
-        let result = pf_unavailable_block(&FailLogger, "s", "r", 2, "k").await;
+        let result = pf_unavailable_block(&FailLogger, "s", "r", 2, "k", None).await;
         assert!(result.is_err());
     }
 
@@ -1567,6 +1592,7 @@ mod tests {
             "",
             crate::conductor::privacy::gate3::KeptPrivate::StopsContent,
             &[],
+            None,
         )
         .await
         .unwrap()
@@ -1603,7 +1629,7 @@ mod tests {
     #[tokio::test]
     async fn pf_error_block_propagates_log_write_failure() {
         use crate::conductor::privacy::logger::FailLogger;
-        let result = pf_error_block(&FailLogger, "s", "r", 2, "k", "rc=-1").await;
+        let result = pf_error_block(&FailLogger, "s", "r", 2, "k", "rc=-1", None).await;
         assert!(result.is_err());
     }
 
@@ -2563,6 +2589,7 @@ mod tests {
             forced_high,
             kept,
             &[],
+            None,
         )
         .await
         .expect("partition")
@@ -2601,6 +2628,7 @@ mod tests {
             forced_high,
             kept,
             &[f_source(allowed)],
+            None,
         )
         .await
         .expect("partition")
@@ -2768,6 +2796,7 @@ mod tests {
                 false,
                 KeptPrivate::RemovesSpans,
                 std::slice::from_ref(&src),
+                None,
             )
             .await
             .expect("partition")
@@ -3038,7 +3067,7 @@ mod tests {
         ));
         // items.id=924: and the source spans, whose allowed answers it applies.
         assert!(body.contains(
-            "        forced_high,\n        kept_private,\n        source_spans,\n    )\n    .await?;"
+            "        forced_high,\n        kept_private,\n        source_spans,\n        provider,\n    )\n    .await?;"
         ));
         let gate3_body = src
             .split("pub async fn gate3<")
@@ -3047,7 +3076,7 @@ mod tests {
             .unwrap();
         // items.id=933: the source spans travel with it, to the filter path only.
         assert!(gate3_body.contains(
-            "                kept_private,\n                source_spans,\n            )\n            .await;"
+            "                kept_private,\n                source_spans,\n                provider,\n            )\n            .await;"
         ));
     }
 
@@ -3522,6 +3551,7 @@ mod tests {
                 "",
                 KeptPrivate::RemovesSpans,
                 spans,
+                None,
             )
             .await
             .unwrap()
@@ -3588,6 +3618,7 @@ mod tests {
                 false,
                 KeptPrivate::RemovesSpans,
                 &[],
+                None,
             )
             .await
             .expect("partition")
@@ -3646,5 +3677,300 @@ mod tests {
             args.contains("RemovesSpans,\n                source_spans,"),
             "{args}"
         );
+    }
+
+    // -- items.id=958: the provider on a gate3 row ------------------------------
+    // A row carries the provider the caller names and nothing else changes. The
+    // rows written inside gate3_with_pf (gate_timeout, gate3_pf_no_spans, the
+    // consent-pending and forced-review rows) need the Privacy Filter and an app
+    // handle, so they are pinned by a source scan and not driven here.
+
+    const P: &str = "provider-958";
+
+    async fn gate3_call(
+        logger: &crate::conductor::privacy::logger::TestLogger,
+        severity: u8,
+        target_tier: u8,
+        access: ExternalAccess,
+        spans: &[SourceSpan],
+        provider: Option<&str>,
+    ) -> Gate3Result {
+        gate3(
+            logger,
+            "step-958",
+            "run-958",
+            "Test Focus",
+            "msg-958",
+            "in Leeds",
+            severity,
+            target_tier,
+            access,
+            2,
+            None,
+            None,
+            false,
+            "",
+            "",
+            "",
+            KeptPrivate::RemovesSpans,
+            spans,
+            provider,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// (event type the case must write, severity, target tier, ceiling, spans)
+    fn stamped_cases() -> Vec<(&'static str, u8, u8, ExternalAccess, Vec<SourceSpan>)> {
+        vec![
+            (
+                "gate3_tier_ceiling_block",
+                1,
+                2,
+                ExternalAccess::LocalOnly,
+                vec![],
+            ),
+            (
+                "gate3_source_spans_unreviewed",
+                1,
+                1,
+                ExternalAccess::Unrestricted,
+                vec![source(3, "Leeds", None)],
+            ),
+            (
+                "gate3_sensitivity_block",
+                3,
+                2,
+                ExternalAccess::Unrestricted,
+                vec![],
+            ),
+            (
+                "gate3_promotion_approved",
+                1,
+                1,
+                ExternalAccess::Unrestricted,
+                vec![],
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn gate3_stamps_the_provider_on_the_row_each_of_these_writers_writes() {
+        use crate::conductor::privacy::logger::TestLogger;
+        for (event, severity, tier, access, spans) in stamped_cases() {
+            let logger = TestLogger::new();
+            gate3_call(&logger, severity, tier, access, &spans, Some(P)).await;
+            let entries = logger.entries();
+            assert_eq!(entries.len(), 1, "{event}");
+            assert_eq!(entries[0].event_type, event);
+            assert_eq!(entries[0].provider.as_deref(), Some(P), "{event}");
+
+            let logger = TestLogger::new();
+            gate3_call(&logger, severity, tier, access, &spans, None).await;
+            assert_eq!(
+                logger.entries()[0].provider,
+                None,
+                "{event}: None stays None"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_pf_block_helpers_stamp_the_provider() {
+        use crate::conductor::privacy::logger::TestLogger;
+        let logger = TestLogger::new();
+        pf_error_block(&logger, "s", "r", 2, "k", "rc=-1", Some(P))
+            .await
+            .unwrap();
+        pf_too_long_block(&logger, "s", "r", 2, "k", Some(P))
+            .await
+            .unwrap();
+        pf_unavailable_block(&logger, "s", "r", 2, "k", Some(P))
+            .await
+            .unwrap();
+        let entries = logger.entries();
+        let types: Vec<&str> = entries.iter().map(|e| e.event_type.as_str()).collect();
+        assert_eq!(
+            types,
+            [
+                "gate3_pf_error_block",
+                "gate3_pf_too_long",
+                "gate3_pf_unavailable_block"
+            ]
+        );
+        assert!(entries.iter().all(|e| e.provider.as_deref() == Some(P)));
+        let logger = TestLogger::new();
+        pf_error_block(&logger, "s", "r", 2, "k", "rc=-1", None)
+            .await
+            .unwrap();
+        assert_eq!(logger.entries()[0].provider, None);
+    }
+
+    /// The provider changes the row and nothing else: every outcome the gate
+    /// reaches without the filter, and each block helper, returns the same result
+    /// with and without a provider.
+    #[tokio::test]
+    async fn a_provider_changes_no_outcome() {
+        use crate::conductor::privacy::logger::TestLogger;
+        for (event, severity, tier, access, spans) in stamped_cases() {
+            let with =
+                gate3_call(&TestLogger::new(), severity, tier, access, &spans, Some(P)).await;
+            let without =
+                gate3_call(&TestLogger::new(), severity, tier, access, &spans, None).await;
+            assert_eq!(format!("{with:?}"), format!("{without:?}"), "{event}");
+        }
+        let a = pf_error_block(&TestLogger::new(), "s", "r", 2, "k", "x", Some(P))
+            .await
+            .unwrap();
+        let b = pf_error_block(&TestLogger::new(), "s", "r", 2, "k", "x", None)
+            .await
+            .unwrap();
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+        let a = pf_too_long_block(&TestLogger::new(), "s", "r", 2, "k", Some(P))
+            .await
+            .unwrap();
+        let b = pf_too_long_block(&TestLogger::new(), "s", "r", 2, "k", None)
+            .await
+            .unwrap();
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+        let a = pf_unavailable_block(&TestLogger::new(), "s", "r", 2, "k", Some(P))
+            .await
+            .unwrap();
+        let b = pf_unavailable_block(&TestLogger::new(), "s", "r", 2, "k", None)
+            .await
+            .unwrap();
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+        // The fail-closed behaviour on a failing logger is the same too.
+        use crate::conductor::privacy::logger::FailLogger;
+        assert!(pf_error_block(&FailLogger, "s", "r", 2, "k", "x", Some(P))
+            .await
+            .is_err());
+    }
+
+    /// gate3_fact_reapplied is written by partition_with_rule: it takes the provider.
+    #[tokio::test]
+    async fn a_reapplied_choice_row_carries_the_provider() {
+        use crate::conductor::privacy::logger::TestLogger;
+        let _lock = crate::test_support::ENV_MUTEX.lock().await;
+        let saved_root = std::env::var("QR_DATA_ROOT").ok();
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        std::env::set_var("QR_DATA_ROOT", tempdir.path());
+
+        let (user_id, persona_id, run_id) = ("p958-user", "p958-persona", "run-p958");
+        let span_text = "p958@example.com";
+        let fact_key = expected_fact_key("private_email", span_text);
+        crate::persistence::output_store::test_seed_focus_run(
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            run_id,
+            "quick-ask",
+        )
+        .await
+        .expect("seed focus_run must succeed");
+        crate::persistence::personal_store::write_standing_preference(
+            user_id,
+            persona_id,
+            TEST_KEY_HEX,
+            &fact_key,
+            "private_email",
+            "generalize",
+            Some("[email address]"),
+            None,
+        )
+        .await
+        .expect("write_standing_preference must succeed");
+
+        for (provider, expected) in [(Some(P), Some(P)), (None, None)] {
+            let logger = TestLogger::new();
+            let outcome = partition_with_rule(
+                &logger,
+                user_id,
+                persona_id,
+                TEST_KEY_HEX,
+                "step-1",
+                run_id,
+                2,
+                vec![entity_with("private_email", span_text)],
+                false,
+                KeptPrivate::StopsContent,
+                &[],
+                provider,
+            )
+            .await
+            .expect("partition must succeed");
+            assert!(outcome.early_result.expect("auto-resolved").approved);
+            let entries = logger.entries();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].event_type, "gate3_fact_reapplied");
+            assert_eq!(entries[0].provider.as_deref(), expected);
+        }
+
+        if let Some(v) = saved_root {
+            std::env::set_var("QR_DATA_ROOT", v);
+        } else {
+            std::env::remove_var("QR_DATA_ROOT");
+        }
+    }
+
+    /// Source pin for what the drivable tests cannot reach: no gate3 writer writes
+    /// `provider: None` (every row takes the caller's value), the two callers that
+    /// know their destination pass it, the two that do not pass None, and the four
+    /// output_scan writers are untouched.
+    #[test]
+    fn every_gate3_writer_takes_the_callers_provider_and_the_callers_pass_the_right_one() {
+        fn production(src: &str) -> String {
+            src.split("#[cfg(test)]\nmod tests {")
+                .next()
+                .unwrap()
+                .to_owned()
+        }
+        let gate3_src = production(include_str!("gate3.rs"));
+        assert!(!gate3_src.contains("provider: None"));
+        let rows = gate3_src.matches("DisclosureLogEntry {").count();
+        assert_eq!(rows, 12, "12 writers");
+        assert_eq!(
+            gate3_src
+                .matches("provider: provider.map(str::to_owned),")
+                .count(),
+            12
+        );
+
+        // The outbound review: the attempt's provider.
+        let review = production(include_str!("../step_review.rs"));
+        let scanner = review
+            .split("impl<L: DisclosureLogger> ReviewScanner for Gate3Scanner")
+            .nth(1)
+            .unwrap();
+        let args = scanner
+            .split(".gate3(")
+            .nth(1)
+            .unwrap()
+            .split(".await")
+            .next()
+            .unwrap();
+        assert!(
+            args.contains("source_spans,\n                self.provider_id,\n            )"),
+            "{args}"
+        );
+        assert!(review.contains("        provider_id,\n    };\n    let input = ReviewInput"));
+        // API Chat: the bound destination.
+        let chat = production(include_str!("../../commands/api_chat.rs"));
+        assert!(chat.contains("Some(provider_id),\n        )\n        .await\n}"));
+        assert!(chat.contains("&destination.provider_id,\n            )\n            .await;\n            match result"));
+        // Step 13 and the copy review name no provider.
+        for src in [
+            production(include_str!("../executor.rs")),
+            production(include_str!("../../commands/consent.rs")),
+        ] {
+            for c in src.split(".gate3(").skip(1) {
+                let args = c.split(".await").next().unwrap();
+                let last = args.trim_end().trim_end_matches(')').trim_end();
+                assert!(last.ends_with("None,"), "{args}");
+            }
+        }
+        // output_scan keeps its four None writers.
+        let scan = production(include_str!("output_scan.rs"));
+        assert_eq!(scan.matches("provider: None,").count(), 4);
     }
 }
