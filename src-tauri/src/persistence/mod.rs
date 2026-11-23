@@ -51,6 +51,7 @@ pub mod session_store;
 #[cfg(test)]
 mod shared_db_privacy_tests;
 pub mod shared_db_residual;
+pub mod shared_log_read;
 pub mod source_registry_store;
 pub mod step_review_store;
 pub mod store_sweep;
