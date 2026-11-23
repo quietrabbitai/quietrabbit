@@ -36,6 +36,7 @@ use crate::commands::shared_log_deck::{
     self as deck, classify_consent, classify_disclosure, counts_as_send, Classified, Tag,
     HISTORY_CLEARED,
 };
+use crate::persistence::consent_history_purge as deletion;
 use crate::persistence::provider_store::ProviderMode;
 use crate::persistence::shared_log_read::{
     self as read, ConsentRowView, DisclosureAggregate, ProviderInfo, SharedLogRaw,
@@ -124,7 +125,8 @@ pub struct SharedLogSummary {
     pub providers: Vec<SharedLogProvider>,
     /// False only when nothing at all is recorded (the empty state).
     pub has_any: bool,
-    /// Consent records a purge would remove (the cleared-on marker is not one).
+    /// Consent records a purge would delete: the older ones. Records showing what is in
+    /// force, and the cleared-on markers, are never counted.
     pub consent_record_count: u32,
     /// created_at of the newest "history cleared" record: the permanent line.
     pub cleared_on: Option<String>,
@@ -389,11 +391,24 @@ pub(crate) fn build_summary(
             provider_ids.extend(acc.providers.iter().map(String::as_str));
         }
     }
-    let consent_record_count = raw
-        .consent
-        .iter()
-        .filter(|c| c.event_type != HISTORY_CLEARED)
-        .count();
+    // What a purge would delete: the SAME rule the purge applies (consent_history_purge::
+    // deletable_ids), over each Focus's records oldest first, so the count in the
+    // confirm text is the number actually deleted.
+    let mut by_focus: BTreeMap<&str, Vec<deletion::KeepRow<'_>>> = BTreeMap::new();
+    for c in &raw.consent {
+        by_focus
+            .entry(c.focus_slug.as_str())
+            .or_default()
+            .push(deletion::KeepRow {
+                id: &c.id,
+                event_type: &c.event_type,
+                document_type: c.document_type.as_deref(),
+            });
+    }
+    let consent_record_count: usize = by_focus
+        .values()
+        .map(|rows| deletion::deletable_ids(rows).len())
+        .sum();
     let cleared_on = raw
         .consent
         .iter()
@@ -962,8 +977,31 @@ mod tests {
         );
         assert!(!empty.has_any && empty.groups.is_empty() && empty.cleared_on.is_none());
         let s = build_summary(&raw(), &lookups(), SharedLogWindow::Last30, today(), &NONE);
-        // The cleared marker is not a purgeable record and is the permanent line.
-        assert_eq!(s.consent_record_count, 1);
+        // An in-force grant and the cleared marker are never counted: the count is what a
+        // purge would DELETE, so nothing here.
+        assert_eq!(s.consent_record_count, 0);
+        // Older records are counted by the purge's own rule: the superseded grant, the
+        // withdrawal and the other type (3), not the newest grant.
+        let with = |id: &str, ev: &str| ConsentRowView {
+            id: id.into(),
+            ..consent(
+                "2026-11-20",
+                "tech-support",
+                ev,
+                "2026-11-20T09:00:00+00:00",
+            )
+        };
+        let older = SharedLogRaw {
+            consent: vec![
+                with("g1", "collection_consent_granted"),
+                with("w1", "collection_consent_withdrawn"),
+                with("g2", "collection_consent_granted"),
+                with("o1", "sensitivity_override"),
+            ],
+            ..Default::default()
+        };
+        let counted = build_summary(&older, &lookups(), SharedLogWindow::Last30, today(), &NONE);
+        assert_eq!(counted.consent_record_count, 3);
         assert_eq!(s.cleared_on.as_deref(), Some("2026-11-20T12:00:00+00:00"));
         // A Persona that only has a cleared marker is not "nothing".
         let only = SharedLogRaw {
@@ -1268,6 +1306,20 @@ mod tests {
                 .expect("create_persona");
             ids.push(id);
         }
+        // The settings row the consent commands read (the Focus the grant is about).
+        crate::persistence::focus_settings_store::create_focus_settings(
+            &pool,
+            &ids[0],
+            "tech-support",
+            "bidirectional",
+            "shared",
+            2,
+            crate::conductor::tokens::ExternalAccess::LocalOnly,
+            "open",
+            None,
+        )
+        .await
+        .expect("focus_settings row");
         Env {
             _tempdir: tempdir,
             _lock: lock,
@@ -1380,5 +1432,138 @@ mod tests {
             Err("nothing_to_clear".to_owned())
         );
         assert_eq!(counts(&e, &e.persona).await, (0, 1, 3));
+    }
+
+    /// The ruling's end-to-end case, on real encrypted files: an in-force grant and an
+    /// in-force raise survive; everything older goes; and the consent commands and the
+    /// raise's own lookup still work on what is left.
+    #[tokio::test]
+    async fn a_purge_keeps_what_is_in_force_and_the_consent_commands_still_work() {
+        use crate::commands::collection_consent::{
+            submit_decision_for_session, withdraw_for_session, CollectionConsentDecision,
+        };
+        use crate::commands::document_raise::{previous_raise, Ids};
+        use crate::conductor::collection_consent_text::current_version;
+        let e = env().await;
+        let hook = || Ok(());
+        let cv = current_version();
+        let grant = || {
+            submit_decision_for_session(
+                &e.pool,
+                &e.user,
+                &e.key,
+                &e.persona,
+                "tech-support",
+                CollectionConsentDecision::Granted,
+                cv,
+                &hook,
+            )
+        };
+        // grant, withdraw, grant again: three collection events, the last is in force.
+        grant().await.unwrap();
+        withdraw_for_session(&e.pool, &e.user, &e.key, &e.persona, "tech-support", &hook)
+            .await
+            .unwrap();
+        grant().await.unwrap();
+        // Two raises of one document type (the second is in force) and an unrelated event.
+        let mut c =
+            crate::persistence::personal_store::open_personal_db(&e.user, &e.persona, &e.key)
+                .await
+                .unwrap();
+        let mut raise = async |doc: &str| {
+            cstore::append(
+                &mut c,
+                &NewConsentEvent {
+                    event_type: ConsentEventType::DocumentCeilingRaised,
+                    focus_slug: "writing-assistant",
+                    run_id: None,
+                    text_version: None,
+                    consent_reference_id: None,
+                    content_summary: "A fixed description.",
+                    document_type: Some(doc),
+                },
+            )
+            .await
+            .unwrap()
+        };
+        let _old_raise = raise("cover_letter").await;
+        let new_raise = raise("cover_letter").await;
+        drop(c);
+        seed(&e, &e.persona, 1, 4).await; // one SensitivityOverride, four disclosure rows
+
+        let kept_grant = {
+            let mut c =
+                crate::persistence::personal_store::open_personal_db(&e.user, &e.persona, &e.key)
+                    .await
+                    .unwrap();
+            let all = cstore::list(&mut c, "tech-support").await.unwrap();
+            assert_eq!(all.len(), 3);
+            all.last().unwrap().id.clone()
+        };
+        // Deleted: the older grant, the withdrawal, the older raise, the override = 4.
+        assert_eq!(
+            clear_history_for_session(&e.pool, &e.user, &e.key, &e.persona, true).await,
+            Ok(4)
+        );
+        let mut c =
+            crate::persistence::personal_store::open_personal_db(&e.user, &e.persona, &e.key)
+                .await
+                .unwrap();
+        let left = cstore::list(&mut c, "tech-support").await.unwrap();
+        assert_eq!(
+            left.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            vec![kept_grant.clone()]
+        );
+        let markers = cstore::list(&mut c, "*").await.unwrap();
+        assert_eq!(markers.len(), 1);
+        drop(c);
+        assert_eq!(counts(&e, &e.persona).await, (2, 1, 4)); // grant + raise, one marker, log intact
+
+        // The raise's own lookup still sees the surviving record.
+        let ids = Ids {
+            user_id: &e.user,
+            key_hex: &e.key,
+            persona_id: &e.persona,
+            context_key: "ctx",
+            focus_id: "writing-assistant",
+        };
+        let prev = previous_raise(&ids, "cover_letter")
+            .await
+            .unwrap()
+            .expect("kept raise");
+        assert_eq!(prev.id, new_raise);
+
+        // A grant again is idempotent: no second grant event.
+        grant().await.unwrap();
+        let mut c =
+            crate::persistence::personal_store::open_personal_db(&e.user, &e.persona, &e.key)
+                .await
+                .unwrap();
+        assert_eq!(cstore::list(&mut c, "tech-support").await.unwrap().len(), 1);
+        drop(c);
+        // Only kept records remain: a second purge writes nothing.
+        assert_eq!(
+            clear_history_for_session(&e.pool, &e.user, &e.key, &e.persona, true).await,
+            Err("nothing_to_clear".to_owned())
+        );
+        assert_eq!(counts(&e, &e.persona).await, (2, 1, 4));
+        // A withdrawal still works and references the surviving grant.
+        withdraw_for_session(&e.pool, &e.user, &e.key, &e.persona, "tech-support", &hook)
+            .await
+            .unwrap();
+        let mut c =
+            crate::persistence::personal_store::open_personal_db(&e.user, &e.persona, &e.key)
+                .await
+                .unwrap();
+        let after = cstore::list(&mut c, "tech-support").await.unwrap();
+        assert_eq!(after.len(), 2);
+        assert_eq!(
+            after[1].event_type,
+            ConsentEventType::CollectionConsentWithdrawn
+        );
+        assert_eq!(
+            after[1].consent_reference_id.as_deref(),
+            Some(kept_grant.as_str())
+        );
     }
 }

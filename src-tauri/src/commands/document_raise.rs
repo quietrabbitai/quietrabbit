@@ -204,7 +204,7 @@ async fn checked(
 }
 
 /// The latest earlier raise of this document type in this Persona and Focus.
-async fn previous_raise(
+pub(crate) async fn previous_raise(
     ids: &Ids<'_>,
     document_type: &str,
 ) -> Result<Option<consent_audit_store::ConsentAuditRecord>, String> {

@@ -41,13 +41,21 @@ Library screen after Chat History (HistoryScreen.tsx). Placeholder copy under na
   a reapplied choice is shown but is not a send. "Reviewed" in a summary line means every counted send was a
   gate3 promotion row: the link from a reviewed send to its provider is NOT verified (gate3 rows write provider
   None, so a reviewed send reads "an outside service" and is absent under a provider filter).
-- PURGE (persistence/consent_history_purge.rs, clear_consent_history). Consent records only, in ONE
-  transaction: delete every row except history_cleared, then append a history_cleared marker (focus_slug "*")
-  through consent_audit_store::append. If the marker cannot be written the delete is rolled back. No purge
-  removes a marker, so the "cleared on" line is permanent and repeats keep every earlier one. Nothing to clear
-  writes nothing (nothing_to_clear). The command needs confirm true, takes writer_gate first, and checks the
-  Persona. disclosure_log is never deleted and the module never names it (source scan). consent_audit_store.rs
-  gained only the HistoryCleared variant; its own never-updates-or-deletes test is untouched.
+- PURGE (persistence/consent_history_purge.rs, clear_consent_history). HOUSEKEEPING, NOT A PURGE OF THE
+  CONSENTS (Jason's call, Chat-PM ruling): it never deletes a record showing a consent in force. KEPT:
+  every history_cleared marker; per Focus the newest collection_consent_* record IF it is a grant; per Focus
+  and document type the newest document_ceiling_raised record. DELETED: every other consent_audit_records
+  row (superseded grants, withdrawals, older raises, all other types). "Newest" is created_at then rowid,
+  the same order and rev/rfind idiom as latest_collection_event and previous_raise, so those two still see
+  the kept record. ONE rule, deletable_ids, serves both the purge and the count the summary reports
+  (consent_record_count is what a purge would delete, and the confirm text shows that number). One
+  transaction: the deletes (one by id each), then a history_cleared marker (focus_slug "*") through
+  consent_audit_store::append; if the marker cannot be written the deletes roll back. No purge removes a
+  marker, so the "cleared on" line is permanent. Nothing to delete writes nothing (nothing_to_clear), so a
+  purge that only keeps records leaves no second marker. A record of an unknown event type makes the store's
+  list fail, and the purge then fails closed. The command needs confirm true, takes writer_gate first and
+  checks the Persona. disclosure_log is never deleted and the module never names it (source scan).
+  consent_audit_store.rs gained only the HistoryCleared variant.
 - NOT VERIFIED: Windows and macOS rendering and font fallback (checked in the in-app browser only, at 375 px
   and desktop, with a stubbed backend); the real encrypted-file path was exercised by the command tests but not
   hand-checked in the running app; the sixth Library button wraps because the row is flex-wrap (read from the
