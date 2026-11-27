@@ -13503,6 +13503,26 @@ mod tests {
         tier2: Option<&str>,
         tier3: Option<&str>,
     ) -> (Option<String>, PrivacyGateway<TestLogger>) {
+        let saved = Some(FLOOR_CONSENT_MODIFIED);
+        let (_out, prompt, gateway) =
+            destination_attempt(pool, privacy_tier, access, tier2, tier3, saved).await;
+        (prompt, gateway)
+    }
+
+    /// destination_run with the saved floor-consent preference as an argument, also
+    /// returning the step's result (a park is one).
+    async fn destination_attempt(
+        pool: &sqlx::SqlitePool,
+        privacy_tier: u8,
+        access: ExternalAccess,
+        tier2: Option<&str>,
+        tier3: Option<&str>,
+        floor_preference: Option<&str>,
+    ) -> (
+        Option<FailureResult>,
+        Option<String>,
+        PrivacyGateway<TestLogger>,
+    ) {
         use crate::conductor::personal_fact_fields::Tier;
         use crate::persistence::fact_policy_store::{FactPolicyRow, UserPolicies};
         let snapshot = UserPolicies::Rows(vec![FactPolicyRow {
@@ -13521,7 +13541,7 @@ mod tests {
         ctx.raw_abstraction = privacy_tier.min(ctx.execution_tier);
         ctx.abstraction_tier = ctx.raw_abstraction.max(2);
         declare_field(&mut ctx, "job_title");
-        ctx.floor_consent_preference = Some(FLOOR_CONSENT_MODIFIED.to_owned());
+        ctx.floor_consent_preference = floor_preference.map(str::to_owned);
         {
             let mut conn = crate::persistence::personal_store::open_personal_db(
                 &ctx.user_id,
@@ -13546,9 +13566,9 @@ mod tests {
         }
         let (forced, seen) = capturing_scanner();
         let _g = step_review::forced::arm(&ctx, forced).await;
-        let (_out, _t, gateway) = run_once_with(&ctx, pool, &track).await;
+        let (out, _t, gateway) = run_once_with(&ctx, pool, &track).await;
         let seen = seen.borrow();
-        (seen.first().cloned(), gateway)
+        (out.expect("the step ran"), seen.first().cloned(), gateway)
     }
 
     /// The red case. At the default Focus privacy tier 2, a step that may reach a
@@ -13572,6 +13592,48 @@ mod tests {
             assert_eq!(rows[0].fields_withheld, ["job_title"]);
         })
         .await;
+    }
+
+    /// The floor-consent consequence of unit 0. At Focus privacy tier 1 the raw
+    /// abstraction tier is 1 and the effective one 2, so the clamp compares the raw
+    /// value with column 2. On a signed-in-capable step that column now holds the
+    /// signed-in word, never pass, so an anonymous Share counts as clamped: with no
+    /// saved preference the step parks before anything is rendered or sent, and with it
+    /// saved the step runs without the value. At privacy tiers 2 and 3 raw and
+    /// effective are equal and nothing parks.
+    #[tokio::test]
+    async fn a_signed_in_capable_step_at_privacy_tier_one_parks_on_floor_consent() {
+        let access = ExternalAccess::AnonymousPreferred;
+        for (privacy_tier, saved, parks) in [
+            (1u8, None, true),
+            (1, Some(FLOOR_CONSENT_MODIFIED), false),
+            (2, None, false),
+            (3, None, false),
+        ] {
+            with_temp_shared_db(|pool| async move {
+                let (out, prompt, _gateway) =
+                    destination_attempt(&pool, privacy_tier, access, Some("pass"), None, saved)
+                        .await;
+                let case = format!("privacy={privacy_tier} saved={saved:?}");
+                let floor = out
+                    .as_ref()
+                    .filter(|r| r.action == FailureAction::AwaitFloorConsent);
+                assert_eq!(floor.is_some(), parks, "{case}: {out:?}");
+                if let Some(park) = floor {
+                    let meta = park.metadata.as_ref().unwrap();
+                    assert_eq!(
+                        meta["floor_clamped_fields"],
+                        serde_json::json!(["job_title"]),
+                        "{case}"
+                    );
+                    assert_eq!(meta["approved_fields"], serde_json::json!({}), "{case}");
+                    assert_eq!(prompt, None, "{case}: nothing reaches the review");
+                } else {
+                    assert_eq!(prompt.as_deref(), Some("Role:  End"), "{case}");
+                }
+            })
+            .await;
+        }
     }
 
     /// A step's catalogue word as the prompt shows it.
