@@ -53,7 +53,10 @@
 // gated per-entity by refresh_verdict_conn exactly like any other source
 // refresh: AutoAccept applies, Conflict is skipped and flags
 // source_registry.status = 'pending_refresh' (full per-field conflict UI is
-// out of scope for this transport item), Ignore is skipped.
+// out of scope for this transport item), Ignore is skipped. Ahead of that
+// gate, an incoming entity_fact whose row id is already held locally, active
+// or ended, is skipped (items.id=962): a fact the recipient stopped or
+// replaced stays that way until the owner sends a new row.
 //
 // LOCAL-EDIT GUARD DEPENDENCY: this reconciliation model only protects a
 // recipient's local edits because entity_store::update_entity and
@@ -873,26 +876,23 @@ async fn apply_update(
         source_registry_store::mark_records_deleted_in_source_conn(&mut conn, &source_id, &missing)
             .await?;
 
-        // entity_facts: matched per (entity_id, field_name) by comparing the
-        // incoming currently-active fact's own id against the recipient's
-        // own active fact id for that field -- same id means already
-        // synced, nothing to do. Gated by the *owning entity's* verdict
+        // entity_facts: matched by row id. An incoming fact whose id any local
+        // row holds, active or ended, is skipped (items.id=962): active means
+        // already synced; ended means it was stopped, replaced or retired
+        // here, and a row is never revived. The skip comes before the verdict
+        // and before apply_synced_fact's supersede, so the recipient's newer
+        // active value stays. Otherwise gated by the *owning entity's* verdict
         // (facts carry no modification_state of their own); a singleton
         // fact (entity_id None) has no owning entity to gate on and always
         // applies, matching materialization's own unconditional handling of
         // singleton facts.
         for fact in &payload.entity_facts {
-            let local_active_id: Option<String> = sqlx::query_scalar(
-                "SELECT id FROM entity_facts WHERE field_name = ? AND valid_until IS NULL
-                 AND (entity_id = ? OR (entity_id IS NULL AND ? IS NULL))",
-            )
-            .bind(&fact.field_name)
-            .bind(&fact.entity_id)
-            .bind(&fact.entity_id)
-            .fetch_optional(&mut conn)
-            .await?;
-
-            if local_active_id.as_deref() == Some(fact.id.as_str()) {
+            let known: Option<String> =
+                sqlx::query_scalar("SELECT id FROM entity_facts WHERE id = ?")
+                    .bind(&fact.id)
+                    .fetch_optional(&mut conn)
+                    .await?;
+            if known.is_some() {
                 continue;
             }
 
@@ -3486,5 +3486,389 @@ mod tests {
             leaked, 0,
             "no fact of the owned entity reached the recipient"
         );
+    }
+
+    // items.id=962: an id this database already holds is skipped, whether its row
+    // is active or ended.
+
+    struct SyncPair {
+        owner_id: String,
+        owner_persona: String,
+        owner_key: String,
+        recipient_id: String,
+        persona_id: String,
+        recipient_key: String,
+        recipient_priv: StaticSecret,
+        share_id: String,
+        _folder: tempfile::TempDir,
+    }
+
+    /// A user's General fact, through the app's own writer: every call mints a
+    /// new row id.
+    async fn save_general(user_id: &str, persona_id: &str, key_hex: &str, name: &str, value: &str) {
+        personal_store::save_personal_field(
+            user_id, persona_id, key_hex, name, value, "personal", "user", "self", "pass", "pass",
+            "ipc", None,
+        )
+        .await
+        .unwrap();
+    }
+
+    impl SyncPair {
+        /// An accepted, provisioned SYNCED share with both sync folders set.
+        /// `seed` writes the owner's content before the share is sent.
+        async fn new<F, Fut>(pool: &sqlx::SqlitePool, fills: (u8, u8), seed: F) -> Self
+        where
+            F: FnOnce(String, String, String) -> Fut,
+            Fut: std::future::Future<Output = ()>,
+        {
+            let (owner_id, owner_persona, owner_key, _) =
+                make_user_with_persona(pool, "Alice", fills.0).await;
+            let (recipient_id, _, recipient_key, recipient_priv) =
+                make_user_with_persona(pool, "Bob", fills.1).await;
+            seed(owner_id.clone(), owner_persona.clone(), owner_key.clone()).await;
+            let share_id = send_persona_share(
+                pool,
+                &owner_id,
+                &owner_persona,
+                &owner_key,
+                &recipient_id,
+                ShareType::Synced,
+            )
+            .await
+            .unwrap();
+            let persona_id = accept_and_provision_sync(
+                pool,
+                &share_id,
+                &recipient_id,
+                &recipient_key,
+                &recipient_priv,
+            )
+            .await
+            .unwrap();
+            let folder = tempfile::tempdir().unwrap();
+            let folder_path = folder.path().to_str().unwrap();
+            settings_store::set_persona_share_sync_folder(
+                &owner_id,
+                &owner_key,
+                &owner_persona,
+                &share_id,
+                settings_store::SyncRole::Owner,
+                folder_path,
+            )
+            .await
+            .unwrap();
+            settings_store::set_persona_share_sync_folder(
+                &recipient_id,
+                &recipient_key,
+                &persona_id,
+                &share_id,
+                settings_store::SyncRole::Recipient,
+                folder_path,
+            )
+            .await
+            .unwrap();
+            Self {
+                owner_id,
+                owner_persona,
+                owner_key,
+                recipient_id,
+                persona_id,
+                recipient_key,
+                recipient_priv,
+                share_id,
+                _folder: folder,
+            }
+        }
+
+        /// Two General facts, "employer" and "industry".
+        async fn general(pool: &sqlx::SqlitePool, fills: (u8, u8)) -> Self {
+            Self::new(pool, fills, |user, persona, key| async move {
+                save_general(&user, &persona, &key, "employer", "Acme").await;
+                save_general(&user, &persona, &key, "industry", "Retail").await;
+            })
+            .await
+        }
+
+        async fn owner_saves(&self, name: &str, value: &str) {
+            save_general(
+                &self.owner_id,
+                &self.owner_persona,
+                &self.owner_key,
+                name,
+                value,
+            )
+            .await;
+        }
+
+        async fn owner_removes(&self, name: &str) {
+            assert!(personal_store::delete_personal_field(
+                &self.owner_id,
+                &self.owner_persona,
+                &self.owner_key,
+                name,
+            )
+            .await
+            .unwrap());
+        }
+
+        /// One push and one pull; both must do something and succeed.
+        async fn sync(&self, pool: &sqlx::SqlitePool) {
+            assert!(push_if_changed(
+                pool,
+                &self.owner_id,
+                &self.owner_persona,
+                &self.owner_key,
+                &self.share_id,
+                &self.recipient_id,
+            )
+            .await
+            .expect("push must succeed"));
+            assert!(pull_if_newer(
+                &self.recipient_id,
+                &self.persona_id,
+                &self.recipient_key,
+                &self.share_id,
+                &self.recipient_priv,
+            )
+            .await
+            .expect("pull must succeed"));
+        }
+
+        async fn recipient_conn(&self) -> SqliteConnection {
+            personal_store::open_personal_db(
+                &self.recipient_id,
+                &self.persona_id,
+                &self.recipient_key,
+            )
+            .await
+            .unwrap()
+        }
+
+        /// Every recipient row for a field name, active or ended.
+        async fn rows(&self, name: &str) -> Vec<FactRow> {
+            sqlx::query_as(
+                "SELECT id, CAST(field_value AS TEXT), valid_until, extra_metadata
+                 FROM entity_facts WHERE field_name = ? ORDER BY created_at, id",
+            )
+            .bind(name)
+            .fetch_all(&mut self.recipient_conn().await)
+            .await
+            .unwrap()
+        }
+
+        async fn active(&self, name: &str) -> Option<(String, String)> {
+            let mut live: Vec<_> = self
+                .rows(name)
+                .await
+                .into_iter()
+                .filter(|r| r.2.is_none())
+                .map(|r| (r.0, r.1))
+                .collect();
+            assert!(live.len() <= 1);
+            live.pop()
+        }
+
+        /// Stop the recipient's active "employer" and return the ended row.
+        async fn stop_employer(&self) -> FactRow {
+            let id = self.active("employer").await.unwrap().0;
+            let mut conn = self.recipient_conn().await;
+            crate::persistence::facts_stop_store::stop_fact_conn(&mut conn, &id)
+                .await
+                .unwrap();
+            drop(conn);
+            let stopped = self.rows("employer").await.remove(0);
+            assert!(stopped.2.is_some());
+            assert!(stopped.3.contains("stopped_at"));
+            stopped
+        }
+    }
+
+    /// (id, value, valid_until, extra_metadata)
+    type FactRow = (String, String, Option<String>, String);
+
+    #[tokio::test]
+    async fn a_stopped_synced_fact_resent_unchanged_stays_stopped_and_the_rest_applies() {
+        let _env = setup().await;
+        let pool = &_env.pool;
+        let pair = SyncPair::general(pool, (0x51, 0x61)).await;
+        let stopped = pair.stop_employer().await;
+
+        pair.owner_saves("job_title", "Nurse").await;
+        pair.owner_removes("industry").await;
+        pair.sync(pool).await;
+
+        assert_eq!(pair.rows("employer").await, vec![stopped.clone()]);
+        assert_eq!(pair.active("job_title").await.unwrap().1, "Nurse");
+        assert_eq!(pair.active("industry").await, None);
+
+        // A later update applies too.
+        pair.owner_saves("location_city", "Leeds").await;
+        pair.sync(pool).await;
+        assert_eq!(pair.rows("employer").await, vec![stopped.clone()]);
+        assert_eq!(pair.active("location_city").await.unwrap().1, "Leeds");
+
+        // The owner removes the stopped fact: the stopped row is not touched.
+        pair.owner_removes("employer").await;
+        pair.sync(pool).await;
+        assert_eq!(pair.rows("employer").await, vec![stopped]);
+    }
+
+    #[tokio::test]
+    async fn a_new_owner_row_arrives_after_a_stop() {
+        let _env = setup().await;
+        let pool = &_env.pool;
+        let pair = SyncPair::general(pool, (0x52, 0x62)).await;
+        let stopped = pair.stop_employer().await;
+
+        pair.owner_saves("employer", "Globex").await;
+        pair.sync(pool).await;
+
+        let (id, value) = pair.active("employer").await.unwrap();
+        assert_eq!(value, "Globex");
+        assert_ne!(id, stopped.0);
+        let rows = pair.rows("employer").await;
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&stopped));
+    }
+
+    #[tokio::test]
+    async fn a_value_used_again_survives_an_unchanged_resend() {
+        let _env = setup().await;
+        let pool = &_env.pool;
+        let pair = SyncPair::general(pool, (0x53, 0x63)).await;
+        let stopped = pair.stop_employer().await;
+        let mut conn = pair.recipient_conn().await;
+        crate::persistence::facts_stop_store::use_again_fact_conn(&mut conn, &stopped.0)
+            .await
+            .unwrap();
+        drop(conn);
+        let restored = pair.active("employer").await.unwrap();
+        assert_ne!(restored.0, stopped.0);
+
+        pair.owner_saves("job_title", "Nurse").await;
+        pair.sync(pool).await;
+
+        assert_eq!(pair.active("employer").await, Some(restored));
+        assert_eq!(pair.active("job_title").await.unwrap().1, "Nurse");
+    }
+
+    #[tokio::test]
+    async fn the_recipients_own_saved_value_survives_an_unchanged_resend() {
+        let _env = setup().await;
+        let pool = &_env.pool;
+        let pair = SyncPair::general(pool, (0x54, 0x64)).await;
+        save_general(
+            &pair.recipient_id,
+            &pair.persona_id,
+            &pair.recipient_key,
+            "employer",
+            "My own",
+        )
+        .await;
+        let own = pair.active("employer").await.unwrap();
+
+        pair.owner_saves("job_title", "Nurse").await;
+        pair.sync(pool).await;
+
+        assert_eq!(pair.active("employer").await, Some(own));
+        assert_eq!(pair.active("job_title").await.unwrap().1, "Nurse");
+    }
+
+    /// A known id is skipped before the entity's verdict is read. In a pushed
+    /// snapshot the entity pass flags a held entity itself, so this payload
+    /// carries the fact and no entities: only the fact loop can set the flag.
+    #[tokio::test]
+    async fn an_ended_entity_fact_row_sets_no_pending_refresh() {
+        let _env = setup().await;
+        let pool = &_env.pool;
+        let pair = SyncPair::new(pool, (0x55, 0x65), |user, persona, key| async move {
+            let entity_id = entity_store::create_entity(
+                &user,
+                &persona,
+                &key,
+                "person",
+                "Contact",
+                &[],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            personal_store::create_entity_fact_with_provenance(
+                &user,
+                &persona,
+                &key,
+                Some(entity_id.as_str()),
+                "phone",
+                "555-1234",
+                "personal",
+                "interview",
+                &persona,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+
+        let phone = pair.active("phone").await.unwrap();
+        let mut conn = pair.recipient_conn().await;
+        crate::persistence::facts_stop_store::stop_fact_conn(&mut conn, &phone.0)
+            .await
+            .unwrap();
+        let source_id = find_source_registry_id(&mut conn).await.unwrap().unwrap();
+        let entity_id: String =
+            sqlx::query_scalar("SELECT entity_id FROM entity_facts WHERE id = ?")
+                .bind(&phone.0)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        // The premise: the stop leaves the entity held.
+        assert_eq!(
+            source_registry_store::refresh_verdict_conn(&mut conn, &entity_id)
+                .await
+                .unwrap(),
+            Some(RefreshVerdict::Conflict)
+        );
+        drop(conn);
+
+        let mut owner_conn =
+            personal_store::open_personal_db(&pair.owner_id, &pair.owner_persona, &pair.owner_key)
+                .await
+                .unwrap();
+        let entity_facts = crate::auth::persona_sharing::load_shared_entity_facts(
+            &mut owner_conn,
+            std::slice::from_ref(&entity_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(entity_facts.len(), 1);
+        assert_eq!(entity_facts[0].id, phone.0);
+        let payload = PersonaSyncUpdatePayload {
+            schema_version: PERSONA_SYNC_UPDATE_PAYLOAD_SCHEMA_VERSION.to_owned(),
+            emitted_at: crate::providers::utils::now(),
+            entities: Vec::new(),
+            entity_facts,
+            voice_profile_entries: Vec::new(),
+        };
+        apply_update(
+            &pair.recipient_id,
+            &pair.persona_id,
+            &pair.recipient_key,
+            &payload,
+        )
+        .await
+        .unwrap();
+
+        let source =
+            source_registry_store::get_source_conn(&mut pair.recipient_conn().await, &source_id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(source.status, "active");
+        assert_eq!(pair.active("phone").await, None);
     }
 }
