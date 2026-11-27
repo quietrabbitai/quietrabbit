@@ -364,7 +364,9 @@ pub async fn use_again_fact_conn(
 /// Use again a section WE stopped: status back to active, the stop marker removed,
 /// and a new active row for each fact ended at the section's shared timestamp, in
 /// the section and in the descendants stopped with it (a fact or a child section
-/// stopped on its own earlier stays stopped). The facts are found by the shared
+/// stopped on its own earlier stays stopped). Refused with SectionNotFound unless
+/// the section's parent chain is visible (active and unowned all the way up, the
+/// read side's set), so its facts never come back active under a stopped parent. The facts are found by the shared
 /// timestamp, not by today's parent chain, so one moved since still comes back. Atomic: a conflict (a value for
 /// one of those labels already in use) refuses the whole restore with
 /// NewerValueExists and writes nothing. Returns how many facts came back.
@@ -373,7 +375,8 @@ pub async fn use_again_section_conn(
     section_id: &str,
 ) -> Result<u32, FactsViewError> {
     let row = sqlx::query(
-        "SELECT json_extract(extra_metadata, '$.stopped_at') AS stopped_at
+        "SELECT parent_entity_id,
+                json_extract(extra_metadata, '$.stopped_at') AS stopped_at
          FROM entities
          WHERE id = ? AND owner_focus IS NULL AND status = 'archived'
            AND json_extract(extra_metadata, '$.stopped_at') IS NOT NULL",
@@ -384,6 +387,14 @@ pub async fn use_again_section_conn(
     .map_err(db)?
     .ok_or(FactsViewError::SectionNotFound)?;
     let stopped_at: String = row.try_get("stopped_at").map_err(db)?;
+    // A parent is in the visible set only when its whole chain is, so this one
+    // lookup covers every ancestor.
+    let parent_id: Option<String> = row.try_get("parent_entity_id").map_err(db)?;
+    if let Some(parent) = &parent_id {
+        if !visible_ids(conn).await?.contains(parent) {
+            return Err(FactsViewError::SectionNotFound);
+        }
+    }
 
     let rows = sqlx::query(&format!(
         "SELECT {STOPPED_COLUMNS} FROM entity_facts

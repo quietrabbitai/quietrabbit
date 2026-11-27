@@ -81,9 +81,13 @@ The Library's Facts button. Add and change are items.id=961, sharing choices ite
   chain; a fact or child section stopped on its own earlier stays stopped. A stop and a use again
   flip each pristine entity whose facts they touch (the section always) to user_modified, which is
   what keeps a persona sync from writing a stopped synced section's or descendant's facts back.
-- LIMITS of the cascade: it ends what is active at stop time. A fact written to a descendant later
-  is read as usual. use_again_section by id on a child stopped earlier still works while its parent
-  is stopped (the Removed list does not offer it), and its facts are then read.
+- use_again_section is refused (section_not_found, nothing written) unless the section's whole
+  parent chain is in the visible set, so a child's facts never come back active under a stopped or
+  owned ancestor. This supersedes the earlier "use again by id still works" under a stopped parent.
+  The check is on the section asked for: facts restored by stamp are not re-checked against where
+  their entity sits now.
+- LIMIT of the cascade: it ends what is active at stop time. A fact written to a descendant later
+  is read as usual.
 - Provenance words: user_confirmed, ipc, extract_confirm = "You confirmed this"; corrected,
   conversation, extracted have their own; anything else (interview, synced_share) shows none.
   Production writers set ipc (commands/personal.rs) and extract_confirm (conductor/extract.rs);

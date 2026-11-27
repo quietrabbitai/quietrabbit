@@ -1318,6 +1318,76 @@ mod tests {
         assert_eq!(read_by_loaders(&e).await.0, ["CHILD", "GRANDCHILD", "HOME"]);
     }
 
+    /// Use again on a section is refused, writing nothing, while any ancestor is
+    /// stopped or owned: a child's facts never come back active under a stopped
+    /// parent. It works once the ancestors are visible again.
+    #[tokio::test]
+    async fn a_section_cannot_come_back_under_a_stopped_or_owned_ancestor() {
+        let e = env().await;
+        let mut c = conn(&e, &e.a).await;
+        let home = entity(&mut c, "Home", &[], None).await;
+        let kid = entity(&mut c, "Garden", &[], Some(&home)).await;
+        let grandkid = entity(&mut c, "Shed", &[], Some(&kid)).await;
+        copied_fact(&mut c, &e.b, &home, "Address", "HOME").await;
+        copied_fact(&mut c, &e.b, &grandkid, "Lock", "GRANDCHILD").await;
+        drop(c);
+        // The grandchild on its own first, then Home: Garden between them stays active.
+        assert_eq!(stop_section(&e, &e.a, &grandkid).await.unwrap(), 1);
+        assert_eq!(stop_section(&e, &e.a, &home).await.unwrap(), 1);
+
+        let snapshot = |e: &Env| {
+            let (u, a, k) = (e.user.clone(), e.a.clone(), e.key.clone());
+            async move {
+                let mut c = open_personal_db(&u, &a, &k).await.unwrap();
+                let facts: Vec<(String, Option<String>, String)> = sqlx::query_as(
+                    "SELECT id, valid_until, extra_metadata FROM entity_facts ORDER BY id",
+                )
+                .fetch_all(&mut c)
+                .await
+                .unwrap();
+                (facts, entity_rows(&mut c).await)
+            }
+        };
+        let before = snapshot(&e).await;
+        // A grandparent is stopped, not the direct parent.
+        assert_eq!(
+            again_section(&e, &e.a, &grandkid).await.unwrap_err(),
+            "section_not_found"
+        );
+        assert_eq!(snapshot(&e).await, before, "nothing written");
+        assert!(read_by_loaders(&e).await.0.is_empty());
+
+        assert_eq!(again_section(&e, &e.a, &home).await.unwrap(), 1);
+        assert_eq!(again_section(&e, &e.a, &grandkid).await.unwrap(), 1);
+        assert_eq!(read_by_loaders(&e).await.0, ["GRANDCHILD", "HOME"]);
+
+        // A direct parent that is stopped, and one that is Focus-owned.
+        stop_section(&e, &e.a, &grandkid).await.unwrap();
+        stop_section(&e, &e.a, &kid).await.unwrap();
+        let before = snapshot(&e).await;
+        assert_eq!(
+            again_section(&e, &e.a, &grandkid).await.unwrap_err(),
+            "section_not_found"
+        );
+        assert_eq!(snapshot(&e).await, before, "nothing written");
+        again_section(&e, &e.a, &kid).await.unwrap();
+        let mut c = conn(&e, &e.a).await;
+        let dev = owned(&mut c, "Router").await;
+        sqlx::query("UPDATE entities SET parent_entity_id = ? WHERE id = ?")
+            .bind(&dev)
+            .bind(&grandkid)
+            .execute(&mut c)
+            .await
+            .unwrap();
+        drop(c);
+        let before = snapshot(&e).await;
+        assert_eq!(
+            again_section(&e, &e.a, &grandkid).await.unwrap_err(),
+            "section_not_found"
+        );
+        assert_eq!(snapshot(&e).await, before, "nothing written");
+    }
+
     /// A conflict in a DESCENDANT refuses the whole restore; a descendant moved since
     /// the stop still comes back (the facts are found by the shared timestamp).
     #[tokio::test]
@@ -1821,9 +1891,15 @@ mod tests {
             assert!(!code.contains(col), "an UPDATE assigns {col}");
         }
         // The stop and the restore each check the visible set before any write.
-        for f in ["stop_fact_conn", "stop_section_conn", "use_again_fact_conn"] {
+        for f in [
+            "stop_fact_conn",
+            "stop_section_conn",
+            "use_again_fact_conn",
+            "use_again_section_conn",
+        ] {
             let start = code.find(&format!("pub async fn {f}")).unwrap();
-            let body = &code[start..];
+            // The joined lines have no trailing newline, and the last function ends the file.
+            let body = format!("{}\n", &code[start..]);
             let end = body.find("\n}\n").unwrap();
             let body = &body[..end];
             let guard = body.find("visible_ids(conn)").expect("visible set");
