@@ -20,7 +20,9 @@
 //   (no v1 field may be passed there). The anonymous route offers Share only when
 //   can_share.
 // - A stored `ask` (the command accepts it, no screen offers it) releases the value
-//   behind the outbound review: the anonymous route shows it read only.
+//   behind the outbound review: the anonymous route shows it as itself and lets the
+//   user REPLACE it with Describe or Keep back, never Share and never ask again, so
+//   sharing can always be made stricter.
 //
 // FOR UNIT 2'S COPY: Share on the anonymous route has no effect on a step that may
 // reach signed-in services (that step applies the signed-in choice, unit 0), so the
@@ -46,10 +48,13 @@ const OPEN_SENSITIVITIES: readonly string[] = ['general', 'personal']
 
 export type SharingWord = 'pass' | 'summarize' | 'omit'
 
+/** What a stored ask may be replaced with. */
+const ASK_REPLACEMENTS: readonly SharingWord[] = ['summarize', 'omit']
+
 export type RouteControl =
   | { kind: 'choose'; value: SharingWord; options: SharingWord[] }
-  /** A stored ask, shown read only. */
-  | { kind: 'ask' }
+  /** A stored ask, shown as itself. `options` are what may replace it. */
+  | { kind: 'ask'; options: SharingWord[] }
 
 export interface SharingRoute {
   route: 'anonymous' | 'signedIn'
@@ -82,7 +87,9 @@ function routeControl(
   options: SharingWord[],
   askAllowed: boolean,
 ): RouteControl | null {
-  if (tier.effective === 'ask') return askAllowed ? { kind: 'ask' } : null
+  if (tier.effective === 'ask') {
+    return askAllowed ? { kind: 'ask', options: [...ASK_REPLACEMENTS] } : null
+  }
   const value = options.find((word) => word === tier.effective)
   return value === undefined ? null : { kind: 'choose', value, options }
 }

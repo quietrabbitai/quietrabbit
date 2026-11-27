@@ -224,9 +224,14 @@ assert.deepEqual(
   block(ready(info({ tier2: { effective: 'pass', can_share: false } }))),
   failedClosed,
 )
-// A stored ask is shown as itself, read only.
-const asking = block(ready(info({ tier2: { choice: 'ask', effective: 'ask' } })))
-assert.deepEqual(control(asking, 0), { kind: 'ask' })
+// A stored ask is shown as itself and can be replaced by Describe or Keep back only:
+// never Share, even where the route could share, and never ask again.
+for (const canShare of [true, false]) {
+  const asking = block(
+    ready(info({ tier2: { choice: 'ask', effective: 'ask', can_share: canShare } })),
+  )
+  assert.deepEqual(control(asking, 0), { kind: 'ask', options: ['summarize', 'omit'] })
+}
 
 // Partly shared: some route is not at Keep back. Never for a fixed, loading, failed or
 // absent block.
