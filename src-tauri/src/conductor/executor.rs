@@ -13467,6 +13467,93 @@ mod tests {
         );
     }
 
+    // -- items.id=960 unit 0 (decisions.id=968 addendum 2): a bridged field applies the
+    // DESTINATION's choice -----------------------------------------------------------
+
+    /// One external step declaring job_title, run through execute_once with the tiers
+    /// lifecycle::execute_step computes for a ceiling of `access` under the Focus
+    /// privacy tier `privacy_tier` (raw = min(privacy, execution), abstraction =
+    /// max(raw, 2)). `tier2` and `tier3` are the user's choices, in both the INITIALIZE
+    /// snapshot and the table the executor re-reads. Returns the prompt the review saw
+    /// and the gateway.
+    async fn destination_run(
+        pool: &sqlx::SqlitePool,
+        privacy_tier: u8,
+        access: ExternalAccess,
+        tier2: Option<&str>,
+        tier3: Option<&str>,
+    ) -> (Option<String>, PrivacyGateway<TestLogger>) {
+        use crate::conductor::personal_fact_fields::Tier;
+        use crate::persistence::fact_policy_store::{FactPolicyRow, UserPolicies};
+        let snapshot = UserPolicies::Rows(vec![FactPolicyRow {
+            field_name: "job_title".to_owned(),
+            tier2: tier2.map(str::to_owned),
+            tier3: tier3.map(str::to_owned),
+            set_at: String::new(),
+            set_by: "user".to_owned(),
+        }]);
+        let track = track_from(&[("job_title", "Staff Engineer")], &snapshot);
+        let key_hex = hosted_pick_rig(pool).await;
+        let mut ctx = resolved_ctx(None, access, None, "Role: {job_title} End");
+        ctx.key_hex = key_hex;
+        ctx.qr_hosted_provider_preference = Some("fixture-host-a".to_owned());
+        ctx.execution_tier = crate::conductor::lifecycle::execution_tier_ordinal(access);
+        ctx.raw_abstraction = privacy_tier.min(ctx.execution_tier);
+        ctx.abstraction_tier = ctx.raw_abstraction.max(2);
+        declare_field(&mut ctx, "job_title");
+        ctx.floor_consent_preference = Some(FLOOR_CONSENT_MODIFIED.to_owned());
+        {
+            let mut conn = crate::persistence::personal_store::open_personal_db(
+                &ctx.user_id,
+                &ctx.persona_id,
+                &ctx.key_hex,
+            )
+            .await
+            .expect("personal.db opens in the fixture");
+            for (t, word) in [(Tier::Two, tier2), (Tier::Three, tier3)] {
+                if let Some(w) = word {
+                    crate::persistence::fact_policy_store::set_fact_policy(
+                        &mut conn,
+                        "job_title",
+                        t,
+                        w,
+                        "user",
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+        }
+        let (forced, seen) = capturing_scanner();
+        let _g = step_review::forced::arm(&ctx, forced).await;
+        let (_out, _t, gateway) = run_once_with(&ctx, pool, &track).await;
+        let seen = seen.borrow();
+        (seen.first().cloned(), gateway)
+    }
+
+    /// The red case. At the default Focus privacy tier 2, a step that may reach a
+    /// signed-in provider (execution tier 3) must apply the signed-in choice, here the
+    /// default Keep back. The anonymous-services Share must not release the raw value.
+    #[tokio::test]
+    async fn a_signed_in_capable_step_does_not_apply_the_anonymous_share() {
+        with_temp_shared_db(|pool| async move {
+            let (prompt, gateway) = destination_run(
+                &pool,
+                2,
+                ExternalAccess::AnonymousPreferred,
+                Some("pass"),
+                None,
+            )
+            .await;
+            let prompt = prompt.expect("the step was sent");
+            assert_eq!(prompt, "Role:  End");
+            let rows = gate1_entries(&gateway);
+            assert!(rows[0].fields_shared.is_empty(), "{:?}", rows[0]);
+            assert_eq!(rows[0].fields_withheld, ["job_title"]);
+        })
+        .await;
+    }
+
     /// Plan item 4, the crossing. A LOCAL step that declares location_city now renders
     /// it, and its reply carries the value. Gate 3 at that step reviews the reply for the
     /// tier-2 step that follows (severity 2: approved, the step completes). The next,
