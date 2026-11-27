@@ -1715,6 +1715,14 @@ export type FactView = {
 	 *  the view says so rather than claiming the stop holds.
 	 */
 	sync_may_restore: boolean,
+	/**
+	 *  The fact came from another Persona: its source_persona_id is not this one
+	 *  (a missing one counts). This is the Gate 1 bridge's own cross-Persona test
+	 *  (personal_fact_bridge::bridge_fields), which never releases such a value.
+	 *  NOT cross_persona_export: a row marked as an export whose source is this
+	 *  Persona is bridged as this Persona's own (items.id=960).
+	 */
+	copied_in: boolean,
 };
 
 export type FactsTree = {

@@ -52,7 +52,9 @@ pub(crate) async fn facts_tree_for_session(
     persona_id: &str,
 ) -> Result<FactsTree, String> {
     let mut conn = open_checked(pool, user_id, key_hex, persona_id).await?;
-    store::facts_tree_conn(&mut conn).await.map_err(code)
+    store::facts_tree_conn(&mut conn, persona_id)
+        .await
+        .map_err(code)
 }
 
 pub(crate) async fn fact_history_for_session(
@@ -76,7 +78,7 @@ pub(crate) async fn search_facts_for_session(
     query: &str,
 ) -> Result<FactsTree, String> {
     let mut conn = open_checked(pool, user_id, key_hex, persona_id).await?;
-    store::search_facts_conn(&mut conn, query)
+    store::search_facts_conn(&mut conn, persona_id, query)
         .await
         .map_err(code)
 }
@@ -395,6 +397,158 @@ mod tests {
             v.extend(s.facts.iter().map(|f| format!("{}/{}", s.name, f.label)));
         }
         v
+    }
+
+    /// items.id=960 unit 1: copied_in is "the source Persona is not this one", in the
+    /// tree and in search, whatever cross_persona_export says, and it agrees with
+    /// what the Gate 1 bridge does with the same rows: under a stored Share the
+    /// bridge releases exactly the General facts that are not copied in.
+    #[tokio::test]
+    async fn copied_in_is_the_bridges_own_cross_persona_test() {
+        use crate::conductor::personal_fact_fields::registry;
+        use crate::persistence::fact_policy_store::{FactPolicyRow, UserPolicies};
+        let e = env().await;
+        let mut c = conn(&e, &e.a).await;
+        // (label, source is this Persona, marked as an export)
+        let rows = [
+            ("location_city", true, false),
+            ("job_title", true, true),
+            ("employer", false, true),
+            ("industry", false, false),
+        ];
+        for (label, own, export) in rows {
+            let source = if own { &e.a } else { &e.b };
+            create_entity_fact_with_provenance_conn(
+                &mut c,
+                None,
+                label,
+                "Zanzibar",
+                "personal",
+                "user_confirmed",
+                source,
+                export,
+                export.then_some(e.b.as_str()),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let maya = entity(&mut c, "Maya", &[], None).await;
+        fact(&mut c, &e.a, Some(&maya), "own_note", "Zanzibar", "ipc").await;
+        create_entity_fact_with_provenance_conn(
+            &mut c,
+            Some(&maya),
+            "copied_note",
+            "Zanzibar",
+            "personal",
+            "user_confirmed",
+            &e.b,
+            true,
+            Some(&e.b),
+            None,
+        )
+        .await
+        .unwrap();
+        drop(c);
+
+        let expected = [
+            ("copied_note", true),
+            ("employer", true),
+            ("industry", true),
+            ("job_title", false),
+            ("location_city", false),
+            ("own_note", false),
+        ];
+        let flags = |t: &FactsTree| {
+            let mut v: Vec<(String, bool)> = t
+                .general
+                .iter()
+                .chain(t.sections.iter().flat_map(|s| s.facts.iter()))
+                .map(|f| (f.label.clone(), f.copied_in))
+                .collect();
+            v.sort();
+            v
+        };
+        let expected: Vec<(String, bool)> = expected
+            .iter()
+            .map(|(l, c)| ((*l).to_owned(), *c))
+            .collect();
+        assert_eq!(flags(&tree(&e, &e.a).await.unwrap()), expected);
+        // Search by value, and by section name (the second read of search).
+        let by_value = search_facts_for_session(&e.pool, &e.user, &e.key, &e.a, "zanzibar")
+            .await
+            .unwrap();
+        assert_eq!(flags(&by_value), expected);
+        let by_name = search_facts_for_session(&e.pool, &e.user, &e.key, &e.a, "maya")
+            .await
+            .unwrap();
+        assert_eq!(
+            flags(&by_name),
+            [
+                ("copied_note".to_owned(), true),
+                ("own_note".to_owned(), false)
+            ]
+        );
+
+        // The bridge over the same file, every field at Share.
+        let policies = UserPolicies::Rows(
+            rows.iter()
+                .map(|(label, ..)| FactPolicyRow {
+                    field_name: (*label).to_owned(),
+                    tier2: Some("pass".to_owned()),
+                    tier3: None,
+                    set_at: String::new(),
+                    set_by: "user".to_owned(),
+                })
+                .collect(),
+        );
+        let loaded = crate::persistence::personal_store::load_entity_facts_for_context(
+            &e.user, &e.a, &e.key,
+        )
+        .await
+        .unwrap();
+        let bridged = crate::conductor::personal_fact_bridge::bridge_fields(
+            loaded.iter(),
+            &e.a,
+            registry().map_err(|_| ()),
+            &policies,
+        );
+        assert_eq!(bridged.len(), rows.len());
+        for field in bridged {
+            let copied = expected
+                .iter()
+                .find(|(l, _)| *l == field.field_name)
+                .unwrap()
+                .1;
+            assert_eq!(
+                field.abstraction_tier2,
+                if copied { "not_permitted" } else { "pass" },
+                "{}",
+                field.field_name
+            );
+        }
+    }
+
+    /// A row with no source Persona (the insert trigger forbids one; this drops it)
+    /// counts as copied in.
+    #[tokio::test]
+    async fn a_fact_with_no_source_persona_counts_as_copied_in() {
+        let e = env().await;
+        let mut c = conn(&e, &e.a).await;
+        sqlx::query("DROP TRIGGER trg_entity_facts_provenance_required")
+            .execute(&mut c)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO entity_facts
+             (id, entity_id, field_name, field_value, sensitivity, source, created_at)
+             VALUES ('no-source', NULL, 'employer', 'Acme', 'personal', 'ipc', 't')",
+        )
+        .execute(&mut c)
+        .await
+        .unwrap();
+        drop(c);
+        assert!(tree(&e, &e.a).await.unwrap().general[0].copied_in);
     }
 
     /// General then sections A to Z; provenance and earlier counts come through.

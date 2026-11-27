@@ -109,6 +109,12 @@ pub struct FactView {
     /// re-inserts a General fact it still sends, so stopping this one may not last:
     /// the view says so rather than claiming the stop holds.
     pub sync_may_restore: bool,
+    /// The fact came from another Persona: its source_persona_id is not this one
+    /// (a missing one counts). This is the Gate 1 bridge's own cross-Persona test
+    /// (personal_fact_bridge::bridge_fields), which never releases such a value.
+    /// NOT cross_persona_export: a row marked as an export whose source is this
+    /// Persona is bridged as this Persona's own (items.id=960).
+    pub copied_in: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -184,6 +190,7 @@ struct Row_ {
     sensitivity: String,
     source: String,
     since: String,
+    source_persona_id: Option<String>,
 }
 
 /// The visible sections, ordered root A to Z each followed by its descendants A to Z.
@@ -273,7 +280,8 @@ async fn active_rows(
 ) -> Result<(Vec<Row_>, HashMap<(Option<String>, String), u32>), FactsViewError> {
     let rows = sqlx::query(
         "SELECT id, entity_id, field_name, field_value, sensitivity, source,
-                COALESCE(valid_from, created_at) AS since, valid_until, extra_metadata
+                COALESCE(valid_from, created_at) AS since, valid_until, extra_metadata,
+                source_persona_id
          FROM entity_facts
          ORDER BY lower(field_name), created_at, id",
     )
@@ -308,13 +316,19 @@ async fn active_rows(
             sensitivity: r.try_get("sensitivity")?,
             source: r.try_get("source")?,
             since: r.try_get("since")?,
+            source_persona_id: r.try_get("source_persona_id")?,
         });
     }
     Ok((active, earlier))
 }
 
-fn fact_view(r: &Row_, earlier: &HashMap<(Option<String>, String), u32>) -> FactView {
+fn fact_view(
+    r: &Row_,
+    earlier: &HashMap<(Option<String>, String), u32>,
+    persona_id: &str,
+) -> FactView {
     FactView {
+        copied_in: r.source_persona_id.as_deref() != Some(persona_id),
         id: r.id.clone(),
         label: r.label.clone(),
         value: r.value.clone(),
@@ -372,6 +386,7 @@ async fn subtree_active_counts(
 
 async fn load_tree(
     conn: &mut SqliteConnection,
+    persona_id: &str,
 ) -> Result<(FactsTree, Vec<Ent>, Vec<Row_>), FactsViewError> {
     let ents = visible_entities(conn).await?;
     let ids: HashSet<&str> = ents.iter().map(|e| e.id.as_str()).collect();
@@ -381,7 +396,7 @@ async fn load_tree(
     let general: Vec<FactView> = rows
         .iter()
         .filter(|r| r.entity_id.is_none())
-        .map(|r| fact_view(r, &earlier))
+        .map(|r| fact_view(r, &earlier, persona_id))
         .collect();
     let sections: Vec<SectionView> = ents
         .iter()
@@ -394,7 +409,7 @@ async fn load_tree(
             facts: rows
                 .iter()
                 .filter(|r| r.entity_id.as_deref() == Some(e.id.as_str()))
-                .map(|r| fact_view(r, &earlier))
+                .map(|r| fact_view(r, &earlier, persona_id))
                 .collect(),
         })
         .collect();
@@ -412,9 +427,13 @@ async fn load_tree(
     ))
 }
 
-/// The Persona's whole Summary: General, then the visible sections.
-pub async fn facts_tree_conn(conn: &mut SqliteConnection) -> Result<FactsTree, FactsViewError> {
-    Ok(load_tree(conn).await?.0)
+/// The Persona's whole Summary: General, then the visible sections. `persona_id` is
+/// the Persona whose file `conn` is (it decides FactView.copied_in).
+pub async fn facts_tree_conn(
+    conn: &mut SqliteConnection,
+    persona_id: &str,
+) -> Result<FactsTree, FactsViewError> {
+    Ok(load_tree(conn, persona_id).await?.0)
 }
 
 /// Earlier values of one visible fact's label, newest first. A fact id that is not
@@ -467,13 +486,14 @@ fn matches(hay: &str, needle: &str) -> bool {
 /// alias shows all its facts. Sections with nothing to show are dropped.
 pub async fn search_facts_conn(
     conn: &mut SqliteConnection,
+    persona_id: &str,
     query: &str,
 ) -> Result<FactsTree, FactsViewError> {
     let needle = query.trim().to_lowercase();
     if needle.is_empty() {
         return Err(FactsViewError::QueryEmpty);
     }
-    let (tree, _, _) = load_tree(conn).await?;
+    let (tree, _, _) = load_tree(conn, persona_id).await?;
 
     // Aliases are searched with json_each (invariant 12), then intersected with
     // the visible set, so an owned or stopped entity's alias never matches.
@@ -532,7 +552,7 @@ pub async fn search_facts_conn(
         }
     }
     let hits: HashMap<String, SectionView> = shown.into_iter().map(|s| (s.id.clone(), s)).collect();
-    let (full, _, _) = load_tree(conn).await?;
+    let (full, _, _) = load_tree(conn, persona_id).await?;
     let mut sections = Vec::new();
     let mut count = general.len();
     for s in full.sections {

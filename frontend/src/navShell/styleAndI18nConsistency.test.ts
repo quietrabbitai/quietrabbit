@@ -82,18 +82,6 @@ const PRE_EXISTING_ORPHAN_KEYS: string[] = [
   'step_review.stop.refused', // same
   'step_review.stop.too_long', // items.id=923: same (the run status event carries no park reason)
   'promotion.stop.sensitive_blocked', // items.id=923 (F2): same; the Gate 3 stop is a park reason no surface shows yet
-  'fact_policy.error.persona_not_found', // items.id=930: the codes and policy words of get_fact_policies and set_fact_policy; the screen that shows them is not built
-  'fact_policy.error.unknown_field', // items.id=930: the codes and policy words of get_fact_policies and set_fact_policy; the screen that shows them is not built
-  'fact_policy.error.invalid_tier', // items.id=930: the codes and policy words of get_fact_policies and set_fact_policy; the screen that shows them is not built
-  'fact_policy.error.invalid_policy', // items.id=930: the codes and policy words of get_fact_policies and set_fact_policy; the screen that shows them is not built
-  'fact_policy.error.pass_not_allowed', // items.id=930: the codes and policy words of get_fact_policies and set_fact_policy; the screen that shows them is not built
-  'fact_policy.error.tier3_not_selectable', // items.id=930: the codes and policy words of get_fact_policies and set_fact_policy; the screen that shows them is not built
-  'fact_policy.error.catalogue_unavailable', // items.id=930: the codes and policy words of get_fact_policies and set_fact_policy; the screen that shows them is not built
-  'fact_policy.error.fact_policy_unavailable', // items.id=930: the codes and policy words of get_fact_policies and set_fact_policy; the screen that shows them is not built
-  'fact_policy.policy.pass', // items.id=930: the codes and policy words of get_fact_policies and set_fact_policy; the screen that shows them is not built
-  'fact_policy.policy.summarize', // items.id=930: the codes and policy words of get_fact_policies and set_fact_policy; the screen that shows them is not built
-  'fact_policy.policy.omit', // items.id=930: the codes and policy words of get_fact_policies and set_fact_policy; the screen that shows them is not built
-  'fact_policy.policy.ask', // items.id=930: the codes and policy words of get_fact_policies and set_fact_policy; the screen that shows them is not built
   'handoff.error.persona_not_found', // items.id=387: the codes of get_handoff_state; the panel that shows them is items.id=912
   'handoff.error.invalid_focus_id', // same
   'handoff.error.invalid_context_key', // same
