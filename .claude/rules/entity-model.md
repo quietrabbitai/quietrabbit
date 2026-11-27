@@ -80,7 +80,8 @@ The Library's Facts button. Add and change are items.id=961; sharing choices are
   stopped with it, descendants' included, found by the shared timestamp and not by today's parent
   chain; a fact or child section stopped on its own earlier stays stopped. A stop and a use again
   flip each pristine entity whose facts they touch (the section always) to user_modified, which is
-  what keeps a persona sync from writing a stopped synced section's or descendant's facts back.
+  what makes a persona sync hold the owner's NEW fact rows for a stopped synced section or
+  descendant (rows already here are skipped by id, "Persona sync and a known row id" below).
 - use_again_section is refused (section_not_found, nothing written) unless the section's whole
   parent chain is in the visible set, so a child's facts never come back active under a stopped or
   owned ancestor. This supersedes the earlier "use again by id still works" under a stopped parent.
@@ -117,10 +118,23 @@ The Library's Facts button. Add and change are items.id=961; sharing choices are
 - A stop does not reach chat history, saved outputs, a run snapshot's approved disclosure buffers
   (work already started), copies a share already made, or a view-only recipient's cache before its
   next sync.
-- OPEN DEFECT, persona sync: persona_sync::engine::apply_synced_fact inserts under the owner's row
-  id. A stopped synced GENERAL fact keeps that id, so while the owner still sends it every pull
-  fails (UNIQUE entity_facts.id) and the WHOLE update rolls back; when the owner changes the value
-  the fact returns. Seen in a throwaway test. No IPC command creates a synced share today.
+- Persona sync and a known row id (items.id=962): a synced fact is inserted under the owner's row
+  id, so the fact loop in persona_sync::engine::apply_update skips any incoming fact whose id ANY
+  local entity_facts row holds, active or ended: stopped, replaced by the recipient's own save, or
+  retired. The skip is in the CALLER, before the verdict (the fact loop sets no pending_refresh for
+  it, though the entity pass still flags a held entity in the payload) and before
+  apply_synced_fact's supersede, so a Use again value or the recipient's own value stays. The rest
+  of the update applies.
+  - The owner's fact comes back when the owner's side writes a NEW row for it: a changed value, the
+    same value saved again, or stop then Use again (save_personal_field and the restore always
+    insert a new id). A new row for an entity-scoped fact still goes through the entity's verdict.
+  - The owner removing a stopped fact leaves the stopped row as it is (absence retirement reads
+    active rows only).
+  - LIMIT: if the owner's database goes back to an earlier state, so a row the recipient has ended
+    is active there again, the recipient skips it and keeps what it has, with no error.
+  - An in-place change under the same id (dedup_store::carry_user_fields_conn writes field_value;
+    resolve_candidate had no outside caller when checked) does not sync, active row or ended.
+  - No IPC command creates a synced share today.
 
 ### UI copy rule
 navShell.facts.* never says "QR", never promises that Quiet Rabbit will not use a stopped value, and
