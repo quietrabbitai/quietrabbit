@@ -140,6 +140,36 @@ export function sharingBlock(
   }
 }
 
+/** Which of the block's lines show (design record section 10a, display
+ *  conditions). The loading and failed blocks show none of them. */
+export interface SharingNotes {
+  /** What Keep back cannot catch: under a fixed block and under the choices. */
+  limits: boolean
+  /** Both routes are at the default. */
+  defaultNote: boolean
+  /** When a choice takes hold. */
+  next: boolean
+  /** What Describe sends: wherever Describe is offered. */
+  describeNote: boolean
+  /** That an anonymous Share does not reach signed-in work: only while the
+   *  anonymous choice is not Keep back (a stored ask is not). */
+  anonymousScope: boolean
+}
+
+export function sharingNotes(block: SharingBlock): SharingNotes {
+  const choices = block.kind === 'choices' ? block : null
+  const anonymous = choices?.routes[0].control
+  return {
+    limits: block.kind === 'fixed' || choices !== null,
+    defaultNote: choices?.defaultNote === true,
+    next: choices !== null,
+    describeNote:
+      choices?.routes.some((r) => r.control.options.includes('summarize')) === true,
+    anonymousScope:
+      anonymous !== undefined && (anonymous.kind === 'ask' || anonymous.value !== 'omit'),
+  }
+}
+
 /** Whether a fact is marked as partly shared: some route is not at Keep back. A fixed,
  *  loading or failed block is never marked. */
 export function isPartlyShared(block: SharingBlock): boolean {

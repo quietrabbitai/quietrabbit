@@ -227,6 +227,74 @@
   overflow-wrap: anywhere;
 }
 
+.my-facts__sharing {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.my-facts__sharing-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.my-facts__route {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 4px 10px;
+}
+
+.my-facts__route-name {
+  display: flex;
+  flex-direction: column;
+  flex: 0 1 220px;
+  min-width: 0;
+  font-size: 13px;
+}
+
+.my-facts__route-select {
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.my-facts__route-select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.my-facts__route-ask {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 220px;
+  gap: 4px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: none;
+}
+
+.my-facts__route-ask-value {
+  margin: 0;
+  font-size: 13px;
+}
+
+.my-facts__route-note {
+  flex-basis: 100%;
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
 .my-facts__removed-list {
   display: flex;
   flex-direction: column;

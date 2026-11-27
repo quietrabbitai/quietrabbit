@@ -291,6 +291,28 @@
         "newer": "There's already a newer value for this, so the old one wasn't brought back.",
         "gone": "That's no longer there. The list has been refreshed.",
         "generic": "That didn't work. Try again."
+      },
+      "sharing": {
+        "title": "Sharing with cloud providers",
+        "route": {
+          "anonymous": "Anonymous providers",
+          "anonymousGloss": "Providers that don't ask you to sign in",
+          "signedIn": "Signed-in providers",
+          "signedInGloss": "Providers you sign in to"
+        },
+        "routeAria": "{{field}}: sharing with {{route}}",
+        "default": "Kept back unless you choose otherwise.",
+        "next": "Applies from the next send. A change can also reach work that has already started.",
+        "anonymousScope": "Share applies only when work goes to an anonymous provider. Work that may go to a signed-in provider follows your signed-in choice.",
+        "fixed": "Kept back from cloud providers.",
+        "limits": "Quiet Rabbit matches the exact text of this fact. It can't catch the same detail typed into a chat, put in other words, or too short to match (under four characters). It covers this saved fact only.",
+        "describeNote": "Sends only a label for the kind of detail, not the detail itself.",
+        "ask": {
+          "value": "Ask me: you choose in the review before it's sent.",
+          "replaceLabel": "Change to"
+        },
+        "loading": "Loading sharing choices…",
+        "failed": "Couldn't load your sharing choices. Try again."
       }
     },
     "content": {
@@ -755,19 +777,19 @@
   },
   "fact_policy": {
     "error": {
-      "persona_not_found": "This persona is not available.",
-      "unknown_field": "This detail can't have a sharing choice.",
-      "invalid_tier": "That sharing level isn't available.",
+      "persona_not_found": "This Persona isn't available.",
+      "unknown_field": "This detail doesn't have a sharing choice.",
+      "invalid_tier": "That kind of provider isn't available for sharing.",
       "invalid_policy": "That choice isn't available.",
       "pass_not_allowed": "This detail can't be shared.",
-      "tier3_not_selectable": "This detail can't be shared at that level.",
-      "catalogue_unavailable": "Sharing choices aren't available right now.",
-      "fact_policy_unavailable": "Couldn't save or read your sharing choice. Try again in a moment."
+      "tier3_not_selectable": "This detail can't be shared with signed-in providers. You can describe it or keep it back.",
+      "catalogue_unavailable": "Sharing choices aren't available right now. Try again later.",
+      "fact_policy_unavailable": "Couldn't save or read your sharing choice. Try again."
     },
     "policy": {
       "pass": "Share",
       "summarize": "Describe",
-      "omit": "Withhold",
+      "omit": "Keep back",
       "ask": "Ask me"
     }
   },

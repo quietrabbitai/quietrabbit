@@ -14,6 +14,7 @@ import {
   isPartlyShared,
   sharingBlock,
   sharingErrorText,
+  sharingNotes,
   sharingWordText,
   type PoliciesLoad,
   type SharingBlock,
@@ -249,6 +250,38 @@ assert.equal(isPartlyShared(block(shared, { copied_in: true })), false)
 assert.equal(isPartlyShared(block({ kind: 'loading' })), false)
 assert.equal(isPartlyShared(block({ kind: 'failed', code: 'x' })), false)
 assert.equal(isPartlyShared(sharingBlock(fact(), false, shared)), false)
+
+// The display conditions of design record section 10a.
+const none = {
+  limits: false,
+  defaultNote: false,
+  next: false,
+  describeNote: false,
+  anonymousScope: false,
+}
+assert.deepEqual(sharingNotes(block({ kind: 'loading' })), none)
+assert.deepEqual(sharingNotes(block({ kind: 'failed', code: 'x' })), none)
+assert.deepEqual(sharingNotes(sharingBlock(fact(), false, shared)), none)
+assert.deepEqual(sharingNotes(block(shared, { sensitivity: 'medical' })), {
+  ...none,
+  limits: true,
+})
+const open = { ...none, limits: true, next: true, describeNote: true }
+assert.deepEqual(sharingNotes(block(ready(info()))), { ...open, defaultNote: true })
+// The anonymous scope note: only while the ANONYMOUS choice is not Keep back.
+for (const [over, scope] of [
+  [{ tier2: { effective: 'omit', choice: 'omit' } }, false],
+  [{ tier3: { effective: 'summarize', choice: 'summarize' } }, false],
+  [{ tier2: { effective: 'pass', choice: 'pass' } }, true],
+  [{ tier2: { effective: 'summarize', choice: 'summarize' } }, true],
+  [{ tier2: { effective: 'ask', choice: 'ask' } }, true],
+] as const) {
+  assert.deepEqual(
+    sharingNotes(block(ready(info(over)))),
+    { ...open, anonymousScope: scope },
+    JSON.stringify(over),
+  )
+}
 
 // Words and errors come from the existing keys; every code the commands can return has
 // its own sentence, and anything else reads as unavailable.

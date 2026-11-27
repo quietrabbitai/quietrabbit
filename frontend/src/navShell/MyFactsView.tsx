@@ -5,10 +5,14 @@
 //
 // WHAT IT DOES: browse (General, then sections with their facts as one flowing line),
 // search this Persona, open a fact (where it came from, earlier values), stop using a
-// fact or a section, and the Removed list with Use again. Add, change and the
-// Historian are items.id=961; sharing choices are items.id=960; the design record's
-// "Ask about this" therefore is not here, and stop using sits where it would have:
-// in a fact's panel and on a section's header.
+// fact or a section, and the Removed list with Use again. A catalogued General fact's
+// panel also has the Sharing block (items.id=960: FactSharing.tsx, factSharing.ts,
+// factSharingController.ts). Add, change and the Historian are items.id=961; the
+// design record's "Ask about this" therefore is not here, and stop using sits where
+// it would have: in a fact's panel and on a section's header.
+//
+// SHARING READS FAIL ON THEIR OWN: policies that cannot be read give a failed Sharing
+// block with a retry. The tree and Stop using stay usable.
 //
 // FAILS CLOSED: if the tree, the Removed list or a search cannot be read, the whole
 // view is one line and a retry. No partial tree is ever shown.
@@ -38,6 +42,14 @@ import {
   writeErrorText,
   type T,
 } from './myFactsFormat'
+import { FactSharing } from './FactSharing'
+import { sharingBlock } from './factSharing'
+import {
+  createSharingController,
+  INITIAL_SHARING,
+  type SharingController,
+  type SharingState,
+} from './factSharingController'
 import { StopUsingDialog } from './StopUsingDialog'
 import './MyFactsView.css'
 
@@ -70,6 +82,25 @@ export function MyFactsView({ personaId, personaName }: MyFactsViewProps) {
   const [notice, setNotice] = useState<string | null>(null)
   // Bumped after a write (and by retry) so everything is read again.
   const [reloadKey, setReloadKey] = useState(0)
+  const [sharing, setSharing] = useState<SharingState>(INITIAL_SHARING)
+  const sharingController = useRef<SharingController | null>(null)
+  useEffect(() => {
+    const controller = createSharingController(
+      {
+        get: () => commands.getFactPolicies(personaId),
+        set: (fieldName, tier, policy) =>
+          commands.setFactPolicy(personaId, fieldName, tier, policy),
+      },
+      setSharing,
+    )
+    sharingController.current = controller
+    return () => controller.dispose()
+  }, [personaId])
+  // Read again whenever the facts are (a stop or a use again). Declared after the
+  // effect above, so the controller exists.
+  useEffect(() => {
+    void sharingController.current?.load()
+  }, [personaId, reloadKey])
   const alive = useRef(true)
   useEffect(() => {
     alive.current = true
@@ -208,7 +239,7 @@ export function MyFactsView({ personaId, personaName }: MyFactsViewProps) {
   // never flashes back from an older search.
   const shown = searching ? (found?.key === `${reloadKey}|${trimmed}` ? found.tree : null) : tree
 
-  function factPanel(fact: FactView) {
+  function factPanel(fact: FactView, inGeneral: boolean) {
     const history = histories[fact.id]
     const source = provenanceText(tt, fact.provenance)
     const since = t('navShell.facts.since', { date: shortDate(fact.since) })
@@ -232,6 +263,18 @@ export function MyFactsView({ personaId, personaName }: MyFactsViewProps) {
             {t('navShell.facts.stop.fact')}
           </button>
         </div>
+        <FactSharing
+          block={sharingBlock(fact, inGeneral, sharing.load)}
+          fieldText={fieldLabel(tt, fact.label)}
+          busy={sharing.busy}
+          errorCode={
+            sharing.writeError?.field === fact.label ? sharing.writeError.code : null
+          }
+          onChoose={(tier, word) =>
+            void sharingController.current?.choose(fact.label, tier, word)
+          }
+          onRetry={() => void sharingController.current?.load()}
+        />
         {history === 'loading' && <p className="my-facts__muted">{t('navShell.facts.loading')}</p>}
         {history === 'error' && <p role="alert">{t('navShell.facts.earlierError')}</p>}
         {Array.isArray(history) && (
@@ -254,7 +297,7 @@ export function MyFactsView({ personaId, personaName }: MyFactsViewProps) {
     )
   }
 
-  function factLine(facts: FactView[]) {
+  function factLine(facts: FactView[], inGeneral: boolean) {
     const open = facts.find((f) => f.id === openFact)
     return (
       <>
@@ -268,7 +311,10 @@ export function MyFactsView({ personaId, personaName }: MyFactsViewProps) {
                   className="my-facts__fact"
                   data-fact=""
                   aria-expanded={openFact === fact.id}
-                  onClick={() => setOpenFact(openFact === fact.id ? null : fact.id)}
+                  onClick={() => {
+                    sharingController.current?.clearError()
+                    setOpenFact(openFact === fact.id ? null : fact.id)
+                  }}
                 >
                   <span className="my-facts__label">{fieldLabel(tt, fact.label)}</span>{' '}
                   {fact.value}
@@ -278,7 +324,7 @@ export function MyFactsView({ personaId, personaName }: MyFactsViewProps) {
             )
           })}
         </ul>
-        {open !== undefined && factPanel(open)}
+        {open !== undefined && factPanel(open, inGeneral)}
       </>
     )
   }
@@ -301,7 +347,7 @@ export function MyFactsView({ personaId, personaName }: MyFactsViewProps) {
           </button>
         </div>
         {section.facts.length > 0 ? (
-          factLine(section.facts)
+          factLine(section.facts, false)
         ) : (
           !searching && <p className="my-facts__muted">{t('navShell.facts.sectionEmpty')}</p>
         )}
@@ -320,7 +366,7 @@ export function MyFactsView({ personaId, personaName }: MyFactsViewProps) {
                 <span className="my-facts__type">{t('navShell.facts.generalSub')}</span>
               </h3>
             </div>
-            {factLine(visible.general)}
+            {factLine(visible.general, true)}
           </section>
         )}
         {nestSections(visible.sections).map((node) => (
