@@ -226,8 +226,73 @@
       "retryPlaceholder": "[PLACEHOLDER - Chat-BRAND] Retry"
     },
     "library": "Library",
+    "facts": {
+      "title": "What Quiet Rabbit has kept for {{persona}}",
+      "purpose": "The facts kept for this Persona.",
+      "loading": "Loading…",
+      "countOne": "1 fact",
+      "countOther": "{{count}} facts",
+      "general": "General",
+      "generalSub": "Facts that aren't about one person or thing",
+      "sectionEmpty": "No facts yet.",
+      "empty": "Nothing has been kept for {{persona}} yet.",
+      "unreadable": "Couldn't open this Persona's facts. Try again.",
+      "retry": "Try again",
+      "searchLabel": "Search {{persona}}",
+      "noMatches": "No matches in {{persona}}. Search only looks in this Persona.",
+      "since": "Since {{date}}",
+      "earlierOne": "1 earlier value",
+      "earlierOther": "{{count}} earlier values",
+      "earlierRange": "{{from}} to {{until}}",
+      "earlierError": "Couldn't open the earlier values.",
+      "tag": {
+        "medical": "Medical",
+        "financial": "Financial"
+      },
+      "field": {
+        "locationCity": "City",
+        "jobTitle": "Job title",
+        "employer": "Employer",
+        "industry": "Industry"
+      },
+      "source": {
+        "youConfirmed": "You confirmed this",
+        "youCorrected": "You corrected this",
+        "fromChat": "From a chat",
+        "found": "Found by Quiet Rabbit"
+      },
+      "stop": {
+        "fact": "Stop using this fact",
+        "section": "Stop using {{name}}",
+        "factTitle": "Stop using this fact?",
+        "sectionTitle": "Stop using {{name}}?",
+        "factBody": "Quiet Rabbit stops reading it from your facts for new work. It stays in your Removed list, so you can see what was there or use it again.",
+        "sectionBodyNone": "This section moves to your Removed list, so you can use it again.",
+        "sectionBodyOne": "Quiet Rabbit stops reading the 1 fact in this section for new work. The section moves to your Removed list, so you can use it again.",
+        "sectionBodyOther": "Quiet Rabbit stops reading the {{count}} facts in this section for new work. The section moves to your Removed list, so you can use it again.",
+        "insideOne": "1 section inside it will be hidden here, but it is not stopped: its facts can still be read, including when this Persona is shared. To stop it too, cancel and stop it first.",
+        "insideOther": "{{count}} sections inside it will be hidden here, but they are not stopped: their facts can still be read, including when this Persona is shared. To stop them too, cancel and stop each one first.",
+        "limits": "Chats and documents you already have keep what they say. Work that has already started may still use what you stop. Copies you've already shared with another Persona may keep it.",
+        "syncMayRestore": "This fact came from a shared Persona. It can come back the next time that Persona sends an update.",
+        "confirm": "Stop using",
+        "cancel": "Cancel"
+      },
+      "removed": {
+        "link": "Removed ({{count}})",
+        "title": "Removed",
+        "note": "These were stopped. They are kept so you can see what was there.",
+        "empty": "Nothing has been removed.",
+        "date": "Removed {{date}}",
+        "useAgain": "Use again",
+        "back": "Back to facts"
+      },
+      "error": {
+        "newer": "There's already a newer value for this, so the old one wasn't brought back.",
+        "gone": "That's no longer there. The list has been refreshed.",
+        "generic": "That didn't work. Try again."
+      }
+    },
     "content": {
-      "myFactsPlaceholder": "My Facts -- not yet built.",
       "chatPlaceholder": "Chat -- not yet wired for this screen.",
       "cloudChatUnavailable": "Choose a Persona to start chatting."
     },

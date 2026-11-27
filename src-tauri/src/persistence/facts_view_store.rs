@@ -105,6 +105,10 @@ pub struct FactView {
     pub since: String,
     /// How many earlier (end-dated) values the same label has.
     pub earlier_count: u32,
+    /// A General fact that a Persona sync wrote (source synced_share). The sync
+    /// re-inserts a General fact it still sends, so stopping this one may not last:
+    /// the view says so rather than claiming the stop holds.
+    pub sync_may_restore: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -314,6 +318,7 @@ fn fact_view(r: &Row_, earlier: &HashMap<(Option<String>, String), u32>) -> Fact
         sensitivity: r.sensitivity.clone(),
         provenance: provenance_of(&r.source),
         since: r.since.clone(),
+        sync_may_restore: r.entity_id.is_none() && r.source == "synced_share",
         earlier_count: earlier
             .get(&(r.entity_id.clone(), r.label.clone()))
             .copied()
@@ -441,7 +446,13 @@ pub async fn search_facts_conn(
         alias_hit.insert(r.try_get("id")?);
     }
 
-    let fact_hit = |f: &FactView| matches(&f.label, &needle) || matches(&f.value, &needle);
+    // A stored label like job_title is shown as "Job title", so the spaced form
+    // matches too.
+    let fact_hit = |f: &FactView| {
+        matches(&f.label, &needle)
+            || matches(&f.label.replace('_', " "), &needle)
+            || matches(&f.value, &needle)
+    };
     let general: Vec<FactView> = tree.general.into_iter().filter(|f| fact_hit(f)).collect();
     let parent_of: HashMap<String, Option<String>> = tree
         .sections

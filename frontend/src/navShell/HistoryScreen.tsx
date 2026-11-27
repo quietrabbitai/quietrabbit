@@ -35,6 +35,7 @@ import { useTranslation } from 'react-i18next'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { commands, type ChatInfo, type PersonaInfo } from '../bindings'
 import { LibraryPane } from '../library/LibraryPane'
+import { MyFactsView } from './MyFactsView'
 import { SharedLogView } from './SharedLogView'
 import { PersonaPillRow } from './persona/PersonaPillRow'
 import { usePersonaLocalFilter } from './persona/usePersonaLocalFilter'
@@ -210,7 +211,13 @@ export function HistoryScreen({
           (libraryFilter === null ? (
             <p className="history-screen__notice">{t('navShell.history.noPersonaSelected')}</p>
           ) : (
-            <p>{t('navShell.content.myFactsPlaceholder')}</p>
+            <MyFactsView
+              key={libraryFilter}
+              personaId={libraryFilter}
+              personaName={
+                personas.find((p) => p.id === libraryFilter)?.display_name ?? ''
+              }
+            />
           ))}
         {view === 'chatHistory' &&
           (libraryFilter === null ? (

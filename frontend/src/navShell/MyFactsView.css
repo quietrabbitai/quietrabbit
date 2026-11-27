@@ -1,0 +1,296 @@
+/* MyFactsView.tsx and StopUsingDialog.tsx -- items.id=959, the Facts view. Same
+ * convention as SharedLogView.css: consumes index.css's custom properties, declares
+ * no colors of its own (the overlay scrim matches that file's). Marks are text, never
+ * colour alone. */
+
+.my-facts {
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+}
+
+.my-facts__title {
+  font-size: 15px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.my-facts__muted {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.my-facts__toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.my-facts__search {
+  flex: 1 1 200px;
+  max-width: 320px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.my-facts__button,
+.my-facts__confirm {
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.my-facts__confirm {
+  border-color: var(--border-strong);
+  font-weight: 600;
+}
+
+.my-facts__button:hover {
+  background: var(--surface-hover);
+}
+
+.my-facts__button:disabled,
+.my-facts__confirm:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.my-facts__link {
+  border: none;
+  background: none;
+  padding: 2px 4px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.my-facts__unreadable,
+.my-facts__empty {
+  margin: 0;
+  padding: 12px 4px;
+  font-size: 13px;
+}
+
+.my-facts__notice {
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface-sunken);
+  font-size: 12px;
+}
+
+.my-facts__tree,
+.my-facts__removed {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.my-facts__section {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.my-facts__child {
+  margin: 8px 0 0 12px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+}
+
+.my-facts__section-head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 4px 12px;
+}
+
+.my-facts__section-name {
+  margin: 0;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.my-facts__type {
+  margin-left: 4px;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-muted);
+}
+
+.my-facts__line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  row-gap: 2px;
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.my-facts__pair {
+  display: flex;
+  align-items: baseline;
+  min-width: 0;
+}
+
+.my-facts__pair + .my-facts__pair::before {
+  content: '·';
+  padding: 0 4px;
+  color: var(--text-label);
+}
+
+.my-facts__fact {
+  padding: 2px 4px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.my-facts__fact:hover {
+  background: var(--surface-hover);
+}
+
+.my-facts__fact[aria-expanded='true'] {
+  border-color: var(--accent);
+  background: var(--accent-wash);
+}
+
+.my-facts__label {
+  color: var(--text-label);
+}
+
+.my-facts__tag {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.my-facts__panel {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface-sunken);
+}
+
+.my-facts__panel-value {
+  margin: 0;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.my-facts__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.my-facts__earlier {
+  margin: 0;
+  padding-left: 16px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.my-facts__removed-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.my-facts__removed-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.my-facts__removed-main {
+  margin: 0;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.my-facts__overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.my-facts__dialog {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(420px, 100%);
+  max-height: 100%;
+  overflow-y: auto;
+  padding: 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text);
+  text-align: left;
+}
+
+.my-facts__dialog-title {
+  margin: 0;
+  font-size: 14px;
+}
+
+.my-facts__dialog-body {
+  margin: 0;
+  font-size: 13px;
+}
+
+.my-facts__dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}

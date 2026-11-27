@@ -443,6 +443,27 @@ mod tests {
         );
     }
 
+    /// Only a General fact written by a Persona sync warns that a stop may not last.
+    #[tokio::test]
+    async fn only_a_synced_general_fact_warns_that_a_stop_may_not_last() {
+        let e = env().await;
+        let mut c = conn(&e, &e.a).await;
+        fact(&mut c, &e.a, None, "employer", "Acme", "synced_share").await;
+        fact(&mut c, &e.a, None, "industry", "Retail", "ipc").await;
+        let maya = entity(&mut c, "Maya", &[], None).await;
+        fact(&mut c, &e.a, Some(&maya), "City", "Leeds", "synced_share").await;
+        drop(c);
+        let t = tree(&e, &e.a).await.unwrap();
+        let flagged: Vec<_> = t
+            .general
+            .iter()
+            .chain(t.sections.iter().flat_map(|s| s.facts.iter()))
+            .filter(|f| f.sync_may_restore)
+            .map(|f| f.label.as_str())
+            .collect();
+        assert_eq!(flagged, ["employer"]);
+    }
+
     /// The mapping is closed: every other source value shows no line.
     #[test]
     fn provenance_maps_only_the_listed_sources() {
@@ -540,6 +561,7 @@ mod tests {
         let e = env().await;
         let mut c = conn(&e, &e.a).await;
         fact(&mut c, &e.a, None, "employer", "Acme Ltd", "ipc").await;
+        fact(&mut c, &e.a, None, "home_town", "York", "ipc").await;
         let maya = entity(&mut c, "Maya", &["Mimi", "100%_sis"], None).await;
         fact(&mut c, &e.a, Some(&maya), "City", "Leeds", "ipc").await;
         fact(&mut c, &e.a, Some(&maya), "Birthday", "14 July", "ipc").await;
@@ -566,6 +588,8 @@ mod tests {
         );
         // A General fact.
         assert_eq!(labels(&s("acme").await), ["employer"]);
+        // A stored field name also matches in its spaced form.
+        assert_eq!(labels(&s("home town").await), ["home_town"]);
         assert_eq!(s("acme").await.fact_count, 1);
         // No match.
         let none = s("zzz").await;

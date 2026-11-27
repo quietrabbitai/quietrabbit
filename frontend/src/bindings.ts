@@ -1709,6 +1709,12 @@ export type FactView = {
 	since: string,
 	/**  How many earlier (end-dated) values the same label has. */
 	earlier_count: number,
+	/**
+	 *  A General fact that a Persona sync wrote (source synced_share). The sync
+	 *  re-inserts a General fact it still sends, so stopping this one may not last:
+	 *  the view says so rather than claiming the stop holds.
+	 */
+	sync_may_restore: boolean,
 };
 
 export type FactsTree = {
