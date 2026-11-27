@@ -3,13 +3,15 @@
 // items.id=930 stage 4 (decisions.id=953 ruling 6): the user's own commands for the
 // DISCLOSURE POLICY of the closed catalogue of personal facts (location_city,
 // job_title, employer, industry): what each may do at the two external tiers when a
-// step that goes outside the device declares it. No UI is built by this item.
+// step that goes outside the device declares it. The screen over these commands is My
+// Facts' Sharing block (items.id=960).
 //
 //   get_fact_policies(persona_id)
 //       one entry per catalogued field: its label and sensitivity (the catalogue's),
 //       and for tier 2 and tier 3 the user's stored choice (None when none), the
 //       catalogue default, the EFFECTIVE policy the resolver gives today and whether
-//       the user may choose pass there. Read only.
+//       the user may choose pass there. Read only. Which tier's choice a STEP applies
+//       follows its destination (executor::to_gate_track_asks, items.id=960).
 //   set_fact_policy(persona_id, field_name, tier, policy)
 //       one (field, tier) choice. tier is the NUMBER 2 or 3: any other number is
 //       refused (invalid_tier), never mapped to omit. policy is a stored word: pass,
@@ -19,7 +21,8 @@
 //       other word are refused with nothing written). Returns the field's new entry.
 //
 // Persona-level, not Focus-level, and not collection-consent-gated: a user's own
-// choice always works. NOT wired into Gate 1 or any run: the bridge is items.id=931.
+// choice always works. The commands touch no run: the bridge (items.id=931) reads the
+// table.
 //
 // EVERY command: takes writer_gate::command first (a key rotation waits for it),
 // derives the user and the data key from the unlocked session through
@@ -28,14 +31,13 @@
 // so items.id=638 can lift it) and does its work in a *_for_session body with no
 // Tauri state, tested directly.
 //
-// ERROR CODES (ERROR_CODES, each with a placeholder key fact_policy.error.<code> in
+// ERROR CODES (ERROR_CODES, each with a key fact_policy.error.<code> in
 // the frontend's en.json, a test requires it): persona_not_found, unknown_field,
 // invalid_tier, invalid_policy, pass_not_allowed, tier3_not_selectable,
 // catalogue_unavailable, fact_policy_unavailable. The last is any store failure and
-// carries no detail. The wording is placeholder (Chat-BRAND). The user-facing words
-// share, describe and withhold are placeholder keys fact_policy.policy.<word> for the
-// stored words pass, summarize and omit (and ask, items.id=924: released only behind the
-// outbound review; it has no key yet, no screen offers it).
+// carries no detail. The user's words are fact_policy.policy.<word> for the stored
+// words pass, summarize, omit and ask (items.id=924: released only behind the outbound
+// review; no screen offers it, the Sharing block only replaces a stored one).
 
 use serde::Serialize;
 use specta::Type;
@@ -558,8 +560,8 @@ mod tests {
         }
     }
 
-    /// Every error code has a placeholder key in the frontend's en.json (Chat-BRAND
-    /// owns the wording), and so does every stored policy word.
+    /// Every error code has a key in the frontend's en.json (Chat-BRAND owns the
+    /// wording), and so does every stored policy word.
     #[test]
     fn every_error_code_and_policy_word_has_a_placeholder_key_in_en_json() {
         let json: serde_json::Value =

@@ -52,7 +52,7 @@ Key facts:
   relationship store.
 
 ## My Facts: browse, stop using, use again (items.id=959, decisions.id=968, 969)
-The Library's Facts button. Add and change are items.id=961, sharing choices items.id=960.
+The Library's Facts button. Add and change are items.id=961; sharing choices are the next section.
 - Code: commands/my_facts.rs (get_facts_tree, get_fact_history, search_facts, list_removed,
   stop_using_fact, stop_using_section, use_again_fact, use_again_section),
   persistence/facts_view_store.rs (reads only, a scan pins it), persistence/facts_stop_store.rs
@@ -125,3 +125,35 @@ The Library's Facts button. Add and change are items.id=961, sharing choices ite
 ### UI copy rule
 navShell.facts.* never says "QR", never promises that Quiet Rabbit will not use a stopped value, and
 states the limits above (myFactsFormat.test.ts pins it).
+
+## My Facts: sharing choices (items.id=960, decisions.id=953, 968 addendum 2)
+The Sharing block in a fact's panel, over get_fact_policies and set_fact_policy. How a stored choice
+applies to a step is in personal-fields.md ("WHICH CHOICE APPLIES").
+- Code (frontend navShell): factSharing.ts (pure: what the block is, which lines show, the partly
+  shared mark), factSharingController.ts (pure: read, write, re-read), FactSharing.tsx (controlled, no
+  state, no command), MyFactsView.tsx (one controller per Persona; binds the two commands). It is the
+  only writer of the policy in the app (a source pin). No DOM test runner: the wiring is pinned on source.
+- WHO HAS A BLOCK: a General fact whose STORED name is exactly one of the four catalogued names (the
+  bridge's own rule). "City" typed under General shows as "City" like location_city but has no block;
+  mapping a typed label to a catalogued name belongs to items.id=961. Nothing in the app creates a fact
+  under the four names yet, so the block shows only for rows that already exist.
+- FIXED, no control: FactView.copied_in (source_persona_id is not this Persona, a missing one included;
+  the bridge's test, NOT cross_persona_export), a sensitivity other than general or personal, or
+  not_permitted. The fact's own floors are decided before the policies load, so they hold when it fails.
+- ROUTES: anonymous (tier 2) offers Share when can_share, Describe, Keep back; signed-in (tier 3) offers
+  Describe and Keep back only. A control's value is `effective`, never `choice`. A stored ask (no screen
+  offers it) is shown as itself with buttons that replace it with Describe or Keep back.
+- FAILS CLOSED: an unreadable read, a missing entry or ONE word a route cannot hold fails the whole block:
+  a line and Try again, no control. The tree and Stop using stay usable. An unreadable policy table is
+  not distinguishable: the command answers choice omit, so the block shows Keep back and a write fails.
+- WRITES: no optimistic value. Every write is followed by a read, whatever it answered
+  (set_fact_policy can fail after storing); the write's returned entry is not used; a failed re-read drops
+  the old values; one write at a time per Persona; only the newest read applies; nothing after dispose.
+- A choice is per field NAME: it survives a new value and stop / use again. A run in progress takes the
+  STRICTER of its snapshot and the table before each hosted step; a parked run resumed after a
+  loosening builds its track again and takes the new choice.
+- COPY: navShell.facts.sharing.* and fact_policy.* (design record section 10a; en.json is the home).
+  Pinned: no "QR", no "always" or "never", no claim of where a value stays, no tier or digit; the limits
+  line (exact text, typed chat, other words, under four characters, this saved fact only) shows under
+  every fixed or choosable block; the anonymous scope note only while that choice is not Keep back; the
+  Describe note wherever Describe is offered.

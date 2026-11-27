@@ -312,7 +312,9 @@
           "replaceLabel": "Change to"
         },
         "loading": "Loading sharing choices…",
-        "failed": "Couldn't load your sharing choices. Try again."
+        "failed": "Couldn't load your sharing choices. Try again.",
+        "partly": "Partly shared",
+        "partlyTitle": "Some of this can go to cloud providers. Open it to see which."
       }
     },
     "content": {

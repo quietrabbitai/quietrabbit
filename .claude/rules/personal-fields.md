@@ -59,6 +59,18 @@ default OMIT at tiers 2 and 3) reaches Gate 1 at the user's disclosure policy.
   whatever the user says. ask (items.id=924, D7) releases the raw value only to a hosted step that gets the
   outbound review and only for a value of 4 or more characters, and the carry scan raises every occurrence
   with every answer; anywhere else it is omit, and at tier 3 it follows pass's rule.
+- WHICH CHOICE APPLIES (items.id=960 unit 0, decisions.id=968 addendum 2). The stored columns are tier2 (the
+  anonymous route) and tier3 (the signed-in route), but Gate 1 and the carry scan read a column by the
+  ABSTRACTION tier, max(min(Focus privacy tier, execution tier), 2) from tier 2 up. So for a BRIDGED field at
+  execution_tier 3 or more (a step that may reach signed-in providers), executor::to_gate_track_asks puts the
+  tier-3 word in BOTH columns, before ask is resolved, so both ask lists follow it: the destination's choice
+  applies at every privacy tier, and no pass or ask reaches such a step (the resolver, for a field that is
+  not tier3_selectable). gate1.rs and carry_scan.rs are unchanged. Consequences: with anonymous Keep back and
+  signed-in Describe the label is sent where the default privacy tier used to send nothing; an anonymous
+  Share has no effect on such a step, even when the provider picked is anonymous (the tier comes from the
+  ceiling); at privacy tier 1 (raw 1, abstraction 2) a declared bridged field with an anonymous Share counts
+  as floor clamped there and the step parks until the preference is saved; the gate1 row still records
+  abstraction_tier 2 beside execution_tier 3.
 - RE-READ. A run uses the INITIALIZE snapshot and execute_once reads fact_disclosure_policy AGAIN before
   Gate 1 for a hosted step that holds a bridged field, taking the STRICTER word of the two (not_permitted >
   omit, with unknown as omit > summarize > ask > pass, items.id=924; equal words keep the snapshot, so an explicit pass
@@ -89,7 +101,9 @@ default OMIT at tiers 2 and 3) reaches Gate 1 at the user's disclosure policy.
   attribute (local) or halt an external step, Gate 2 can flag a reply echoing a value (flag only), step and
   output sensitivity rise to personal, and checkpoint manifests carry name:value hashes. Local steps are
   otherwise unchanged.
-- NOT BUILT: UI and copy, group facts, bridging entity-scoped (device) facts into PersonalTrack (device
+- THE UI (items.id=960) is the Sharing block of My Facts: see "My Facts: sharing choices" in
+  entity-model.md.
+- NOT BUILT: group facts, bridging entity-scoped (device) facts into PersonalTrack (device
   values reach a hosted step through their own path since items.id=924), releasing medical,
   financial or cross-Persona facts, an end-to-end hosted call (the
   loopback client is not HTTPS). Hand checks for the live app are listed in the items.id=931 handoff.

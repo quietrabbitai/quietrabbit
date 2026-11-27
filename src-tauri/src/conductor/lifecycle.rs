@@ -8511,6 +8511,58 @@ mod tests {
         .await;
     }
 
+    /// items.id=960 (handoff 696 point e): a run parked with a completed step that used
+    /// the field, then resumed after the user LOOSENED the choice, builds its track
+    /// again and carries the new words. A policy is not in the checkpoint manifest, so
+    /// the resume is not stale. The executor's re-read before a hosted step takes the
+    /// stricter of this snapshot and the table, which are then equal.
+    #[tokio::test]
+    async fn a_parked_run_resumed_after_a_loosening_takes_the_new_choice() {
+        with_temp_data_root(async {
+            let (pool, run_id) = bridge_setup().await;
+            bridge_fact_row("job_title", "Staff Engineer", None, BRIDGE_PERSONA, false).await;
+            bridge_policy("job_title", "omit").await;
+            // Parks at `draft` after `earlier` used job_title under Keep back.
+            stale_check_checkpoint(&pool, &run_id, &["job_title"]).await;
+            {
+                let mut conn = crate::persistence::personal_store::open_personal_db(
+                    BRIDGE_USER,
+                    BRIDGE_PERSONA,
+                    RESUME_TEST_KEY_HEX,
+                )
+                .await
+                .unwrap();
+                for (tier, word) in [
+                    (crate::conductor::personal_fact_fields::Tier::Two, "pass"),
+                    (
+                        crate::conductor::personal_fact_fields::Tier::Three,
+                        "summarize",
+                    ),
+                ] {
+                    crate::persistence::fact_policy_store::set_fact_policy(
+                        &mut conn,
+                        "job_title",
+                        tier,
+                        word,
+                        "user",
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            let resumed = bridge_rehydrate(&pool, &run_id, Default::default()).await;
+            let job = bridged(&resumed, "job_title").unwrap();
+            assert_eq!(
+                (
+                    job.abstraction_tier2.as_str(),
+                    job.abstraction_tier3.as_str()
+                ),
+                ("pass", "summarize")
+            );
+        })
+        .await;
+    }
+
     /// A policy table that cannot be read gives omit for every bridged field (the run is
     /// not failed), and a value that fails the field validator keeps its CLEANED text in
     /// PersonalTrack.fields (Gate 2, the voice scan and sensitivity still read it, which

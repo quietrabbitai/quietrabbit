@@ -302,4 +302,14 @@ assert.deepEqual(
 assert.ok(flat.includes('factLine(visible.general, true)'))
 assert.ok(flat.includes('factLine(section.facts, false)'))
 
+// The line mark is the pure rule over the same block, and shows both approved words.
+assert.ok(
+  flat.includes(
+    'const partly = isPartlyShared(sharingBlock(fact, inGeneral, sharing.load))',
+  ),
+)
+assert.ok(flat.includes('{partly && ('))
+assert.ok(flat.includes("title={t('navShell.facts.sharing.partlyTitle')}"))
+assert.ok(flat.includes("{t('navShell.facts.sharing.partly')}"))
+
 console.log('factSharingController.test.ts: all assertions passed')

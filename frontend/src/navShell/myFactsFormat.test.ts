@@ -109,6 +109,51 @@ for (const s of strings) {
   assert.doesNotMatch(s, /delet/i, s)
   assert.doesNotMatch(s, /this computer/i, s)
 }
+// items.id=960: the Sharing block's words, navShell.facts.sharing.* and the
+// fact_policy.* keys it shows. They keep the rules above (walked again here for
+// fact_policy.*, which is outside navShell.facts) and four more: nothing is promised
+// with "always" or "never" (decisions.id=866: say what the user controls), no claim
+// of where a value stays, no tier and no digit, and no unqualified guarantee.
+const sharing: string[] = []
+const collect = (v: unknown) => {
+  if (typeof v === 'string') sharing.push(v)
+  else for (const child of Object.values(v as Record<string, unknown>)) collect(child)
+}
+collect(en.navShell.facts.sharing)
+collect(en.fact_policy)
+assert.equal(sharing.length, 18 + 12)
+for (const s of sharing) {
+  assert.doesNotMatch(s, /\bQR\b/, s)
+  assert.doesNotMatch(s, /won.t use|will not use|no longer uses?/i, s)
+  assert.doesNotMatch(s, /delet/i, s)
+  assert.doesNotMatch(s, /\b(always|never)\b/i, s)
+  assert.doesNotMatch(
+    s,
+    /this computer|this device|your (computer|device|machine)|on.device|\blocal/i,
+    s,
+  )
+  assert.doesNotMatch(s, /\btier|\d/i, s)
+  assert.doesNotMatch(s, /guarantee|\bcannot leave\b|\bprivate\b|\bsafe\b/i, s)
+}
+// What Keep back cannot catch is stated, and the fixed line claims no place.
+for (const limit of [
+  /exact text/,
+  /typed into a chat/,
+  /other words/,
+  /under four characters/,
+  /this saved fact only/,
+]) {
+  assert.match(t('navShell.facts.sharing.limits'), limit)
+}
+assert.equal(t('navShell.facts.sharing.fixed'), 'Kept back from cloud providers.')
+assert.equal(t('fact_policy.policy.omit'), 'Keep back')
+// Share on the anonymous route is scoped; Describe is a label, not the detail.
+assert.match(t('navShell.facts.sharing.anonymousScope'), /only when/)
+assert.match(t('navShell.facts.sharing.anonymousScope'), /follows your signed-in choice/)
+assert.match(t('navShell.facts.sharing.describeNote'), /only a label .* not the detail itself/)
+// A change is not claimed to wait for new work.
+assert.match(t('navShell.facts.sharing.next'), /can also reach work that has already started/)
+
 // The limits of a stop are stated.
 assert.match(t('navShell.facts.stop.limits'), /keep what they say/)
 assert.match(t('navShell.facts.stop.limits'), /already started may still use what you stop/)

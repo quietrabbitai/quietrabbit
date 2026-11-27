@@ -43,7 +43,7 @@ import {
   type T,
 } from './myFactsFormat'
 import { FactSharing } from './FactSharing'
-import { sharingBlock } from './factSharing'
+import { isPartlyShared, sharingBlock } from './factSharing'
 import {
   createSharingController,
   INITIAL_SHARING,
@@ -304,6 +304,8 @@ export function MyFactsView({ personaId, personaName }: MyFactsViewProps) {
         <ul className="my-facts__line">
           {facts.map((fact) => {
             const tag = sensitivityTag(tt, fact.sensitivity)
+            // No mark until the policies have been read: its absence says nothing.
+            const partly = isPartlyShared(sharingBlock(fact, inGeneral, sharing.load))
             return (
               <li key={fact.id} className="my-facts__pair">
                 <button
@@ -319,6 +321,14 @@ export function MyFactsView({ personaId, personaName }: MyFactsViewProps) {
                   <span className="my-facts__label">{fieldLabel(tt, fact.label)}</span>{' '}
                   {fact.value}
                   {tag !== null && <span className="my-facts__tag">{tag}</span>}
+                  {partly && (
+                    <span
+                      className="my-facts__tag"
+                      title={t('navShell.facts.sharing.partlyTitle')}
+                    >
+                      {t('navShell.facts.sharing.partly')}
+                    </span>
+                  )}
                 </button>
               </li>
             )
