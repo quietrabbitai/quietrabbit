@@ -70,12 +70,20 @@ The Library's Facts button. Add and change are items.id=961, sharing choices ite
   stop_scope ('fact' or 'section') into the row's extra_metadata. A marked row is never an earlier
   value (use again writes the same value back). A stopped section is status archived on the PARENT
   only, with stopped_at in the entity's extra_metadata, which also tells it from an archive made
-  elsewhere; its own facts share that timestamp. Children are never written.
+  elsewhere. Its facts AND the active facts of every descendant section (any status, never into an
+  owned entity) are end-dated with that one timestamp and scope 'section'. No descendant's status
+  or metadata is written (invariant 14); the end-dating is what stops the loaders below reading
+  them. SectionView.stop_fact_count is that same walk, and the confirm states it.
 - Use again: a NEW row (invariant 8) copying value, sensitivity, abstraction tiers, source and the
   three provenance columns. Refused newer_value_exists when the label has an active value; only the
   label's latest ended row can come back. A section restore is atomic and brings back only the facts
-  stopped with it. A stop and a use again flip a pristine entity to user_modified, which is what
-  keeps a persona sync from overwriting a stopped synced SECTION.
+  stopped with it, descendants' included, found by the shared timestamp and not by today's parent
+  chain; a fact or child section stopped on its own earlier stays stopped. A stop and a use again
+  flip each pristine entity whose facts they touch (the section always) to user_modified, which is
+  what keeps a persona sync from writing a stopped synced section's or descendant's facts back.
+- LIMITS of the cascade: it ends what is active at stop time. A fact written to a descendant later
+  is read as usual. use_again_section by id on a child stopped earlier still works while its parent
+  is stopped (the Removed list does not offer it), and its facts are then read.
 - Provenance words: user_confirmed, ipc, extract_confirm = "You confirmed this"; corrected,
   conversation, extracted have their own; anything else (interview, synced_share) shows none.
   Production writers set ipc (commands/personal.rs) and extract_confirm (conductor/extract.rs);
@@ -94,11 +102,11 @@ The Library's Facts button. Add and change are items.id=961, sharing choices ite
   view-sync fact loader and dedup. The one read of ended rows outside My Facts is
   entity_store::check_entity_cascade's superseded COUNT (no production caller). entity_purge counts
   and deletes owned rows only.
-- NOT cascaded: load_entity_facts_for_context and list_pending_cross_persona_exports do not read
-  entities.status, and persona share, sync and view-sync list status='active' entities one by one,
-  not by parent chain. So a CHILD of a stopped section is hidden in My Facts but its active facts
-  are still loaded and still shared. The stop-section confirm says so; do not claim otherwise
-  until those loaders apply invariant 14. (The Gate 1 bridge takes singletons only.)
+- Invariant 14 is NOT applied by the loaders: load_entity_facts_for_context and
+  list_pending_cross_persona_exports do not read entities.status, and persona share, sync and
+  view-sync list status='active' entities one by one, not by parent chain. A section stop therefore
+  stops its descendants' facts by end-dating them (above); a section archived by anything that does
+  NOT end-date them leaves them loaded and shared. (The Gate 1 bridge takes singletons only.)
 - Entity reads with no status filter: get_entity_conn by id (source_registry refresh verdict and
   mark-modified, persona_sync's exists check, dedup's load_record_conn), check_entity_cascade,
   source_registry::list_record_ids_for_source, entity_purge's owned-entity list.

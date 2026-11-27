@@ -823,8 +823,8 @@ mod tests {
             reads += 1;
         }
         assert_eq!(
-            reads, 3,
-            "the section loader, the alias search and the removed sections"
+            reads, 4,
+            "the section loader, the stop counts, the alias search and the removed sections"
         );
         assert!(!src.contains("entity_store::"), "no entity_store reader");
         assert!(
@@ -1095,9 +1095,9 @@ mod tests {
         );
     }
 
-    /// A stopped section: the PARENT only is archived, its own facts share one
-    /// timestamp, the child is untouched but hidden at read time, and the Removed list
-    /// shows the section with its fact count (the child is not listed alone).
+    /// A stopped section: the PARENT only is archived; its facts and its child's share
+    /// one timestamp; no child status is written; and the Removed list shows the
+    /// section with the whole count (the child is not listed alone).
     #[tokio::test]
     async fn stopping_a_section_archives_the_parent_only() {
         let e = env().await;
@@ -1109,7 +1109,7 @@ mod tests {
         let k1 = fact(&mut c, &e.a, Some(&kid), "Size", "Small", "ipc").await;
         drop(c);
 
-        assert_eq!(stop_section(&e, &e.a, &home).await.unwrap(), 2);
+        assert_eq!(stop_section(&e, &e.a, &home).await.unwrap(), 3);
 
         let mut c = conn(&e, &e.a).await;
         let parent: String = sqlx::query_scalar("SELECT status FROM entities WHERE id = ?")
@@ -1139,8 +1139,9 @@ mod tests {
                 .unwrap();
         let ent_meta: serde_json::Value = serde_json::from_str(&ent_meta).unwrap();
         assert_eq!(ent_meta["stopped_at"], stamp);
-        // The child's fact is still active.
-        assert!(meta(&mut c, &k1).await.get("stopped_at").is_none());
+        // The child's fact is ended with the same stamp and marker.
+        assert_eq!(meta(&mut c, &k1).await["stopped_at"], stamp);
+        assert_eq!(meta(&mut c, &k1).await["stop_scope"], "section");
         drop(c);
 
         assert!(tree(&e, &e.a).await.unwrap().sections.is_empty());
@@ -1148,11 +1149,241 @@ mod tests {
         assert_eq!(r.count, 1);
         assert!(r.facts.is_empty(), "its facts are listed with the section");
         assert_eq!(r.sections[0].name, "Home");
-        assert_eq!(r.sections[0].fact_count, 2);
+        assert_eq!(r.sections[0].fact_count, 3);
         assert_eq!(
             stop_section(&e, &e.a, &home).await.unwrap_err(),
             "section_not_found",
             "already stopped"
+        );
+    }
+
+    /// What the context loader and the cross-Persona export list would read, by value.
+    async fn read_by_loaders(e: &Env) -> (Vec<String>, Vec<String>) {
+        use crate::persistence::personal_store::{
+            list_pending_cross_persona_exports, load_entity_facts_for_context,
+        };
+        let mut context: Vec<String> = load_entity_facts_for_context(&e.user, &e.a, &e.key)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| f.field_value)
+            .collect();
+        let mut exports: Vec<String> = list_pending_cross_persona_exports(&e.user, &e.a, &e.key)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| f.field_value)
+            .collect();
+        context.sort();
+        exports.sort();
+        (context, exports)
+    }
+
+    /// A fact copied in from Persona B, so it is on the export list too.
+    async fn copied_fact(
+        c: &mut sqlx::SqliteConnection,
+        from: &str,
+        entity: &str,
+        label: &str,
+        value: &str,
+    ) -> String {
+        create_entity_fact_with_provenance_conn(
+            c,
+            Some(entity),
+            label,
+            value,
+            "personal",
+            "ipc",
+            from,
+            true,
+            Some(from),
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn entity_rows(c: &mut sqlx::SqliteConnection) -> Vec<(String, String, String)> {
+        sqlx::query_as("SELECT id, status, extra_metadata FROM entities ORDER BY id")
+            .fetch_all(c)
+            .await
+            .unwrap()
+    }
+
+    /// Stopping a section stops its child's and grandchild's facts being READ (the
+    /// context loader and the export list do not walk parents), writes no descendant's
+    /// status or metadata, and use again brings them back.
+    #[tokio::test]
+    async fn a_section_stop_ends_descendant_facts_and_use_again_returns_them() {
+        let e = env().await;
+        let mut c = conn(&e, &e.a).await;
+        let home = entity(&mut c, "Home", &[], None).await;
+        let kid = entity(&mut c, "Garden", &[], Some(&home)).await;
+        let grandkid = entity(&mut c, "Shed", &[], Some(&kid)).await;
+        let other = entity(&mut c, "Other", &[], None).await;
+        copied_fact(&mut c, &e.b, &home, "Address", "HOME").await;
+        copied_fact(&mut c, &e.b, &kid, "Size", "CHILD").await;
+        copied_fact(&mut c, &e.b, &grandkid, "Lock", "GRANDCHILD").await;
+        copied_fact(&mut c, &e.b, &other, "Note", "UNRELATED").await;
+        sqlx::query("UPDATE entities SET modification_state = 'pristine'")
+            .execute(&mut c)
+            .await
+            .unwrap();
+        let before = entity_rows(&mut c).await;
+        drop(c);
+        let all = ["CHILD", "GRANDCHILD", "HOME", "UNRELATED"];
+        let (context, exports) = read_by_loaders(&e).await;
+        assert_eq!(context, all);
+        assert_eq!(exports, all);
+
+        // The count the confirm states is the count the stop ends.
+        let t = tree(&e, &e.a).await.unwrap();
+        let counts: Vec<_> = t
+            .sections
+            .iter()
+            .map(|s| (s.name.as_str(), s.stop_fact_count))
+            .collect();
+        assert_eq!(
+            counts,
+            [("Home", 3), ("Garden", 2), ("Shed", 1), ("Other", 1)]
+        );
+        assert_eq!(stop_section(&e, &e.a, &home).await.unwrap(), 3);
+
+        let (context, exports) = read_by_loaders(&e).await;
+        assert_eq!(context, ["UNRELATED"]);
+        assert_eq!(exports, ["UNRELATED"]);
+        let r = removed(&e, &e.a).await;
+        assert_eq!((r.count, r.sections[0].fact_count), (1, 3));
+        assert!(r.facts.is_empty());
+
+        let mut c = conn(&e, &e.a).await;
+        let after = entity_rows(&mut c).await;
+        for (b, a) in before.iter().zip(&after) {
+            if b.0 == home {
+                assert_eq!(a.1, "archived");
+            } else {
+                assert_eq!(a, b, "no descendant status or metadata is written");
+            }
+        }
+        // Flipped so a persona sync holds them for review; the unrelated one is not.
+        let states: std::collections::HashMap<String, String> =
+            sqlx::query_as::<_, (String, String)>("SELECT id, modification_state FROM entities")
+                .fetch_all(&mut c)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
+        for id in [&home, &kid, &grandkid] {
+            assert_eq!(states[id], "user_modified");
+        }
+        assert_eq!(states[&other], "pristine");
+        drop(c);
+
+        assert_eq!(again_section(&e, &e.a, &home).await.unwrap(), 3);
+        let (context, exports) = read_by_loaders(&e).await;
+        assert_eq!(context, all);
+        assert_eq!(exports, all);
+        assert_eq!(removed(&e, &e.a).await.count, 0);
+    }
+
+    /// A child stopped earlier, with what is under it, stays stopped through the
+    /// parent's stop and use again.
+    #[tokio::test]
+    async fn a_child_stopped_earlier_stays_stopped_through_the_parents_use_again() {
+        let e = env().await;
+        let mut c = conn(&e, &e.a).await;
+        let home = entity(&mut c, "Home", &[], None).await;
+        let kid = entity(&mut c, "Garden", &[], Some(&home)).await;
+        let grandkid = entity(&mut c, "Shed", &[], Some(&kid)).await;
+        copied_fact(&mut c, &e.b, &home, "Address", "HOME").await;
+        copied_fact(&mut c, &e.b, &kid, "Size", "CHILD").await;
+        copied_fact(&mut c, &e.b, &grandkid, "Lock", "GRANDCHILD").await;
+        drop(c);
+
+        assert_eq!(stop_section(&e, &e.a, &kid).await.unwrap(), 2);
+        assert_eq!(stop_section(&e, &e.a, &home).await.unwrap(), 1);
+        assert!(read_by_loaders(&e).await.0.is_empty());
+        assert_eq!(again_section(&e, &e.a, &home).await.unwrap(), 1);
+
+        let (context, exports) = read_by_loaders(&e).await;
+        assert_eq!(context, ["HOME"]);
+        assert_eq!(exports, ["HOME"]);
+        let r = removed(&e, &e.a).await;
+        assert_eq!(r.sections.len(), 1);
+        assert_eq!(
+            (r.sections[0].name.as_str(), r.sections[0].fact_count),
+            ("Garden", 2)
+        );
+        assert_eq!(again_section(&e, &e.a, &kid).await.unwrap(), 2);
+        assert_eq!(read_by_loaders(&e).await.0, ["CHILD", "GRANDCHILD", "HOME"]);
+    }
+
+    /// A conflict in a DESCENDANT refuses the whole restore; a descendant moved since
+    /// the stop still comes back (the facts are found by the shared timestamp).
+    #[tokio::test]
+    async fn descendant_restore_is_atomic_and_follows_the_stamp_not_the_chain() {
+        let e = env().await;
+        let mut c = conn(&e, &e.a).await;
+        let home = entity(&mut c, "Home", &[], None).await;
+        let kid = entity(&mut c, "Garden", &[], Some(&home)).await;
+        fact(&mut c, &e.a, Some(&home), "Address", "HOME", "ipc").await;
+        fact(&mut c, &e.a, Some(&kid), "Size", "CHILD", "ipc").await;
+        drop(c);
+        stop_section(&e, &e.a, &home).await.unwrap();
+        let mut c = conn(&e, &e.a).await;
+        let newer = fact(&mut c, &e.a, Some(&kid), "Size", "NEWER", "ipc").await;
+        let before = count_facts(&mut c).await;
+        drop(c);
+        assert_eq!(
+            again_section(&e, &e.a, &home).await.unwrap_err(),
+            "newer_value_exists"
+        );
+        let mut c = conn(&e, &e.a).await;
+        assert_eq!(count_facts(&mut c).await, before, "no partial restore");
+        sqlx::query("UPDATE entity_facts SET valid_until = 'later' WHERE id = ?")
+            .bind(&newer)
+            .execute(&mut c)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE entities SET parent_entity_id = NULL WHERE id = ?")
+            .bind(&kid)
+            .execute(&mut c)
+            .await
+            .unwrap();
+        drop(c);
+        assert_eq!(again_section(&e, &e.a, &home).await.unwrap(), 2);
+        assert_eq!(read_by_loaders(&e).await.0, ["CHILD", "HOME"]);
+    }
+
+    /// The descendant walk never goes into a Focus-owned entity, and the stated count
+    /// does not include its facts.
+    #[tokio::test]
+    async fn a_section_stop_never_writes_an_owned_descendant() {
+        let e = env().await;
+        let mut c = conn(&e, &e.a).await;
+        let home = entity(&mut c, "Home", &[], None).await;
+        fact(&mut c, &e.a, Some(&home), "Address", "HOME", "ipc").await;
+        let dev = owned(&mut c, "Router").await;
+        sqlx::query("UPDATE entities SET parent_entity_id = ? WHERE id = ?")
+            .bind(&home)
+            .bind(&dev)
+            .execute(&mut c)
+            .await
+            .unwrap();
+        let dev_fact = fact(&mut c, &e.a, Some(&dev), "firmware", "FW", "ipc").await;
+        drop(c);
+        assert_eq!(tree(&e, &e.a).await.unwrap().sections[0].stop_fact_count, 1);
+        assert_eq!(stop_section(&e, &e.a, &home).await.unwrap(), 1);
+        let mut c = conn(&e, &e.a).await;
+        let until: Option<String> =
+            sqlx::query_scalar("SELECT valid_until FROM entity_facts WHERE id = ?")
+                .bind(&dev_fact)
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+        assert!(
+            until.is_none(),
+            "an owned entity's fact is never ended here"
         );
     }
 
@@ -1578,7 +1809,10 @@ mod tests {
                 n += 1;
             }
         }
-        assert_eq!(n, 3, "two entities UPDATEs and the restore SELECT");
+        assert_eq!(
+            n, 5,
+            "two entities UPDATEs, the descendant walk and the two restore SELECTs"
+        );
         for col in [
             "source_persona_id =",
             "cross_persona_export =",

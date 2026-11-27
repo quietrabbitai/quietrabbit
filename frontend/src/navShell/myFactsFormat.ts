@@ -87,8 +87,7 @@ export function nestSections(sections: SectionView[]): SectionNode[] {
   return nodes
 }
 
-/** How many sections sit anywhere inside `id`. Stopping `id` hides them but does not
- *  stop them, so the confirm names the number. */
+/** How many sections sit anywhere inside `id`. */
 export function descendantCount(sections: SectionView[], id: string): number {
   const inside = new Set([id])
   let count = 0
@@ -101,18 +100,19 @@ export function descendantCount(sections: SectionView[], id: string): number {
   return count
 }
 
-/** The sentence for a stop-section confirm: the section's own facts. */
-export function stopSectionBody(t: T, factCount: number): string {
+/** The sentence for a stop-section confirm. `factCount` is every fact the stop ends,
+ *  those of the sections inside included (SectionView.stop_fact_count). */
+export function stopSectionBody(t: T, factCount: number, hasInside: boolean): string {
+  if (hasInside) {
+    if (factCount === 0) return t('navShell.facts.stop.treeBodyNone')
+    return factCount === 1
+      ? t('navShell.facts.stop.treeBodyOne')
+      : t('navShell.facts.stop.treeBodyOther', { count: factCount })
+  }
   if (factCount === 0) return t('navShell.facts.stop.sectionBodyNone')
   return factCount === 1
     ? t('navShell.facts.stop.sectionBodyOne')
     : t('navShell.facts.stop.sectionBodyOther', { count: factCount })
-}
-
-export function stopSectionInside(t: T, count: number): string {
-  return count === 1
-    ? t('navShell.facts.stop.insideOne')
-    : t('navShell.facts.stop.insideOther', { count })
 }
 
 export function factCountText(t: T, count: number): string {

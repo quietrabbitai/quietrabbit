@@ -2919,7 +2919,10 @@ export type RemovedSection = {
 	entity_type: string,
 	name: string,
 	parent_id: string | null,
-	/**  Facts that were stopped together with the section (what use again restores). */
+	/**
+	 *  Facts that were stopped together with the section, its descendants' included
+	 *  (what use again restores).
+	 */
 	fact_count: number,
 	stopped_at: string,
 };
@@ -3092,6 +3095,11 @@ export type SectionView = {
 	/**  The parent section, or None for a top-level one. */
 	parent_id: string | null,
 	facts: FactView[],
+	/**
+	 *  How many facts stop using this section would end: its own active facts and
+	 *  those of every descendant section (what the confirm states).
+	 */
+	stop_fact_count: number,
 };
 
 export type SelectionInfoDto = {

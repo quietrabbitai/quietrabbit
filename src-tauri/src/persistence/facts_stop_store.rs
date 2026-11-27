@@ -9,9 +9,12 @@
 // entity, and a scan in my_facts.rs pins that no DELETE statement exists in this
 // file. Stop using marks (valid_until plus the stop marker, see facts_view_store);
 // use again starts a NEW active row (decisions.id=416 invariant 8), so history is
-// kept. Retirement is read-time: a stopped section sets status 'archived' on the
-// section ITSELF only, never on its children (invariant 14), and a child stopped on
-// its own stays stopped when its parent comes back.
+// kept. A stopped section sets status 'archived' on the section ITSELF only, never
+// on a descendant (invariant 14). But the context loader and the share and sync
+// loaders do not read the parent chain, so the stop ALSO end-dates the active facts
+// of every descendant section, under the same timestamp and section marker: that is
+// what stops them being read. A child stopped on its own has its own timestamp, so
+// it stays stopped when its parent comes back.
 //
 // WHICH ROWS A WRITE MAY TOUCH. Every write first resolves its id inside the
 // visible set that the read side uses (active, unowned, parent chain visible), so
@@ -124,8 +127,12 @@ pub async fn stop_fact_conn(
 }
 
 /// Stop using a visible section: status archived on the section ONLY, the stop
-/// marker on the entity, and the section's OWN active facts end-dated with one
-/// shared timestamp. Children are not written. Returns how many facts were ended.
+/// marker on that entity, and the active facts of the section AND of every
+/// descendant section end-dated with one shared timestamp and the section marker.
+/// No descendant's status or metadata is written. A descendant whose facts are
+/// ended is flipped pristine -> user_modified (as the section is), so a persona
+/// sync holds it for review instead of writing its facts back. Focus-owned
+/// entities are never walked into. Returns how many facts were ended.
 pub async fn stop_section_conn(
     conn: &mut SqliteConnection,
     section_id: &str,
@@ -156,16 +163,27 @@ pub async fn stop_section_conn(
             if n != 1 {
                 return Err(FactsViewError::SectionNotFound);
             }
-            let ended = sqlx::query(
-                "UPDATE entity_facts
-                 SET valid_until = ?,
-                     extra_metadata = json_set(CASE WHEN json_type(extra_metadata) = 'object' THEN extra_metadata ELSE '{}' END,
-                                               '$.stopped_at', ?, '$.stop_scope', 'section')
-                 WHERE entity_id = ? AND valid_until IS NULL",
-            )
-            .bind(&ts)
-            .bind(&ts)
+            // The section and its descendants that have something to end.
+            let touched: Vec<String> = sqlx::query_scalar(&format!(
+                "{SUBTREE}
+                 SELECT DISTINCT entity_id FROM entity_facts
+                 WHERE valid_until IS NULL AND entity_id IN (SELECT id FROM subtree)"
+            ))
             .bind(section_id)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(db)?;
+            let ended = sqlx::query(&format!(
+                "{SUBTREE}
+                 UPDATE entity_facts
+                 SET valid_until = ?,
+                     extra_metadata = json_set(CASE WHEN json_type(extra_metadata) = 'object' THEN extra_metadata ELSE '{{}}' END,
+                                               '$.stopped_at', ?, '$.stop_scope', 'section')
+                 WHERE valid_until IS NULL AND entity_id IN (SELECT id FROM subtree)"
+            ))
+            .bind(section_id)
+            .bind(&ts)
+            .bind(&ts)
             .execute(&mut *conn)
             .await
             .map_err(db)?
@@ -173,11 +191,24 @@ pub async fn stop_section_conn(
             mark_record_user_modified_conn(conn, section_id)
                 .await
                 .map_err(db)?;
+            for id in touched.iter().filter(|id| id.as_str() != section_id) {
+                mark_record_user_modified_conn(conn, id)
+                    .await
+                    .map_err(db)?;
+            }
             Ok(u32::try_from(ended).unwrap_or(u32::MAX))
         }
         .await
     })
 }
+
+/// The section bound first and every unowned entity under it, whatever its status
+/// (UNION, so a parent cycle ends).
+const SUBTREE: &str = "WITH RECURSIVE subtree(id) AS (
+    SELECT ?
+    UNION
+    SELECT e.id FROM entities e JOIN subtree s ON e.parent_entity_id = s.id
+    WHERE e.owner_focus IS NULL)";
 
 struct Stopped {
     id: String,
@@ -331,8 +362,10 @@ pub async fn use_again_fact_conn(
 }
 
 /// Use again a section WE stopped: status back to active, the stop marker removed,
-/// and a new active row for each fact ended at the section's shared timestamp (a
-/// fact stopped on its own earlier stays stopped). Atomic: a conflict (a value for
+/// and a new active row for each fact ended at the section's shared timestamp, in
+/// the section and in the descendants stopped with it (a fact or a child section
+/// stopped on its own earlier stays stopped). The facts are found by the shared
+/// timestamp, not by today's parent chain, so one moved since still comes back. Atomic: a conflict (a value for
 /// one of those labels already in use) refuses the whole restore with
 /// NewerValueExists and writes nothing. Returns how many facts came back.
 pub async fn use_again_section_conn(
@@ -354,12 +387,12 @@ pub async fn use_again_section_conn(
 
     let rows = sqlx::query(&format!(
         "SELECT {STOPPED_COLUMNS} FROM entity_facts
-         WHERE entity_id = ? AND valid_until = ?
+         WHERE valid_until = ?
            AND json_extract(extra_metadata, '$.stop_scope') = 'section'
            AND json_extract(extra_metadata, '$.stopped_at') = ?
-         ORDER BY field_name, id"
+           AND entity_id IN (SELECT id FROM entities WHERE owner_focus IS NULL)
+         ORDER BY entity_id, field_name, id"
     ))
-    .bind(section_id)
     .bind(&stopped_at)
     .bind(&stopped_at)
     .fetch_all(&mut *conn)
@@ -370,7 +403,7 @@ pub async fn use_again_section_conn(
         facts.push(stopped_from(r)?);
     }
     for s in &facts {
-        if active_exists(conn, Some(section_id), &s.label).await? {
+        if active_exists(conn, s.entity_id.as_deref(), &s.label).await? {
             return Err(FactsViewError::NewerValueExists);
         }
     }
@@ -403,9 +436,14 @@ pub async fn use_again_section_conn(
             if n != 1 {
                 return Err(FactsViewError::SectionNotFound);
             }
-            mark_record_user_modified_conn(conn, section_id)
-                .await
-                .map_err(db)?;
+            let mut touched: HashSet<&str> = facts
+                .iter()
+                .filter_map(|f| f.entity_id.as_deref())
+                .collect();
+            touched.insert(section_id);
+            for id in touched {
+                mark_record_user_modified_conn(conn, id).await.map_err(db)?;
+            }
             Ok(u32::try_from(facts.len()).unwrap_or(u32::MAX))
         }
         .await

@@ -119,6 +119,9 @@ pub struct SectionView {
     /// The parent section, or None for a top-level one.
     pub parent_id: Option<String>,
     pub facts: Vec<FactView>,
+    /// How many facts stop using this section would end: its own active facts and
+    /// those of every descendant section (what the confirm states).
+    pub stop_fact_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -326,12 +329,54 @@ fn fact_view(r: &Row_, earlier: &HashMap<(Option<String>, String), u32>) -> Fact
     }
 }
 
+/// For every unowned entity: the active facts in it and in everything under it. The
+/// same walk as the stop (facts_stop_store SUBTREE): any status, never into a
+/// Focus-owned entity.
+async fn subtree_active_counts(
+    conn: &mut SqliteConnection,
+) -> Result<impl Fn(&str) -> u32, FactsViewError> {
+    let links = sqlx::query("SELECT id, parent_entity_id FROM entities WHERE owner_focus IS NULL")
+        .fetch_all(&mut *conn)
+        .await?;
+    let mut children: HashMap<String, Vec<String>> = HashMap::new();
+    for r in &links {
+        if let Some(parent) = r.try_get::<Option<String>, _>("parent_entity_id")? {
+            children.entry(parent).or_default().push(r.try_get("id")?);
+        }
+    }
+    let counts = sqlx::query(
+        "SELECT entity_id, COUNT(*) AS n FROM entity_facts
+         WHERE valid_until IS NULL AND entity_id IS NOT NULL GROUP BY entity_id",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut own: HashMap<String, i64> = HashMap::new();
+    for r in &counts {
+        own.insert(r.try_get("entity_id")?, r.try_get("n")?);
+    }
+    Ok(move |root: &str| {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut stack = vec![root];
+        let mut total = 0i64;
+        while let Some(id) = stack.pop() {
+            if seen.insert(id) {
+                total += own.get(id).copied().unwrap_or(0);
+                if let Some(kids) = children.get(id) {
+                    stack.extend(kids.iter().map(String::as_str));
+                }
+            }
+        }
+        u32::try_from(total).unwrap_or(u32::MAX)
+    })
+}
+
 async fn load_tree(
     conn: &mut SqliteConnection,
 ) -> Result<(FactsTree, Vec<Ent>, Vec<Row_>), FactsViewError> {
     let ents = visible_entities(conn).await?;
     let ids: HashSet<&str> = ents.iter().map(|e| e.id.as_str()).collect();
     let (rows, earlier) = active_rows(conn, &ids).await?;
+    let stop_count = subtree_active_counts(conn).await?;
 
     let general: Vec<FactView> = rows
         .iter()
@@ -345,6 +390,7 @@ async fn load_tree(
             entity_type: e.entity_type.clone(),
             name: e.name.clone(),
             parent_id: e.parent_id.clone(),
+            stop_fact_count: stop_count(&e.id),
             facts: rows
                 .iter()
                 .filter(|r| r.entity_id.as_deref() == Some(e.id.as_str()))
@@ -534,7 +580,8 @@ pub struct RemovedSection {
     pub entity_type: String,
     pub name: String,
     pub parent_id: Option<String>,
-    /// Facts that were stopped together with the section (what use again restores).
+    /// Facts that were stopped together with the section, its descendants' included
+    /// (what use again restores).
     pub fact_count: u32,
     pub stopped_at: String,
 }
@@ -593,16 +640,15 @@ pub async fn list_removed_conn(conn: &mut SqliteConnection) -> Result<RemovedLis
     }
 
     let mut facts: Vec<RemovedFact> = Vec::new();
-    let mut section_fact_count: HashMap<(String, String), u32> = HashMap::new();
+    // Facts ended together with a section stop, by its shared timestamp: they can sit
+    // in the section or in any descendant of it.
+    let mut section_fact_count: HashMap<String, u32> = HashMap::new();
     for ((entity_id, label), group) in &by_key {
-        // Facts ended together with a section, by (section, stamp).
-        if let Some(eid) = entity_id {
+        if entity_id.is_some() {
             for r in group {
                 if let Some((at, scope)) = &r.marker {
                     if scope == SCOPE_SECTION {
-                        *section_fact_count
-                            .entry((eid.clone(), at.clone()))
-                            .or_insert(0) += 1;
+                        *section_fact_count.entry(at.clone()).or_insert(0) += 1;
                     }
                 }
             }
@@ -663,10 +709,7 @@ pub async fn list_removed_conn(conn: &mut SqliteConnection) -> Result<RemovedLis
         }
         let id: String = r.try_get("id")?;
         let stopped_at: String = r.try_get("stopped_at")?;
-        let fact_count = section_fact_count
-            .get(&(id.clone(), stopped_at.clone()))
-            .copied()
-            .unwrap_or(0);
+        let fact_count = section_fact_count.get(&stopped_at).copied().unwrap_or(0);
         sections.push(RemovedSection {
             id,
             entity_type: r.try_get("entity_type")?,

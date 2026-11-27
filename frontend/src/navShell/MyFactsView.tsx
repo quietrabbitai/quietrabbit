@@ -35,7 +35,6 @@ import {
   sensitivityTag,
   shortDate,
   stopSectionBody,
-  stopSectionInside,
   writeErrorText,
   type T,
 } from './myFactsFormat'
@@ -409,11 +408,9 @@ export function MyFactsView({ personaId, personaName }: MyFactsViewProps) {
       if (target.fact.sync_may_restore) lines.push(t('navShell.facts.stop.syncMayRestore'))
       return lines
     }
-    const lines = [stopSectionBody(tt, target.section.facts.length)]
-    const inside = descendantCount(tree.sections, target.section.id)
-    if (inside > 0) lines.push(stopSectionInside(tt, inside))
-    lines.push(limits)
-    return lines
+    const { id, facts, stop_fact_count: count } = target.section
+    const hasInside = descendantCount(tree.sections, id) > 0 || count > facts.length
+    return [stopSectionBody(tt, count, hasInside), limits]
   }
 
   return (

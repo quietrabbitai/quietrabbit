@@ -16,7 +16,6 @@ import {
   provenanceText,
   sensitivityTag,
   stopSectionBody,
-  stopSectionInside,
   writeErrorText,
   type T,
 } from './myFactsFormat.ts'
@@ -38,6 +37,7 @@ const section = (id: string, parent: string | null): SectionView => ({
   name: id,
   parent_id: parent,
   facts: [],
+  stop_fact_count: 0,
 })
 
 // Labels.
@@ -75,13 +75,18 @@ assert.equal(descendantCount(flat, 'a'), 2)
 assert.equal(descendantCount(flat, 'b'), 1)
 assert.equal(descendantCount(flat, 'd'), 0)
 
-// A section stop states its own facts, and says sections inside are NOT stopped.
-assert.match(stopSectionBody(t, 1), /the 1 fact/)
-assert.match(stopSectionBody(t, 3), /3 facts/)
-assert.ok(stopSectionBody(t, 0).length > 0)
-for (const text of [stopSectionInside(t, 1), stopSectionInside(t, 2)]) {
-  assert.match(text, /not stopped/)
-  assert.match(text, /can still be read/)
+// A section stop states every fact it ends, and says when sections inside go too.
+assert.match(stopSectionBody(t, 1, false), /the 1 fact in this section for/)
+assert.match(stopSectionBody(t, 3, false), /the 3 facts in this section for/)
+assert.match(stopSectionBody(t, 1, true), /the 1 fact in this section and the sections inside it/)
+assert.match(stopSectionBody(t, 5, true), /the 5 facts in this section and the sections inside it/)
+assert.match(stopSectionBody(t, 0, true), /sections inside it/)
+assert.doesNotMatch(stopSectionBody(t, 0, false), /inside/)
+// No sentence says a section inside is left running.
+for (const inside of [true, false]) {
+  for (const n of [0, 1, 2]) {
+    assert.doesNotMatch(stopSectionBody(t, n, inside), /not stopped|can still be read/)
+  }
 }
 
 assert.equal(writeErrorText(t, 'newer_value_exists'), t('navShell.facts.error.newer'))
