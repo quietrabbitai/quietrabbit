@@ -596,10 +596,13 @@ impl StepExecutor {
         };
         // items.id=924 (D7): an ask field is released raw only to a hosted step that
         // gets the outbound review, whose carry scan then raises it.
+        // items.id=960 unit 0: the destination's execution tier decides which choice a
+        // bridged field applies, whichever column the abstraction level then reads.
         let (gate_track, asked_by_tier) = to_gate_track_asks(
             personal_track,
             fresh_policies.as_ref(),
             treatment.hosted && ctx.bound.is_none(),
+            treatment.execution_tier,
         );
         let asked_fields: &[String] = if treatment.abstraction_tier >= 3 {
             &asked_by_tier[1]
@@ -3328,7 +3331,7 @@ fn to_gate_track(ct: &PersonalTrack) -> GateTrack {
 /// to_gate_track_asks for a step that releases no ask field (ask is omit).
 #[cfg(test)]
 fn to_gate_track_with(ct: &PersonalTrack, fresh: Option<&UserPolicies>) -> GateTrack {
-    to_gate_track_asks(ct, fresh, false).0
+    to_gate_track_asks(ct, fresh, false, 2).0
 }
 
 /// The user's fact policies, read again for one step (items.id=931). Any failure to
@@ -3368,10 +3371,20 @@ async fn reload_fact_policies(ctx: &StepContext) -> UserPolicies {
 /// run) and its value has at least carry_scan::MIN_VALUE_CHARS characters (so the scan can
 /// find it); otherwise it is omit. The names released that way, per tier [2, 3], are
 /// returned for the carry scan, which raises every occurrence in the review.
+///
+/// items.id=960 unit 0 (decisions.id=968 addendum 2, decisions.id=953 addendum of
+/// 2026-11-27): the column Gate 1 and the carry scan read follows the ABSTRACTION tier,
+/// max(min(Focus privacy tier, execution tier), 2), not the destination. So when
+/// `execution_tier` is 3 or more (a step that may reach a signed-in provider), a bridged
+/// field takes its tier-3 word in BOTH columns, and `ask` is resolved from that word, so
+/// both ask lists agree. The resolver never gives pass or ask at tier 3 for a field that
+/// is not tier3_selectable (no v1 field is). A field that is not bridged, and any step
+/// below execution tier 3, is mapped as before.
 fn to_gate_track_asks(
     ct: &PersonalTrack,
     fresh: Option<&UserPolicies>,
     ask_releases: bool,
+    execution_tier: u8,
 ) -> (GateTrack, [Vec<String>; 2]) {
     use crate::conductor::personal_fact_bridge::{is_bridged, resolve_word, stricter};
     use crate::conductor::personal_fact_fields::{registry, Origin, Tier};
@@ -3421,6 +3434,13 @@ fn to_gate_track_asks(
                 field.abstraction_tier2.clone(),
                 field.abstraction_tier3.clone(),
             )
+        };
+        // items.id=960 unit 0: the destination's choice (see above). BEFORE ask is
+        // resolved, so the ask lists follow the same words as the columns.
+        let tier2 = if bridged && execution_tier >= 3 {
+            tier3.clone()
+        } else {
+            tier2
         };
         let scannable =
             field.field_value.chars().count() >= crate::conductor::carry_scan::MIN_VALUE_CHARS;
@@ -13453,12 +13473,12 @@ mod tests {
     fn ask_is_released_only_where_the_review_raises_it() {
         let pt = bridged_track_with(&[("location_city", "Leeds")], Some("ask"), "personal");
         let field = |gt: &GateTrack| gt.fields().get("location_city").unwrap().clone();
-        let (gt, asked) = to_gate_track_asks(&pt, None, true);
+        let (gt, asked) = to_gate_track_asks(&pt, None, true, 2);
         assert_eq!(field(&gt).abstraction_tier2, AbstractionPolicy::Pass);
         assert_eq!(asked[0], ["location_city"]);
         assert_eq!(field(&gt).abstraction_tier3, AbstractionPolicy::Omit);
         assert!(asked[1].is_empty());
-        let (gt, asked) = to_gate_track_asks(&pt, None, false);
+        let (gt, asked) = to_gate_track_asks(&pt, None, false, 2);
         assert_eq!(field(&gt).abstraction_tier2, AbstractionPolicy::Omit);
         assert!(asked[0].is_empty());
         assert_eq!(
@@ -13552,6 +13572,260 @@ mod tests {
             assert_eq!(rows[0].fields_withheld, ["job_title"]);
         })
         .await;
+    }
+
+    /// A step's catalogue word as the prompt shows it.
+    fn shown(word: Option<&str>) -> &'static str {
+        match word {
+            Some("pass") => "Role: Staff Engineer End",
+            Some("summarize") => "Role: personal job title information End",
+            _ => "Role:  End",
+        }
+    }
+
+    /// Every Focus privacy tier against every external ceiling: the prompt and the
+    /// gate1 row follow the DESTINATION's choice (the anonymous one at execution tier
+    /// 2, the signed-in one at 3), so the raw value is in the prompt iff the
+    /// destination's choice is pass. The writer refuses pass at tier 3, so no signed-in
+    /// pair here holds it (see the next test).
+    #[tokio::test]
+    async fn a_bridged_field_applies_the_destinations_choice_at_every_privacy_tier() {
+        let pairs: [(Option<&str>, Option<&str>); 7] = [
+            (Some("pass"), None),
+            (Some("pass"), Some("omit")),
+            (Some("pass"), Some("summarize")),
+            (Some("omit"), Some("summarize")),
+            (Some("summarize"), None),
+            (Some("summarize"), Some("omit")),
+            (None, Some("summarize")),
+        ];
+        let mut cases = 0;
+        let mut raw_sent = 0;
+        for privacy_tier in [1u8, 2, 3] {
+            for access in [
+                ExternalAccess::AnonymousRequired,
+                ExternalAccess::AnonymousPreferred,
+                ExternalAccess::Unrestricted,
+            ] {
+                for (tier2, tier3) in pairs {
+                    let sent_raw = with_temp_shared_db(|pool| async move {
+                        let (prompt, gateway) =
+                            destination_run(&pool, privacy_tier, access, tier2, tier3).await;
+                        let signed_in = access != ExternalAccess::AnonymousRequired;
+                        let word = if signed_in { tier3 } else { tier2 };
+                        let case = format!(
+                            "privacy={privacy_tier} access={access:?} tier2={tier2:?} \
+                             tier3={tier3:?}"
+                        );
+                        assert_eq!(prompt.as_deref(), Some(shown(word)), "{case}");
+                        let rows = gate1_entries(&gateway);
+                        assert_eq!(
+                            rows[0].fields_shared.len(),
+                            usize::from(word == Some("pass")),
+                            "{case}"
+                        );
+                        prompt.is_some_and(|p| p.contains("Staff Engineer"))
+                    })
+                    .await;
+                    cases += 1;
+                    raw_sent += usize::from(sent_raw);
+                }
+            }
+        }
+        assert_eq!(cases, 3 * 3 * 7);
+        // The three pairs with an anonymous pass, at the anonymous-only ceiling, at
+        // each of the three privacy tiers, and nowhere else.
+        assert_eq!(raw_sent, 3 * 3);
+    }
+
+    /// Pass is never possible for a signed-in-capable step, even when a pass the writer
+    /// would refuse is already stored in the tier-3 column.
+    #[tokio::test]
+    async fn a_stored_signed_in_pass_never_releases_the_raw_value() {
+        use crate::persistence::fact_policy_store::{FactPolicyRow, UserPolicies};
+        let row = FactPolicyRow {
+            field_name: "job_title".to_owned(),
+            tier2: Some("pass".to_owned()),
+            tier3: Some("pass".to_owned()),
+            set_at: String::new(),
+            set_by: "user".to_owned(),
+        };
+        let policies = UserPolicies::Rows(vec![row]);
+        let pt = track_from(&[("job_title", "Staff Engineer")], &policies);
+        for fresh in [None, Some(&policies)] {
+            let (gt, asked) = to_gate_track_asks(&pt, fresh, true, 3);
+            let f = gt.fields().get("job_title").unwrap();
+            assert_eq!(f.abstraction_tier2, AbstractionPolicy::Omit);
+            assert_eq!(f.abstraction_tier3, AbstractionPolicy::Omit);
+            assert!(asked[0].is_empty() && asked[1].is_empty());
+        }
+    }
+
+    /// The mapping alone: from execution tier 3 up, a bridged field holds the tier-3
+    /// word in both columns. Below it (a local step, an anonymous-only step) each
+    /// column keeps its own word, and a field that is not bridged is never touched.
+    #[test]
+    fn only_a_bridged_field_at_execution_tier_three_takes_the_signed_in_word() {
+        use crate::persistence::fact_policy_store::{FactPolicyRow, UserPolicies};
+        let policies = UserPolicies::Rows(vec![FactPolicyRow {
+            field_name: "job_title".to_owned(),
+            tier2: Some("pass".to_owned()),
+            tier3: Some("summarize".to_owned()),
+            set_at: String::new(),
+            set_by: "user".to_owned(),
+        }]);
+        let mut pt = track_from(&[("job_title", "Staff Engineer")], &policies);
+        pt.add_field(crate::conductor::types::PersonalField {
+            field_name: "ordinary".to_owned(),
+            field_value: "plain".to_owned(),
+            sensitivity: "personal".to_owned(),
+            sensitivity_severity: 2,
+            source_id: "personal-specialist".to_owned(),
+            abstraction_tier2: "pass".to_owned(),
+            abstraction_tier3: "omit".to_owned(),
+        })
+        .unwrap();
+        for execution_tier in [1u8, 2, 3, 4] {
+            let (gt, _) = to_gate_track_asks(&pt, None, true, execution_tier);
+            let f = |n: &str| gt.fields().get(n).unwrap();
+            let anonymous = if execution_tier >= 3 {
+                AbstractionPolicy::Summarize
+            } else {
+                AbstractionPolicy::Pass
+            };
+            assert_eq!(
+                f("job_title").abstraction_tier2,
+                anonymous,
+                "{execution_tier}"
+            );
+            assert_eq!(
+                f("job_title").abstraction_tier3,
+                AbstractionPolicy::Summarize
+            );
+            assert_eq!(f("ordinary").abstraction_tier2, AbstractionPolicy::Pass);
+            assert_eq!(f("ordinary").abstraction_tier3, AbstractionPolicy::Omit);
+        }
+    }
+
+    /// The carry scan's shape at execution tier 3, run under the Focus privacy tier
+    /// `privacy_tier`: a hosted step after a local reply that carries location_city,
+    /// with the user's own text naming it too.
+    async fn signed_in_carry(
+        pool: &sqlx::SqlitePool,
+        privacy_tier: u8,
+        tier2: &str,
+        tier3: Option<&str>,
+    ) -> HostedSeen {
+        use crate::conductor::personal_fact_fields::Tier;
+        use crate::persistence::fact_policy_store::{FactPolicyRow, UserPolicies};
+        let mut ctx = carried_hosted_ctx(pool, Some(tier2)).await;
+        if let Some(w) = tier3 {
+            let mut conn = crate::persistence::personal_store::open_personal_db(
+                &ctx.user_id,
+                &ctx.persona_id,
+                &ctx.key_hex,
+            )
+            .await
+            .expect("personal.db opens in the fixture");
+            crate::persistence::fact_policy_store::set_fact_policy(
+                &mut conn,
+                "location_city",
+                Tier::Three,
+                w,
+                "user",
+            )
+            .await
+            .unwrap();
+        }
+        let access = ExternalAccess::AnonymousPreferred;
+        ctx.step.routing_tier = access;
+        ctx.step.external_access_override = Some(access);
+        ctx.focus_external_access = access;
+        ctx.effective_access = access;
+        ctx.execution_tier = 3;
+        ctx.raw_abstraction = privacy_tier.min(3);
+        ctx.abstraction_tier = ctx.raw_abstraction.max(2);
+        ctx.external_input = "I commute in leeds".to_owned();
+        let snapshot = UserPolicies::Rows(vec![FactPolicyRow {
+            field_name: "location_city".to_owned(),
+            tier2: Some(tier2.to_owned()),
+            tier3: tier3.map(str::to_owned),
+            set_at: String::new(),
+            set_by: "user".to_owned(),
+        }]);
+        let pt = track_from(&[("location_city", "Leeds")], &snapshot);
+        run_hosted_after(
+            &ctx,
+            pool,
+            &pt,
+            track_with_requirements("A road bike for LEEDS hills."),
+        )
+        .await
+    }
+
+    /// The carry scan follows the same words. With the anonymous choice at pass, a
+    /// signed-in-capable step at Keep back raises the carried and typed value with no
+    /// suggestion, and at Describe with the fixed label.
+    #[tokio::test]
+    async fn the_carry_scan_follows_the_destinations_choice() {
+        for privacy_tier in [2u8, 3] {
+            for (tier3, label) in [
+                (None, None),
+                (
+                    Some("summarize"),
+                    Some("personal location city information"),
+                ),
+            ] {
+                with_temp_shared_db(|pool| async move {
+                    let seen = signed_in_carry(&pool, privacy_tier, "pass", tier3).await;
+                    assert_eq!(seen.prompts.len(), 1);
+                    assert!(
+                        seen.prompts[0]
+                            .ends_with(&format!("Region: {}", label.unwrap_or("")).trim_end()),
+                        "{}",
+                        seen.prompts[0]
+                    );
+                    assert_eq!(span_texts(&seen), ["LEEDS", "leeds"]);
+                    for s in &seen.sources {
+                        assert_eq!(s.suggestion.as_deref(), label);
+                    }
+                })
+                .await;
+            }
+        }
+    }
+
+    /// The ask list follows too. An ask chosen for anonymous services releases nothing
+    /// to a signed-in-capable step whose own choice is Describe: the label is rendered,
+    /// the value is not, and the typed and carried copies are raised once each as
+    /// carried values with the label, never as released-by-ask spans.
+    #[tokio::test]
+    async fn an_anonymous_ask_releases_nothing_to_a_signed_in_capable_step() {
+        for privacy_tier in [2u8, 3] {
+            with_temp_shared_db(|pool| async move {
+                let seen = signed_in_carry(&pool, privacy_tier, "ask", Some("summarize")).await;
+                assert_eq!(
+                    seen.prompts,
+                    [
+                        "Requirements: A road bike for LEEDS hills.\nUser: I commute in leeds\n\
+                      Region: personal location city information"
+                    ]
+                );
+                assert_eq!(span_texts(&seen), ["LEEDS", "leeds"]);
+                for s in &seen.sources {
+                    assert_eq!(
+                        s.suggestion.as_deref(),
+                        Some("personal location city information")
+                    );
+                }
+            })
+            .await;
+        }
+        let pt = bridged_track_with(&[("location_city", "Leeds")], Some("ask"), "personal");
+        let (gt, asked) = to_gate_track_asks(&pt, None, true, 3);
+        assert!(asked[0].is_empty() && asked[1].is_empty(), "{asked:?}");
+        let f = gt.fields().get("location_city").unwrap();
+        assert_eq!(f.abstraction_tier2, AbstractionPolicy::Omit);
     }
 
     /// Plan item 4, the crossing. A LOCAL step that declares location_city now renders
