@@ -159,5 +159,10 @@ assert.match(t('navShell.facts.stop.limits'), /keep what they say/)
 assert.match(t('navShell.facts.stop.limits'), /already started may still use what you stop/)
 assert.match(t('navShell.facts.stop.limits'), /shared/)
 assert.match(t('navShell.facts.stop.syncMayRestore'), /can come back/)
+// items.id=962, 964: a stop holds until the sharing side writes the fact anew, so
+// the next update alone is not what brings it back.
+assert.match(t('navShell.facts.stop.syncMayRestore'), /Removed list/)
+assert.match(t('navShell.facts.stop.syncMayRestore'), /changes it or saves it again/)
+assert.doesNotMatch(t('navShell.facts.stop.syncMayRestore'), /next time that Persona sends an update/)
 
 console.log('myFactsFormat.test.ts: all assertions passed')

@@ -274,7 +274,7 @@
         "treeBodyOne": "Quiet Rabbit stops reading the 1 fact in this section and the sections inside it for new work. They move to your Removed list, so you can use them again.",
         "treeBodyOther": "Quiet Rabbit stops reading the {{count}} facts in this section and the sections inside it for new work. They move to your Removed list, so you can use them again.",
         "limits": "Chats and documents you already have keep what they say. Work that has already started may still use what you stop. Copies you've already shared with another Persona may keep it.",
-        "syncMayRestore": "This fact came from a shared Persona. It can come back the next time that Persona sends an update.",
+        "syncMayRestore": "This fact came from a shared Persona. It stays in your Removed list unless the Persona that shared it changes it or saves it again. Then it can come back to your facts in that Persona's next update.",
         "confirm": "Stop using",
         "cancel": "Cancel"
       },
