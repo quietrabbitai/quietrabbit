@@ -12,6 +12,7 @@ pub mod final_failure;
 pub mod group_sync;
 pub mod hardware_probe;
 pub mod ipc;
+pub mod moving_day;
 pub mod ollama_ownership;
 pub mod ollama_sidecar;
 pub mod ollama_spawn_thread;

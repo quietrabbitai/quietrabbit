@@ -48,9 +48,13 @@ on:
 env:
   CI_RUST_TOOLCHAIN: "1.97.1"
   CI_SQLCIPHER_VERSION: "v4.14.0"
+  # age and expect (items.id=966) are for `check`'s stock-age interop test. They
+  # sit in the shared list so clippy and check need the same .deb set and do not
+  # replace each other's apt cache entry.
   CI_APT_PACKAGES: >-
     libwebkit2gtk-4.1-dev build-essential curl wget file libssl-dev
     libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+    age expect
 
 jobs:
   # fmt + cargo-deny (items.id=787): neither compiles the crate, so this job
@@ -243,8 +247,12 @@ jobs:
     # variables into its key, so the first run after this change is a cold build.
     # Set in `check` ONLY: `cargo clippy` emits no debuginfo, so the same value in
     # `clippy` would only invalidate its cache for no gain.
+    # items.id=966 (decisions.id=972): src-tauri/tests/moving_day_age_interop.rs
+    # skips when `age` or `expect` is missing, EXCEPT with this set, where it
+    # fails, so it cannot pass silently here.
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      QR_REQUIRE_STOCK_AGE: "1"
     steps:
       - uses: actions/checkout@v4
 

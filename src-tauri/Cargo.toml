@@ -314,6 +314,15 @@ serde-saphyr = { version = "1.3.0", default-features = false, features = ["deser
 # kdf golden-vector tests re-run. MIT OR Apache-2.0.
 unicode-normalization = "=0.1.25"
 
+# items.id=966 (decisions.id=971 J1, 972): the age v1 passphrase format inside
+# the QRMEMORY 1 container (moving_day::container), and nothing else of age: the
+# two deny.toml ignores that come with this crate depend on that, and a source
+# scan in moving_day pins it. Pinned EXACTLY (age calls itself beta): the files
+# it writes must keep opening, so a bump is deliberate, re-runs the fixed-file
+# and stock-age tests, and rechecks both ignores. Default features are empty.
+# MIT OR Apache-2.0.
+age = "=0.12.1"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
@@ -366,6 +375,14 @@ docx-rust = { path = "vendor/docx-rust" }
 # `cargo test --lib kdf::tests::real_default_parameters_derive_successfully`:
 # about 0.06 s with the override, about 1.6 s without.
 [profile.dev.package.argon2]
+opt-level = 3
+
+# items.id=966: the same for scrypt, which age derives the Moving Day file key
+# with (about 256 MiB at the written work factor).
+[profile.dev.package.scrypt]
+opt-level = 3
+
+[profile.dev.package.salsa20]
 opt-level = 3
 
 # items.id=678: build sha2 optimized in the dev and test profiles. The Privacy

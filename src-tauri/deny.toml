@@ -193,6 +193,36 @@ ignore = [
     # to 0.9.
     { id = "RUSTSEC-2026-0543", reason = "unmaintained: chrono 0.4.45, a DIRECT dependency (about 97 uses in 60 files under src-tauri/src); no CVE and no safe upgrade (0.4.45 is the newest release). Recommended alternatives are jiff or time; migrating is out of scope here and is tracked on items.id=928, which is also where this entry is revisited. Parsing exposure: chrono only parses fixed, strict formats (DateTime::parse_from_rfc3339 and NaiveDate::parse_from_str with %Y-%m-%d) of timestamps QR wrote into its own databases, a price document's as_of date (spend/price.rs) and the dates of a provider catalog body (provider_catalog/apply.rs parse_date, which rejects any string that is not 10 bytes first); no call parses a user-typed or network-supplied free-form date outside those, and there is no from_rfc2822, no custom strftime pattern and no parse of chat or document text. Unlike the ttf-parser entry above this is not a parser of uploaded files. Accepted as a forward-looking maintenance risk, not a proven-safe case." },
     { id = "RUSTSEC-2026-0459", reason = "SQLite before 3.54.0 can return uninitialized page-cache memory for a database opened with a sibling -wal file of a different page size. libsqlite3-sys 0.30.1 is built with the sqlcipher feature (not bundled), so QR links the system SQLCipher and its exposure is that library's SQLite (3.53.4 in SQLCipher 4.18.0 locally, CI builds v4.14.0), not the crate's bundled copy. The attack needs a crafted database plus sibling -wal file written where QR opens it; a code search found no import, restore or attach path (not an exhaustive proof). No fix without the sqlx 0.9 upgrade (sqlx 0.8.6 pins libsqlite3-sys 0.30.x). Revisit when a SQLCipher release embeds SQLite 3.54.0 or later, or when sqlx moves to 0.9." },
+
+    # --- age 0.12.1 (items.id=966, decisions.id=972) ---
+    # The Moving Day file (moving_day::container) is an age v1 PASSPHRASE file,
+    # and age brings two flagged crates that no feature or `cargo update` can
+    # remove: p256, hpke and ml-kem are non-optional, its default feature set is
+    # empty, and 0.12.1 was the newest release on 2026-11-28 (0.11.5 is a patch
+    # to the older line). Chains confirmed with `cargo tree --target all -i`.
+    #
+    # RUSTSEC-2026-0387, crypto-bigint 0.5.5 (operations meant to be
+    # constant-time may branch on secret integers, fixed in 0.7.6): reached only
+    # as age 0.12.1 -> p256 0.13.2 -> elliptic-curve 0.13.8, directly and also
+    # through hpke (a dependency of age and age-core). NOT REACHABLE from what we
+    # call: by source reading, only age's tagged public-key recipient files
+    # (native/tag.rs, native/tagpq.rs, native/tagpq/kem.rs) name p256 or hpke,
+    # and the passphrase path (native/scrypt.rs, protocol.rs,
+    # primitives/stream.rs) does not. moving_day constructs only the scrypt
+    # recipient and identity, and a source scan there pins that. This was not
+    # checked on a linked binary. elliptic-curve 0.13 holds crypto-bigint on 0.5.
+    #
+    # RUSTSEC-2026-0374, basic-toml 0.1.10 (unmaintained, no safe upgrade):
+    # reached only as age 0.12.1 -> i18n-embed-fl 0.10.1 and i18n-embed 0.16.0
+    # -> i18n-embed-impl 0.8.4 -> i18n-config 0.4.8 -> basic-toml. Both crates
+    # that depend on i18n-config are proc macros, so it is build-time only.
+    #
+    # Recheck trigger for BOTH entries: any age version bump, or any new use of
+    # crypto-bigint 0.5.5 or basic-toml in the tree (an ignore is by advisory
+    # id, so it would hide that use too), or any new use of an age API outside
+    # the passphrase functions.
+    { id = "RUSTSEC-2026-0387", reason = "vulnerability: crypto-bigint 0.5.5 timing, reached only via age 0.12.1 -> p256 0.13.2 (also via hpke) -> elliptic-curve 0.13.8. Not reachable from our use: moving_day calls only age's scrypt passphrase functions (source scan), and age's passphrase path does not name p256 or hpke (source reading, not a binary check). No upgrade path in age 0.12.1. Accepted by Jason 2026-11-28 (decisions.id=972). Recheck on any age bump or any new use of crypto-bigint 0.5.5." },
+    { id = "RUSTSEC-2026-0374", reason = "unmaintained: basic-toml 0.1.10, reached only via age 0.12.1 -> i18n-embed(-fl) -> proc macros i18n-embed-impl 0.8.4 / i18n-embed-fl 0.10.1 -> i18n-config 0.4.8. No CVE, build-time only, no upgrade path in age 0.12.1 (decisions.id=972). Recheck on any age bump or any new use of basic-toml." },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
